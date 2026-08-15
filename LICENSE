@@ -1,6 +1,31 @@
-MIT License
+==============================================================================
+HP Pro c640 Chromebook Linux Integration Project Licensing
+==============================================================================
 
-Copyright (c) 2026 Samson
+This project is licensed under a mixed-license (multi-license) model in
+compliance with the REUSE Specification 3.0 and SPDX standards.
+
+The primary umbrella license for the repository, original orchestration scripts,
+utility libraries, diagnostic tools, and general documentation is the **MIT License**.
+
+Specific submodules, hardware drivers, and configuration sets are derived from
+or interface with third-party open-source projects and are distributed under
+their respective upstream licenses (e.g. LGPL-2.1-or-later, BSD-3-Clause).
+
+The complete texts of all applicable licenses are available in the `LICENSES/`
+directory of this repository:
+  - `LICENSES/MIT.txt`
+  - `LICENSES/LGPL-2.1-or-later.txt`
+  - `LICENSES/BSD-3-Clause.txt`
+  - `LICENSES/CC0-1.0.txt`
+
+------------------------------------------------------------------------------
+1. PRIMARY PROJECT LICENSE (MIT)
+------------------------------------------------------------------------------
+Applicable to: Root orchestrator (`setup.sh`), core libraries (`lib/*`),
+diagnostics and scripts (`scripts/*`), and general documentation.
+
+Copyright (c) 2026 Samson <https://github.com/samson1357924>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,8 +45,19 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----
+------------------------------------------------------------------------------
+2. SUBMODULE & DERIVED COMPONENT LICENSING MATRIX
+------------------------------------------------------------------------------
 
-### Third-Party & Derived Component Licensing Notice:
+| Directory / Component | License (SPDX Identifier) | License File Location | Upstream / Original Authors |
+| :--- | :--- | :--- | :--- |
+| `fingerprint/driver/*` | LGPL-2.1-or-later | `LICENSES/LGPL-2.1-or-later.txt` | libfprint / Abhinav Baid, Felix Niederer, Michael Evans, Marco Trevisan |
+| `fingerprint/tests/*`  | LGPL-2.1-or-later | `LICENSES/LGPL-2.1-or-later.txt` | Samson & libfprint contributors |
+| `audio/ucm/ucm2/*`     | BSD-3-Clause      | `LICENSES/BSD-3-Clause.txt`      | ALSA Project / WeirdTreeThing & alsa-ucm-conf-cros |
+| `audio/patches/*`      | MIT               | `LICENSES/MIT.txt`               | Samson (Contributed upstream to PipeWire under DCO) |
+| `keyboard/90-*.hwdb`   | CC0-1.0            | `LICENSES/CC0-1.0.txt`           | Hardware Scancode Mapping Data (systemd-hwdb) |
+| `power/tlp/*`          | MIT               | `LICENSES/MIT.txt`               | Comet Lake-U Tuning Profile (User Configuration Data) |
+| `scripts/c640-ec-control.sh` | MIT         | `LICENSES/MIT.txt`               | Shell tool interfacing with ChromiumOS EC (BSD-3-Clause) |
 
-* **Driver code** located under `fingerprint/driver/` and unit test code under `fingerprint/tests/` are derived from the upstream `libfprint` project and are licensed under the terms of the **GNU Lesser General Public License, version 2.1 or later (LGPL-2.1-or-later)**. See `COPYING.LGPL` for the full text.
+For full details regarding upstream copyrights, contributor credits, and
+derivative modifications, please refer to [`CREDITS.md`](CREDITS.md).

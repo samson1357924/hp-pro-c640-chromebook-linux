@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# REUSE.toml configuration for HP Pro c640 Chromebook Linux project
+
+version = 1
+
+SPDX-PackageName = "hp-pro-c640-chromebook-linux"
+SPDX-PackageSupplier = "Samson <https://github.com/samson1357924>"
+SPDX-PackageDownloadLocation = "https://github.com/samson1357924/hp-pro-c640-chromebook-linux"
+
+# Root orchestrator and core tooling scripts
+[[annotations]]
+path = [
+    "setup.sh",
+    "scripts/**",
+    "lib/**",
+    "keyboard/install-keyboard.sh",
+    "keyboard/keyd/**",
+    "power/**",
+    "ec/**",
+    "fingerprint/install-fingerprint.sh",
+    "audio/install-audio.sh",
+    "audio/install-audio-ucm.sh",
+    "audio/diagnose-audio.sh"
+]
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "MIT"
+
+# Keyboard hwdb mapping data (derived from systemd 60-chromebook-keyboard.hwdb)
+[[annotations]]
+path = "keyboard/90-chromebook-keyboard.hwdb"
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "CC0-1.0"
+
+# CI workflows and issue templates
+[[annotations]]
+path = ".github/**"
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "MIT"
+
+# License text copy at repository root (GNU LGPL v2.1 text)
+[[annotations]]
+path = "COPYING.LGPL"
+SPDX-FileCopyrightText = "1989, 1991 Free Software Foundation, Inc."
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+# Fingerprint driver & unit tests (derived from upstream libfprint/crfpmoc)
+[[annotations]]
+path = [
+    "fingerprint/driver/**",
+    "fingerprint/tests/**"
+]
+SPDX-FileCopyrightText = [
+    "2024 Abhinav Baid <abhinavbaid@gmail.com>",
+    "2024 Felix Niederer <felix@niederer.dev>",
+    "2025 Michael Evans <mike.67.442@gmail.com>",
+    "2026 Marco Trevisan (Treviño) <mail@3v1n0.net>",
+    "2026 Samson <https://github.com/samson1357924>"
+]
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+
+# Audio UCM Configurations
+[[annotations]]
+path = "audio/ucm/**"
+SPDX-FileCopyrightText = [
+    "2019 Advanced Linux Sound Architecture (ALSA) project",
+    "2022-2026 WeirdTreeThing <https://github.com/WeirdTreeThing>"
+]
+SPDX-License-Identifier = "BSD-3-Clause"
+
+# Documentation and Guides
+[[annotations]]
+path = ["docs/**", "**/*.md"]
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "MIT"
+
+# Dotfiles and linter configurations
+[[annotations]]
+path = [
+    ".gitignore",
+    ".markdownlint.yaml",
+    ".shellcheckrc",
+    "lychee.toml"
+]
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "CC0-1.0"
