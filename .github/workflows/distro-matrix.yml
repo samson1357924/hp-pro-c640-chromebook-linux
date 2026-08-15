@@ -63,7 +63,7 @@ jobs:
             image: "fedora:40"
             family: "fedora"
             init_cmd: "dnf install -y bash coreutils sudo git"
-            check_pkgs_cmd: "dnf install --assumeno -y"
+            check_pkgs_cmd: "dnf install --assumeyes --downloadonly --destdir=/tmp/ci-dnf-check -y"
 
           - name: "Arch Linux"
             image: "archlinux:base-devel"
@@ -95,6 +95,7 @@ jobs:
           echo "Resolving packages: $DEPS"
           read -r -a deps_arr <<< "$DEPS"
           ${{ matrix.distro.check_pkgs_cmd }} "${deps_arr[@]}"
+          rm -rf /tmp/ci-dnf-check
 
       - name: Test Setup CLI Dry-Run
         run: |
