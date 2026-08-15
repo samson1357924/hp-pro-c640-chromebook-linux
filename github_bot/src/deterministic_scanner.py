@@ -94,9 +94,11 @@ class DeterministicScanner:
                         remediation="Wrap multi-byte fields in GUINT32_TO_LE() or GUINT16_TO_LE() per cros-ec spec.",
                     ))
 
+        # REUSE-IgnoreStart
         # Check SPDX License Header
         if any(filename.endswith(ext) for ext in [".sh", ".c", ".h", ".py"]):
-            if patch_content and not re.search(r"SPDX-License-Identifier:", patch_content) and len(lines) > 5:
+            spdx_marker = "SPDX-License" + "-Identifier:"
+            if patch_content and not re.search(re.escape(spdx_marker), patch_content) and len(lines) > 5:
                 # Only check if file seems to be new
                 if patch_content.startswith("@@ -0,0"):
                     findings.append(ScanFinding(
@@ -105,8 +107,9 @@ class DeterministicScanner:
                         file_path=filename,
                         line_number=1,
                         message="New file missing SPDX-License-Identifier header.",
-                        remediation="Add '# SPDX-License-Identifier: MIT' or appropriate license header.",
+                        remediation="Add '# " + spdx_marker + " MIT' or appropriate license header.",
                     ))
+        # REUSE-IgnoreEnd
 
         return findings
 

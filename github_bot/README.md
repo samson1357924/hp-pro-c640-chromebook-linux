@@ -1,6 +1,7 @@
 # HP Pro c640 Chromebook Linux GitHub AI Bot
 
-Production multi-agent GitHub review and issue triage bot for **HP Pro c640 Chromebook (Google Dratini / Hatch platform) Linux Enablement**.
+Production multi-agent GitHub review and issue triage bot for
+**HP Pro c640 Chromebook (Google Dratini / Hatch platform) Linux Enablement**.
 
 ---
 
@@ -8,7 +9,8 @@ Production multi-agent GitHub review and issue triage bot for **HP Pro c640 Chro
 
 1. **🔒 Secure Execution Boundary (`pull_request_target`)**:
    - Executes trusted bot code from the default branch (`main` / `master`).
-   - Fetches immutable PR commits into isolated refs (`refs/c640-bot/review-base`, `refs/c640-bot/review-head`) with SHA validation.
+   - Fetches immutable PR commits into isolated refs
+     (`refs/c640-bot/review-base`, `refs/c640-bot/review-head`) with SHA validation.
    - Prevents unauthorized re-reviews from untrusted forks.
 
 2. **⚡ Multi-Provider LLM Engine**:
@@ -24,13 +26,14 @@ Production multi-agent GitHub review and issue triage bot for **HP Pro c640 Chro
 
 4. **📋 Multi-Agent PR Review Pipeline**:
    - `hardware_driver`: C driver, ALSA UCM2, udev, hwdb, EC fan/battery limits.
-   - `script_safety`: ShellCheck, root/user separation (`get_real_user`), backup manifest tracking (`/var/lib/cros-enablement`).
+   - `script_safety`: ShellCheck, root/user separation (`get_real_user`), backup manifest tracking.
    - `docs_public`: Bilingual sync between `README.md` and `README.zh-CN.md`, REUSE/SPDX licensing, MarkdownLint.
    - `explainer_agent`: Plain-language maintainer summary.
 
 5. **🎯 Decision-First Issue Triage (0–100 Quality Scoring)**:
-   - Structured checklist with required sections (`CLASSIFICATION`, `ACTIONABILITY`, `ROOT_CAUSE_HYPOTHESES`, `QUALITY_BREAKDOWN`, `MISSING_INFO`).
-   - Audio Dummy Output, `/dev/cros_fp` permissions, HWDB DMI mismatch, and S0ix Modern Standby sleep drain playbooks.
+   - Structured checklist with required sections (`CLASSIFICATION`, `ACTIONABILITY`, `ROOT_CAUSE_HYPOTHESES`,
+     `QUALITY_BREAKDOWN`, `MISSING_INFO`).
+   - Audio Dummy Output, `/dev/cros_fp` permissions, HWDB DMI mismatch, and S0ix Modern Standby playbooks.
    - Automated label application from allowlisted tags.
    - Sticky comments: updates existing bot comments in-place without timeline spam.
 
@@ -39,6 +42,7 @@ Production multi-agent GitHub review and issue triage bot for **HP Pro c640 Chro
 ## 🚀 Slash Commands
 
 In issue and PR comment threads:
+
 - `/review`: Triggers a fresh multi-agent PR review or issue investigation.
 - `/triage`: Runs the issue triage agent to compute quality score and missing-info checklist.
 - `/explain`: Generates a non-jargon plain-language summary for maintainers.

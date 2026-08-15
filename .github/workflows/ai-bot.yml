@@ -63,8 +63,10 @@ jobs:
           git fetch --no-tags origin "+${base_sha}:refs/c640-bot/review-base" "+${head_sha}:refs/c640-bot/review-head"
           test "$(git rev-parse refs/c640-bot/review-base)" = "$base_sha"
           test "$(git rev-parse refs/c640-bot/review-head)" = "$head_sha"
-          echo "REVIEW_BASE_REF=refs/c640-bot/review-base" >> "$GITHUB_ENV"
-          echo "REVIEW_HEAD_REF=refs/c640-bot/review-head" >> "$GITHUB_ENV"
+          {
+            echo "REVIEW_BASE_REF=refs/c640-bot/review-base"
+            echo "REVIEW_HEAD_REF=refs/c640-bot/review-head"
+          } >> "$GITHUB_ENV"
 
       - name: Validate PR comment metadata and fetch immutable refs
         id: validate-pr-comment
@@ -92,9 +94,11 @@ jobs:
             echo "Fetched refs did not match PR metadata; API diff fallback will be used."
             exit 0
           fi
-          echo "REVIEW_BASE_REF=refs/c640-bot/review-base" >> "$GITHUB_ENV"
-          echo "REVIEW_HEAD_REF=refs/c640-bot/review-head" >> "$GITHUB_ENV"
-          echo "SAFE_PR_REVIEW=true" >> "$GITHUB_ENV"
+          {
+            echo "REVIEW_BASE_REF=refs/c640-bot/review-base"
+            echo "REVIEW_HEAD_REF=refs/c640-bot/review-head"
+            echo "SAFE_PR_REVIEW=true"
+          } >> "$GITHUB_ENV"
           echo "safe_pr_review=true" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
