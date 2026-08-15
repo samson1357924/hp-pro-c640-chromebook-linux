@@ -1,0 +1,144 @@
+name: HP Pro c640 Multi-Agent GitHub AI Bot
+
+on:
+  # NOTE: pull_request_target runs in the base-branch context with secrets access
+  # (CPA_BASE_URL / CPA_API_KEY / OPENCODE_API_KEY / GITHUB_TOKEN).
+  # Untrusted PR code is never checked out or executed; the bot only analyzes diffs.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Manual execution mode"
+        required: true
+        default: review
+        type: choice
+        options:
+          - review
+          - triage
+          - explain
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ai-bot:
+    name: Multi-Agent AI Review & Triage
+    if: >
+      github.event_name != 'issue_comment' ||
+      (
+        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.comment.author_association) &&
+        (
+          contains(github.event.comment.body, '/review') ||
+          contains(github.event.comment.body, '/triage') ||
+          contains(github.event.comment.body, '/explain')
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out Trusted Bot Codebase
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch immutable PR refs for review
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          base_sha='${{ github.event.pull_request.base.sha }}'
+          head_sha='${{ github.event.pull_request.head.sha }}'
+          git fetch --no-tags origin "+${base_sha}:refs/c640-bot/review-base" "+${head_sha}:refs/c640-bot/review-head"
+          test "$(git rev-parse refs/c640-bot/review-base)" = "$base_sha"
+          test "$(git rev-parse refs/c640-bot/review-head)" = "$head_sha"
+          echo "REVIEW_BASE_REF=refs/c640-bot/review-base" >> "$GITHUB_ENV"
+          echo "REVIEW_HEAD_REF=refs/c640-bot/review-head" >> "$GITHUB_ENV"
+
+      - name: Validate PR comment metadata and fetch immutable refs
+        id: validate-pr-comment
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          echo "SAFE_PR_REVIEW=false" >> "$GITHUB_ENV"
+          echo "safe_pr_review=false" >> "$GITHUB_OUTPUT"
+          if ! pr_metadata="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '[.base.sha, .head.sha, .head.repo.full_name] | @tsv')"; then
+            echo "Unable to read PR metadata; API diff fallback will be used."
+            exit 0
+          fi
+          IFS=$'\t' read -r base_sha head_sha head_repo <<< "$pr_metadata"
+          if [ -z "$base_sha" ] || [ -z "$head_sha" ] || [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "Fork PR detected; API diff fallback will be used."
+            exit 0
+          fi
+          if ! git fetch --no-tags origin "+${base_sha}:refs/c640-bot/review-base" "+${head_sha}:refs/c640-bot/review-head"; then
+            echo "Unable to fetch immutable PR refs; API diff fallback will be used."
+            exit 0
+          fi
+          if ! fetched_base_sha="$(git rev-parse refs/c640-bot/review-base)" || ! fetched_head_sha="$(git rev-parse refs/c640-bot/review-head)" || [ "$fetched_base_sha" != "$base_sha" ] || [ "$fetched_head_sha" != "$head_sha" ]; then
+            echo "Fetched refs did not match PR metadata; API diff fallback will be used."
+            exit 0
+          fi
+          echo "REVIEW_BASE_REF=refs/c640-bot/review-base" >> "$GITHUB_ENV"
+          echo "REVIEW_HEAD_REF=refs/c640-bot/review-head" >> "$GITHUB_ENV"
+          echo "SAFE_PR_REVIEW=true" >> "$GITHUB_ENV"
+          echo "safe_pr_review=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Bot Unit Tests
+        run: |
+          python3 -m unittest discover -s github_bot/tests -v
+
+      - name: Determine Bot Execution Mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          mode="review"
+          case "${{ github.event_name }}" in
+            issues)
+              mode="triage"
+              ;;
+            issue_comment)
+              mode="comment"
+              ;;
+            workflow_dispatch)
+              mode="${{ inputs.mode }}"
+              ;;
+            pull_request_target)
+              mode="review"
+              ;;
+          esac
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
+      - name: Run AI Bot
+        shell: bash
+        env:
+          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
+          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body || '' }}
+          ISSUE_TITLE: ${{ github.event.issue.title || '' }}
+          ISSUE_BODY: ${{ github.event.issue.body || '' }}
+          PYTHONPATH: github_bot/src
+        run: |
+          set -euo pipefail
+          python3 github_bot/src/github_runner.py --mode="${{ steps.mode.outputs.mode }}"
