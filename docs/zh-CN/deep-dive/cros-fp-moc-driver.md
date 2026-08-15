@@ -56,13 +56,25 @@ ChromeOS 專屬的 **Match-on-Chip (MoC)** 安全隔離架構：
 * **解決方案**：引入 weak-pointer 參照計數守護，在非同步 callback 觸發時先行校驗
   指標有效性。
 
-### 挑戰 3：加密種子持久化 (TPM Seed & Context Management)
+### 挑戰 3：加密種子與 Context 的持久化
 
-* **問題**：FPMCU 的 RAM 模板在重開機後會被清除，且每台設備需要獨立的金鑰進行
-  模板加解密。
-* **解決方案**：驅動於首次運行時在 `/var/lib/fprint/crfpmoc.key` 產生 32-byte
-  密碼學安全隨機種子（權限 `0600`），並在每次與 FPMCU 握手時透過
-  `EC_CMD_FP_SEED` 與 `EC_CMD_FP_CONTEXT` 注入安全種子。
+* **問題**：模板由 FPMCU 上的金鑰加解密，而該金鑰由兩個輸入衍生：**seed** 與
+  **user context (`user_id`)**。兩者都在 FPMCU 的 **RAM（不是 flash）**：seed（與
+  `SEED_SET` 旗標）只在*暖*重開機（FPMCU 持續供電）時保留，*冷*重開機會遺失、由主機從
+  `/var/lib/fprint/crfpmoc.key` 重新送 `FP_SEED`（已設時重送會被 `EC_RES_ACCESS_DENIED` 拒絕）。
+  但 **user context 在 FPMCU RAM，且每次 `FP_CONTEXT_ASYNC` 都會被重置**，所以**每次 open 都必須
+  重新透過 `EC_CMD_FP_CONTEXT` 注入**。此外，`FP_CONTEXT` 步驟會觸發 FPMCU 感應器的
+  reset/open（`fp_sensor_open`，約 175 ms）把感應器重新初始化——若缺少此步，重開機後
+  的感應器無法解/處理模板（`EC_RES_UNAVAILABLE`）。
+* **解決方案**：驅動首次運行時在 `/var/lib/fprint/crfpmoc.key` 產生 32-byte 密碼學安全隨機
+  種子（權限 `0600`），並**只**在 FPMCU 回報 seed 尚未設定時（`EC_CMD_FP_ENC_STATUS`）
+  才送 `EC_CMD_FP_SEED`。但**每次** open 都會送 `EC_CMD_FP_CONTEXT`（即使 seed 已設），
+  用來重建易失的 user context，並在重開機後重新開啟感應器。seed 檔跨重開機穩定不變，
+  因此已註冊模板通常無需重新註冊即可解密。
+
+  > **註（回歸問題）**：曾有 driver commit 在 seed 已設時跳過 `FP_CONTEXT`，導致重開機後
+  > 感應器未初始化（`EC_RES_UNAVAILABLE`），且改變了 context 帶起流程，使該版本下註冊的
+  > 模板無法解密——詳見 Troubleshooting §7。
 
 ---
 
