@@ -24,10 +24,14 @@ in accordance with open-source licensing standards.
   * Copyright (C) 2026 Marco Trevisan (Treviño) `<mail@3v1n0.net>`
   * Copyright (C) 2026 Samson `<samson1357924@users.noreply.github.com>` (Hardening & Polling fixes)
 * **Summary of Derivative Modifications in this Repository**:
-  * Implemented a 50ms periodic state machine polling loop (`G_SOURCE_CONTINUE`) to eliminate epoll event starvation on kernels without hardware GPIO interrupt endpoints.
-  * Added weak-pointer safety guards (`g_weak_ref_init` / `g_weak_ref_get`) to eliminate Use-After-Free crashes during asynchronous enrollment cancellation.
+  * Implemented a 50ms periodic state machine polling loop (`G_SOURCE_CONTINUE`)
+    to eliminate epoll event starvation on kernels without hardware GPIO
+    interrupt endpoints.
+  * Added weak-pointer safety guards (`g_weak_ref_init` / `g_weak_ref_get`) to
+    eliminate Use-After-Free crashes during asynchronous enrollment cancellation.
   * Implemented dynamic random seed storage in `/var/lib/fprint/crfpmoc.key` with strict `0600` permissions.
-  * Created standalone C unit test suite (`fingerprint/tests/test-crfpmoc-unit.c`) validating Protocol v3/v1 packet sizes, LE conversions, and bitmasks.
+  * Created standalone C unit test suite (`fingerprint/tests/test-crfpmoc-unit.c`)
+    validating Protocol v3/v1 packet sizes, LE conversions, and bitmasks.
 
 ---
 
@@ -42,7 +46,8 @@ in accordance with open-source licensing standards.
   * Copyright (c) 2019-2026 Advanced Linux Sound Architecture (ALSA) project
   * Copyright (c) 2022-2026 WeirdTreeThing `<https://github.com/WeirdTreeThing>` and alsa-ucm-conf-cros contributors
 * **Attribution & BSD Conditions**:
-  * Redistribution and use in source and binary forms are permitted provided that the copyright notices, conditions, and disclaimers are retained.
+  * Redistribution and use in source and binary forms are permitted provided
+    that the copyright notices, conditions, and disclaimers are retained.
   * Neither the name of the ALSA Project nor WeirdTreeThing is used to endorse or promote products derived from this repository.
 
 ---
@@ -70,6 +75,7 @@ in accordance with open-source licensing standards.
 ## 5. Ecosystem & Community Acknowledgments
 
 We express our sincere gratitude to the broader Linux on Chromebook community:
+
 * **MrChromebox** ([mrchromebox.tech](https://mrchromebox.tech/)): For UEFI Full ROM coreboot firmware builds.
 * **Chrultrabook Project**: For pioneering Linux documentation and hardware exploration across Google Chromebook platforms.
 * **Sound Open Firmware (SOF) Project**: For the open-source audio DSP firmware stack enabling Intel Comet Lake audio.
