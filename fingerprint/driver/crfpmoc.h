@@ -1,7 +1,16 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * ChromeOS Fingerprint driver for libfprint
  *
  * Copyright (C) 2024 Abhinav Baid <abhinavbaid@gmail.com>
+ * Copyright (C) 2024 Felix Niederer <felix@niederer.dev>
+ * Copyright (C) 2026 Marco Trevisan (Treviño) <mail@3v1n0.net>
+ * Copyright (C) 2026 Samson <https://github.com/samson1357924>
+ *
+ * This file contains modifications to the upstream crfpmoc driver
+ * (50ms polling loop, weak-pointer guards, seed persistence).
+ * Modified: 2026-08-15. See CREDITS.md for details.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# Maintainer: Samson <samson1357924>
+# Contributor: HP Pro c640 Linux Enablement Team
+
+pkgname=libfprint-crfpmoc
+pkgver=1.94.10
+pkgrel=1
+pkgdesc="Library for fingerprint readers with ChromeOS Match-on-Chip (MoC) driver support"
+arch=('x86_64')
+url="https://github.com/samson1357924/crfpmoc"
+license=('LGPL-2.1-or-later')
+depends=('glib2' 'libgusb' 'pixman' 'libgudev' 'nss' 'systemd-libs')
+makedepends=('meson' 'ninja' 'pkgconf' 'gobject-introspection' 'git')
+provides=('libfprint' 'libfprint-2.so')
+conflicts=('libfprint')
+backup=('etc/udev/rules.d/60-cros-fp.rules')
+source=("git+https://github.com/samson1357924/crfpmoc.git#branch=master"
+        "60-cros-fp.rules")
+sha256sums=('SKIP'
+            'SKIP')
+
+build() {
+    cd "${srcdir}/crfpmoc"
+    arch-meson build \
+        -Ddrivers=default \
+        -Dintrospection=true \
+        -Dgtk-examples=false \
+        -Ddoc=false
+    ninja -C build
+}
+
+package() {
+    cd "${srcdir}/crfpmoc"
+    DESTDIR="${pkgdir}" ninja -C build install
+    install -Dm644 "${srcdir}/60-cros-fp.rules" "${pkgdir}/usr/lib/udev/rules.d/60-cros-fp.rules"
+}

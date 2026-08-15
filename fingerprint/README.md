@@ -1,6 +1,6 @@
 # Fingerprint Setup (ChromeOS Match-on-Chip `crfpmoc`)
 
-This module provides complete instructions, driver source reference, and automated installation scripts for the **FPC1025 Match-on-Chip (MoC)** fingerprint reader on the HP Pro c640 Chromebook (Google `dratini`).
+This module provides complete instructions, driver source reference, cross-distribution packaging templates, and automated installation scripts for the **FPC1025 Match-on-Chip (MoC)** fingerprint reader on the HP Pro c640 Chromebook (Google `dratini` / `hatch`).
 
 ---
 
@@ -21,14 +21,30 @@ The fingerprint sensor on HP Pro c640 is connected via SPI to the ChromeOS Finge
 
 ---
 
-## 🛠️ Automated Installation
+## 🛠️ Installation & Management
 
-Run the automated script to install the udev rules, compile and install `crfpmoc` `libfprint`, and configure PAM:
+### Automated Installation (Cross-Distro)
+
+The included installation script automatically detects your distribution (Ubuntu/Debian, Fedora, Arch, openSUSE), installs dependencies, builds libfprint, installs udev rules, and configures PAM:
 
 ```bash
 chmod +x install-fingerprint.sh
 ./install-fingerprint.sh
 ```
+
+**Supported Options**:
+* `./install-fingerprint.sh --check` : Inspect fingerprint device status and list registered prints.
+* `./install-fingerprint.sh --dry-run` : Preview installation steps without making system changes.
+* `./install-fingerprint.sh --uninstall` : Revert udev rules and restore distro stock packages.
+
+---
+
+## 📦 Native Distribution Packaging
+
+For users who prefer native package management over direct source installation:
+
+* **Arch Linux / EndeavourOS**: Use the provided [`packaging/PKGBUILD`](packaging/PKGBUILD) with `makepkg -si`.
+* **Fedora / openSUSE**: Use [`packaging/libfprint-crfpmoc.spec`](packaging/libfprint-crfpmoc.spec) with `rpmbuild`.
 
 ---
 
@@ -97,9 +113,8 @@ sudo journalctl -u fprintd -f
 
 ---
 
-## 📁 Driver Source Code (`driver/`)
+## 📁 Driver Source Code & Tests
 
-The patched driver implementation files are bundled in `driver/` for full transparency and reproducible builds:
 * [`driver/crfpmoc.c`](driver/crfpmoc.c): Main driver state machines, 50ms polling loop, and memory guards.
 * [`driver/crfpmoc.h`](driver/crfpmoc.h): ChromeOS EC Host Command structures, MKBP bitmasks, and packet definitions.
 * [`driver/crfpmoc-ec-transfer.c`](driver/crfpmoc-ec-transfer.c): Async `ioctl` transfer execution over `/dev/cros_fp`.
@@ -109,5 +124,6 @@ The patched driver implementation files are bundled in `driver/` for full transp
 ---
 
 ## 🙏 致謝 (Credits)
-* **Abhinav Baid**, **Felix Niederer**, **Michael Evans**, **Marco Trevisan (Treviño)** & **libfprint team**.
-* **ChromiumOS EC team** & **Chrultrabook Project**.
+
+* **[Abhinav Baid](https://github.com/abhinavbaid)**, **[Felix Niederer](https://github.com/felixniederer)**, **[Michael Evans](https://github.com/michaeleevans)**, **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** & **libfprint team**.
+* **[ChromiumOS EC Team](https://chromium.googlesource.com/chromiumos/platform/ec/)** & **[Chrultrabook Project](https://chrultrabook.com/)**.

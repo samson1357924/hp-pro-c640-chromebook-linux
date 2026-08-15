@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * ChromeOS Fingerprint driver for libfprint
  *
  * Copyright (C) 2026 Marco Trevisan (Treviño) <mail@3v1n0.net>

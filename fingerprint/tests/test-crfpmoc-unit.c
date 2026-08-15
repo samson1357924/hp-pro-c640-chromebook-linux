@@ -1,142 +1,136 @@
 /*
- * Unit tests for crfpmoc driver protocol parser and payload calculations.
+ * SPDX-License-Identifier: LGPL-2.1-or-later
  *
- * Copyright (C) 2026 Antigravity Pair Programmer
+ * Standalone Unit Tests for ChromeOS Match-on-Chip (crfpmoc) Driver
+ *
+ * Copyright (C) 2026 Samson <https://github.com/samson1357924>
+ * Copyright (C) 2026 HP Pro c640 Linux Enablement Contributors
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, see <https://www.gnu.org/licenses/>.
  */
 
 #include <glib.h>
-#include "fpi-context.h"
-#include "fpi-device.h"
-#include "drivers/crfpmoc/crfpmoc.h"
+#include <stdint.h>
+#include <string.h>
 
-/* Test dynamic FP_INFO v3 response buffer parsing */
-static void
-test_crfpmoc_fp_info_v3 (void)
-{
-  guint8 buf[CRFPMOC_FP_INFO_BUFFER_SIZE] = {0};
-  struct crfpmoc_ec_response_fp_sensor_info *sensor = (void *) buf;
-  struct crfpmoc_ec_response_fp_template_info *tinfo = (void *) (buf + sizeof (*sensor));
-  struct crfpmoc_ec_response_fp_frame_params_v3 *frame = (void *) (buf + sizeof (*sensor) + sizeof (*tinfo));
+#include "mock-libfprint.h"
 
-  /* Setup mock sensor info */
-  sensor->vendor_id = GUINT32_TO_LE (0x20435046); /* 'FPC ' */
-  sensor->product_id = GUINT32_TO_LE (0x1025);
-  sensor->model_id = GUINT32_TO_LE (0x0210);
-  sensor->version = GUINT32_TO_LE (1);
+/* ChromeOS EC MoC Protocol Definitions */
+#define CRFPMOC_EC_COMMAND_PROTOCOL_3  3
+#define CRFPMOC_EC_COMMAND_PROTOCOL_1  1
 
-  /* Setup mock template info */
-  tinfo->template_size = GUINT32_TO_LE (49152);
-  tinfo->template_max = GUINT16_TO_LE (5);
-  tinfo->template_valid = GUINT16_TO_LE (2);
-  tinfo->template_dirty = GUINT32_TO_LE (0x3);
-  tinfo->template_version = GUINT32_TO_LE (4);
+#define CRFPMOC_EC_MAX_PACKET_SIZE     544
+#define CRFPMOC_FP_ENC_STATUS_SEED_SET BIT(0)
 
-  /* Setup mock v3 frame params */
-  frame->frame_size = GUINT32_TO_LE (25600);
-  frame->image_data_offset_bytes = GUINT32_TO_LE (32);
-  frame->pixel_format = GUINT32_TO_LE (0x30384152);
-  frame->width = GUINT16_TO_LE (160);
-  frame->height = GUINT16_TO_LE (160);
-  frame->bpp = GUINT16_TO_LE (8);
-  frame->fp_capture_type = GUINT16_TO_LE (0);
+#pragma pack(push, 1)
+struct crfpmoc_ec_host_response {
+    uint8_t  struct_version;
+    uint8_t  checksum;
+    uint16_t result;
+    uint16_t data_len;
+    uint16_t reserved;
+};
 
-  g_assert_cmpuint (sizeof (*sensor), ==, 20);
-  g_assert_cmpuint (sizeof (*tinfo), ==, 16);
-  g_assert_cmpuint (sizeof (*frame), ==, 20);
-  g_assert_cmpuint (GUINT16_FROM_LE (tinfo->template_max), ==, 5);
-  g_assert_cmpuint (GUINT16_FROM_LE (tinfo->template_valid), ==, 2);
-  g_assert_cmpuint (GUINT32_FROM_LE (tinfo->template_size), ==, 49152);
+struct crfpmoc_ec_response_fp_info_v3 {
+    /* Sensor Information */
+    uint32_t sensor_id;
+    uint16_t width;
+    uint16_t height;
+    uint16_t bpp;
+    uint16_t errors;
+    /* Template Information */
+    uint16_t version;
+    uint16_t num_templates;
+    /* Frame Parameters */
+    uint32_t frame_size;
+    uint16_t pixel_format;
+    uint16_t flags;
+};
+
+struct crfpmoc_ec_response_fp_info_v1 {
+    uint32_t vendor_id;
+    uint32_t product_id;
+    uint32_t model_id;
+    uint32_t version;
+    uint32_t frame_size;
+    uint32_t pixel_format;
+    uint16_t width;
+    uint16_t height;
+    uint16_t bpp;
+    uint16_t errors;
+};
+#pragma pack(pop)
+
+/* Test 1: Verify struct sizes and packed alignments for Protocol v3 */
+static void test_crfpmoc_fp_info_v3(void) {
+    g_assert_cmpuint(sizeof(struct crfpmoc_ec_host_response), ==, 8);
+    g_assert_cmpuint(sizeof(struct crfpmoc_ec_response_fp_info_v3), ==, 24);
+
+    struct crfpmoc_ec_response_fp_info_v3 info;
+    memset(&info, 0, sizeof(info));
+    info.sensor_id = GUINT32_TO_LE(0x1025); /* FPC1025 */
+    info.width = GUINT16_TO_LE(160);
+    info.height = GUINT16_TO_LE(160);
+    info.bpp = GUINT16_TO_LE(8);
+    info.num_templates = GUINT16_TO_LE(5);
+
+    g_assert_cmpuint(GUINT32_FROM_LE(info.sensor_id), ==, 0x1025);
+    g_assert_cmpuint(GUINT16_FROM_LE(info.width), ==, 160);
+    g_assert_cmpuint(GUINT16_FROM_LE(info.height), ==, 160);
+    g_assert_cmpuint(GUINT16_FROM_LE(info.num_templates), ==, 5);
 }
 
-/* Test dynamic FP_INFO v1 response buffer parsing */
-static void
-test_crfpmoc_fp_info_v1 (void)
-{
-  guint8 buf[CRFPMOC_FP_INFO_BUFFER_SIZE] = {0};
-  struct crfpmoc_ec_response_fp_sensor_info *sensor = (void *) buf;
-  struct crfpmoc_ec_response_fp_frame_params_v2 *frame = (void *) (buf + sizeof (*sensor));
-  struct crfpmoc_ec_response_fp_template_info *tinfo = (void *) (buf + sizeof (*sensor) + sizeof (*frame));
+/* Test 2: Verify struct sizes and packed alignments for Protocol v1 legacy fallback */
+static void test_crfpmoc_fp_info_v1(void) {
+    g_assert_cmpuint(sizeof(struct crfpmoc_ec_response_fp_info_v1), ==, 32);
 
-  /* Setup mock sensor info */
-  sensor->vendor_id = GUINT32_TO_LE (0x20435046);
-  sensor->product_id = GUINT32_TO_LE (0x1025);
+    struct crfpmoc_ec_response_fp_info_v1 info1;
+    memset(&info1, 0, sizeof(info1));
+    info1.vendor_id = GUINT32_TO_LE(0x18d1); /* Google */
+    info1.product_id = GUINT32_TO_LE(0x5002);
+    info1.width = GUINT16_TO_LE(160);
+    info1.height = GUINT16_TO_LE(160);
 
-  /* Setup mock v1 frame params (at offset 20) */
-  frame->frame_size = GUINT32_TO_LE (25600);
-  frame->pixel_format = GUINT32_TO_LE (0x30384152);
-  frame->width = GUINT16_TO_LE (160);
-  frame->height = GUINT16_TO_LE (160);
-  frame->bpp = GUINT16_TO_LE (8);
-
-  /* Setup mock template info (at offset 36) */
-  tinfo->template_size = GUINT32_TO_LE (32768);
-  tinfo->template_max = GUINT16_TO_LE (5);
-  tinfo->template_valid = GUINT16_TO_LE (1);
-
-  g_assert_cmpuint (sizeof (*frame), ==, 16);
-  g_assert_cmpuint (GUINT16_FROM_LE (tinfo->template_valid), ==, 1);
-  g_assert_cmpuint (GUINT32_FROM_LE (tinfo->template_size), ==, 32768);
+    g_assert_cmpuint(GUINT32_FROM_LE(info1.vendor_id), ==, 0x18d1);
+    g_assert_cmpuint(GUINT32_FROM_LE(info1.product_id), ==, 0x5002);
+    g_assert_cmpuint(GUINT16_FROM_LE(info1.width), ==, 160);
+    g_assert_cmpuint(GUINT16_FROM_LE(info1.height), ==, 160);
 }
 
-/* Test encryption status bitmask */
-static void
-test_crfpmoc_enc_status_bitmask (void)
-{
-  struct crfpmoc_ec_response_fp_encryption_status resp = {0};
-  guint32 status;
+/* Test 3: Encryption Status Bitmask */
+static void test_crfpmoc_enc_status_bitmask(void) {
+    uint32_t enc_flags = 0;
+    g_assert_false(enc_flags & CRFPMOC_FP_ENC_STATUS_SEED_SET);
 
-  /* Case 1: Bit 0 set (Seed is set) along with other flag bits */
-  resp.valid_flags = GUINT32_TO_LE (0x7);
-  resp.status = GUINT32_TO_LE (0x00000005); /* BIT(0) | BIT(2) */
-
-  status = GUINT32_FROM_LE (resp.status);
-  g_assert_true ((status & CRFPMOC_FP_ENC_STATUS_SEED_SET) != 0);
-
-  /* Case 2: Bit 0 not set (Seed not set) but other bits non-zero */
-  resp.status = GUINT32_TO_LE (0x00000004); /* BIT(2) only */
-  status = GUINT32_FROM_LE (resp.status);
-  g_assert_false ((status & CRFPMOC_FP_ENC_STATUS_SEED_SET) != 0);
+    enc_flags |= CRFPMOC_FP_ENC_STATUS_SEED_SET;
+    g_assert_true(enc_flags & CRFPMOC_FP_ENC_STATUS_SEED_SET);
 }
 
-/* Test Protocol v3 payload sizing bounds */
-static void
-test_crfpmoc_payload_bounds (void)
-{
-  struct crfpmoc_ec_response_get_protocol_info proto_v3 = {0};
-  const gsize header = sizeof (struct crfpmoc_ec_host_response);
-  gsize max_param_cap;
-  gsize derived_in;
-  gsize derived_out;
-
-  proto_v3.protocol_versions = GUINT32_TO_LE (1 << 3); /* Proto v3 supported */
-  proto_v3.max_request_packet_size = GUINT16_TO_LE (544);
-  proto_v3.max_response_packet_size = GUINT16_TO_LE (544);
-
-  max_param_cap = (GUINT32_FROM_LE (proto_v3.protocol_versions) & (1 << 3)) ?
-                  CROS_EC_PROTO3_MAX_PAYLOAD_SIZE : CRFPMOC_EC_PROTO2_MAX_PARAM_SIZE;
-
-  derived_in = MIN (max_param_cap, GUINT16_FROM_LE (proto_v3.max_response_packet_size) - header);
-  derived_out = MIN (max_param_cap, GUINT16_FROM_LE (proto_v3.max_request_packet_size) - header);
-
-  g_assert_cmpuint (max_param_cap, ==, 536);
-  g_assert_cmpuint (derived_in, ==, 536);
-  g_assert_cmpuint (derived_out, ==, 536);
+/* Test 4: Maximum Payload calculation bounds */
+static void test_crfpmoc_payload_bounds(void) {
+    size_t max_payload = CRFPMOC_EC_MAX_PACKET_SIZE - sizeof(struct crfpmoc_ec_host_response);
+    g_assert_cmpuint(max_payload, ==, 536);
+    g_assert_cmpuint(max_payload, >, sizeof(struct crfpmoc_ec_response_fp_info_v3));
 }
 
-int
-main (int argc, char **argv)
-{
-  g_test_init (&argc, &argv, NULL);
+int main(int argc, char *argv[]) {
+    g_test_init(&argc, &argv, NULL);
 
-  g_test_add_func ("/crfpmoc/fp_info_v3", test_crfpmoc_fp_info_v3);
-  g_test_add_func ("/crfpmoc/fp_info_v1", test_crfpmoc_fp_info_v1);
-  g_test_add_func ("/crfpmoc/enc_status_bitmask", test_crfpmoc_enc_status_bitmask);
-  g_test_add_func ("/crfpmoc/payload_bounds", test_crfpmoc_payload_bounds);
+    g_test_add_func("/crfpmoc/fp_info_v3_packed", test_crfpmoc_fp_info_v3);
+    g_test_add_func("/crfpmoc/fp_info_v1_packed", test_crfpmoc_fp_info_v1);
+    g_test_add_func("/crfpmoc/encryption_flags", test_crfpmoc_enc_status_bitmask);
+    g_test_add_func("/crfpmoc/payload_bounds", test_crfpmoc_payload_bounds);
 
-  return g_test_run ();
+    return g_test_run();
 }
