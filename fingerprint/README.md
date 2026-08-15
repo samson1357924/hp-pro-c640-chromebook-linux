@@ -62,3 +62,20 @@ fprintd-delete "$USER"
 ### 5. System Authentication
 * **Sudo**: `sudo whoami` (Prompts for fingerprint with password fallback).
 * **GDM / Lock Screen**: Press `Super + L`, touch sensor to unlock.
+
+---
+
+## 📁 Driver Source Code (`driver/`)
+
+The patched driver implementation files are bundled in `driver/` for full transparency and reproducible builds:
+* [`driver/crfpmoc.c`](driver/crfpmoc.c): Main driver state machines, 50ms polling loop, and memory guards.
+* [`driver/crfpmoc.h`](driver/crfpmoc.h): ChromeOS EC Host Command structures, MKBP bitmasks, and packet definitions.
+* [`driver/crfpmoc-ec-transfer.c`](driver/crfpmoc-ec-transfer.c): Async `ioctl` transfer execution over `/dev/cros_fp`.
+* [`driver/crfpmoc-ec-transfer.h`](driver/crfpmoc-ec-transfer.h): Transfer lifecycle and callback headers.
+* [`tests/test-crfpmoc-unit.c`](tests/test-crfpmoc-unit.c): Standalone pure-C unit test suite.
+
+---
+
+## 🙏 致謝 (Credits)
+* **Abhinav Baid**, **Felix Niederer**, **Michael Evans**, **Marco Trevisan (Treviño)** & **libfprint team**.
+* **ChromiumOS EC team** & **Chrultrabook Project**.

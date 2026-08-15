@@ -82,6 +82,21 @@ See [keyboard/README.md](keyboard/README.md) for details.
 
 ---
 
+---
+
+## 🙏 致謝與鳴謝 (Acknowledgements & Credits)
+
+特別感謝以下開源專案、貢獻者與社群為 ChromeOS 與 Linux 跨平台硬體支援所奠定的基礎：
+
+* **[Abhinav Baid](https://github.com/abhinavbaid)**：原創 `crfpmoc` (ChromeOS Match-on-Chip) libfprint 驅動程式作者。
+* **[Felix Niederer](https://github.com/felixniederer)**：`crfpmoc` 驅動程式早期維護與架構貢獻。
+* **[Michael Evans](https://github.com/michaeleevans)**：協議擴展與多版本修復貢獻。
+* **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** 及 **[libfprint / freedesktop.org](https://gitlab.freedesktop.org/libfprint/libfprint)** 團隊：強大且健全的 Linux 生物識別驅動框架。
+* **[MrChromebox](https://mrchromebox.tech/)** 與 **[Chrultrabook Project](https://chrultrabook.com/)** 社群：提供卓越的 Coreboot / UEFI Full ROM 韌體與 Chromebook Linux 社群支援。
+* **[ChromiumOS Embedded Controller (EC) Team](https://chromium.googlesource.com/chromiumos/platform/ec/)**：開源的 ChromeOS EC Host Commands 與 FPMCU 協議規範。
+
+---
+
 ## 📜 License
 
 * Documentation and scripts in this repository are licensed under the [MIT License](LICENSE).
