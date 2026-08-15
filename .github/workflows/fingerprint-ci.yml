@@ -63,13 +63,15 @@ jobs:
           fi
 
           echo "Compiling test-crfpmoc-unit with $CC..."
-          $CC $CFLAGS \
+          read -r -a cflags <<< "$CFLAGS"
+          read -r -a ldflags <<< "$LDFLAGS"
+          "$CC" "${cflags[@]}" \
             -DHAVE_UDEV=1 \
             -I./fingerprint/driver \
             -I./fingerprint/tests \
             fingerprint/tests/test-crfpmoc-unit.c \
             -o test-crfpmoc-unit \
-            $LDFLAGS
+            "${ldflags[@]}"
 
           echo "Running standalone unit test..."
           ./test-crfpmoc-unit --verbose

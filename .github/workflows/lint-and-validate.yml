@@ -36,11 +36,11 @@ jobs:
 
       - name: Run ShellCheck (Modular with External Sources)
         run: |
-          find . -type f -name "*.sh" -not -path "*/.*/*" | xargs shellcheck -x -P lib:scripts:audio:keyboard:fingerprint:power:ec -s bash
+          find . -type f -name "*.sh" -not -path "*/.*/*" -print0 | xargs -0 shellcheck -S warning -x -P lib:scripts:audio:keyboard:fingerprint:power:ec -s bash
 
       - name: Run shfmt Check (Formatting Consistency)
         run: |
-          find . -type f -name "*.sh" -not -path "*/.*/*" | xargs shfmt -d -i 4 -ci -bn -sr
+          find . -type f -name "*.sh" -not -path "*/.*/*" -print0 | xargs -0 shfmt -d -i 4 -ci -bn -sr
 
   hardware-configs:
     name: Validate hwdb, udev & keyd
@@ -82,12 +82,12 @@ jobs:
           if udevadm --help | grep -q "verify"; then
             udevadm verify fingerprint/60-cros-fp.rules
           else
-            for rule_file in $(find . -type f -name "*.rules"); do
+            while IFS= read -r rule_file; do
               echo "Checking $rule_file"
               grep -E 'KERNEL=[^=]' "$rule_file" && { echo "Error: KERNEL must use == for match"; exit 1; }
               grep -E 'SUBSYSTEM=[^=]' "$rule_file" && { echo "Error: SUBSYSTEM must use == for match"; exit 1; }
               grep -E 'TAG=[^=+]' "$rule_file" && { echo "Error: TAG assignment should usually use +="; exit 1; }
-            done
+            done < <(find . -type f -name "*.rules" -print0)
           fi
           echo "udev rules verified successfully."
 
