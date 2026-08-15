@@ -1,0 +1,179 @@
+{
+  "name": "HP-Pro-c640-Linux-AI-Bot",
+  "version": "1.0.0",
+  "description": "Multi-agent PR code review, hardware safety analysis, and issue triage for HP Pro c640 Chromebook Linux Enablement.",
+  "llmConfigFile": "./config/LLM_config.example.json",
+  "defaultProvider": "opencode",
+  "commentMarker": "<!-- C640_LINUX_AI_REVIEW_REPORT -->",
+  "triageMarker": "<!-- C640_LINUX_AI_TRIAGE_REPORT -->",
+  "commandMarker": "<!-- C640_LINUX_AI_COMMAND_REPORT -->",
+  "defaultBranchCandidates": [
+    "main",
+    "master"
+  ],
+  "maxDiffChars": 180000,
+  "maxIssueBodyChars": 40000,
+  "codingModels": [
+    "gemini-3.7-flash-high",
+    "grok-4.6",
+    "deepseek-v4-flash-free"
+  ],
+  "fallbackModels": [
+    "gemini-3.7-flash-high",
+    "grok-4.6",
+    "deepseek-v4-flash-free",
+    "claude-opus-4-6-thinking",
+    "mimo-v2.5-free",
+    "gemini-3.6-flash-high",
+    "nemotron-3-ultra-free"
+  ],
+  "fallbackModel": "gemini-3.7-flash-high",
+  "dynamicModelDiscovery": true,
+  "mediaOcr": {
+    "enabled": true,
+    "model": "gemini-3.7-flash-high",
+    "fallbackModels": [
+      "mimo-v2.5-free",
+      "grok-4.6"
+    ],
+    "maxItems": 4,
+    "maxBytesPerItem": 5000000,
+    "maxSummaryChars": 12000,
+    "timeoutSeconds": 180,
+    "extensions": [
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gif",
+      ".webp",
+      ".bmp",
+      ".mp4",
+      ".webm",
+      ".mov",
+      ".log",
+      ".txt"
+    ]
+  },
+  "roles": {
+    "hardware_driver": {
+      "model": "gemini-3.7-flash-high",
+      "description": "Hardware, ALSA UCM2, libfprint C driver, udev, hwdb, and EC safety reviewer",
+      "promptFile": "./prompts/roles/reviewer_hardware_driver.md",
+      "temperature": 0.1,
+      "maxTokens": 6144,
+      "reasoningEffort": "high"
+    },
+    "script_safety": {
+      "model": "gemini-3.7-flash-high",
+      "description": "Shell script safety, root privilege isolation, backup/manifest, and ShellCheck reviewer",
+      "promptFile": "./prompts/roles/reviewer_script_safety.md",
+      "temperature": 0.1,
+      "maxTokens": 6144,
+      "reasoningEffort": "high"
+    },
+    "docs_public": {
+      "model": "gemini-3.7-flash-high",
+      "description": "Bilingual documentation (EN/ZH), REUSE/SPDX licensing, and MarkdownLint reviewer",
+      "promptFile": "./prompts/roles/reviewer_docs_public.md",
+      "temperature": 0.2,
+      "maxTokens": 4096,
+      "reasoningEffort": "high"
+    },
+    "triage_agent": {
+      "model": "deepseek-v4-flash-free",
+      "description": "Issue investigator: decision-first classification, quality scoring, missing-info checklist, and root-cause hypotheses",
+      "promptFile": "./prompts/roles/triage_agent.md",
+      "temperature": 0.2,
+      "maxTokens": 6144,
+      "reasoningEffort": "max"
+    },
+    "explainer_agent": {
+      "model": "grok-4.6",
+      "description": "Plain-language PR and Issue explainer for maintainers",
+      "promptFile": "./prompts/roles/explainer_agent.md",
+      "temperature": 0.3,
+      "maxTokens": 4096,
+      "reasoningEffort": "high"
+    }
+  },
+  "reviewPipeline": [
+    "hardware_driver",
+    "script_safety",
+    "docs_public"
+  ],
+  "sensitivePathGlobs": [
+    ".github/workflows/**",
+    "setup.sh",
+    "scripts/**",
+    "lib/**",
+    "audio/**",
+    "fingerprint/**",
+    "keyboard/**",
+    "power/**",
+    "ec/**",
+    "github_bot/**"
+  ],
+  "slashCommands": {
+    "/review": "On PRs: multi-agent hardware/script/docs review. On issues: issue investigation.",
+    "/triage": "Issue investigation with quality score and missing-info checklist.",
+    "/explain": "On PRs: plain-language explanation. On issues: issue investigation."
+  },
+  "triage": {
+    "minResponseChars": 400,
+    "requiredSections": [
+      "CLASSIFICATION",
+      "ACTIONABILITY",
+      "SUMMARY",
+      "EVIDENCE_USED",
+      "ROOT_CAUSE_HYPOTHESES",
+      "REPORTER_NEXT_STEPS",
+      "MAINTAINER_NEXT_STEPS",
+      "SUGGESTED_LABELS",
+      "ISSUE_QUALITY_SCORE",
+      "QUALITY_BREAKDOWN",
+      "MISSING_INFO",
+      "RISK",
+      "SECURITY_ROUTING"
+    ],
+    "failClosedOnIncomplete": true,
+    "publishIncompleteStub": true,
+    "maxThreadCommentChars": 12000,
+    "thread": {
+      "enabled": true,
+      "maxComments": 30,
+      "maxChars": 20000,
+      "excludeBotMarkers": true
+    },
+    "applySuggestedLabels": true,
+    "labelAllowlist": [
+      "bug",
+      "hardware",
+      "audio",
+      "fingerprint",
+      "keyboard",
+      "power-s0ix",
+      "ec-control",
+      "distro-specific",
+      "ubuntu-debian",
+      "fedora",
+      "arch-linux",
+      "nixos",
+      "opensuse",
+      "documentation",
+      "needs-info",
+      "needs-triage",
+      "likely-user-setup",
+      "enhancement",
+      "good first issue"
+    ]
+  },
+  "llmResponseGate": {
+    "rejectFinishReasons": [
+      "length",
+      "max_tokens",
+      "content_filter"
+    ],
+    "minResponseChars": 0,
+    "sameModelRetryOnLength": 1
+  }
+}

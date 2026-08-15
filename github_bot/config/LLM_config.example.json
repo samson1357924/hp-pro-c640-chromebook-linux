@@ -1,0 +1,152 @@
+{
+  "opencode": {
+    "baseUrl": "https://opencode.ai/zen/v1/",
+    "api": "openai-completions",
+    "apikey": "${OPENCODE_API_KEY}",
+    "timeoutSeconds": 600,
+    "models": [
+      {
+        "id": "deepseek-v4-flash-free",
+        "name": "DeepSeek V4 Flash Free",
+        "input": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "max",
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 200000,
+        "maxTokens": 128000,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "ling-3.0-flash-free",
+        "name": "Ling-3.0-flash Free",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 262144,
+        "maxTokens": 32768,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "laguna-s-2.1-free",
+        "name": "Laguna S 2.1 Free",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 256000,
+        "maxTokens": 32000,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "mimo-v2.5-free",
+        "name": "MiMo V2.5 Free",
+        "input": ["text", "image", "audio", "video"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 200000,
+        "maxTokens": 32000
+      },
+      {
+        "id": "nemotron-3-ultra-free",
+        "name": "Nemotron 3 Ultra Free",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "longcat-2.0-free",
+        "name": "LongCat 2.0 Free",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "north-mini-code-free",
+        "name": "North Mini Code Free",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 256000,
+        "maxTokens": 64000,
+        "compat": { "requiresStringContent": true }
+      },
+      {
+        "id": "big-pickle",
+        "name": "Big Pickle",
+        "input": ["text"],
+        "reasoning": true,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 200000,
+        "maxTokens": 32000,
+        "compat": { "requiresStringContent": true }
+      }
+    ]
+  },
+  "cpa": {
+    "baseUrl": "${CPA_BASE_URL}",
+    "api": "responses",
+    "apikey": "${CPA_API_KEY}",
+    "timeoutSeconds": 420,
+    "models": [
+      {
+        "id": "gemini-3.7-flash-high",
+        "name": "Gemini 3.7 Flash High",
+        "description": "Google Gemini 3.7 Flash High reasoning model via CPA",
+        "input": ["text", "image", "audio", "video"],
+        "output": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "maxContextTokens": 1048576,
+        "maxOutputTokens": 65536
+      },
+      {
+        "id": "grok-4.6",
+        "name": "Grok 4.6",
+        "description": "xAI Grok 4.6 high performance reasoning model via CPA",
+        "input": ["text", "image"],
+        "output": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "maxContextTokens": 131072,
+        "maxOutputTokens": 16384
+      },
+      {
+        "id": "claude-opus-4-6-thinking",
+        "name": "Claude Opus 4.6 Thinking",
+        "description": "Anthropic Claude Opus 4.6 Thinking reasoning model via CPA",
+        "input": ["text", "image"],
+        "output": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "maxContextTokens": 200000,
+        "maxOutputTokens": 32768
+      },
+      {
+        "id": "gemini-3.6-flash-high",
+        "name": "Gemini 3.6 Flash High",
+        "description": "Google Gemini 3.6 Flash High via CPA",
+        "input": ["text", "image", "audio", "video"],
+        "output": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "maxContextTokens": 1048576,
+        "maxOutputTokens": 65536
+      },
+      {
+        "id": "grok-4.5",
+        "name": "Grok 4.5 (CPA)",
+        "input": ["text", "image"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "contextWindow": 500000,
+        "maxTokens": 500000,
+        "compat": { "requiresStringContent": true }
+      }
+    ]
+  }
+}

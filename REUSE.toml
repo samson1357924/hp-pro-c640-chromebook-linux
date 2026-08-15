@@ -21,7 +21,8 @@ path = [
     "fingerprint/install-fingerprint.sh",
     "audio/install-audio.sh",
     "audio/install-audio-ucm.sh",
-    "audio/diagnose-audio.sh"
+    "audio/diagnose-audio.sh",
+    "github_bot/**"
 ]
 SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
 SPDX-License-Identifier = "MIT"
