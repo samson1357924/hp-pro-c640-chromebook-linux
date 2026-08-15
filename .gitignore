@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+*.pcapng
+*.variant
+*.log
+
+# Editor & System
+.DS_Store
+.vscode/
+.idea/
+*~
+*.swp
