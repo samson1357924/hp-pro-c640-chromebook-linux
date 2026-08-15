@@ -1,6 +1,14 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# Key mapping data derived from systemd 60-chromebook-keyboard.hwdb (CC0-1.0)
 # HP Pro c640 Chromebook (Google Dratini / Hatch) Keyboard Top-Row Mapping
-evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pnDratini*:pvr*
+# Matches both standard Google Coreboot DMI strings and OEM HP DMI tables
+
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
  KEYBOARD_KEY_ea=back
  KEYBOARD_KEY_e9=forward
  KEYBOARD_KEY_e7=refresh
