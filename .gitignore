@@ -17,9 +17,40 @@ meson-logs/
 *.rpm
 *.tar.gz
 *.tar.xz
+*.tgz
+*.zip
 debian/.debhelper/
 debian/files
 debian/*.substvars
+
+# Diagnostics (hardware reports may contain serials & PII)
+c640-diagnostic-*
+diagnostic-*.tar*
+
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.secret
+.credentials
+.netrc
+
+# Shell history & misc
+.bash_history
+.zsh_history
+Thumbs.db
+core
+core.*
+*.tmp
 
 # Python caches
 __pycache__/
