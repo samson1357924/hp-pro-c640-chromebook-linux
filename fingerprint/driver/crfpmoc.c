@@ -11,8 +11,10 @@
  * Copyright (C) 2026 HP Pro c640 Linux Enablement Contributors
  *
  * This file contains modifications to the upstream crfpmoc driver
- * (50ms polling loop, weak-pointer guards, seed persistence).
- * Modified: 2026-08-15. See CREDITS.md for details.
+ * (50ms polling loop, weak-pointer guards, and re-establishing the
+ * FP_CONTEXT / sensor bring-up on every open so fingerprint works after a
+ * reboot — see the KEYS_CLEAR_MODE step in the KEYS sub-SSM).
+ * Modified: 2026-08-16. See CREDITS.md for details.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -158,6 +160,7 @@ enum {
 enum {
   KEYS_ENC_STATUS,
   KEYS_SET_SEED,
+  KEYS_CLEAR_MODE,
   KEYS_CTX_ASYNC,
   KEYS_CTX_POLL,
   KEYS_DONE,
@@ -2133,7 +2136,15 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
   if (!(status & CRFPMOC_FP_ENC_STATUS_SEED_SET))
     fpi_ssm_next_state (ssm); /* KEYS_SET_SEED */
   else
-    fpi_ssm_jump_to_state (ssm, KEYS_DONE);
+    /* The seed (and the SEED_SET flag) live in FPMCU RAM, not flash: they
+     * survive a warm reboot only because the FPMCU stays powered, and on a cold
+     * boot they are lost and the host re-sends FP_SEED from
+     * /var/lib/fprint/crfpmoc.key.  The user context (user_id) is also RAM.
+     * FP_CONTEXT_ASYNC triggers a sensor reset (fp_sensor_open, ~175 ms) that
+     * re-initializes the sensor; that bring-up is required before any crypto
+     * operation, so we must run FP_CONTEXT on every open even when the seed is
+     * already set.  Only the FP_SEED step can be skipped. */
+    fpi_ssm_jump_to_state (ssm, KEYS_CLEAR_MODE);
 }
 
 static void
@@ -2148,6 +2159,26 @@ crfpmoc_keys_seed_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
       return;
     }
 
+  fpi_ssm_next_state (ssm); /* KEYS_CLEAR_MODE */
+}
+
+static void
+crfpmoc_keys_clear_mode_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
+{
+  g_autoptr(GError) error = NULL;
+  FpiSsm *ssm = user_data;
+
+  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
+    {
+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+      return;
+    }
+
+  /* FP_CONTEXT_ASYNC internally triggers FP_MODE_RESET_SENSOR, which the EC
+   * rejects (INVALID_PARAM) if any other mode bit (e.g. FP_MODE_FINGER_UP set
+   * by the verify finger-up check) is still active.  Clear the sensor mode
+   * here so the reset always has a clean slate. */
+  fp_dbg ("crfpmoc_keys_clear_mode_cb: sensor mode cleared before context reset");
   fpi_ssm_next_state (ssm); /* KEYS_CTX_ASYNC */
 }
 
@@ -2226,6 +2257,17 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         break;
       }
 
+    case KEYS_CLEAR_MODE:
+      {
+        struct crfpmoc_ec_params_fp_mode p = { .mode = 0 };
+        transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
+                                                &p, sizeof (p),
+                                                sizeof (struct crfpmoc_ec_response_fp_mode));
+        crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                        crfpmoc_keys_clear_mode_cb, ssm);
+        break;
+      }
+
     case KEYS_CTX_ASYNC:
       {
         struct crfpmoc_ec_params_fp_context_v1 p = {
@@ -2244,6 +2286,12 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         struct crfpmoc_ec_params_fp_context_v1 p = {
           .action = CRFPMOC_FP_CONTEXT_GET_RESULT,
         };
+        /* FP_CONTEXT_GET_RESULT would copy p.userid into the EC's user_id, an
+         * input to Chromium's template key derivation.  We deliberately leave
+         * userid zeroed: the current driver relies on a zero context so that
+         * enroll/verify stay consistently bound across reboots.  Sending a
+         * non-zero context here would require re-enrolling all existing
+         * templates. */
         transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_CONTEXT, 1,
                                                 &p, sizeof (p), 0);
         crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
