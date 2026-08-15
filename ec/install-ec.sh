@@ -48,12 +48,12 @@ install_ec_tools() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-ec.rules"
     else
-        echo 'KERNEL=="cros_ec", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"' | sudo tee "$udev_dst" >/dev/null
+        echo 'KERNEL=="cros_ec", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"' | sudo tee "$udev_dst" > /dev/null
         manifest_add_entry "$udev_dst" "ec" "0"
 
         # Ensure plugdev group exists and add user
-        if ! getent group plugdev >/dev/null 2>&1; then
-            sudo groupadd plugdev 2>/dev/null || true
+        if ! getent group plugdev > /dev/null 2>&1; then
+            sudo groupadd plugdev 2> /dev/null || true
         fi
         local real_user
         real_user="$(get_real_user)"
@@ -61,9 +61,9 @@ install_ec_tools() {
             sudo usermod -aG plugdev "$real_user" || true
         fi
 
-        sudo udevadm control --reload-rules 2>/dev/null || true
-        sudo udevadm trigger --subsystem-match=misc 2>/dev/null || true
-        [ -e /dev/cros_ec ] && sudo chmod 0660 /dev/cros_ec 2>/dev/null || true
+        sudo udevadm control --reload-rules 2> /dev/null || true
+        sudo udevadm trigger --subsystem-match=misc 2> /dev/null || true
+        [ -e /dev/cros_ec ] && sudo chmod 0660 /dev/cros_ec 2> /dev/null || true
         log_success "Configured udev access for /dev/cros_ec."
     fi
 
@@ -97,10 +97,10 @@ uninstall_ec_tools() {
     rollback_component "ec"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo systemctl disable --now c640-battery-limit.service 2>/dev/null || true
+        sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
         sudo rm -f /usr/local/bin/c640-ec-control \
-                   /etc/systemd/system/c640-battery-limit.service \
-                   /etc/udev/rules.d/60-cros-ec.rules
+            /etc/systemd/system/c640-battery-limit.service \
+            /etc/udev/rules.d/60-cros-ec.rules
         sudo systemctl daemon-reload
     fi
     log_success "EC utilities removed."
@@ -111,7 +111,7 @@ ENABLE_BATTERY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --install|-i)
+        --install | -i)
             ACTION="install"
             shift
             ;;
@@ -119,15 +119,15 @@ while [ $# -gt 0 ]; do
             ENABLE_BATTERY=1
             shift
             ;;
-        --uninstall|-u)
+        --uninstall | -u)
             ACTION="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

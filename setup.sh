@@ -4,13 +4,14 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR"
 
 # shellcheck source=lib/logger.sh
 source "$SCRIPT_DIR/lib/logger.sh"
 # shellcheck source=lib/distro.sh
 source "$SCRIPT_DIR/lib/distro.sh"
 # shellcheck source=lib/backup.sh
-source "$ROOT_DIR/lib/backup.sh" 2>/dev/null || source "$SCRIPT_DIR/lib/backup.sh"
+source "$ROOT_DIR/lib/backup.sh" 2> /dev/null || source "$SCRIPT_DIR/lib/backup.sh"
 # shellcheck source=lib/syscheck.sh
 source "$SCRIPT_DIR/lib/syscheck.sh"
 
@@ -101,10 +102,10 @@ run_sysreport() {
 run_uninstall() {
     log_section "Uninstalling All HP Pro c640 Linux Enablement Components"
     chmod +x "$SCRIPT_DIR/keyboard/install-keyboard.sh" \
-             "$SCRIPT_DIR/audio/install-audio.sh" \
-             "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" \
-             "$SCRIPT_DIR/power/install-power.sh" \
-             "$SCRIPT_DIR/ec/install-ec.sh" 2>/dev/null || true
+        "$SCRIPT_DIR/audio/install-audio.sh" \
+        "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" \
+        "$SCRIPT_DIR/power/install-power.sh" \
+        "$SCRIPT_DIR/ec/install-ec.sh" 2> /dev/null || true
 
     "$SCRIPT_DIR/keyboard/install-keyboard.sh" --uninstall || true
     "$SCRIPT_DIR/audio/install-audio.sh" --uninstall || true
@@ -118,47 +119,47 @@ run_uninstall() {
 MODE=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --all|-a|1)
+        --all | -a | 1)
             MODE="all"
             shift
             ;;
-        --audio|--audio-install|-u|2)
+        --audio | --audio-install | -u | 2)
             MODE="audio"
             shift
             ;;
-        --fingerprint|-f|--fp|3)
+        --fingerprint | -f | --fp | 3)
             MODE="fingerprint"
             shift
             ;;
-        --keyboard|-k|--kbd|4)
+        --keyboard | -k | --kbd | 4)
             MODE="keyboard"
             shift
             ;;
-        --power|-p|5)
+        --power | -p | 5)
             MODE="power"
             shift
             ;;
-        --ec|6)
+        --ec | 6)
             MODE="ec"
             shift
             ;;
-        --check|-c|--status|7)
+        --check | -c | --status | 7)
             MODE="check"
             shift
             ;;
-        --sysreport|8)
+        --sysreport | 8)
             MODE="sysreport"
             shift
             ;;
-        --uninstall|--rollback|9)
+        --uninstall | --rollback | 9)
             MODE="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

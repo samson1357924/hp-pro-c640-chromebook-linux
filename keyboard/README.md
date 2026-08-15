@@ -1,6 +1,9 @@
 # Keyboard Top-Row Mapping (HP Pro c640 Chromebook)
 
-ChromeOS devices feature dedicated top-row action keys instead of traditional F1-F12 keys. Under standard Linux, these keys can be remapped either at the kernel/hardware level using `systemd-hwdb` or at the input daemon level using `keyd`.
+ChromeOS devices feature dedicated top-row action keys instead of traditional
+F1-F12 keys. Under standard Linux, these keys can be remapped either at the
+kernel/hardware level using `systemd-hwdb` or at the input daemon level using
+`keyd`.
 
 ---
 
@@ -18,13 +21,14 @@ ChromeOS devices feature dedicated top-row action keys instead of traditional F1
 | **Top 8 (F8)** | 🔇 (Mute) | `KEYBOARD_KEY_a0` | `KEY_MUTE` | Audio Mute |
 | **Top 9 (F9)** | 🔉 (Volume Down) | `KEYBOARD_KEY_ae` | `KEY_VOLUMEDOWN` | Decrease Audio Volume |
 | **Top 10 (F10)** | 🔊 (Volume Up) | `KEYBOARD_KEY_b0` | `KEY_VOLUMEUP` | Increase Audio Volume |
-| **Search / Launcher**| 🔍 (Search) | `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) or CapsLock |
+| **Search / Launcher** | 🔍 (Search) | `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) or CapsLock |
 
 ---
 
 ## 🛠️ Implementation Options
 
 ### Option 1: systemd-hwdb (Recommended & Default)
+
 Zero daemon overhead, low latency, native kernel input mapping.
 
 ```bash
@@ -33,6 +37,7 @@ chmod +x keyboard/install-keyboard.sh
 ```
 
 **Options**:
+
 * `./keyboard/install-keyboard.sh --check` : Check if hwdb is deployed.
 * `./keyboard/install-keyboard.sh --dry-run` : Preview operations.
 * `./keyboard/install-keyboard.sh --uninstall` : Revert hwdb changes.
@@ -40,9 +45,12 @@ chmod +x keyboard/install-keyboard.sh
 ---
 
 ### Option 2: `keyd` Daemon (Advanced Multi-Layer & Dual-Role)
-If you want the **Search key** to act as **CapsLock on tap** and **Super/Meta on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
+
+If you want the **Search key** to act as **CapsLock on tap** and **Super/Meta
+on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 
 1. Install `keyd`:
+
    ```bash
    # Ubuntu / Debian
    sudo apt install -y keyd  # or build from https://github.com/rvaiya/keyd
@@ -51,7 +59,9 @@ If you want the **Search key** to act as **CapsLock on tap** and **Super/Meta on
    # Arch Linux
    sudo pacman -S keyd
    ```
+
 2. Copy configuration:
+
    ```bash
    sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
    sudo systemctl enable --now keyd

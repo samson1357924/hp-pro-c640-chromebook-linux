@@ -23,7 +23,7 @@ configure_pam_fingerprint() {
 
     case "$DISTRO_FAMILY" in
         debian)
-            if command -v pam-auth-update >/dev/null 2>&1; then
+            if command -v pam-auth-update > /dev/null 2>&1; then
                 log_info "Enabling fprintd via pam-auth-update..."
                 sudo pam-auth-update --enable fprintd
                 log_success "PAM configuration updated via pam-auth-update."
@@ -32,7 +32,7 @@ configure_pam_fingerprint() {
             fi
             ;;
         fedora)
-            if command -v authselect >/dev/null 2>&1; then
+            if command -v authselect > /dev/null 2>&1; then
                 log_info "Enabling fingerprint via authselect..."
                 sudo authselect enable-feature with-fingerprint
                 sudo authselect apply-changes
@@ -42,7 +42,7 @@ configure_pam_fingerprint() {
             fi
             ;;
         suse)
-            if command -v pam-config >/dev/null 2>&1; then
+            if command -v pam-config > /dev/null 2>&1; then
                 log_info "Enabling fprintd via pam-config..."
                 sudo pam-config -a --fprintd
                 log_success "PAM configuration updated via pam-config."
@@ -73,14 +73,14 @@ disable_pam_fingerprint() {
 
     case "$DISTRO_FAMILY" in
         debian)
-            if command -v pam-auth-update >/dev/null 2>&1; then
+            if command -v pam-auth-update > /dev/null 2>&1; then
                 log_info "Disabling fprintd via pam-auth-update..."
                 sudo pam-auth-update --remove fprintd
                 log_success "PAM fingerprint configuration removed."
             fi
             ;;
         fedora)
-            if command -v authselect >/dev/null 2>&1; then
+            if command -v authselect > /dev/null 2>&1; then
                 log_info "Disabling fingerprint via authselect..."
                 sudo authselect disable-feature with-fingerprint
                 sudo authselect apply-changes
@@ -88,13 +88,13 @@ disable_pam_fingerprint() {
             fi
             ;;
         suse)
-            if command -v pam-config >/dev/null 2>&1; then
+            if command -v pam-config > /dev/null 2>&1; then
                 log_info "Disabling fprintd via pam-config..."
                 sudo pam-config -d --fprintd
                 log_success "PAM fingerprint configuration removed."
             fi
             ;;
-        arch|nixos|*)
+        arch | nixos | *)
             log_info "Please revert any manual PAM fprintd entries from /etc/pam.d/system-auth if needed."
             ;;
     esac

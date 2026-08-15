@@ -45,8 +45,8 @@ uninstall_keyboard() {
     if [ "${DRY_RUN:-0}" != "1" ]; then
         if [ -f "$HWDB_DST" ]; then
             sudo rm -f "$HWDB_DST"
-            sudo systemd-hwdb update 2>/dev/null || true
-            sudo udevadm trigger --subsystem-match=input 2>/dev/null || true
+            sudo systemd-hwdb update 2> /dev/null || true
+            sudo udevadm trigger --subsystem-match=input 2> /dev/null || true
             log_info "Removed $HWDB_DST and updated systemd-hwdb."
         fi
     fi
@@ -86,23 +86,23 @@ install_keyboard() {
 ACTION="install"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --install|-i)
+        --install | -i)
             ACTION="install"
             shift
             ;;
-        --check|-c)
+        --check | -c)
             ACTION="check"
             shift
             ;;
-        --uninstall|-u)
+        --uninstall | -u)
             ACTION="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

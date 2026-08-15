@@ -31,7 +31,7 @@ check_power_status() {
     check_dmi_board || true
 
     local mem_sleep
-    mem_sleep=$(cat /sys/power/mem_sleep 2>/dev/null || echo "unknown")
+    mem_sleep=$(cat /sys/power/mem_sleep 2> /dev/null || echo "unknown")
     log_info "Supported mem_sleep modes: $mem_sleep"
     if [[ "$mem_sleep" == *"[s2idle]"* ]]; then
         log_success "  S0ix Modern Standby (s2idle) is currently active."
@@ -41,17 +41,17 @@ check_power_status() {
 
     log_info "PCIe ASPM Policy:"
     local aspm_policy
-    aspm_policy=$(cat /sys/module/pcie_aspm/parameters/policy 2>/dev/null || echo "unknown")
+    aspm_policy=$(cat /sys/module/pcie_aspm/parameters/policy 2> /dev/null || echo "unknown")
     log_info "  Current ASPM Policy: $aspm_policy"
 
     log_info "Active Power Management Daemons:"
-    if systemctl is-active --quiet thermald 2>/dev/null; then
+    if systemctl is-active --quiet thermald 2> /dev/null; then
         log_success "  thermald is active (Intel Thermal Management)."
     else
         log_warn "  thermald is not running. Consider installing thermald."
     fi
 
-    if systemctl is-active --quiet tlp 2>/dev/null; then
+    if systemctl is-active --quiet tlp 2> /dev/null; then
         log_success "  tlp is active."
     fi
 }
@@ -66,7 +66,7 @@ uninstall_power() {
         sudo rm -f /etc/systemd/logind.conf.d/99-hp-c640-lid.conf
         sudo rm -f /etc/wireplumber/wireplumber.conf.d/50-disable-suspend.conf
 
-        sudo systemctl restart systemd-logind 2>/dev/null || true
+        sudo systemctl restart systemd-logind 2> /dev/null || true
     fi
     log_success "Power optimization profiles removed."
 }
@@ -160,8 +160,8 @@ install_power() {
     fi
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo systemctl enable --now thermald 2>/dev/null || true
-        sudo systemctl enable --now tlp 2>/dev/null || true
+        sudo systemctl enable --now thermald 2> /dev/null || true
+        sudo systemctl enable --now tlp 2> /dev/null || true
     fi
 
     log_section "Power optimizations installed successfully! ⚡"
@@ -172,23 +172,23 @@ install_power() {
 ACTION="install"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --install|-i)
+        --install | -i)
             ACTION="install"
             shift
             ;;
-        --check|-c)
+        --check | -c)
             ACTION="check"
             shift
             ;;
-        --uninstall|-u)
+        --uninstall | -u)
             ACTION="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

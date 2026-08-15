@@ -50,11 +50,11 @@ manifest_add_entry() {
 
     # Create empty json if not exists
     if [ ! -f "$MANIFEST_FILE" ]; then
-        echo '{"version":"1.0","records":[]}' | sudo tee "$MANIFEST_FILE" >/dev/null
+        echo '{"version":"1.0","records":[]}' | sudo tee "$MANIFEST_FILE" > /dev/null
     fi
 
     # Append entry using python with atomic file write
-    if command -v python3 >/dev/null 2>&1; then
+    if command -v python3 > /dev/null 2>&1; then
         sudo python3 -c '
 import json, sys, os
 manifest_path = sys.argv[1]
@@ -101,7 +101,7 @@ rollback_component() {
         return 0
     fi
 
-    if command -v python3 >/dev/null 2>&1; then
+    if command -v python3 > /dev/null 2>&1; then
         sudo python3 -c '
 import json, os, sys, shutil, glob
 

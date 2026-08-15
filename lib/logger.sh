@@ -34,8 +34,8 @@ _log_write() {
 
     # File output (strip ANSI colors)
     if [ -n "$LOG_FILE" ]; then
-        mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-        echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
+        mkdir -p "$(dirname "$LOG_FILE")" 2> /dev/null || true
+        echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2> /dev/null || true
     fi
 }
 
@@ -65,7 +65,7 @@ log_step() {
     shift 2
     echo -e "\n${CLR_CYAN}${CLR_BOLD}===> [${step_num}/${total_steps}] ${*}${CLR_RESET}" >&2
     if [ -n "$LOG_FILE" ]; then
-        echo -e "\n=== [${step_num}/${total_steps}] ${*} ===" >> "$LOG_FILE" 2>/dev/null || true
+        echo -e "\n=== [${step_num}/${total_steps}] ${*} ===" >> "$LOG_FILE" 2> /dev/null || true
     fi
 }
 

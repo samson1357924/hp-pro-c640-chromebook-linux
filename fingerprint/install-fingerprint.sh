@@ -37,14 +37,14 @@ check_fp_status() {
     real_user="$(get_real_user)"
 
     log_info "fprintd Device List for user '$real_user':"
-    if command -v fprintd-list >/dev/null 2>&1; then
+    if command -v fprintd-list > /dev/null 2>&1; then
         fprintd-list "$real_user" || log_warn "fprintd-list returned non-zero. Device may not be registered yet."
     else
         log_warn "fprintd-list command not found in PATH."
     fi
 
     log_info "Installed libfprint libraries in $LIBDIR:"
-    ls -la "$LIBDIR"/libfprint-2.so* 2>/dev/null || log_warn "No libfprint-2.so found in $LIBDIR."
+    ls -la "$LIBDIR"/libfprint-2.so* 2> /dev/null || log_warn "No libfprint-2.so found in $LIBDIR."
 }
 
 uninstall_fp() {
@@ -53,7 +53,7 @@ uninstall_fp() {
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo rm -f /etc/udev/rules.d/60-cros-fp.rules
-        sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm control --reload-rules 2> /dev/null || true
         log_info "Removed /etc/udev/rules.d/60-cros-fp.rules"
 
         # Revert PAM
@@ -63,9 +63,9 @@ uninstall_fp() {
         case "$DISTRO_FAMILY" in
             debian) echo "  sudo apt install --reinstall -y libfprint-2-2" ;;
             fedora) echo "  sudo dnf reinstall -y libfprint" ;;
-            arch)   echo "  sudo pacman -S --overwrite='*' libfprint" ;;
-            suse)   echo "  sudo zypper install --force libfprint-2-2" ;;
-            *)      echo "  Reinstall libfprint package via your distribution's package manager." ;;
+            arch) echo "  sudo pacman -S --overwrite='*' libfprint" ;;
+            suse) echo "  sudo zypper install --force libfprint-2-2" ;;
+            *) echo "  Reinstall libfprint package via your distribution's package manager." ;;
         esac
     fi
     log_success "Fingerprint driver uninstallation finished."
@@ -73,7 +73,7 @@ uninstall_fp() {
 
 install_fp() {
     log_section "Installing crfpmoc Fingerprint Driver for HP Pro c640 ($DISTRO_NAME)"
-    
+
     # 0. Preflight checks
     check_dmi_board || true
     check_cros_fp_device || true
@@ -99,17 +99,17 @@ install_fp() {
         manifest_add_entry "$udev_rule_dst" "fingerprint" "0"
 
         # Ensure plugdev group exists and add user
-        if ! getent group plugdev >/dev/null 2>&1; then
-            sudo groupadd plugdev 2>/dev/null || true
+        if ! getent group plugdev > /dev/null 2>&1; then
+            sudo groupadd plugdev 2> /dev/null || true
         fi
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             sudo usermod -aG plugdev "$real_user" || true
             log_success "Added user '$real_user' to 'plugdev' group."
         fi
 
-        sudo udevadm control --reload-rules 2>/dev/null || true
-        sudo udevadm trigger --subsystem-match=misc 2>/dev/null || true
-        [ -e /dev/cros_fp ] && sudo chmod 0660 /dev/cros_fp 2>/dev/null || true
+        sudo udevadm control --reload-rules 2> /dev/null || true
+        sudo udevadm trigger --subsystem-match=misc 2> /dev/null || true
+        [ -e /dev/cros_fp ] && sudo chmod 0660 /dev/cros_fp 2> /dev/null || true
     fi
 
     # 3. Prepare crfpmoc build tree
@@ -137,7 +137,7 @@ install_fp() {
     # Sync bundled driver source into the build tree
     if [ -d "$SCRIPT_DIR/driver" ] && [ -d "$crfpmoc_dir/libfprint/drivers/crfpmoc" ] && [ "${DRY_RUN:-0}" != "1" ]; then
         log_info "Syncing local audited driver source files to build tree..."
-        cp -f "$SCRIPT_DIR"/driver/crfpmoc* "$crfpmoc_dir/libfprint/drivers/crfpmoc/" 2>/dev/null || true
+        cp -f "$SCRIPT_DIR"/driver/crfpmoc* "$crfpmoc_dir/libfprint/drivers/crfpmoc/" 2> /dev/null || true
     fi
 
     # 4. Build & Install libfprint
@@ -153,22 +153,22 @@ install_fp() {
         if [ ! -f "build/build.ninja" ]; then
             rm -rf build
             meson setup build --prefix=/usr --libdir="$meson_libdir" \
-                              -Ddrivers=default -Dintrospection=true \
-                              -Dgtk-examples=false -Ddoc=false
+                -Ddrivers=default -Dintrospection=true \
+                -Dgtk-examples=false -Ddoc=false
         else
             meson setup build --reconfigure --prefix=/usr --libdir="$meson_libdir" \
-                              -Ddrivers=default -Dintrospection=true \
-                              -Dgtk-examples=false -Ddoc=false
+                -Ddrivers=default -Dintrospection=true \
+                -Dgtk-examples=false -Ddoc=false
         fi
 
         ninja -C build
 
         # Clean any stale /usr/local artifacts
         sudo rm -f /usr/local/lib/*/libfprint-2.so* \
-                   /usr/local/lib/libfprint-2.so* \
-                   /usr/local/lib/*/pkgconfig/libfprint-2.pc \
-                   /usr/local/lib/*/girepository-1.0/FPrint-2.0.typelib \
-                   /usr/local/share/gir-1.0/FPrint-2.0.gir || true
+            /usr/local/lib/libfprint-2.so* \
+            /usr/local/lib/*/pkgconfig/libfprint-2.pc \
+            /usr/local/lib/*/girepository-1.0/FPrint-2.0.typelib \
+            /usr/local/share/gir-1.0/FPrint-2.0.gir || true
         sudo rm -rf /usr/local/include/libfprint-2 || true
 
         sudo ninja -C build install
@@ -189,7 +189,7 @@ install_fp() {
     else
         sudo rm -f /etc/systemd/system/fprintd.service.d/cros-fp.conf || true
         sudo systemctl daemon-reload
-        sudo systemctl restart fprintd.service 2>/dev/null || sudo systemctl restart fprintd 2>/dev/null || true
+        sudo systemctl restart fprintd.service 2> /dev/null || sudo systemctl restart fprintd 2> /dev/null || true
         configure_pam_fingerprint
     fi
 
@@ -210,23 +210,23 @@ install_fp() {
 ACTION="install"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --install|-i)
+        --install | -i)
             ACTION="install"
             shift
             ;;
-        --check|-c)
+        --check | -c)
             ACTION="check"
             shift
             ;;
-        --uninstall|-u)
+        --uninstall | -u)
             ACTION="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

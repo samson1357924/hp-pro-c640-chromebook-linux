@@ -29,7 +29,7 @@ show_help() {
 }
 
 check_ectool() {
-    if ! command -v ectool >/dev/null 2>&1; then
+    if ! command -v ectool > /dev/null 2>&1; then
         if [ -x "/usr/local/bin/ectool" ]; then
             ECTOOL_BIN="/usr/local/bin/ectool"
         elif [ -x "$ROOT_DIR/ec/bin/ectool" ]; then
@@ -62,10 +62,10 @@ show_status() {
     log_info "=== Battery Status (/sys/class/power_supply/BAT0) ==="
     if [ -d "/sys/class/power_supply/BAT0" ]; then
         local status capacity health energy_full energy_design
-        status=$(cat /sys/class/power_supply/BAT0/status 2>/dev/null || echo "Unknown")
-        capacity=$(cat /sys/class/power_supply/BAT0/capacity 2>/dev/null || echo "Unknown")
-        energy_full=$(cat /sys/class/power_supply/BAT0/energy_full 2>/dev/null || echo "0")
-        energy_design=$(cat /sys/class/power_supply/BAT0/energy_full_design 2>/dev/null || echo "0")
+        status=$(cat /sys/class/power_supply/BAT0/status 2> /dev/null || echo "Unknown")
+        capacity=$(cat /sys/class/power_supply/BAT0/capacity 2> /dev/null || echo "Unknown")
+        energy_full=$(cat /sys/class/power_supply/BAT0/energy_full 2> /dev/null || echo "0")
+        energy_design=$(cat /sys/class/power_supply/BAT0/energy_full_design 2> /dev/null || echo "0")
 
         echo "  - Charge Status: $status ($capacity%)"
         if [ "$energy_design" -gt 0 ]; then
@@ -77,7 +77,7 @@ show_status() {
     log_info "=== Thermal & Fan Status ==="
     if check_ectool; then
         local fan_rpm
-        fan_rpm=$(run_ec pwmgetfanrpm 2>/dev/null || echo "N/A")
+        fan_rpm=$(run_ec pwmgetfanrpm 2> /dev/null || echo "N/A")
         echo "  - Fan Speed: $fan_rpm"
     else
         echo "  - Direct EC Fan monitoring requires ectool."
@@ -86,8 +86,8 @@ show_status() {
     log_info "=== Keyboard Backlight Status ==="
     if [ -f "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
         local kbd_curr kbd_max
-        kbd_curr=$(cat /sys/class/leds/chromeos::kbd_backlight/brightness 2>/dev/null || echo "0")
-        kbd_max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2>/dev/null || echo "100")
+        kbd_curr=$(cat /sys/class/leds/chromeos::kbd_backlight/brightness 2> /dev/null || echo "0")
+        kbd_max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "100")
         echo "  - Keyboard Backlight: $kbd_curr / $kbd_max"
     fi
 }
@@ -157,12 +157,12 @@ set_kblight() {
     local pct="${1:-50}"
     if [ -f "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
         local max
-        max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2>/dev/null || echo "100")
+        max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "100")
         local val=$((pct * max / 100))
         if [ -w "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
             echo "$val" > /sys/class/leds/chromeos::kbd_backlight/brightness
         else
-            echo "$val" | sudo tee /sys/class/leds/chromeos::kbd_backlight/brightness >/dev/null
+            echo "$val" | sudo tee /sys/class/leds/chromeos::kbd_backlight/brightness > /dev/null
         fi
         log_success "Keyboard backlight set to $pct% ($val/$max)."
     elif check_ectool; then
@@ -196,7 +196,7 @@ case "${1:-status}" in
     kblight)
         set_kblight "${2:-50}"
         ;;
-    help|--help|-h)
+    help | --help | -h)
         show_help
         ;;
     *)

@@ -25,7 +25,7 @@ list_backups() {
 
     if [ -f "$MANIFEST_FILE" ]; then
         log_info "Manifest file: $MANIFEST_FILE"
-        if command -v python3 >/dev/null 2>&1; then
+        if command -v python3 > /dev/null 2>&1; then
             python3 -c '
 import json, sys
 manifest_path = sys.argv[1]
@@ -51,15 +51,15 @@ for i, rec in enumerate(data.get("records", []), 1):
 }
 
 case "${1:-list}" in
-    --list|-l|list)
+    --list | -l | list)
         list_backups
         ;;
-    --rollback|-r|rollback)
+    --rollback | -r | rollback)
         shift
         comp="${1:-all}"
         rollback_component "$comp"
         ;;
-    --help|-h)
+    --help | -h)
         show_help
         ;;
     *)

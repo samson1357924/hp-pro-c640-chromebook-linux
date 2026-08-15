@@ -27,14 +27,14 @@ run_diagnostic() {
     check_sof_audio_modules || true
     check_sof_firmware_files || true
 
-    if command -v aplay >/dev/null 2>&1; then
+    if command -v aplay > /dev/null 2>&1; then
         log_info "ALSA Playback Sound Cards:"
-        if LC_ALL=C aplay -l 2>/dev/null | grep -E "^card [0-9]+:"; then
-            LC_ALL=C aplay -l 2>/dev/null | grep -E "^card [0-9]+:" | while read -r line; do
+        if LC_ALL=C aplay -l 2> /dev/null | grep -E "^card [0-9]+:"; then
+            LC_ALL=C aplay -l 2> /dev/null | grep -E "^card [0-9]+:" | while read -r line; do
                 log_success "  $line"
             done
-        elif aplay -l 2>/dev/null | grep -E "(card|卡|裝置)"; then
-            aplay -l 2>/dev/null | grep -E "(card|卡|裝置)" | while read -r line; do
+        elif aplay -l 2> /dev/null | grep -E "(card|卡|裝置)"; then
+            aplay -l 2> /dev/null | grep -E "(card|卡|裝置)" | while read -r line; do
                 log_success "  $line"
             done
         else
@@ -64,9 +64,9 @@ run_diagnostic() {
     done
     [ "$missing_ucm" = 0 ] || log_info "  Tip: Run './setup.sh --audio-install' to deploy missing UCM profiles."
 
-    if command -v wpctl >/dev/null 2>&1; then
+    if command -v wpctl > /dev/null 2>&1; then
         log_info "PipeWire Routing Status:"
-        if wpctl status 2>/dev/null | grep -q "Speaker"; then
+        if wpctl status 2> /dev/null | grep -q "Speaker"; then
             log_success "  PipeWire Speaker sink is active!"
         else
             log_warn "  Speaker sink not found in wpctl status."
@@ -80,18 +80,18 @@ run_diagnostic() {
     local local_user
     local_user="$(get_real_user)"
     log_info "User '$local_user' group membership:"
-    if id -nG "$local_user" 2>/dev/null | grep -qw "plugdev"; then
+    if id -nG "$local_user" 2> /dev/null | grep -qw "plugdev"; then
         log_success "  User '$local_user' is in 'plugdev' group."
     else
         log_warn "  User '$local_user' is NOT in 'plugdev' group. (Run: sudo usermod -aG plugdev $local_user)"
     fi
 
     log_info "Installed libfprint binaries in $LIBDIR:"
-    ls -la "$LIBDIR"/libfprint-2.so* 2>/dev/null || log_warn "  No custom libfprint-2.so in $LIBDIR"
+    ls -la "$LIBDIR"/libfprint-2.so* 2> /dev/null || log_warn "  No custom libfprint-2.so in $LIBDIR"
 
-    if command -v fprintd-list >/dev/null 2>&1; then
+    if command -v fprintd-list > /dev/null 2>&1; then
         log_info "fprintd Enrolled Fingerprints for $local_user:"
-        fprintd-list "$local_user" 2>/dev/null || log_warn "  fprintd returned non-zero. Device may not be registered yet."
+        fprintd-list "$local_user" 2> /dev/null || log_warn "  fprintd returned non-zero. Device may not be registered yet."
     fi
 
     # 4. Keyboard & Function Keys
@@ -102,7 +102,7 @@ run_diagnostic() {
         log_warn "  Custom keyboard hwdb not deployed. Run './setup.sh --keyboard' to install."
     fi
 
-    if systemctl is-active --quiet keyd 2>/dev/null; then
+    if systemctl is-active --quiet keyd 2> /dev/null; then
         log_success "  keyd daemon is running for advanced dual-role key mapping."
     fi
 
@@ -114,8 +114,8 @@ run_diagnostic() {
 
     if [ -d /sys/class/power_supply/BAT0 ]; then
         local bat_status bat_cap
-        bat_status="$(cat /sys/class/power_supply/BAT0/status 2>/dev/null || echo Unknown)"
-        bat_cap="$(cat /sys/class/power_supply/BAT0/capacity 2>/dev/null || echo Unknown)"
+        bat_status="$(cat /sys/class/power_supply/BAT0/status 2> /dev/null || echo Unknown)"
+        bat_cap="$(cat /sys/class/power_supply/BAT0/capacity 2> /dev/null || echo Unknown)"
         log_success "Battery BAT0 detected: ${bat_cap}% ($bat_status)"
     fi
 

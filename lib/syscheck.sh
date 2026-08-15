@@ -17,13 +17,13 @@ check_dmi_board() {
     local sys_vendor="Unknown"
 
     if [ -f /sys/class/dmi/id/board_name ]; then
-        board_name="$(cat /sys/class/dmi/id/board_name 2>/dev/null || echo 'Unknown')"
+        board_name="$(cat /sys/class/dmi/id/board_name 2> /dev/null || echo 'Unknown')"
     fi
     if [ -f /sys/class/dmi/id/product_name ]; then
-        product_name="$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo 'Unknown')"
+        product_name="$(cat /sys/class/dmi/id/product_name 2> /dev/null || echo 'Unknown')"
     fi
     if [ -f /sys/class/dmi/id/sys_vendor ]; then
-        sys_vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo 'Unknown')"
+        sys_vendor="$(cat /sys/class/dmi/id/sys_vendor 2> /dev/null || echo 'Unknown')"
     fi
 
     log_info "Detected Hardware:"
@@ -33,13 +33,13 @@ check_dmi_board() {
 
     # Dratini / Jinlon / Hatch platform detection
     case "$board_name" in
-        *Dratini*|*dratini*|*Jinlon*|*jinlon*|*Hatch*|*hatch*)
+        *Dratini* | *dratini* | *Jinlon* | *jinlon* | *Hatch* | *hatch*)
             log_success "Target Chromebook board ($board_name) matches HP Pro c640 / Hatch platform."
             return 0
             ;;
         *)
             case "$product_name" in
-                *Dratini*|*dratini*|*HP*Pro*c640*|*Hatch*|*hatch*)
+                *Dratini* | *dratini* | *HP*Pro*c640* | *Hatch* | *hatch*)
                     log_success "Target device product ($product_name) matches HP Pro c640."
                     return 0
                     ;;

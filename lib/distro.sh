@@ -11,12 +11,12 @@ SCRIPT_DIR_DISTRO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/logger.sh
 source "$SCRIPT_DIR_DISTRO/logger.sh"
 
-DISTRO_ID=""
-DISTRO_LIKE=""
-DISTRO_FAMILY=""
-DISTRO_NAME=""
-DISTRO_VERSION=""
-LIBDIR=""
+export DISTRO_ID=""
+export DISTRO_LIKE=""
+export DISTRO_FAMILY=""
+export DISTRO_NAME=""
+export DISTRO_VERSION=""
+export LIBDIR=""
 
 detect_distro() {
     if [ -f /etc/os-release ]; then
@@ -42,16 +42,16 @@ detect_distro() {
 
     # Classify into standard distro families
     case "$DISTRO_ID" in
-        ubuntu|debian|linuxmint|pop|elementary|zorin|kali|neon)
+        ubuntu | debian | linuxmint | pop | elementary | zorin | kali | neon)
             DISTRO_FAMILY="debian"
             ;;
-        fedora|rhel|centos|rocky|almalinux|nobara)
+        fedora | rhel | centos | rocky | almalinux | nobara)
             DISTRO_FAMILY="fedora"
             ;;
-        arch|endeavouros|manjaro|cachyos|garuda|artix)
+        arch | endeavouros | manjaro | cachyos | garuda | artix)
             DISTRO_FAMILY="arch"
             ;;
-        opensuse*|suse|tumbleweed|leap)
+        opensuse* | suse | tumbleweed | leap)
             DISTRO_FAMILY="suse"
             ;;
         nixos)
@@ -59,19 +59,19 @@ detect_distro() {
             ;;
         *)
             case "$DISTRO_LIKE" in
-                *debian*|*ubuntu*) DISTRO_FAMILY="debian" ;;
-                *fedora*|*rhel*)   DISTRO_FAMILY="fedora" ;;
-                *arch*)            DISTRO_FAMILY="arch" ;;
-                *suse*)            DISTRO_FAMILY="suse" ;;
-                *)                 DISTRO_FAMILY="unsupported" ;;
+                *debian* | *ubuntu*) DISTRO_FAMILY="debian" ;;
+                *fedora* | *rhel*) DISTRO_FAMILY="fedora" ;;
+                *arch*) DISTRO_FAMILY="arch" ;;
+                *suse*) DISTRO_FAMILY="suse" ;;
+                *) DISTRO_FAMILY="unsupported" ;;
             esac
             ;;
     esac
 
     # Determine multiarch library directory
-    if [ "$DISTRO_FAMILY" = "debian" ] && command -v dpkg-architecture >/dev/null 2>&1; then
+    if [ "$DISTRO_FAMILY" = "debian" ] && command -v dpkg-architecture > /dev/null 2>&1; then
         local deb_multiarch
-        deb_multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+        deb_multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2> /dev/null || true)"
         if [ -n "$deb_multiarch" ] && [ -d "/usr/lib/$deb_multiarch" ]; then
             LIBDIR="/usr/lib/$deb_multiarch"
         elif [ -d "/usr/lib/x86_64-linux-gnu" ]; then
@@ -161,5 +161,5 @@ get_real_user() {
 get_real_user_uid() {
     local u
     u="$(get_real_user)"
-    id -u "$u" 2>/dev/null || echo "1000"
+    id -u "$u" 2> /dev/null || echo "1000"
 }
