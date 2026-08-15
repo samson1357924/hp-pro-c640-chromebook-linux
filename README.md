@@ -1,42 +1,47 @@
-# HP Pro c640 Chromebook (Google Dratini) Linux 避坑全指南與硬體啟用方案
+[English](README.md) | [繁體中文](README.zh-CN.md)
+
+# HP Pro c640 Chromebook (Google Dratini) Linux: The Complete Pitfall-Avoidance Guide and Hardware Enablement Plan
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: ChromeOS / Linux](https://img.shields.io/badge/Platform-Chromebook%20Linux-green.svg)](docs/COMPATIBILITY.md)
 [![Hardware: Google Dratini / Hatch](https://img.shields.io/badge/Hardware-Google%20Dratini%20(Comet%20Lake)-orange.svg)](docs/COMPATIBILITY.md)
 
-本專案為 **HP Pro c640 Chromebook** (Google Board: **`dratini`** / Baseboard: **`hatch`** / Intel 10th Gen Comet Lake-U) 提供完整的 Linux 硬體啟用方案、驅動補丁、跨發行版自動化安裝腳本與全方位避坑指南。
+This project provides a complete Linux hardware enablement plan for the **HP
+Pro c640 Chromebook** (Google Board: **`dratini`** / Baseboard: **`hatch`** /
+Intel 10th Gen Comet Lake-U), including driver patches, cross-distribution
+automated installation scripts, and a comprehensive guide to avoiding pitfalls.
 
 ---
 
-## 💻 設備硬體規格 (Device Specifications)
+## 💻 Device Specifications
 
-* **裝置型號**：[HP Pro c640 Chromebook](https://support.hp.com/hk-zh/product/product-specs/hp-pro-c640-chromebook/33298399)
-* **主機板代號**：Google `dratini`（Baseboard: `hatch`）
-* **處理器**：Intel 10th Gen Core i3/i5/i7 (Comet Lake-U: i3-10110U, i5-10210U, i5-10310U, i7-10610U)
-* **指紋識別器**：Fingerprint Cards FPC1025 (ChromeOS Match-on-Chip via `/dev/cros_fp`)
-* **音訊系統**：Intel Comet Lake cAVS SOF DSP (`snd_sof_pci_intel_cnl`) + Realtek RT5682 + Maxim MAX98357A
-* **韌體**：MrChromebox UEFI Full ROM / Coreboot
+* **Model**: [HP Pro c640 Chromebook](https://support.hp.com/hk-zh/product/product-specs/hp-pro-c640-chromebook/33298399)
+* **Board Codename**: Google `dratini` (Baseboard: `hatch`)
+* **Processor**: Intel 10th Gen Core i3/i5/i7 (Comet Lake-U: i3-10110U, i5-10210U, i5-10310U, i7-10610U)
+* **Fingerprint Reader**: Fingerprint Cards FPC1025 (ChromeOS Match-on-Chip via `/dev/cros_fp`)
+* **Audio System**: Intel Comet Lake cAVS SOF DSP (`snd_sof_pci_intel_cnl`) + Realtek RT5682 + Maxim MAX98357A
+* **Firmware**: MrChromebox UEFI Full ROM / Coreboot
 
 ---
 
-## 📊 硬體運作狀態矩陣 (Hardware Status)
+## 📊 Hardware Status
 
-| 硬體組件 | 運作狀態 | 驅動 / 解決方案 | 說明與支援度 |
+| Hardware Component | Status | Driver / Solution | Notes & Support Level |
 | :--- | :---: | :--- | :--- |
-| **指紋辨識 (Fingerprint)** | 🟢 **100% 正常** | `crfpmoc` (特製 `libfprint` MoC 驅動) | 支援 GDM / 鎖定螢幕秒解鎖與 `sudo` PAM 授權。 |
-| **立體聲喇叭 & 麥克風 (Audio)**| 🟢 **100% 正常** | Intel SOF DSP + ALSA UCM2 / PipeWire | 喇叭 (PCM 5)、耳機 (PCM 0) 自動切換、雙麥克風分流。 |
-| **Wi-Fi 6 & 藍牙 5.0** | 🟢 **免設定** | Intel AX201 (`iwlwifi` / `btusb`) | Linux 官方核心開箱即用，支援 WPA3 與 BLE。 |
-| **觸控螢幕 & 觸控板** | 🟢 **免設定** | `i2c_hid` / `elan_i2c` | 多指手勢滑動與防掌觸 (Palm Rejection) 原生支援。 |
-| **Intel UHD 顯示與硬解** | 🟢 **免設定** | `i915` (Wayland / X11) | 支援 VA-API 4K 60fps 硬體解碼。 |
-| **鍵盤背光 & 頂排功能鍵** | 🟢 **100% 正常** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1-F10 完美對應上一頁、重新整理、亮度、音量。 |
-| **待機休眠 (Sleep/Resume)** | 🟢 **100% 正常** | ACPI S0ix (`s2idle`) | 支援蓋螢幕休眠與按鍵/指紋快速喚醒。 |
-| **雙 Type-C 輸出與快充** | 🟢 **免設定** | USB-PD + DP 1.2 Alt Mode | 雙孔皆支援 45W/65W PD 充電與雙螢幕視訊輸出。 |
+| **Fingerprint** | 🟢 **100% Working** | `crfpmoc` (custom `libfprint` MoC driver) | Supports GDM / instant lock-screen unlock and `sudo` PAM authorization. |
+| **Stereo Speakers & Microphone (Audio)** | 🟢 **100% Working** | Intel SOF DSP + ALSA UCM2 / PipeWire | Speakers (PCM 5), headphones (PCM 0) auto-switching, dual-microphone split. |
+| **Wi-Fi 6 & Bluetooth 5.0** | 🟢 **Works Out of the Box** | Intel AX201 (`iwlwifi` / `btusb`) | Works out of the box with the official Linux kernel, supports WPA3 and BLE. |
+| **Touchscreen & Touchpad** | 🟢 **Works Out of the Box** | `i2c_hid` / `elan_i2c` | Native multi-finger gestures and palm rejection support. |
+| **Intel UHD Display & Hardware Decoding** | 🟢 **Works Out of the Box** | `i915` (Wayland / X11) | Supports VA-API 4K 60fps hardware decoding. |
+| **Keyboard Backlight & Top-Row Function Keys** | 🟢 **100% Working** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1-F10 perfectly mapped to previous page, refresh, brightness, and volume. |
+| **Sleep/Resume** | 🟢 **100% Working** | ACPI S0ix (`s2idle`) | Supports lid-close sleep and quick wake via key or fingerprint. |
+| **Dual Type-C Output & Fast Charging** | 🟢 **Works Out of the Box** | USB-PD + DP 1.2 Alt Mode | Both ports support 45W/65W PD charging and dual-display video output. |
 
 ---
 
-## 🚀 快速開始 (Quick Start)
+## 🚀 Quick Start
 
-### 1. 一鍵全自動安裝 (統一主控 CLI)
+### 1. One-Click Fully Automated Installation (Unified Master CLI)
 
 ```bash
 git clone https://github.com/samson1357924/hp-pro-c640-chromebook-linux.git ~/projects/hp-pro-c640-chromebook-linux
@@ -45,89 +50,123 @@ chmod +x setup.sh
 ./setup.sh --all
 ```
 
-### 2. CLI 常用指令
+### 2. Common CLI Commands
 
-| 需求 | 指令 |
+| Requirement | Command |
 | :--- | :--- |
-| **完整安裝 (鍵盤 + 音效 + 指紋)** | `./setup.sh --all` |
-| **僅安裝音訊 UCM 設定檔** | `./setup.sh --audio` (或 `./audio/install-audio.sh`) |
-| **僅安裝指紋驅動與 PAM** | `./setup.sh --fingerprint` (或 `./fingerprint/install-fingerprint.sh`) |
-| **僅安裝頂排鍵盤映射** | `./setup.sh --keyboard` (或 `./keyboard/install-keyboard.sh`) |
-| **執行系統硬體綜合診斷** | `./setup.sh --check` (或 `./scripts/detect-hardware.sh`) |
-| **預覽模式 (不改動系統檔案)** | `./setup.sh --all --dry-run` |
-| **一鍵解除安裝與復原系統** | `./setup.sh --uninstall` |
+| **Full Installation (keyboard + audio + fingerprint)** | `./setup.sh --all` |
+| **Install audio UCM configuration only** | `./setup.sh --audio` (or `./audio/install-audio.sh`) |
+| **Install fingerprint driver and PAM only** | `./setup.sh --fingerprint` (or `./fingerprint/install-fingerprint.sh`) |
+| **Install top-row keyboard mapping only** | `./setup.sh --keyboard` (or `./keyboard/install-keyboard.sh`) |
+| **Run system hardware comprehensive diagnostics** | `./setup.sh --check` (or `./scripts/detect-hardware.sh`) |
+| **Preview mode (no system files modified)** | `./setup.sh --all --dry-run` |
+| **One-click uninstall and system restore** | `./setup.sh --uninstall` |
 
 ---
 
-## 📚 完整文件目錄索引 (Documentation Suite)
+## 📚 Documentation Suite
 
-* 🚀 **[新手指南 (QUICKSTART.md)](docs/QUICKSTART.md)**：3 分鐘快速啟用流程與指令。
-* 📊 **[硬體相容性清單 (COMPATIBILITY.md)](docs/COMPATIBILITY.md)**：詳細晶片規格、內核需求。
-* 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/FIRMWARE.md)**：MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫 (HW WP)** 與還原 ChromeOS 步驟。
-* 🛠️ **[疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](docs/TROUBLESHOOTING.md)**：十大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
-* 🔄 **[系統復原與解除安裝 (UNINSTALL.md)](docs/UNINSTALL.md)**：備份還原機制與原生套件復原。
+* 🚀 **[QUICKSTART.md (Getting Started)](docs/QUICKSTART.md)**: 3-minute quick enablement flow and commands.
+* 📊 **[COMPATIBILITY.md (Hardware Compatibility)](docs/COMPATIBILITY.md)**: Detailed chip specifications and kernel requirements.
+* 🔧 **[FIRMWARE.md (Firmware Flashing & Recovery)](docs/FIRMWARE.md)**:
+  MrChromebox UEFI flashing, **disconnecting the battery cable to remove the
+  Cr50 hardware write-protect (HW WP)**, and steps to restore ChromeOS.
+* 🛠️ **[TROUBLESHOOTING.md (Troubleshooting & Pitfall FAQ)](docs/TROUBLESHOOTING.md)**:
+  Reference table for the ten most common faults and how to avoid them (Dummy
+  Output, Intel ME enablement requirements, S0ix power tuning, etc.).
+* 🔄 **[UNINSTALL.md (System Recovery & Uninstall)](docs/UNINSTALL.md)**: Backup/restore mechanism and native package restoration.
 
-### 🔬 深度技術解析 (Deep Dive)
-* 🖐️ **[ChromeOS Match-on-Chip 指紋驅動架構](docs/deep-dive/cros-fp-moc-driver.md)**：EC 通訊協議、50ms 狀態機輪詢與 TPM 金鑰安全。
-* 🔊 **[Intel SOF DSP 與 ALSA UCM2 音訊拓撲](docs/deep-dive/intel-sof-ucm-audio.md)**：PCM 映射、Phantom Jack 剖析與 PipeWire 路由。
-* 🔋 **[S0ix 睡眠模式與電源管理](docs/deep-dive/power-and-suspend.md)**：ASPM 節能、Wi-Fi WoWLAN 耗電優化。
+### 🔬 Deep Dive
 
-### 🐧 各發行版專屬指南 (Distro Guides)
-* [Ubuntu & Debian 配置手冊](docs/distros/ubuntu-debian.md)
-* [Fedora & Silverblue 配置手冊](docs/distros/fedora.md)
-* [Arch Linux & EndeavourOS 配置手冊 (含 PKGBUILD)](docs/distros/arch-linux.md)
-* [openSUSE Tumbleweed 配置手冊](docs/distros/opensuse.md)
-* [NixOS 宣告式配置手冊](docs/distros/nixos.md)
+* 🖐️ **[ChromeOS Match-on-Chip Fingerprint Driver Architecture](docs/deep-dive/cros-fp-moc-driver.md)**:
+  EC communication protocol, 50ms state-machine polling, and TPM key security.
+* 🔊 **[Intel SOF DSP and ALSA UCM2 Audio Topology](docs/deep-dive/intel-sof-ucm-audio.md)**:
+  PCM mapping, Phantom Jack analysis, and PipeWire routing.
+* 🔋 **[S0ix Sleep Mode and Power Management](docs/deep-dive/power-and-suspend.md)**:
+  ASPM power saving and Wi-Fi WoWLAN power consumption optimization.
 
----
+### 🐧 Distro Guides
 
-## 🧩 核心功能模組介紹
-
-### 🖐️ 指紋辨識模組 (`fingerprint/`)
-HP Pro c640 搭載 FPC1025 Match-on-Chip 感應器，透過 ChromeOS EC 控制器 (`/dev/cros_fp`) 溝通。本專案整合了經過深度審計與修復的 **`crfpmoc`** 驅動：
-* 採用 50ms 延遲狀態機輪詢，徹底解決 Linux 核心缺少中斷導致的 epoll 飢餓問題。
-* 弱指標記憶體守護，杜絕 Use-After-Free 隱患。
-* `/var/lib/fprint/crfpmoc.key` 獨立隨機加密種子（權限 `0600`）。
-* 提供 Arch PKGBUILD 與 RPM Spec 原生打包檔。
-
-### 🔊 音效子系統 (`audio/`)
-Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
-* 內建立體聲喇叭：PCM 5 (`max98357a`)。
-* 3.5mm 耳機孔：PCM 0 (`rt5682`)，支援自動插拔切換。
-* 數位麥克風陣列：PCM 1 (DMIC Split 分流為雙聲道)。
-* 提供 PipeWire ACP Phantom Jack 修復補丁 ([patches/acp-phantom-jack.patch](audio/patches/acp-phantom-jack.patch))。
-
-### ⌨️ 鍵盤頂排映射 (`keyboard/`)
-* **方案 A（預設推薦）**：`systemd-hwdb` 核心層映射，零資源消耗，支援 TTY、X11 與 Wayland。
-* **方案 B（進階雙模）**：提供 `keyd` 設定檔 ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf))，支援 Search 鍵「短按 CapsLock、長按 Super」，按住 Super 轉換頂排為標準 F1-F10。
+* [Ubuntu & Debian Configuration Guide](docs/distros/ubuntu-debian.md)
+* [Fedora & Silverblue Configuration Guide](docs/distros/fedora.md)
+* [Arch Linux & EndeavourOS Configuration Guide (including PKGBUILD)](docs/distros/arch-linux.md)
+* [openSUSE Tumbleweed Configuration Guide](docs/distros/opensuse.md)
+* [NixOS Declarative Configuration Guide](docs/distros/nixos.md)
 
 ---
 
-## 🙏 致謝與鳴謝 (Acknowledgements & Credits)
+## 🧩 Core Feature Modules
 
-特別感謝以下開源專案、貢獻者與社群為 ChromeOS 與 Linux 跨平台硬體支援所奠定的基礎：
+### 🖐️ Fingerprint Module (`fingerprint/`)
 
-* **[Abhinav Baid](https://github.com/abhinavbaid)**：原創 `crfpmoc` (ChromeOS Match-on-Chip) libfprint 驅動程式作者。
-* **[Felix Niederer](https://github.com/felixniederer)**：`crfpmoc` 驅動程式早期維護與架構貢獻。
-* **[Michael Evans](https://github.com/michaeleevans)**：協議擴展與多版本修復貢獻。
-* **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** 及 **[libfprint / freedesktop.org](https://gitlab.freedesktop.org/libfprint/libfprint)** 團隊：強大且健全的 Linux 生物識別驅動框架。
-* **[MrChromebox](https://mrchromebox.tech/)** 與 **[Chrultrabook Project](https://chrultrabook.com/)** 社群：提供卓越的 Coreboot / UEFI Full ROM 韌體與 Chromebook Linux 社群支援。
-* **[WeirdTreeThing](https://github.com/WeirdTreeThing)**：維護 Chromebook Linux Audio UCM 配置。
-* **[ChromiumOS Embedded Controller (EC) Team](https://chromium.googlesource.com/chromiumos/platform/ec/)**：開源的 ChromeOS EC Host Commands 與 FPMCU 協議規範。
+The HP Pro c640 is equipped with an FPC1025 Match-on-Chip sensor that
+communicates through the ChromeOS EC controller (`/dev/cros_fp`). This project
+integrates the deeply audited and fixed **`crfpmoc`** driver:
+
+* Uses 50ms-delay state-machine polling to fully resolve the epoll starvation
+  issue caused by the missing interrupt in the Linux kernel.
+* Weak-pointer memory guarding to eliminate Use-After-Free hazards.
+* `/var/lib/fprint/crfpmoc.key` independent random encryption seed (permissions `0600`).
+* Provides Arch PKGBUILD and RPM Spec native packaging files.
+
+### 🔊 Audio Subsystem (`audio/`)
+
+Comet Lake SOF DSP audio is fully enabled through the ALSA UCM2 topology:
+
+* Built-in stereo speakers: PCM 5 (`max98357a`).
+* 3.5mm headphone jack: PCM 0 (`rt5682`), with automatic plug/unplug switching.
+* Digital microphone array: PCM 1 (DMIC Split split into two channels).
+* Provides the PipeWire ACP Phantom Jack fix patch ([patches/acp-phantom-jack.patch](audio/patches/acp-phantom-jack.patch)).
+
+### ⌨️ Top-Row Keyboard Mapping (`keyboard/`)
+
+* **Option A (recommended by default)**: `systemd-hwdb` kernel-level mapping,
+  zero resource consumption, supports TTY, X11 and Wayland.
+* **Option B (advanced dual-mode)**: Provides a `keyd` configuration file
+  ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf)) supporting the Search
+  key "short-press CapsLock, long-press Super", and holding Super converts the
+  top row into standard F1-F10.
 
 ---
 
-## 📜 開源協議與合規宣告 (License & Compliance)
+## 🙏 Acknowledgements & Credits
 
-本專案遵循 [REUSE Specification 3.0](https://reuse.software/) 與 [SPDX 標準](https://spdx.dev/) 實施嚴謹的混合授權管理：
+Special thanks to the following open-source projects, contributors and
+communities that laid the foundation for cross-platform ChromeOS and Linux
+hardware support:
 
-| 組件模組 | 適用路徑 | 授權條款 (SPDX) | 授權全文檔案 |
+* **[Abhinav Baid](https://github.com/abhinavbaid)**: Original author of the
+  `crfpmoc` (ChromeOS Match-on-Chip) libfprint driver.
+* **[Felix Niederer](https://github.com/felixniederer)**: Early maintenance and
+  architecture contributions to the `crfpmoc` driver.
+* **[Michael Evans](https://github.com/michaeleevans)**: Protocol extension and multi-version fix contributions.
+* **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** and the
+  **[libfprint / freedesktop.org](https://gitlab.freedesktop.org/libfprint/libfprint)**
+  team: A powerful and robust Linux biometric driver framework.
+* **[MrChromebox](https://mrchromebox.tech/)** and the
+  **[Chrultrabook Project](https://chrultrabook.com/)** community: Outstanding
+  Coreboot / UEFI Full ROM firmware and Chromebook Linux community support.
+* **[WeirdTreeThing](https://github.com/WeirdTreeThing)**: Maintainer of Chromebook Linux Audio UCM configurations.
+* **[ChromiumOS Embedded Controller (EC) Team](https://chromium.googlesource.com/chromiumos/platform/ec/)**:
+  The open-source ChromeOS EC Host Commands and FPMCU protocol specification.
+
+---
+
+## 📜 License & Compliance
+
+This project follows [REUSE Specification 3.0](https://reuse.software/) and the
+[SPDX standard](https://spdx.dev/) to implement rigorous mixed-license
+management:
+
+| Component Module | Applicable Path | License (SPDX) | Full License Text |
 | :--- | :--- | :--- | :--- |
-| **主控腳本與工具** | `setup.sh`, `scripts/`, `lib/`, `power/`, `ec/` | **MIT License** | [`LICENSES/MIT.txt`](LICENSES/MIT.txt) |
-| **指紋辨識驅動與測試** | `fingerprint/driver/`, `fingerprint/tests/` | **LGPL-2.1-or-later** | [`LICENSES/LGPL-2.1-or-later.txt`](LICENSES/LGPL-2.1-or-later.txt) / [`COPYING.LGPL`](COPYING.LGPL) |
-| **音訊 UCM 拓撲設定** | `audio/ucm/` | **BSD-3-Clause** | [`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt) |
-| **硬體按鍵資料庫與說明**| `keyboard/90-*.hwdb`, `docs/` | **CC0-1.0 / MIT** | [`LICENSES/CC0-1.0.txt`](LICENSES/CC0-1.0.txt) |
+| **Master scripts and tools** | `setup.sh`, `scripts/`, `lib/`, `power/`, `ec/` | **MIT License** | [`LICENSES/MIT.txt`](LICENSES/MIT.txt) |
+| **Fingerprint driver and tests** | `fingerprint/driver/`, `fingerprint/tests/` | **LGPL-2.1-or-later** | [`LICENSES/LGPL-2.1-or-later.txt`](LICENSES/LGPL-2.1-or-later.txt) / [`COPYING.LGPL`](COPYING.LGPL) |
+| **Audio UCM topology configuration** | `audio/ucm/` | **BSD-3-Clause** | [`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt) |
+| **Hardware key database and documentation** | `keyboard/90-*.hwdb`, `docs/` | **CC0-1.0 / MIT** | [`LICENSES/CC0-1.0.txt`](LICENSES/CC0-1.0.txt) |
 
 > [!NOTE]
-> 各上游著作權人聲明（Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA Project, ChromiumOS Authors）、致謝清單與衍生修改記錄請詳閱 [**`CREDITS.md`**](CREDITS.md)。
-
+> Please refer to [**`CREDITS.md`**](CREDITS.md) for the copyright statements
+> of the upstream authors (Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA
+> Project, ChromiumOS Authors), the acknowledgement list, and the records of
+> derivative modifications.

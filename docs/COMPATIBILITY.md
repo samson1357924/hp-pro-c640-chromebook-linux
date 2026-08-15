@@ -1,35 +1,37 @@
-# 📊 硬體相容性矩陣 (Hardware Compatibility Matrix)
+# 📊 Hardware Compatibility Matrix
 
-HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hatch`**，Intel 第 10 代 Comet Lake-U 平台) 在 Linux 下的硬體組件支援狀況如下：
+Hardware component support under Linux for the HP Pro c640 Chromebook
+(codenamed **Google `dratini`**, baseboard **`hatch`**, Intel 10th Gen Comet
+Lake-U platform):
 
 ---
 
-## 💻 組件狀態總覽
+## 💻 Component Status Overview
 
-| 硬體組件 | 晶片型號 / 規格 | Linux 核心驅動 | 支援狀態 | 備註 / 解決方案 |
+| Hardware Component | Chip Model / Spec | Linux Kernel Driver | Support Status | Notes / Solutions |
 | :--- | :--- | :--- | :---: | :--- |
-| **指紋辨識** | Fingerprint Cards FPC1025 (FPMCU MoC) | `/dev/cros_fp` (`cros_ec_spi`) | 🟢 **100% 正常** | 使用本專案 `crfpmoc` 驅動 + PAM。支援鎖定解鎖與 `sudo`。 |
-| **內建立體聲喇叭** | Maxim MAX98357A (I2S Amp) | `snd_soc_max98357a` | 🟢 **100% 正常** | 透過 ALSA UCM2 PCM 5 輸出，支援硬體音量控制。 |
-| **3.5mm 耳機孔** | Realtek RT5682 (I2C) | `snd_soc_rt5682` | 🟢 **100% 正常** | 支援自動插拔切換 (JD1) 與耳麥輸入。 |
-| **內建數位麥克風** | 2-channel PDM DMIC | `snd_soc_dmic` | 🟢 **100% 正常** | UCM PCM Split 分流為立體聲 Mic 1 與 Mic 2。 |
-| **Wi-Fi 6** | Intel Wi-Fi 6 AX201 (CNVi) | `iwlwifi` | 🟢 **免設定** | 核心內建支援，支援 802.11ax 與 WPA3。 |
-| **藍牙 5.0** | Intel AX201 Bluetooth | `btusb` / `btintel` | 🟢 **免設定** | 支援 BLE、A2DP 音訊與 HID 藍牙周邊。 |
-| **觸控板** | ELAN I2C Touchpad | `i2c_hid` / `elan_i2c` | 🟢 **免設定** | 多指手勢與防誤觸（Palm Rejection）原生支援。 |
-| **觸控螢幕 (選配)** | Goodix / ELAN / G2Touch | `i2c_hid_acpi` | 🟢 **免設定** | 支援多點觸控與手寫筆 (USI Stylus)。 |
-| **GPU / 內顯** | Intel UHD Graphics 620 | `i915` | 🟢 **免設定** | 支援 Wayland/X11，VA-API 硬體編解碼 (4K 60fps)。 |
-| **視訊鏡頭** | 720p HD Camera (附隱私蓋) | `uvcvideo` | 🟢 **免設定** | 標準 USB UVC 鏡頭。 |
-| **雙 Type-C 輸出** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | 🟢 **免設定** | 雙孔皆支援 45W/65W PD 快充與 DP 1.2 螢幕輸出。 |
-| **鍵盤頂排按鍵** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **100% 正常** | 映射為上一頁/下一頁/重新整理/亮度/音量等標準媒體鍵。 |
-| **待機休眠** | Intel S0ix Modern Standby | ACPI `s2idle` | 🟢 **100% 正常** | 支援蓋螢幕休眠與按鍵/指紋快速喚醒。 |
+| **Fingerprint Reader** | Fingerprint Cards FPC1025 (FPMCU MoC) | `/dev/cros_fp` (`cros_ec_spi`) | 🟢 **100% Working** | Uses this project's `crfpmoc` driver + PAM. Supports lock-screen unlock and `sudo`. |
+| **Built-in Stereo Speakers** | Maxim MAX98357A (I2S Amp) | `snd_soc_max98357a` | 🟢 **100% Working** | Output via ALSA UCM2 PCM 5, supports hardware volume control. |
+| **3.5mm Headphone Jack** | Realtek RT5682 (I2C) | `snd_soc_rt5682` | 🟢 **100% Working** | Supports automatic plug detection switching (JD1) and headset mic input. |
+| **Built-in Digital Microphones** | 2-channel PDM DMIC | `snd_soc_dmic` | 🟢 **100% Working** | UCM PCM Split divides into stereo Mic 1 and Mic 2. |
+| **Wi-Fi 6** | Intel Wi-Fi 6 AX201 (CNVi) | `iwlwifi` | 🟢 **No setup needed** | Built into the kernel, supports 802.11ax and WPA3. |
+| **Bluetooth 5.0** | Intel AX201 Bluetooth | `btusb` / `btintel` | 🟢 **No setup needed** | Supports BLE, A2DP audio and HID Bluetooth peripherals. |
+| **Touchpad** | ELAN I2C Touchpad | `i2c_hid` / `elan_i2c` | 🟢 **No setup needed** | Native multi-finger gestures and palm rejection. |
+| **Touchscreen (optional)** | Goodix / ELAN / G2Touch | `i2c_hid_acpi` | 🟢 **No setup needed** | Supports multi-touch and USI Stylus pen input. |
+| **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | 🟢 **No setup needed** | Supports Wayland/X11, VA-API hardware encode/decode (4K 60fps). |
+| **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | 🟢 **No setup needed** | Standard USB UVC camera. |
+| **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | 🟢 **No setup needed** | Both ports support 45W/65W PD fast charging and DP 1.2 display output. |
+| **Keyboard Top-Row Keys** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **100% Working** | Mapped to standard media keys such as Back/Forward/Reload/Brightness/Volume. |
+| **Standby / Sleep** | Intel S0ix Modern Standby | ACPI `s2idle` | 🟢 **100% Working** | Supports lid-close sleep and fast wake via keys/fingerprint. |
 
 ---
 
-## 🐧 推薦發行版與內核版本需求
+## 🐧 Recommended Distros & Kernel Requirements
 
-* **推薦 Linux 核心**：Linux Kernel `>= 5.15` (推薦 `>= 6.5` 以獲得最佳 SOF DSP 與 S0ix 功耗表現)。
-* **音效伺服器**：PipeWire `>= 0.3.65` (推薦 PipeWire 1.0+ / WirePlumber 0.4.14+)。
-* **已實體驗證發行版**：
-  * **Ubuntu 24.04 LTS / 26.04 LTS** (完美運作)
+* **Recommended Linux kernel**: Linux Kernel `>= 5.15` (recommend `>= 6.5` for the best SOF DSP and S0ix power performance).
+* **Audio server**: PipeWire `>= 0.3.65` (recommend PipeWire 1.0+ / WirePlumber 0.4.14+).
+* **Verified distros**:
+  * **Ubuntu 24.04 LTS / 26.04 LTS** (works perfectly)
   * **Debian 12 (Bookworm) / 13 (Trixie)**
   * **Fedora 39 / 40 / 41**
   * **Arch Linux / EndeavourOS**

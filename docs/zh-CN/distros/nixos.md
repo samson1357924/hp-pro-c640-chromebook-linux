@@ -1,17 +1,18 @@
-# ❄️ NixOS Declarative Configuration Guide
+[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
 
-NixOS uses an immutable and purely declarative system architecture. Integrate
-the following settings into your `/etc/nixos/configuration.nix` or Nix Flake.
+# ❄️ NixOS 宣告式配置指南
+
+NixOS 採用不可變（Immutable）與純宣告式（Declarative）系統架構，請將以下設定整合至您的 `/etc/nixos/configuration.nix` 或 Nix Flake。
 
 ---
 
-## 1. Complete Hardware Enablement Example (`hp-pro-c640.nix`)
+## 1. 完整硬體啟用配置範例 (`hp-pro-c640.nix`)
 
 ```nix
 { config, pkgs, ... }:
 
 {
-  # 1. Enable the audio server (PipeWire + WirePlumber)
+  # 1. 啟用音訊伺服器 (PipeWire + WirePlumber)
   services.pipewire = {
     enable = true;
     alsa.enable = true;
@@ -21,23 +22,23 @@ the following settings into your `/etc/nixos/configuration.nix` or Nix Flake.
   hardware.pulseaudio.enable = false;
   security.rtkit.enable = true;
 
-  # 2. Enable Intel SOF firmware
+  # 2. 啟用 Intel SOF 韌體
   hardware.firmware = [ pkgs.sof-firmware ];
 
-  # 3. Enable the fingerprint service and PAM integration
+  # 3. 啟用指紋識別服務與 PAM 整合
   services.fprintd = {
     enable = true;
     package = pkgs.fprintd.override {
-      # Override libfprint with a version that includes the crfpmoc patch
+      # 覆寫 libfprint 為包含 crfpmoc 補丁之版本
     };
   };
 
-  # 4. ChromeOS /dev/cros_fp udev permissions
+  # 4. ChromeOS /dev/cros_fp udev 權限
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
   '';
 
-  # 5. Keyboard top-row mapping (udev hwdb)
+  # 5. 鍵盤頂排映射 (udev hwdb)
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
@@ -55,7 +56,7 @@ the following settings into your `/etc/nixos/configuration.nix` or Nix Flake.
      KEYBOARD_KEY_ef=brightnessup
   '';
 
-  # 6. S0ix sleep and power management
+  # 6. S0ix 睡眠與電源管理
   boot.kernelParams = [ "pcie_aspm=force" ];
   services.logind = {
     lidSwitch = "suspend";

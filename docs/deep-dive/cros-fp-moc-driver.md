@@ -1,14 +1,19 @@
-# 🔬 深度技術解析：ChromeOS Match-on-Chip (MoC) 指紋驅動架構
+# 🔬 Deep Dive: ChromeOS Match-on-Chip (MoC) Fingerprint Driver Architecture
 
-本文深度解析 **HP Pro c640 Chromebook** (Google `dratini` / `hatch`) 的指紋感測硬體、ChromeOS Embedded Controller (EC) 通訊協議以及 `crfpmoc` libfprint 驅動之實作原理。
+This article dissects the fingerprint sensor hardware of the **HP Pro c640
+Chromebook** (Google `dratini` / `hatch`), the ChromeOS Embedded Controller (EC)
+communication protocol, and the implementation principles of the `crfpmoc`
+libfprint driver.
 
 ---
 
-## 1. 硬體架構與匯流排拓撲
+## 1. Hardware Architecture and Bus Topology
 
-HP Pro c640 的指紋硬體不同於傳統 USB/SPI 指紋讀取器，其採用了 Google ChromeOS 專屬的 **Match-on-Chip (MoC)** 安全隔離架構：
+Unlike traditional USB/SPI fingerprint readers, the fingerprint hardware of the
+HP Pro c640 uses Google ChromeOS's proprietary **Match-on-Chip (MoC)**
+security-isolated architecture:
 
-```
+```text
 +-----------------------------------------------------------------------+
 |                    Host CPU (Intel Comet Lake-U)                      |
 |  - Kernel Driver: cros_ec_spi, cros_ec_chardev                       |
@@ -33,46 +38,61 @@ HP Pro c640 的指紋硬體不同於傳統 USB/SPI 指紋讀取器，其採用�
 
 ---
 
-## 2. 驅動面臨之挑戰與解決方案
+## 2. Driver Challenges and Solutions
 
-### 挑戰 1：Linux 核心中斷轉發缺失 (Epoll Starvation)
-* **問題**：在標準 Linux 核心中，FPMCU 的 ACPI GPIO 中斷（`GPP_A23`）並未與 `cros_ec_chardev` 的等待佇列綁定。使用常規的 `epoll` 或 `GPollableInputStream` 監聽 `/dev/cros_fp` 時，事件永遠不會觸發。
-* **解決方案**：在 `crfpmoc` 中採用 **50ms SSM 延遲狀態機輪詢（50ms SSM Delayed Polling）**。狀態機在輪詢期間主動透過 ioctl 查詢 MKBP 事件遮罩，避免行程死鎖阻塞。
+### Challenge 1: Missing Kernel Interrupt Forwarding (Epoll Starvation)
 
-### 挑戰 2：記憶體弱指標守護 (Weak Pointer Lifecycle Guard)
-* **問題**：當使用者在註冊或比對過程中取消操作（或發生 Timeout），若底層非同步任務尚未結束，可能會存取已被釋放的裝置結構，造成 Use-After-Free (UAF) 崩潰。
-* **解決方案**：引入 weak-pointer 參照計數守護，在非同步 callback 觸發時先行校驗指標有效性。
+* **Problem**: On a standard Linux kernel, the FPMCU's ACPI GPIO interrupt
+  (`GPP_A23`) is not bound to the `cros_ec_chardev` wait queue. When monitoring
+  `/dev/cros_fp` with regular `epoll` or `GPollableInputStream`, events never
+  fire.
+* **Solution**: Adopt **50ms SSM Delayed Polling** in `crfpmoc`. The state
+  machine actively queries the MKBP event mask via ioctl during polling,
+  avoiding deadlocks caused by blocked threads.
 
-### 挑戰 3：加密種子持久化 (TPM Seed & Context Management)
-* **問題**：FPMCU 的 RAM 模板在重開機後會被清除，且每台設備需要獨立的金鑰進行模板加解密。
-* **解決方案**：驅動於首次運行時在 `/var/lib/fprint/crfpmoc.key` 產生 32-byte 密碼學安全隨機種子（權限 `0600`），並在每次與 FPMCU 握手時透過 `EC_CMD_FP_SEED` 與 `EC_CMD_FP_CONTEXT` 注入安全種子。
+### Challenge 2: Weak Pointer Lifecycle Guard
+
+* **Problem**: When a user cancels an operation (or a timeout occurs) during
+  enrollment or matching, the underlying asynchronous task may still access an
+  already-freed device structure, causing a Use-After-Free (UAF) crash.
+* **Solution**: Introduce a weak-pointer reference-counting guard that validates
+  pointer validity before the asynchronous callback fires.
+
+### Challenge 3: Cryptographic Seed Persistence (TPM Seed & Context Management)
+
+* **Problem**: The FPMCU's RAM templates are cleared after reboot, and each
+  device needs an independent key to encrypt/decrypt templates.
+* **Solution**: On first run, the driver generates a 32-byte cryptographically
+  secure random seed in `/var/lib/fprint/crfpmoc.key` (permissions `0600`), and
+  injects the secure seed on every handshake with the FPMCU via `EC_CMD_FP_SEED`
+  and `EC_CMD_FP_CONTEXT`.
 
 ---
 
-## 3. 核心狀態機流程 (Enrollment State Machine)
+## 3. Core State Machine Flow (Enrollment State Machine)
 
 ```mermaid
 sequenceDiagram
-    participant User as 使用者
-    participant fprintd as fprintd 守護行程
-    participant crfpmoc as crfpmoc 驅動
+    participant User as User
+    participant fprintd as fprintd daemon
+    participant crfpmoc as crfpmoc driver
     participant FPMCU as ChromeOS FPMCU (/dev/cros_fp)
 
     User->>fprintd: fprintd-enroll "$USER"
     fprintd->>crfpmoc: open()
-    crfpmoc->>FPMCU: EC_CMD_FP_INFO (探測版本與能力)
-    crfpmoc->>FPMCU: EC_CMD_FP_SEED (注入加密種子)
-    crfpmoc->>FPMCU: EC_CMD_FP_CONTEXT (設定使用者上下文)
+    crfpmoc->>FPMCU: EC_CMD_FP_INFO (probe version and capabilities)
+    crfpmoc->>FPMCU: EC_CMD_FP_SEED (inject encryption seed)
+    crfpmoc->>FPMCU: EC_CMD_FP_CONTEXT (set user context)
     
-    loop 5 次按壓採樣
-        User->>FPMCU: 按下手指
-        crfpmoc->>FPMCU: 50ms 輪詢 MKBP 事件
-        FPMCU-->>crfpmoc: 回傳採樣品質與進度 (0~100%)
+    loop 5 enroll presses
+        User->>FPMCU: press finger
+        crfpmoc->>FPMCU: 50ms poll for MKBP events
+        FPMCU-->>crfpmoc: return sample quality and progress (0~100%)
         crfpmoc->>fprintd: fpi_device_enroll_progress()
     end
 
-    crfpmoc->>FPMCU: EC_CMD_FP_TEMPLATE (下載加密模板)
-    FPMCU-->>crfpmoc: 傳回分塊模板資料
-    crfpmoc->>fprintd: 儲存加密模板至 /var/lib/fprint/
-    fprintd-->>User: 註冊成功！
+    crfpmoc->>FPMCU: EC_CMD_FP_TEMPLATE (download encrypted template)
+    FPMCU-->>crfpmoc: return chunked template data
+    crfpmoc->>fprintd: store encrypted template in /var/lib/fprint/
+    fprintd-->>User: enrollment successful!
 ```

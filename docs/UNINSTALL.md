@@ -1,59 +1,76 @@
-# 🔄 系統復原與解除安裝指南 (Uninstallation & Rollback)
+# 🔄 Uninstallation & Rollback Guide
 
-本專案具備完整的**無損撤銷（Idempotent & Reversible）**機制。所有透過 `setup.sh` 或各子模組安裝的檔案均受到 `/var/lib/cros-enablement/install-manifest.json` 與 `/var/backups/cros-enablement/` 的保護。
+This project has a complete **lossless, idempotent & reversible** mechanism.
+All files installed via `setup.sh` or the individual sub-modules are protected
+by `/var/lib/cros-enablement/install-manifest.json` and
+`/var/backups/cros-enablement/`.
 
 ---
 
-## ⚡ 一鍵全自動解除安裝
+## ⚡ One-Click Full Uninstallation
 
-在專案目錄下執行：
+Run this inside the project directory:
 
 ```bash
 ./setup.sh --uninstall
 ```
 
-該指令會全自動執行：
-1. 移除 `/usr/share/alsa/ucm2/` 中的 `sof-rt5682` 自訂 UCM 設定檔。
-2. 移除 `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 並重整硬體資料庫。
-3. 移除 `/etc/udev/rules.d/60-cros-fp.rules`。
-4. 提示發行版重裝原生 `libfprint` 套件的指令。
+This command automatically:
+
+1. Removes the custom `sof-rt5682` UCM configuration files from `/usr/share/alsa/ucm2/`.
+2. Removes `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` and rebuilds the hardware database.
+3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
+4. Shows the commands to reinstall the distro's native `libfprint` package.
 
 ---
 
-## 🛠️ 單一模組獨立解除安裝
+## 🛠️ Per-Module Uninstallation
 
-* **僅移除音訊 UCM 配置**：
+* **Remove only the audio UCM configuration**:
+
   ```bash
   ./audio/install-audio.sh --uninstall
   ```
-* **僅移除指紋 udev 規則**：
+
+* **Remove only the fingerprint udev rules**:
+
   ```bash
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
-* **僅移除鍵盤頂排映射**：
+
+* **Remove only the keyboard top-row mapping**:
+
   ```bash
   ./keyboard/install-keyboard.sh --uninstall
   ```
 
 ---
 
-## 📦 發行版原生套件還原
+## 📦 Restore Distro Native Packages
 
-若您曾編譯並安裝過 `crfpmoc` 的 `libfprint`，可透過系統套件管理員重新安裝發行版原生版本：
+If you compiled and installed the `crfpmoc` `libfprint`, you can reinstall the
+distro's native version through your package manager:
 
 * **Ubuntu / Debian**:
+
   ```bash
   sudo apt install --reinstall -y libfprint-2-2
   ```
+
 * **Fedora**:
+
   ```bash
   sudo dnf reinstall -y libfprint
   ```
+
 * **Arch Linux**:
+
   ```bash
   sudo pacman -S --overwrite='*' libfprint
   ```
+
 * **openSUSE**:
+
   ```bash
   sudo zypper install --force libfprint-2-2
   ```

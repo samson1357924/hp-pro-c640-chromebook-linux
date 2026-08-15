@@ -1,12 +1,15 @@
-# 🚀 快速上手指南 (Quick Start Guide)
+# 🚀 Quick Start Guide
 
-本指南將在 3 分鐘內引導您在 **HP Pro c640 Chromebook** (Google `dratini` / `hatch`) 上完成所有硬體驅動配置。
+This guide walks you through all the hardware driver configuration on your
+**HP Pro c640 Chromebook** (Google `dratini` / `hatch`) within 3 minutes.
 
 ---
 
-## ⚡ 一鍵全自動安裝 (One-Liner Setup)
+## ⚡ One-Liner Setup
 
-複製並執行以下指令，全自動安裝頂排鍵盤映射、ALSA UCM2 音效配置與 `crfpmoc` 指紋驅動：
+Copy and run the following commands to automatically install the top-row
+keyboard mapping, ALSA UCM2 audio configuration and the `crfpmoc` fingerprint
+driver:
 
 ```bash
 git clone https://github.com/samson1357924/hp-pro-c640-chromebook-linux.git ~/projects/hp-pro-c640-chromebook-linux
@@ -17,51 +20,52 @@ chmod +x setup.sh
 
 ---
 
-## 🧭 常用指令一覽
+## 🧭 Common Commands Overview
 
-| 目的 | 指令 |
+| Purpose | Command |
 | :--- | :--- |
-| **一鍵全功能安裝** | `./setup.sh --all` |
-| **僅安裝音訊 UCM 配置** | `./setup.sh --audio` 或 `./audio/install-audio.sh` |
-| **僅安裝指紋驅動與 PAM** | `./setup.sh --fingerprint` 或 `./fingerprint/install-fingerprint.sh` |
-| **僅安裝鍵盤頂排映射** | `./setup.sh --keyboard` 或 `./keyboard/install-keyboard.sh` |
-| **系統硬體綜合診斷** | `./setup.sh --check` 或 `./scripts/detect-hardware.sh` |
-| **預覽所有變更 (Dry-Run)** | `./setup.sh --all --dry-run` |
-| **一鍵解除安裝與還原** | `./setup.sh --uninstall` |
+| **Full one-click installation** | `./setup.sh --all` |
+| **Install only the audio UCM configuration** | `./setup.sh --audio` or `./audio/install-audio.sh` |
+| **Install only the fingerprint driver and PAM** | `./setup.sh --fingerprint` or `./fingerprint/install-fingerprint.sh` |
+| **Install only the keyboard top-row mapping** | `./setup.sh --keyboard` or `./keyboard/install-keyboard.sh` |
+| **Comprehensive hardware diagnostics** | `./setup.sh --check` or `./scripts/detect-hardware.sh` |
+| **Preview all changes (dry-run)** | `./setup.sh --all --dry-run` |
+| **One-click uninstall and rollback** | `./setup.sh --uninstall` |
 
 ---
 
-## 🖐️ 指紋快速登錄
+## 🖐️ Fingerprint Enrollment
 
-安裝完成後，使用標準 `fprintd` 工具登錄指紋：
+After installation, enroll your fingerprint with the standard `fprintd` tool:
 
 ```bash
-# 1. 登錄預設手指 (右手食指)
+# 1. Enroll the default finger (right index finger)
 fprintd-enroll "$USER"
 
-# 2. 驗證指紋
+# 2. Verify the fingerprint
 fprintd-verify "$USER"
 
-# 3. 測試 sudo 認證 (使用 -k 清除現有 sudo 快取)
+# 3. Test sudo authentication (use -k to clear the existing sudo cache)
 sudo -k && sudo whoami
 ```
 
 ---
 
-## 🔊 音效即時測試
+## 🔊 Test Audio Immediately
 
 ```bash
-# 測試立體聲喇叭輸出
+# Test stereo speaker output
 speaker-test -c 2 -t wav
 
-# 查看當前音效設備狀態
+# Check the current audio device status
 wpctl status
 ```
 
 ---
 
-## 📖 下一步閱讀
+## 📖 What's Next
 
-* 遇到任何疑難雜症？請參閱 [疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](TROUBLESHOOTING.md)。
-* 想了解 MrChromebox 刷機與硬體寫入保護解除？請參閱 [韌體刷機與還原指南 (FIRMWARE.md)](FIRMWARE.md)。
-* 特定發行版 (Fedora/Arch/NixOS)？請參閱 [發行版專屬指南 (distros/)](distros/ubuntu-debian.md)。
+* Running into any problems? See the [Troubleshooting & Pitfall FAQ (TROUBLESHOOTING.md)](TROUBLESHOOTING.md).
+* Want to learn about MrChromebox flashing and hardware write-protection
+  removal? See the [Firmware Flashing & Recovery Guide (FIRMWARE.md)](FIRMWARE.md).
+* Using a specific distro (Fedora/Arch/NixOS)? See the [distro-specific guides (distros/)](distros/ubuntu-debian.md).

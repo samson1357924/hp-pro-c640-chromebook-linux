@@ -1,10 +1,12 @@
-# 🐧 Ubuntu & Debian Configuration Guide
+[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
 
-Applies to: **Ubuntu 22.04 / 24.04 / 26.04 LTS**, **Debian 12 (Bookworm) / 13 (Trixie)**, **Linux Mint**, **Pop!_OS**.
+# 🐧 Ubuntu & Debian 專屬配置指南
+
+適用發行版：**Ubuntu 22.04 / 24.04 / 26.04 LTS**, **Debian 12 (Bookworm) / 13 (Trixie)**, **Linux Mint**, **Pop!_OS**。
 
 ---
 
-## 1. Quick Automated Installation
+## 1. 快速自動安裝
 
 ```bash
 git clone https://github.com/samson1357924/hp-pro-c640-chromebook-linux.git
@@ -15,9 +17,9 @@ chmod +x setup.sh
 
 ---
 
-## 2. Manual Step-by-Step Guide (Transparent and Auditable)
+## 2. 手動分步指南 (透明可審查)
 
-### (1) Install Package Dependencies
+### (1) 安裝套件依賴
 
 ```bash
 sudo apt update
@@ -29,7 +31,7 @@ sudo apt install -y build-essential meson ninja-build pkg-config \
                     pipewire wireplumber alsa-ucm-conf
 ```
 
-### (2) Deploy Audio UCM Configuration
+### (2) 部署音訊 UCM 配置
 
 ```bash
 sudo cp -r audio/ucm/ucm2/* /usr/share/alsa/ucm2/
@@ -37,7 +39,7 @@ sudo alsactl init
 systemctl --user restart wireplumber
 ```
 
-### (3) Deploy Keyboard Top-Row Mapping
+### (3) 部署鍵盤頂排映射
 
 ```bash
 sudo cp keyboard/90-chromebook-keyboard.hwdb /etc/udev/hwdb.d/
@@ -45,15 +47,15 @@ sudo systemd-hwdb update
 sudo udevadm trigger --subsystem-match=input
 ```
 
-### (4) Compile and Install the Fingerprint Driver
+### (4) 編譯並安裝指紋驅動
 
 ```bash
-# Set up udev permissions
+# 設定 udev 權限
 sudo cp fingerprint/60-cros-fp.rules /etc/udev/rules.d/
 sudo usermod -aG plugdev "$USER"
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# Run the automated install script to compile and install
+# 執行自動安裝腳本進行編譯與安裝
 ./fingerprint/install-fingerprint.sh
 sudo pam-auth-update --enable fprintd
 ```
