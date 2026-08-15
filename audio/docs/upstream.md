@@ -4,9 +4,9 @@
 
 | Track | Content | Status | URL |
 | :--- | :--- | :--- | :--- |
-| alsa-ucm-conf PR #832 | Upstream the 22 UCM files for sof-rt5682 | **closed (withdrawn)** 2026-08-15 — submitted without coordinating with the downstream UCM author first; retry requires prior coordination (see [../upstream/alsa-ucm-conf-pr-832.md](../upstream/alsa-ucm-conf-pr-832.md)) | https://github.com/alsa-project/alsa-ucm-conf/pull/832 |
-| cros issue #433 | Success report for the downstream UCM | published | https://github.com/WeirdTreeThing/chromebook-linux-audio/issues/433 |
-| pipewire work item #5428 | RFC: ACP marks all analog profiles `available: no` when no UCM exists | open | https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5428 |
+| alsa-ucm-conf PR #832 | Upstream the 22 UCM files for sof-rt5682 | **closed (withdrawn)** 2026-08-15 — submitted without coordinating with the downstream UCM author first; retry requires prior coordination (see [../upstream/alsa-ucm-conf-pr-832.md](../upstream/alsa-ucm-conf-pr-832.md)) | <https://github.com/alsa-project/alsa-ucm-conf/pull/832> |
+| cros issue #433 | Success report for the downstream UCM | published | <https://github.com/WeirdTreeThing/chromebook-linux-audio/issues/433> |
+| pipewire work item #5428 | RFC: ACP marks all analog profiles `available: no` when no UCM exists | open | <https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5428> |
 | pipewire phantom-jack MR | Fix: phantom jacks (ASoC has no phantom jack support) → treat as always-present | **not submitted** — freedesktop fork quota limit blocks creating a personal fork | materials in [../upstream/](../upstream/) |
 
 Archived copies: [audio/upstream/](../upstream/README.md).

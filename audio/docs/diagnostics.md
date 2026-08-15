@@ -9,59 +9,74 @@
 ## 2. Toolchain
 
 ### 2.1 `wpctl status`
+
 Sinks/sources, the `*` default marker, and profile state.
+
 ```bash
 wpctl status
 ```
 
 ### 2.2 `wpctl inspect` / `wpctl get-volume`
+
 ```bash
 wpctl inspect @DEFAULT_AUDIO_SINK@
 wpctl get-volume @DEFAULT_AUDIO_SINK@
 ```
 
 ### 2.3 `pw-dump`
+
 Node objects carry `api.alsa.*` props and the active profile:
+
 ```bash
 pw-dump | jq -r '.. | objects | select(.type? == "PipeWire:Interface:Node") |
   .info.props | "\(.["node.name"]) profile=\(.["api.alsa.profile"])"'
 ```
 
 ### 2.4 `spa-acp-tool` — the A/B probe (main tool)
+
 ```bash
 export ACP_PATHS_DIR=/usr/share/alsa-card-profile/mixer/paths
 export ACP_PROFILES_DIR=/usr/share/alsa-card-profile/mixer/profile-sets
 spa-acp-tool -vvvv -p 'api.alsa.path=hw:0' -p 'api.alsa.use-ucm=false' list-profiles
 spa-acp-tool -vvvv -p 'api.alsa.path=hw:0' -p 'api.alsa.use-ucm=true'  list-profiles
 ```
+
 Expected difference:
+
 * `use-ucm=false` → only `off` (and `output:stereo-fallback available: no`).
 * `use-ucm=true` → HiFi family profiles with `available: yes`.
 
 `-vvvv` is required for profile/port probe debug (levels below 4 silence it).
 
 ### 2.5 `alsa-info.sh`
+
 ```bash
 wget https://www.alsa-project.org/alsa-info.sh && sh alsa-info.sh
 ```
+
 Upload and attach the URL when reporting issues.
 
 ### 2.6 `alsactl init`
+
 ```bash
 sudo alsactl init
 ```
+
 Shows UCM2 load errors (the no-UCM case has a characteristic error).
 
 ### 2.7 `journalctl -u wireplumber`
+
 ```bash
 journalctl --user -u wireplumber -e
 # keywords: ACP, "Failed to enumerate profiles", profile warnings
 ```
 
 ### 2.8 `dmesg`
+
 ```bash
 dmesg | grep -i -E 'sof|rt5682|max98357'
 ```
+
 Clean output rules out firmware/kernel (see [root-cause.md §4](root-cause.md)).
 
 ## 3. "No UCM" Checklist

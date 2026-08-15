@@ -7,15 +7,22 @@ OUTPUT=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sim-no-ucm) SIM_NO_UCM=1 ;;
-        -o|--output)  OUTPUT="$2"; shift ;;
-        -h|--help)
+        -o | --output)
+            OUTPUT="$2"
+            shift
+            ;;
+        -h | --help)
             echo "Usage: $0 [--sim-no-ucm] [-o FILE]"
             echo ""
             echo "  --sim-no-ucm   Simulate a machine WITHOUT UCM using spa-acp-tool"
             echo "                 (restarts your PipeWire session; run from a normal login)"
             echo "  -o FILE        Also append the report to FILE"
-            exit 0 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
     esac
     shift
 done
@@ -40,21 +47,21 @@ echo "==========================================================="
 echo ""
 
 echo "--- [1/5] System & DMI ---"
-echo "Product Name : $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo 'Unknown')"
-echo "Sys Vendor   : $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo 'Unknown')"
-echo "Board Name   : $(cat /sys/class/dmi/id/board_name 2>/dev/null || echo 'Unknown')"
-echo "Product Fam. : $(cat /sys/class/dmi/id/product_family 2>/dev/null || echo 'Unknown')"
+echo "Product Name : $(cat /sys/class/dmi/id/product_name 2> /dev/null || echo 'Unknown')"
+echo "Sys Vendor   : $(cat /sys/class/dmi/id/sys_vendor 2> /dev/null || echo 'Unknown')"
+echo "Board Name   : $(cat /sys/class/dmi/id/board_name 2> /dev/null || echo 'Unknown')"
+echo "Product Fam. : $(cat /sys/class/dmi/id/product_family 2> /dev/null || echo 'Unknown')"
 echo "Kernel       : $(uname -r)"
 echo ""
 
 echo "--- [2/5] Sound Cards & PCM Map ---"
-if command -v aplay >/dev/null 2>&1; then
-    aplay -l 2>/dev/null | grep -E "^card|^[[:space:]]+device" || echo "  [INFO] No playback devices found."
+if command -v aplay > /dev/null 2>&1; then
+    aplay -l 2> /dev/null | grep -E "^card|^[[:space:]]+device" || echo "  [INFO] No playback devices found."
 else
     echo "  [INFO] aplay not installed."
 fi
-if command -v arecord >/dev/null 2>&1; then
-    arecord -l 2>/dev/null | grep -E "^card|^[[:space:]]+device" || echo "  [INFO] No capture devices found."
+if command -v arecord > /dev/null 2>&1; then
+    arecord -l 2> /dev/null | grep -E "^card|^[[:space:]]+device" || echo "  [INFO] No capture devices found."
 fi
 echo ""
 
@@ -73,40 +80,40 @@ echo "  $COUNT/8 UCM files installed."
 echo ""
 
 echo "--- [4/5] PipeWire Status ---"
-if command -v wpctl >/dev/null 2>&1; then
-    wpctl status 2>/dev/null | sed -n '/^Audio/,/^Streams/p' || echo "  [INFO] PipeWire not running."
+if command -v wpctl > /dev/null 2>&1; then
+    wpctl status 2> /dev/null | sed -n '/^Audio/,/^Streams/p' || echo "  [INFO] PipeWire not running."
 fi
-if command -v pw-dump >/dev/null 2>&1; then
+if command -v pw-dump > /dev/null 2>&1; then
     echo "ALSA card names (pw-dump):"
-    pw-dump 2>/dev/null | grep -o '"alsa.card_name" : "[^"]*"' | sort -u || true
+    pw-dump 2> /dev/null | grep -o '"alsa.card_name" : "[^"]*"' | sort -u || true
 fi
-if command -v systemctl >/dev/null 2>&1; then
+if command -v systemctl > /dev/null 2>&1; then
     echo "User services:"
-    systemctl --user is-active pipewire wireplumber 2>/dev/null || true
+    systemctl --user is-active pipewire wireplumber 2> /dev/null || true
 fi
 echo ""
 
 echo "--- [5/5] SOF Kernel Logs ---"
-if command -v dmesg >/dev/null 2>&1; then
-    if dmesg 2>/dev/null | grep -i "sof" | tail -n 20; then
+if command -v dmesg > /dev/null 2>&1; then
+    if dmesg 2> /dev/null | grep -i "sof" | tail -n 20; then
         :
     else
         echo "  [INFO] dmesg restricted; retrying with sudo:"
-        sudo dmesg 2>/dev/null | grep -i "sof" | tail -n 20 || echo "  [INFO] No SOF dmesg lines available."
+        sudo dmesg 2> /dev/null | grep -i "sof" | tail -n 20 || echo "  [INFO] No SOF dmesg lines available."
     fi
 fi
 echo ""
 
 sim_no_ucm() {
     echo ">>> [SIM] Testing profile-set discovery WITHOUT UCM ..."
-    systemctl --user stop wireplumber pipewire 2>/dev/null || true
+    systemctl --user stop wireplumber pipewire 2> /dev/null || true
     trap 'systemctl --user start pipewire wireplumber 2>/dev/null || true' EXIT
     export ACP_PATHS_DIR="/usr/share/alsa-card-profile/mixer/paths"
     export ACP_PROFILES_DIR="/usr/share/alsa-card-profile/mixer/profile-sets"
     systemctl --user start pipewire
     sleep 1
-    CARD="$(aplay -l 2>/dev/null | grep -oP 'card \K[0-9]+(?=.*sofrt5682)' | head -n1)"
-    if command -v spa-acp-tool >/dev/null 2>&1 && [ -n "$CARD" ]; then
+    CARD="$(aplay -l 2> /dev/null | grep -oP 'card \K[0-9]+(?=.*sofrt5682)' | head -n1)"
+    if command -v spa-acp-tool > /dev/null 2>&1 && [ -n "$CARD" ]; then
         spa-acp-tool -c "$CARD" list-profiles 2>&1 || true
     else
         echo "  [INFO] spa-acp-tool unavailable or card not found; skipping simulation."

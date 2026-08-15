@@ -46,8 +46,8 @@ check_audio_status() {
     check_sof_firmware_files || true
 
     log_info "ALSA Sound Cards:"
-    if command -v aplay >/dev/null 2>&1; then
-        LC_ALL=C aplay -l 2>/dev/null | grep -E "^card [0-9]+:" || log_warn "No sound cards detected."
+    if command -v aplay > /dev/null 2>&1; then
+        LC_ALL=C aplay -l 2> /dev/null | grep -E "^card [0-9]+:" || log_warn "No sound cards detected."
     fi
 
     log_info "Installed UCM2 Profiles in $UCM_DST:"
@@ -61,14 +61,14 @@ check_audio_status() {
         fi
     done
 
-    if command -v wpctl >/dev/null 2>&1; then
+    if command -v wpctl > /dev/null 2>&1; then
         log_info "PipeWire Audio Sinks & Sources:"
-        if wpctl status 2>/dev/null | grep -q "Speaker"; then
+        if wpctl status 2> /dev/null | grep -q "Speaker"; then
             log_success "  PipeWire Speaker sink is active!"
         else
             log_warn "  Speaker sink not found in wpctl status."
         fi
-        if wpctl status 2>/dev/null | grep -q "Mic"; then
+        if wpctl status 2> /dev/null | grep -q "Mic"; then
             log_success "  PipeWire Microphone source is active!"
         fi
     fi
@@ -79,7 +79,7 @@ check_audio_status() {
 uninstall_audio() {
     log_section "Uninstalling ALSA UCM2 Profiles"
     rollback_component "audio"
-    
+
     if [ "${DRY_RUN:-0}" != "1" ]; then
         for rel in "${UCM_FILES[@]}"; do
             if [ -f "$UCM_DST/$rel" ]; then
@@ -88,14 +88,14 @@ uninstall_audio() {
             fi
         done
         # Clean up empty dirs
-        sudo rmdir "$UCM_DST/conf.d/sof-rt5682" 2>/dev/null || true
+        sudo rmdir "$UCM_DST/conf.d/sof-rt5682" 2> /dev/null || true
     fi
     log_success "Audio UCM profiles removed successfully."
 }
 
 install_audio() {
     log_section "Installing ALSA UCM2 Profiles for HP Pro c640 (Dratini)"
-    
+
     # Pre-flight check
     check_dmi_board || true
     check_sof_audio_modules || true
@@ -142,9 +142,9 @@ install_audio() {
         log_dryrun "Restart PipeWire & WirePlumber for user $real_user (UID: $real_uid)"
     else
         if [ -n "$real_user" ] && [ -d "/run/user/$real_uid" ]; then
-            sudo -u "$real_user" XDG_RUNTIME_DIR="/run/user/$real_uid" systemctl --user restart pipewire wireplumber 2>/dev/null || true
+            sudo -u "$real_user" XDG_RUNTIME_DIR="/run/user/$real_uid" systemctl --user restart pipewire wireplumber 2> /dev/null || true
             log_success "PipeWire & WirePlumber restarted for session user '$real_user'."
-        elif systemctl --user restart wireplumber 2>/dev/null; then
+        elif systemctl --user restart wireplumber 2> /dev/null; then
             log_success "WirePlumber restarted."
         else
             log_info "No active user audio session found; changes will take effect after next login or reboot."
@@ -153,10 +153,10 @@ install_audio() {
 
     log_step 4 4 "Verifying Audio Routing..."
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        if LC_ALL=C aplay -l 2>/dev/null | grep -q "sofrt5682"; then
+        if LC_ALL=C aplay -l 2> /dev/null | grep -q "sofrt5682"; then
             log_success "ALSA card 'sofrt5682' is active."
         fi
-        if command -v wpctl >/dev/null 2>&1 && wpctl status 2>/dev/null | grep -q "Speaker"; then
+        if command -v wpctl > /dev/null 2>&1 && wpctl status 2> /dev/null | grep -q "Speaker"; then
             log_success "PipeWire Speaker sink verified!"
         fi
     fi
@@ -168,23 +168,23 @@ install_audio() {
 ACTION="install"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --install|-i)
+        --install | -i)
             ACTION="install"
             shift
             ;;
-        --check|-c)
+        --check | -c)
             ACTION="check"
             shift
             ;;
-        --uninstall|-u)
+        --uninstall | -u)
             ACTION="uninstall"
             shift
             ;;
-        --dry-run|-n)
+        --dry-run | -n)
             export DRY_RUN=1
             shift
             ;;
-        --help|-h)
+        --help | -h)
             show_help
             exit 0
             ;;

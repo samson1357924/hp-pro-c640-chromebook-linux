@@ -7,7 +7,7 @@ cause of the "Dummy Output" issue (see [audio/docs/root-cause.md](../docs/root-c
 
 ## Source
 
-* **Repository**: https://github.com/WeirdTreeThing/alsa-ucm-conf-cros
+* **Repository**: <https://github.com/WeirdTreeThing/alsa-ucm-conf-cros>
 * **Branch**: `standalone`
 * **Vendored commit**: `a46dd193ab81ed71c4465453f5297f21e413769f`
 * **License**: BSD 3-Clause (ALSA project), see [LICENSE](LICENSE)
@@ -20,7 +20,7 @@ machine (verified via `md5sum`, Ubuntu 26.04 LTS, alsa-ucm-conf 1.2.15.3-1ubuntu
 The directory structure mirrors `/usr/share/alsa/ucm2/` so the overlay can be
 installed directly:
 
-```
+```text
 ucm2/
 ├── conf.d/sof-rt5682/          # card configs (Driver=sof-rt5682, HiFi use-case)
 ├── platforms/intel-sof/        # platform.conf (Google_Hatch regex) + codec probing
@@ -54,7 +54,7 @@ cd audio/ucm && find ucm2 -type f -exec md5sum {} + | sort
 
 Reference values (matches source commit `a46dd19`):
 
-```
+```text
 c327bb86234e0397c40a5247dca634a5  ucm2/codecs/hda/hdmi234.conf
 12748e7c945b97ce47629d88a329871f  ucm2/codecs/max98357a/speaker.conf
 62e21d4d807b6e7a4f99bc49252a4151  ucm2/conf.d/sof-rt5682/sof-rt5682.conf

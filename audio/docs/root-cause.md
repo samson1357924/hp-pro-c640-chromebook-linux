@@ -29,7 +29,7 @@
 
 | Old theory | Refutation |
 | :--- | :--- |
-| SOF firmware missing | `dmesg | grep -i sof` shows clean load; `/lib/firmware/intel/sof/` populated; `lsmod | grep snd_sof` shows modules loaded. |
+| SOF firmware missing | `dmesg \| grep -i sof` shows clean load; `/lib/firmware/intel/sof/` populated; `lsmod \| grep snd_sof` shows modules loaded. |
 | Reinstall `firmware-sof-signed` | No effect — package was present and correct. |
 | PipeWire/WirePlumber config broken | Fresh installs reproduce it; service logs show only ACP profile enumeration warnings. |
 
@@ -44,6 +44,7 @@
      least one *alive* port (a port whose jack kcontrol reports "plugged" or
      that needs no jack at all).
 3. **Evidence A — strace shows the failed search**:
+
    ```bash
    strace -f -e trace=openat,newfstatat -o /tmp/wp.strace \
      systemctl --user restart wireplumber
@@ -51,6 +52,7 @@
    # openat(.../conf.d/sof-rt5682/driver.conf) = -1 ENOENT
    # openat(.../conf.d/sof-rt5682/CardLongName.conf) = -1 ENOENT
    ```
+
 4. Mixer-path probing result: only the **Headphone Jack** path survives:
    * Speaker path: `max98357a` has **no jack detection** → the port needs no
      kcontrol only if the path is defined as always-present; with the distro
@@ -60,12 +62,14 @@
 5. Conclusion: every analog output profile is `available: no` → WirePlumber
    only has `off` → no sink → upper layers show Dummy Output.
 6. **Evidence B — spa-acp-tool A/B comparison** (same machine, same session):
+
    ```bash
    ACP_PATHS_DIR=/usr/share/alsa-card-profile/mixer/paths \
    ACP_PROFILES_DIR=/usr/share/alsa-card-profile/mixer/profile-sets \
    spa-acp-tool -p 'api.alsa.use-ucm=false' -c 0 list-profiles
    # → only "off" / output:stereo-fallback available: no
    ```
+
    With `api.alsa.use-ucm=true` (UCM installed):
    `output:stereo-fallback available: yes` and the HiFi profiles listed.
 7. **Evidence C — clean dmesg** excludes the kernel/firmware layer and locks
