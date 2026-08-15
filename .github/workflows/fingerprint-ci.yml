@@ -1,0 +1,110 @@
+name: Fingerprint Driver CI & Packaging Validation
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'fingerprint/**'
+      - '.github/workflows/fingerprint-ci.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'fingerprint/**'
+      - '.github/workflows/fingerprint-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  c-matrix-build:
+    name: Build (${{ matrix.compiler }} - ${{ matrix.sanitizer || 'Standard' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: [none, asan-ubsan]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ${{ matrix.compiler }} \
+            meson \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            libgudev-1.0-dev \
+            libgusb-dev \
+            libpixman-1-dev \
+            libnss3-dev \
+            gobject-introspection \
+            libgirepository1.0-dev \
+            valgrind \
+            umockdev
+
+      - name: Compile and Run Standalone Unit Test
+        env:
+          CC: ${{ matrix.compiler }}
+        run: |
+          CFLAGS="-Wall -Wextra -Werror -pedantic -std=gnu11 $(pkg-config --cflags glib-2.0 libgudev-1.0)"
+          LDFLAGS="$(pkg-config --libs glib-2.0 libgudev-1.0)"
+
+          if [ "${{ matrix.sanitizer }}" = "asan-ubsan" ]; then
+            CFLAGS="$CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer"
+            LDFLAGS="$LDFLAGS -fsanitize=address,undefined"
+          fi
+
+          echo "Compiling test-crfpmoc-unit with $CC..."
+          $CC $CFLAGS \
+            -DHAVE_UDEV=1 \
+            -I./fingerprint/driver \
+            -I./fingerprint/tests \
+            fingerprint/tests/test-crfpmoc-unit.c \
+            -o test-crfpmoc-unit \
+            $LDFLAGS
+
+          echo "Running standalone unit test..."
+          ./test-crfpmoc-unit --verbose
+
+  packaging-lint:
+    name: Packaging Lint & Validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Arch Linux PKGBUILD Lint (namcap)
+        uses: docker://archlinux:latest
+        with:
+          args: >
+            bash -c "
+            pacman -Syu --noconfirm namcap pacman-contrib base-devel git &&
+            useradd -m builder &&
+            chown -R builder:builder /github/workspace &&
+            su builder -c '
+              cd fingerprint/packaging &&
+              echo \"=== Checking PKGBUILD with namcap ===\" &&
+              namcap PKGBUILD || true
+            '
+            "
+
+      - name: Fedora RPM Spec Lint (rpmlint & rpmspec)
+        uses: docker://fedora:latest
+        with:
+          args: >
+            bash -c "
+            dnf install -y rpmlint rpm-build rpmdevtools &&
+            cd fingerprint/packaging &&
+            echo \"=== Validating RPM Spec syntax ===\" &&
+            rpmspec -q --srpm libfprint-crfpmoc.spec &&
+            echo \"=== Running rpmlint on spec file ===\" &&
+            rpmlint libfprint-crfpmoc.spec || true
+            "

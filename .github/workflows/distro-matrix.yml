@@ -1,0 +1,98 @@
+name: Cross-Distro Integration & Docs QA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-check:
+    name: Markdown Lint & Link Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run markdownlint-cli2
+        uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: '**/*.md'
+          config: '.markdownlint.yaml'
+
+      - name: Run Lychee Link Checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --config lychee.toml
+            --base .
+            "**/*.md"
+          fail: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  distro-matrix-test:
+    name: Distro Matrix (${{ matrix.distro.name }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.distro.image }}
+      options: --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: "Ubuntu 24.04 (Noble)"
+            image: "ubuntu:24.04"
+            family: "debian"
+            init_cmd: "apt-get update -y && apt-get install -y --no-install-recommends bash coreutils sudo ca-certificates git"
+            check_pkgs_cmd: "apt-get install --dry-run -y"
+
+          - name: "Fedora 40"
+            image: "fedora:40"
+            family: "fedora"
+            init_cmd: "dnf install -y bash coreutils sudo git"
+            check_pkgs_cmd: "dnf install --assumeno -y"
+
+          - name: "Arch Linux"
+            image: "archlinux:base-devel"
+            family: "arch"
+            init_cmd: "pacman -Syu --noconfirm --needed bash coreutils sudo git"
+            check_pkgs_cmd: "pacman -Sp --needed"
+
+    steps:
+      - name: Prepare Minimal Container Environment
+        run: |
+          ${{ matrix.distro.init_cmd }}
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Verify OS Classification
+        run: |
+          source ./lib/distro.sh
+          echo "Detected Family: $DISTRO_FAMILY ($DISTRO_NAME)"
+          if [ "$DISTRO_FAMILY" != "${{ matrix.distro.family }}" ]; then
+            echo "Family mismatch: expected ${{ matrix.distro.family }}, got $DISTRO_FAMILY"
+            exit 1
+          fi
+
+      - name: Verify Dependencies Resolution
+        run: |
+          source ./lib/distro.sh
+          DEPS=$(get_fingerprint_build_deps)
+          echo "Resolving packages: $DEPS"
+          ${{ matrix.distro.check_pkgs_cmd }} $DEPS
+
+      - name: Test Setup CLI Dry-Run
+        run: |
+          chmod +x setup.sh lib/*.sh scripts/*.sh audio/*.sh keyboard/*.sh fingerprint/*.sh
+          ./setup.sh --all --dry-run
+          ./setup.sh --check --dry-run
+          ./setup.sh --uninstall --dry-run

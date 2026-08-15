@@ -1,0 +1,100 @@
+name: Static Analysis & Hardware Config Validation
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-and-workflows:
+    name: Shell Scripts & Workflows Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Linting Tools
+        run: |
+          # Install actionlint
+          bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          sudo mv actionlint /usr/local/bin/
+
+          # Install shfmt
+          curl -sSLo shfmt "https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64"
+          chmod +x shfmt
+          sudo mv shfmt /usr/local/bin/
+
+      - name: Run actionlint (Workflow & Inline Shell Validation)
+        run: |
+          actionlint -color
+
+      - name: Run ShellCheck (Modular with External Sources)
+        run: |
+          find . -type f -name "*.sh" -not -path "*/.*/*" | xargs shellcheck -x -P lib:scripts:audio:keyboard:fingerprint:power:ec -s bash
+
+      - name: Run shfmt Check (Formatting Consistency)
+        run: |
+          find . -type f -name "*.sh" -not -path "*/.*/*" | xargs shfmt -d -i 4 -ci -bn -sr
+
+  hardware-configs:
+    name: Validate hwdb, udev & keyd
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate systemd-hwdb & Test DMI Queries
+        run: |
+          SANDBOX_DIR=$(mktemp -d)
+          mkdir -p "${SANDBOX_DIR}/etc/udev/hwdb.d"
+          cp keyboard/90-chromebook-keyboard.hwdb "${SANDBOX_DIR}/etc/udev/hwdb.d/"
+
+          # Strict compilation of hwdb binary
+          systemd-hwdb --root="${SANDBOX_DIR}" --strict update
+
+          # Query assertion 1: Google Coreboot DMI (Dratini)
+          QUERY_DMI1="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnDratini:pvr1.0"
+          HWDB_OUT1=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI1}")
+          echo "Query Output for Dratini (Coreboot):"
+          echo "${HWDB_OUT1}"
+          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_e7=refresh"
+          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_a0=mute"
+
+          # Query assertion 2: HP OEM DMI (HP Pro c640 Chromebook)
+          QUERY_DMI2="evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"
+          HWDB_OUT2=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI2}")
+          echo "Query Output for HP Pro c640 (OEM):"
+          echo "${HWDB_OUT2}"
+          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_a0=mute"
+
+          echo "All hwdb key mappings verified across Coreboot & OEM DMI strings!"
+
+      - name: Validate udev Rules Syntax
+        run: |
+          if udevadm --help | grep -q "verify"; then
+            udevadm verify fingerprint/60-cros-fp.rules
+          else
+            for rule_file in $(find . -type f -name "*.rules"); do
+              echo "Checking $rule_file"
+              grep -E 'KERNEL=[^=]' "$rule_file" && { echo "Error: KERNEL must use == for match"; exit 1; }
+              grep -E 'SUBSYSTEM=[^=]' "$rule_file" && { echo "Error: SUBSYSTEM must use == for match"; exit 1; }
+              grep -E 'TAG=[^=+]' "$rule_file" && { echo "Error: TAG assignment should usually use +="; exit 1; }
+            done
+          fi
+          echo "udev rules verified successfully."
+
+      - name: Validate keyd Configuration
+        run: |
+          git clone --depth 1 https://github.com/rvaiya/keyd /tmp/keyd-src
+          make -C /tmp/keyd-src
+          sudo make -C /tmp/keyd-src install
+          keyd check keyboard/keyd/cros.conf
+          echo "keyd configuration valid."

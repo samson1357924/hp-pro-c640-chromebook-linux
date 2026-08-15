@@ -1,0 +1,13 @@
+# .shellcheckrc - ShellCheck configuration for HP Pro c640 Linux Enablement
+# Target Shell dialect
+shell=bash
+
+# Enable all optional checks
+enable=all
+
+# Severity threshold: style, info, warning, error
+severity=style
+
+# Disables:
+# SC1091: Not following dynamic sourced files (/etc/os-release, etc.)
+disable=SC1091

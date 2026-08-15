@@ -11,14 +11,14 @@ body:
     id: os_info
     attributes:
       label: Linux Distribution & Version
-      placeholder: e.g. Ubuntu 24.04 LTS, Fedora 40, Arch Linux
+      placeholder: e.g. Ubuntu 26.04 LTS, Fedora 45, Arch Linux
     validations:
       required: true
   - type: input
     id: kernel_version
     attributes:
       label: Kernel Version (`uname -r`)
-      placeholder: e.g. 6.8.0-38-generic
+      placeholder: e.g. 7.0.0-29-generic
     validations:
       required: true
   - type: input
@@ -35,9 +35,61 @@ body:
       description: What went wrong?
     validations:
       required: true
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ## 🔇 Audio-specific (fill if the issue is audio-related)
+  - type: textarea
+    id: audio_soundcards
+    attributes:
+      label: Sound Cards (`aplay -l`)
+      description: Expected card 0 is `sofrt5682` (Port1, HDMI 1-3, Speakers, DMIC16kHz).
+      placeholder: |
+        **** List of PLAYBACK Hardware Devices ****
+        card 0: sofrt5682 [sofrt5682] ...
+      render: shell
+  - type: textarea
+    id: audio_ucm_files
+    attributes:
+      label: UCM Files Check (`ls -l /usr/share/alsa/ucm2/conf.d/sof-rt5682/`)
+      description: |
+        Missing files here = root cause of Dummy Output (see audio/docs/root-cause.md).
+        Expected 4 files: sof-rt5682.conf, HiFi.conf, rt5682-headset.conf, rt5682-init.conf
+        (plus 4 shared files under platforms/intel-sof/ and codecs/).
+      placeholder: |
+        /usr/share/alsa/ucm2/conf.d/sof-rt5682/...
+      render: shell
+  - type: textarea
+    id: audio_wpctl
+    attributes:
+      label: PipeWire Status (`wpctl status`)
+      description: Dummy Output appears when no real sink exists.
+      placeholder: |
+        Sinks:
+           * 48. Dummy Output [vol: 1.00]
+      render: shell
+  - type: textarea
+    id: audio_dmesg_sof
+    attributes:
+      label: SOF Kernel Log (`dmesg | grep -i -E 'sof|rt5682|max98357'`)
+      description: |
+        Clean output (no cl_dsp_init timeout, no FW errors) rules out firmware
+        issues. See audio/docs/root-cause.md.
+      render: shell
+  - type: checkboxes
+    id: audio_matrix
+    attributes:
+      label: Audio Test Matrix (UCM present × headphone plugged)
+      description: Check each scenario you have tested.
+      options:
+        - label: UCM missing + headphones unplugged → Dummy Output / profile=off
+        - label: UCM missing + headphones plugged → only headphone path audible
+        - label: UCM present + headphones unplugged → Speaker profile available
+        - label: UCM present + headphones plugged → auto-switch to Headphone
   - type: textarea
     id: logs
     attributes:
       label: Relevant System Logs / Diagnostic Output
-      description: Paste output of `./scripts/detect-hardware.sh` or `journalctl -u fprintd -e`
+      description: Paste output of `./scripts/detect-hardware.sh`, `./audio/diagnose-audio.sh` or `journalctl --user -u wireplumber -e`
       render: shell

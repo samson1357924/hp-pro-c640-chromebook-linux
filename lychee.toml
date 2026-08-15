@@ -1,0 +1,23 @@
+# lychee.toml - Link checker configuration for HP Pro c640 Linux Enablement
+root_dir = "."
+format = "detailed"
+verbose = false
+
+max_retries = 3
+retry_wait_time = 2
+timeout = 20
+max_concurrency = 16
+
+exclude_all_private = true
+exclude = [
+    '^https?://localhost',
+    '^https?://127\.0\.0\.1',
+    '^https?://192\.168\.',
+    '^https?://example\.com',
+    'https://www.linkedin.com/.*',
+    'https://twitter.com/.*',
+    'https://x.com/.*',
+    'https://reddit.com/.*'
+]
+
+accept = [200, 204, 206, 403]

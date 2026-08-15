@@ -1,0 +1,120 @@
+name: Audio Subsystem CI (UCM & Patches)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'audio/**'
+      - '.github/workflows/audio-ci.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'audio/**'
+      - '.github/workflows/audio-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ucm-syntax-check:
+    name: Validate UCM2 Profiles
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install Build Dependencies & ALSA Tools
+        run: |
+          dnf -y update
+          dnf -y install alsa-lib alsa-ucm alsa-utils python3 python3-pip make git
+
+      - name: Checkout Current Repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Run UCM2 Validator (Tabs, Syntax, SectionDevice Names)
+        run: |
+          python3 - << 'EOF'
+          import os, sys, re
+
+          VALID_DEVICES = {'Speaker', 'Line', 'Mic', 'Headphones', 'Headset', 'Handset', 'Bluetooth', 'Earpiece', 'SPDIF', 'HDMI', 'USB', 'Direct'}
+          ucm_root = "repo/audio/ucm/ucm2"
+          sys_ucm = "/usr/share/alsa/ucm2"
+          errors = 0
+
+          print(f"[CI] Scanning UCM files in {ucm_root} (with system fallback {sys_ucm})...")
+
+          for root, _, files in os.walk(ucm_root):
+              for f in files:
+                  if not f.endswith(".conf"):
+                      continue
+                  fpath = os.path.join(root, f)
+                  rel_path = os.path.relpath(fpath, "repo")
+                  with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
+                      lines = fp.readlines()
+
+                  for idx, line in enumerate(lines, start=1):
+                      # 1. Check SectionDevice naming
+                      m = re.match(r'^\s*SectionDevice\."([^"]+)"', line)
+                      if m:
+                          dev_name = m.group(1)
+                          if not dev_name.startswith("$"):
+                              base_match = re.match(r"^([a-zA-Z]+)", dev_name)
+                              base = base_match.group(1) if base_match else dev_name
+                              if base not in VALID_DEVICES:
+                                  print(f"::error file={rel_path},line={idx}::Invalid SectionDevice name '{dev_name}' (Must be one of {VALID_DEVICES})")
+                                  errors += 1
+
+          # 2. Check Include paths
+          for root, _, files in os.walk(ucm_root):
+              for f in files:
+                  if not f.endswith(".conf"):
+                      continue
+                  fpath = os.path.join(root, f)
+                  rel_path = os.path.relpath(fpath, "repo")
+                  with open(fpath, "r", encoding="utf-8") as fp:
+                      for idx, line in enumerate(fp, start=1):
+                          inc = re.search(r'Include\.[^.]+\.File\s+"([^"]+)"', line)
+                          if inc:
+                              inc_target = inc.group(1)
+                              if "$" in inc_target:
+                                  continue
+                              if inc_target.startswith("/"):
+                                  target_local = os.path.join(ucm_root, inc_target.lstrip("/"))
+                                  target_sys = os.path.join(sys_ucm, inc_target.lstrip("/"))
+                                  found = os.path.exists(target_local) or os.path.exists(target_sys)
+                              else:
+                                  target_local = os.path.join(root, inc_target)
+                                  target_sys = os.path.join(sys_ucm, os.path.relpath(root, ucm_root), inc_target)
+                                  found = os.path.exists(target_local) or os.path.exists(target_sys)
+                              if not found:
+                                  print(f"::warning file={rel_path},line={idx}::Referenced Include file not found in local or system tree: {inc_target}")
+
+          if errors > 0:
+              print(f"\n[CI FAILURE] Total {errors} UCM error(s) found.")
+              sys.exit(1)
+          print("\n[CI SUCCESS] All UCM2 profile structure checks passed!")
+          EOF
+
+  patch-validation:
+    name: Validate Audio Patches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Current Repository
+        uses: actions/checkout@v4
+
+      - name: Validate Patch Formatting & Structure
+        run: |
+          set -e
+          echo "[CI] Checking patches under audio/patches/..."
+          for patch_file in audio/patches/*.patch; do
+            [ -e "$patch_file" ] || continue
+            echo "Inspecting $patch_file..."
+            if ! grep -q "^--- " "$patch_file" || ! grep -q "^+++ " "$patch_file"; then
+              echo "::error file=$patch_file::Invalid patch format (missing ---/+++ unified diff headers)"
+              exit 1
+            fi
+          done
+          echo "Patches format verified."

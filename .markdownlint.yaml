@@ -1,0 +1,32 @@
+# .markdownlint.yaml - MarkdownLint configuration for HP Pro c640 Linux Enablement
+default: true
+
+# MD013/line-length: Allow longer lines in tables, code blocks and headings
+MD013:
+  line_length: 120
+  code_blocks: false
+  tables: false
+  headings: false
+
+# MD033/no-inline-html: Allow commonly used layout & formatting tags
+MD033:
+  allowed_elements:
+    - "h1"
+    - "p"
+    - "div"
+    - "img"
+    - "kbd"
+    - "a"
+    - "span"
+    - "details"
+    - "summary"
+
+# MD024/no-duplicate-heading: Allow same subheadings under different parent sections
+MD024:
+  siblings_only: true
+
+# MD028/no-blanks-blockquote: Allow blank lines between blockquotes (GFM alert syntax compatibility)
+MD028: false
+
+# MD041/first-line-heading: Allow badges or banners before the first heading
+MD041: false
