@@ -1,11 +1,36 @@
 # Build artifacts
 build/
+_build/
+subprojects/
+meson-logs/
+.ninja*
 *.o
 *.so
 *.a
 *.pcapng
 *.variant
 *.log
+*.testlog
+
+# Packaging & distribution
+*.deb
+*.rpm
+*.tar.gz
+*.tar.xz
+debian/.debhelper/
+debian/files
+debian/*.substvars
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Linux Kernel out-of-tree artifacts
+*.ko
+*.mod
+*.mod.c
+modules.order
+Module.symvers
 
 # Editor & System
 .DS_Store

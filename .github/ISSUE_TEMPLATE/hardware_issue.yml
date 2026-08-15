@@ -1,0 +1,43 @@
+name: Hardware Issue Report
+description: Report a hardware or driver issue on HP Pro c640 Chromebook
+title: "[Bug]: "
+labels: ["bug", "hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please provide detailed diagnostic information to help diagnose hardware problems.
+  - type: input
+    id: os_info
+    attributes:
+      label: Linux Distribution & Version
+      placeholder: e.g. Ubuntu 24.04 LTS, Fedora 40, Arch Linux
+    validations:
+      required: true
+  - type: input
+    id: kernel_version
+    attributes:
+      label: Kernel Version (`uname -r`)
+      placeholder: e.g. 6.8.0-38-generic
+    validations:
+      required: true
+  - type: input
+    id: dmi_info
+    attributes:
+      label: DMI / Board Name (`cat /sys/class/dmi/id/product_name`)
+      placeholder: e.g. Dratini / HP Pro c640 Chromebook
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem Description
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant System Logs / Diagnostic Output
+      description: Paste output of `./scripts/detect-hardware.sh` or `journalctl -u fprintd -e`
+      render: shell

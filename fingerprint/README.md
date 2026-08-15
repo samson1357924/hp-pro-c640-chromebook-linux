@@ -60,8 +60,40 @@ fprintd-delete "$USER"
 ```
 
 ### 5. System Authentication
-* **Sudo**: `sudo whoami` (Prompts for fingerprint with password fallback).
-* **GDM / Lock Screen**: Press `Super + L`, touch sensor to unlock.
+* **Sudo**: Test with cleared timestamp cache:
+  ```bash
+  sudo -k && sudo whoami
+  ```
+  *(The `-k` flag clears existing sudo cache to guarantee a fingerprint verification prompt).*
+* **Lock Screen**: Press `Super + L`, touch the sensor to unlock instantly.
+
+> [!NOTE]
+> **Initial Login vs Lock Screen (GNOME Keyring)**:
+> In Linux desktop environments (such as GNOME/GDM), unlocking your login keyring (which decrypts stored Wi-Fi passwords and browser secrets) requires your user password upon cold boot. Lock screen unlocking (`Super + L`), PAM authorization, and `sudo` authenticate seamlessly via fingerprint.
+
+---
+
+## ❓ Troubleshooting & FAQs
+
+### 1. `/dev/cros_fp: Permission denied`
+Ensure udev rules are loaded and your user belongs to `plugdev`:
+```bash
+sudo cp 60-cros-fp.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=misc
+sudo usermod -aG plugdev "$USER"
+```
+
+### 2. Encryption Key Permissions (`crfpmoc.key`)
+The persistent encryption seed must be owned by `root:root` with strict permissions:
+```bash
+sudo chmod 0600 /var/lib/fprint/crfpmoc.key
+```
+
+### 3. Debugging `fprintd` Service
+To inspect live driver logs and state transitions:
+```bash
+sudo journalctl -u fprintd -f
+```
 
 ---
 

@@ -35,3 +35,15 @@ ChromeOS devices have specialized top-row action keys instead of traditional F1-
    ```bash
    sudo udevadm trigger --subsystem-match=input
    ```
+
+---
+
+## 🧪 Verification & Testing
+
+To verify that key events are properly mapped and captured by Linux:
+
+```bash
+sudo apt install -y evtest
+sudo evtest
+```
+*(Select the `AT Translated Set 2 keyboard` device and press the top-row keys to view the reported keycodes)*
