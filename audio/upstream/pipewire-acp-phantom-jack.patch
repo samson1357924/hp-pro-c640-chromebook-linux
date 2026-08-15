@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# Derived from PipeWire (MIT), spa/plugins/alsa/acp/alsa-mixer.c
+# Submitted upstream via PipeWire Merge Request #5428 (DCO).
+From a4595634a70d76caa63b360f8ea57ed90c38a662 Mon Sep 17 00:00:00 2001
+From: samson1357924 <98934496+samson1357924@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 05:19:34 +0800
+Subject: [PATCH] acp: consider phantom jacks without kcontrol as present
+
+Some sound cards (in particular ASoC devices like Chromebooks with the
+sof-rt5682 machine driver) do not expose a kcontrol for phantom jacks
+such as "Speaker Phantom". The kernel creates phantom jacks only for
+HDA devices; ASoC has no phantom jack support.
+
+Without this, paths that have phantom jacks in their required-any list
+(e.g. analog-output-speaker) are discarded during probing, leaving no
+available output ports. All analog profiles then become unavailable and
+the card ends up without any sink (Dummy Output only).
+
+Treat phantom jacks without a kcontrol as present, keeping the path and
+its port. The port availability stays unknown, which matches the
+state.plugged/unplugged settings in the path configuration files.
+
+Signed-off-by: samson1357924 <98934496+samson1357924@users.noreply.github.com>
+---
+ spa/plugins/alsa/acp/alsa-mixer.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/spa/plugins/alsa/acp/alsa-mixer.c b/spa/plugins/alsa/acp/alsa-mixer.c
+index 84c5cc2..320a6b1 100644
+--- a/spa/plugins/alsa/acp/alsa-mixer.c
++++ b/spa/plugins/alsa/acp/alsa-mixer.c
+@@ -2011,6 +2011,15 @@ static int jack_probe(pa_alsa_jack *j, pa_alsa_mapping *mapping, snd_mixer_t *m)
+     } else {
+         if (j->required != PA_ALSA_REQUIRED_IGNORE)
+             return -1;
++
++        /* A phantom jack (e.g. "Speaker Phantom") describes an always
++         * present device such as internal speakers. Some sound cards
++         * (in particular ASoC devices) do not expose a corresponding
++         * ALSA kcontrol, so treat the jack as present in that case
++         * and keep the associated path. */
++        if (j->required_any != PA_ALSA_REQUIRED_IGNORE &&
++            strstr(j->name, "Phantom") != NULL)
++            j->path->req_any_present = true;
+     }
+ 
+     return 0;
+-- 
+2.53.0
+
