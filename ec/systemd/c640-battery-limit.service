@@ -1,0 +1,11 @@
+[Unit]
+Description=HP Pro c640 Battery Charge Limit (80% Protection)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/c640-ec-control battery-limit 80
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
