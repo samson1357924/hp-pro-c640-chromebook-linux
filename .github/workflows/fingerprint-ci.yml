@@ -54,8 +54,8 @@ jobs:
         env:
           CC: ${{ matrix.compiler }}
         run: |
-          CFLAGS="-Wall -Wextra -Werror -pedantic -std=gnu11 $(pkg-config --cflags glib-2.0 libgudev-1.0)"
-          LDFLAGS="$(pkg-config --libs glib-2.0 libgudev-1.0)"
+          CFLAGS="-Wall -Wextra -Werror -pedantic -std=gnu11 $(pkg-config --cflags glib-2.0 gudev-1.0)"
+          LDFLAGS="$(pkg-config --libs glib-2.0 gudev-1.0)"
 
           if [ "${{ matrix.sanitizer }}" = "asan-ubsan" ]; then
             CFLAGS="$CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer"

@@ -13,6 +13,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Containers use /bin/sh by default; force bash so `source` works everywhere
+defaults:
+  run:
+    shell: bash
+
 jobs:
   docs-check:
     name: Markdown Lint & Link Integrity
@@ -88,7 +93,8 @@ jobs:
           source ./lib/distro.sh
           DEPS=$(get_fingerprint_build_deps)
           echo "Resolving packages: $DEPS"
-          ${{ matrix.distro.check_pkgs_cmd }} "$DEPS"
+          read -r -a deps_arr <<< "$DEPS"
+          ${{ matrix.distro.check_pkgs_cmd }} "${deps_arr[@]}"
 
       - name: Test Setup CLI Dry-Run
         run: |
