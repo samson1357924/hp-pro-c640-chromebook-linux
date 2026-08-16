@@ -35,9 +35,18 @@ jobs:
   ai-bot:
     name: Multi-Agent AI Review & Triage
     if: >
-      github.event_name != 'issue_comment' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'issues' ||
       (
-        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.comment.author_association) &&
+        github.event_name == 'pull_request_target' &&
+        (
+          github.event.pull_request.head.repo.full_name == github.repository ||
+          contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
         (
           contains(github.event.comment.body, '/review') ||
           contains(github.event.comment.body, '/triage') ||
@@ -45,7 +54,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - name: Check out Trusted Bot Codebase

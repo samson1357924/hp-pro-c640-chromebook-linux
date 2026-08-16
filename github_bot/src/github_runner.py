@@ -113,6 +113,14 @@ def parse_event_payload() -> dict[str, Any]:
     return {}
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    """Read an integer environment variable without crashing on empty or malformed values."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HP Pro c640 Linux GitHub AI Bot Runner")
     parser.add_argument("--mode", choices=["review", "triage", "comment", "explain"], default="review", help="Execution mode")
@@ -133,7 +141,19 @@ def main(argv: list[str] | None = None) -> int:
     # Handle execution modes
     if args.mode == "review":
         pr_data = event_payload.get("pull_request") or {}
-        pr_number = pr_data.get("number") or int(os.environ.get("PR_NUMBER", "0")) or None
+        if not pr_data:
+            # issue_comment events carry the PR reference inside issue.pull_request
+            issue_data = event_payload.get("issue") or {}
+            if issue_data.get("pull_request"):
+                pr_data = {"number": issue_data.get("number")}
+        pr_number = pr_data.get("number") or _env_int("PR_NUMBER") or None
+
+        # For comment-dispatched reviews, fetch full PR metadata through the API
+        if api_client and pr_number and not pr_data.get("title"):
+            try:
+                pr_data = api_client.get_pr(pr_number)
+            except Exception as exc:
+                print(f"[GitHubAPI Warning] Could not fetch PR #{pr_number} metadata: {exc}", file=sys.stderr)
 
         diff_text = ""
         changed_files: list[str] = []
@@ -152,9 +172,11 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 diff_text = subprocess.check_output(["git", "diff", f"{base_sha}...{head_sha}"], text=True, errors="replace")
                 changed_files = subprocess.check_output(["git", "diff", "--name-only", f"{base_sha}...{head_sha}"], text=True, errors="replace").splitlines()
-            except Exception:
-                diff_text = "diff --git a/setup.sh b/setup.sh\n--- a/setup.sh\n+++ b/setup.sh\n@@ -1,3 +1,3 @@\n+# Local test diff\n"
-                changed_files = ["setup.sh"]
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to obtain the PR diff for review (base={base_sha}, head={head_sha}). "
+                    f"Refusing to publish a review without real diff content: {exc}"
+                ) from exc
 
         ctx = ReviewContext(
             pr_number=pr_number,
@@ -178,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.mode == "triage":
         issue_data = event_payload.get("issue") or {}
-        issue_number = issue_data.get("number") or int(os.environ.get("ISSUE_NUMBER", "0")) or None
+        issue_number = issue_data.get("number") or _env_int("ISSUE_NUMBER") or None
         title = os.environ.get("ISSUE_TITLE") or issue_data.get("title", "")
         body = os.environ.get("ISSUE_BODY") or issue_data.get("body", "")
         author = issue_data.get("user", {}).get("login", "")
@@ -211,14 +233,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.mode in {"comment", "explain"}:
         comment_body = os.environ.get("COMMENT_BODY", "")
         issue_data = event_payload.get("issue") or {}
-        issue_number = issue_data.get("number") or int(os.environ.get("ISSUE_NUMBER", "0")) or None
+        issue_number = issue_data.get("number") or _env_int("ISSUE_NUMBER") or None
         is_pr = bool(issue_data.get("pull_request"))
 
         if "/triage" in comment_body or (not is_pr and "/review" in comment_body):
             # Dispatch to triage
             return main(["--mode=triage"] + (["--dry-run"] if args.dry_run else []))
         elif is_pr and "/review" in comment_body:
-            # Dispatch to review
+            # Dispatch to review, carrying the PR number through the environment
+            os.environ["PR_NUMBER"] = str(issue_number or "")
             return main(["--mode=review"] + (["--dry-run"] if args.dry_run else []))
         elif "/explain" in comment_body or args.mode == "explain":
             title = issue_data.get("title", "")

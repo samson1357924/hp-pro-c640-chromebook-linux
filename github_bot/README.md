@@ -11,7 +11,8 @@ Production multi-agent GitHub review and issue triage bot for
    - Executes trusted bot code from the default branch (`main` / `master`).
    - Fetches immutable PR commits into isolated refs
      (`refs/c640-bot/review-base`, `refs/c640-bot/review-head`) with SHA validation.
-   - Prevents unauthorized re-reviews from untrusted forks.
+   - Untrusted fork code is never checked out or executed; fork PR diffs are fetched through the
+     GitHub API and only reviewed when opened by a trusted author (OWNER / MEMBER / COLLABORATOR).
 
 2. **⚡ Multi-Provider LLM Engine**:
    - Native integration with **OpenCode Zen** (`https://opencode.ai/zen/v1/`) and **CPA** (`responses` API).

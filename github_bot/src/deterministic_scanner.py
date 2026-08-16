@@ -25,11 +25,28 @@ class DeterministicScanner:
     def scan_diff_file(self, filename: str, patch_content: str) -> list[ScanFinding]:
         findings: list[ScanFinding] = []
         lines = patch_content.splitlines()
+        new_line_no = 0
+        in_hunk = False
 
-        for idx, line in enumerate(lines, 1):
-            if not line.startswith("+") or line.startswith("+++"):
+        for line in lines:
+            hunk_match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if hunk_match:
+                new_line_no = int(hunk_match.group(1))
+                in_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if line.startswith(("---", "+++", "\\ No newline")):
+                continue
+            if line.startswith("-"):
+                continue
+            if not line.startswith("+"):
+                # Context line advances the new-file line counter
+                new_line_no += 1
                 continue
             added = line[1:]
+            line_number = new_line_no
+            new_line_no += 1
 
             # 1. Shell Script Checks
             if filename.endswith(".sh"):
@@ -39,7 +56,7 @@ class DeterministicScanner:
                         rule_id="C640-SH-001",
                         severity="BLOCKER",
                         file_path=filename,
-                        line_number=idx,
+                        line_number=line_number,
                         message="Potential unguarded destructive rm -rf command on critical path.",
                         remediation="Ensure target variable is non-empty before rm -rf (e.g. [ -n \"$DIR\" ] && rm -rf \"$DIR\").",
                     ))
@@ -50,7 +67,7 @@ class DeterministicScanner:
                         rule_id="C640-SH-002",
                         severity="WARNING",
                         file_path=filename,
-                        line_number=idx,
+                        line_number=line_number,
                         message="Unquoted variable in filesystem modification targeting /etc.",
                         remediation="Always double-quote variables in paths: e.g. cp \"$src\" \"$dst\".",
                     ))
@@ -63,7 +80,7 @@ class DeterministicScanner:
                         rule_id="C640-HWDB-001",
                         severity="BLOCKER",
                         file_path=filename,
-                        line_number=idx,
+                        line_number=line_number,
                         message="udev HWDB properties must start with exactly one single space.",
                         remediation="Prefix property line with a single space: ' KEYBOARD_KEY_ea=back'.",
                     ))
@@ -76,7 +93,7 @@ class DeterministicScanner:
                         rule_id="C640-UDEV-001",
                         severity="BLOCKER",
                         file_path=filename,
-                        line_number=idx,
+                        line_number=line_number,
                         message="udev match key uses assignment '=' instead of comparison '=='.",
                         remediation="Change '=' to '==' for match keys (e.g. KERNEL==\"cros_fp\").",
                     ))
@@ -89,7 +106,7 @@ class DeterministicScanner:
                         rule_id="C640-EC-001",
                         severity="WARNING",
                         file_path=filename,
-                        line_number=idx,
+                        line_number=line_number,
                         message="ChromeOS EC host command struct field assigned without explicit endian conversion.",
                         remediation="Wrap multi-byte fields in GUINT32_TO_LE() or GUINT16_TO_LE() per cros-ec spec.",
                     ))
@@ -99,8 +116,8 @@ class DeterministicScanner:
         if any(filename.endswith(ext) for ext in [".sh", ".c", ".h", ".py"]):
             spdx_marker = "SPDX-License" + "-Identifier:"
             if patch_content and not re.search(re.escape(spdx_marker), patch_content) and len(lines) > 5:
-                # Only check if file seems to be new
-                if patch_content.startswith("@@ -0,0"):
+                # Only check if the file appears to be new (hunk starts at new-file line 0)
+                if re.search(r"^@@ -0,0(?:,\d+)? \+1", patch_content, flags=re.MULTILINE):
                     findings.append(ScanFinding(
                         rule_id="C640-LIC-001",
                         severity="WARNING",

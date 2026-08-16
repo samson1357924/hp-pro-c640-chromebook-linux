@@ -113,6 +113,9 @@ class LLMClient:
         self.enable_streaming = enable_streaming
         self.providers: dict[str, dict[str, Any]] = {}
         self.models: dict[str, dict[str, Any]] = {}
+        self._discovery_cache: dict[str, list[str]] | None = None
+        self._discovery_cache_time: float = 0.0
+        self._discovery_ttl_seconds: float = 600.0
 
         if config_path:
             self.load_config(config_path)
@@ -130,9 +133,9 @@ class LLMClient:
             if not isinstance(pdata, dict):
                 continue
             base_url = pdata.get("baseUrl") or ""
-            # Fallback for CPA_BASE_URL if placeholder was empty
+            # CPA has no built-in fallback: CPA_BASE_URL must be explicitly configured
             if not base_url and provider_name == "cpa":
-                base_url = os.environ.get("CPA_BASE_URL", "https://dfewgtrwgyhgfdhffqq3535ggjsw4yfsas.vegisearch.kdns.fr/v1/")
+                base_url = os.environ.get("CPA_BASE_URL", "")
             if base_url and not base_url.endswith("/"):
                 base_url += "/"
 
@@ -160,8 +163,14 @@ class LLMClient:
                 if mid:
                     self.models[mid] = {**m, "_provider": provider_name}
 
-    def discover_models(self, timeout_seconds: int = 8) -> dict[str, list[str]]:
+    def discover_models(self, timeout_seconds: int = 8, *, force_refresh: bool = False) -> dict[str, list[str]]:
         """Dynamically query providers' /models endpoints, cross-filter with models.dev, and register active models."""
+        import time
+
+        now = time.monotonic()
+        if not force_refresh and self._discovery_cache is not None and now - self._discovery_cache_time < self._discovery_ttl_seconds:
+            return dict(self._discovery_cache)
+
         discovered: dict[str, list[str]] = {}
         models_dev_free = fetch_models_dev_free_ids(timeout_seconds=timeout_seconds)
 
@@ -209,7 +218,9 @@ class LLMClient:
             except Exception:
                 # Silently proceed if endpoint is unavailable or unsupported
                 pass
-        return discovered
+        self._discovery_cache = discovered
+        self._discovery_cache_time = time.monotonic()
+        return dict(self._discovery_cache)
 
     def get_dynamic_fallback_chain(self, configured_fallbacks: list[str] | None = None) -> list[str]:
         """Build prioritized fallback chain: CPA priority -> Configured -> Dynamic OpenCode Free -> Dynamic CPA."""
