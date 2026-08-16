@@ -47,6 +47,7 @@
 
 #include "crfpmoc.h"
 #include "crfpmoc-ec-transfer.h"
+#include "crfpmoc-proto.h"
 
 struct _FpiDeviceCrfpMoc
 {
@@ -397,6 +398,10 @@ crfpmoc_umockdev_record (FpiDeviceCrfpMoc *self, int res,
   switch (cmd)
     {
     case CRFPMOC_CROS_EC_DEV_IOCXCMD_V2:
+      /* umockdev replays this ioctl as exactly sizeof(header) + insize
+       * bytes (header struct followed by the response as the driver
+       * reads it from data[0..insize)); any other line length aborts
+       * the whole trace, so this MUST stay sizeof + insize. */
       size = (sizeof (*s_cmd) + s_cmd->insize);
       buffer = g_string_sized_new (size * 2);
       g_string_append_printf (buffer, "CROS_EC_DEV_IOCXCMD_V2 %u ",
@@ -673,16 +678,18 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
 }
 
 static const struct crfpmoc_ec_response_fp_template_info *
-crfpmoc_get_template_info (gconstpointer indata, gint version)
+crfpmoc_get_template_info (gconstpointer indata, gsize len, gint version)
 {
-  const guint8 *buf = indata;
+  gsize offset;
 
-  if (version >= 2)
-    return (const struct crfpmoc_ec_response_fp_template_info *) (buf + sizeof (struct crfpmoc_ec_response_fp_sensor_info));
-  else if (version == 1)
-    return (const struct crfpmoc_ec_response_fp_template_info *) (buf + sizeof (struct crfpmoc_ec_response_fp_sensor_info) + sizeof (struct crfpmoc_ec_response_fp_frame_params_v2));
+  if (indata == NULL)
+    return NULL;
 
-  return NULL;
+  offset = crfpmoc_proto_template_info_offset (version);
+  if (offset == 0 || len < offset + sizeof (struct crfpmoc_ec_response_fp_template_info))
+    return NULL;
+
+  return (const struct crfpmoc_ec_response_fp_template_info *) ((const guint8 *) indata + offset);
 }
 
 /* Parse the device info response, vendor, version, etc. Get the state
@@ -692,37 +699,33 @@ crfpmoc_get_template_info (gconstpointer indata, gint version)
 static gboolean
 crfpmoc_parse_fp_info (FpiDeviceCrfpMoc *self,
                        gconstpointer     indata,
+                       gsize             len,
                        gint              version,
                        guint16          *max_templates,
                        guint16          *template_size,
                        GError          **error)
 {
-  const guint8 *buf = indata;
-  const struct crfpmoc_ec_response_fp_sensor_info *sensor;
-  const struct crfpmoc_ec_response_fp_template_info *tinfo = NULL;
+  CrfpMocFpInfoParsed parsed;
   gchar vendor[5];
   const gchar *model = NULL;
-  guint32 sensor_vendor_id, sensor_product_id, sensor_model_id, sensor_version;
-  guint32 t_size, t_version, t_dirty;
-  guint16 t_max, t_valid;
-  guint32 frame_size = 0, pixel_format = 0;
-  guint16 width = 0, height = 0, bpp = 0;
 
-  sensor = (const struct crfpmoc_ec_response_fp_sensor_info *) buf;
-  sensor_vendor_id = GUINT32_FROM_LE (sensor->vendor_id);
-  sensor_product_id = GUINT32_FROM_LE (sensor->product_id);
-  sensor_model_id = GUINT32_FROM_LE (sensor->model_id);
-  sensor_version = GUINT32_FROM_LE (sensor->version);
+  if (!crfpmoc_proto_parse_fp_info (indata, len, version, &parsed, error))
+    {
+      if (error && !*error)
+        g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "Invalid FP_INFO response");
+      return FALSE;
+    }
 
-  vendor[0] = sensor_vendor_id;
-  vendor[1] = sensor_vendor_id >> 8;
-  vendor[2] = sensor_vendor_id >> 16;
-  vendor[3] = sensor_vendor_id >> 24;
+  vendor[0] = parsed.vendor_id;
+  vendor[1] = parsed.vendor_id >> 8;
+  vendor[2] = parsed.vendor_id >> 16;
+  vendor[3] = parsed.vendor_id >> 24;
   vendor[4] = '\0';
 
   if (strcmp (vendor, "FPC ") == 0)
     {
-      switch ((sensor_model_id >> 4) & 0xfff)
+      switch ((parsed.model_id >> 4) & 0xfff)
         {
         case 0x021:
           model = "FPC1025";
@@ -738,64 +741,23 @@ crfpmoc_parse_fp_info (FpiDeviceCrfpMoc *self,
         }
     }
 
-  if (version >= 2)
-    {
-      tinfo = (const struct crfpmoc_ec_response_fp_template_info *) (buf + sizeof (*sensor));
-      if (version == 3)
-        {
-          const struct crfpmoc_ec_response_fp_frame_params_v3 *frame =
-            (const struct crfpmoc_ec_response_fp_frame_params_v3 *) (buf + sizeof (*sensor) + sizeof (*tinfo));
-          frame_size = GUINT32_FROM_LE (frame->frame_size);
-          pixel_format = GUINT32_FROM_LE (frame->pixel_format);
-          width = GUINT16_FROM_LE (frame->width);
-          height = GUINT16_FROM_LE (frame->height);
-          bpp = GUINT16_FROM_LE (frame->bpp);
-        }
-      else
-        {
-          const struct crfpmoc_ec_response_fp_frame_params_v2 *frame =
-            (const struct crfpmoc_ec_response_fp_frame_params_v2 *) (buf + sizeof (*sensor) + sizeof (*tinfo));
-          frame_size = GUINT32_FROM_LE (frame->frame_size);
-          pixel_format = GUINT32_FROM_LE (frame->pixel_format);
-          width = GUINT16_FROM_LE (frame->width);
-          height = GUINT16_FROM_LE (frame->height);
-          bpp = GUINT16_FROM_LE (frame->bpp);
-        }
-    }
-  else if (version == 1)
-    {
-      const struct crfpmoc_ec_response_fp_frame_params_v2 *frame =
-        (const struct crfpmoc_ec_response_fp_frame_params_v2 *) (buf + sizeof (*sensor));
-      frame_size = GUINT32_FROM_LE (frame->frame_size);
-      pixel_format = GUINT32_FROM_LE (frame->pixel_format);
-      width = GUINT16_FROM_LE (frame->width);
-      height = GUINT16_FROM_LE (frame->height);
-      bpp = GUINT16_FROM_LE (frame->bpp);
+  fp_dbg ("Fingerprint sensor: vendor %s product %x model %x (%s) version %x",
+          vendor, parsed.product_id, parsed.model_id,
+          model ? model : "", parsed.version);
+  fp_dbg ("Image: size %dx%d %d bpp, format 0x%x, frame_size %u",
+          parsed.width, parsed.height, parsed.bpp, parsed.pixel_format, parsed.frame_size);
+  fp_dbg ("Templates: version %u size %u count %u/%u dirty bitmap 0x%x",
+          parsed.template_version, parsed.template_size, parsed.template_valid,
+          parsed.template_max, parsed.template_dirty);
 
-      tinfo = (const struct crfpmoc_ec_response_fp_template_info *) (buf + sizeof (*sensor) + sizeof (*frame));
-    }
-  else
+  if (!parsed.has_template_info)
     {
       g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                           "EC_CMD_FP_INFO v0 does not provide template info");
+                           "EC_CMD_FP_INFO response does not provide template info");
       return FALSE;
     }
 
-  t_size = GUINT32_FROM_LE (tinfo->template_size);
-  t_max = GUINT16_FROM_LE (tinfo->template_max);
-  t_valid = GUINT16_FROM_LE (tinfo->template_valid);
-  t_dirty = GUINT32_FROM_LE (tinfo->template_dirty);
-  t_version = GUINT32_FROM_LE (tinfo->template_version);
-
-  fp_dbg ("Fingerprint sensor: vendor %s product %x model %x (%s) version %x",
-          vendor, sensor_product_id, sensor_model_id,
-          model ? model : "", sensor_version);
-  fp_dbg ("Image: size %dx%d %d bpp, format 0x%x, frame_size %u",
-          width, height, bpp, pixel_format, frame_size);
-  fp_dbg ("Templates: version %u size %u count %u/%u dirty bitmap 0x%x",
-          t_version, t_size, t_valid, t_max, t_dirty);
-
-  if (t_size == 0)
+  if (parsed.template_size == 0)
     {
       g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
                            "Template size is zero, device may not be initialized.");
@@ -803,9 +765,9 @@ crfpmoc_parse_fp_info (FpiDeviceCrfpMoc *self,
     }
 
   if (max_templates)
-    *max_templates = t_max;
+    *max_templates = parsed.template_max;
   if (template_size)
-    *template_size = t_size;
+    *template_size = parsed.template_size;
 
   if (self)
     self->fp_info_version = version;
@@ -877,74 +839,6 @@ crfpmoc_show_proto_info (struct crfpmoc_ec_response_get_protocol_info *protocol_
           protocol_info->max_request_packet_size,
           protocol_info->max_response_packet_size,
           protocol_info->flags);
-}
-
-/* Parse and validate the max in and out payload sizes from the protocol
- * info response. The device-reported packet sizes are used to derive the
- * usable payload sizes, but are always clamped to
- * CRFPMOC_EC_PROTO2_MAX_PARAM_SIZE, which is the absolute upper bound the
- * driver's transfer buffers are sized against. This prevents a malicious
- * or malfunctioning device from inducing oversized transfers.
- *
- * Fails if a reported packet size is too small to even contain the
- * protocol header (which would otherwise underflow), or too small to
- * carry a fingerprint template chunk header plus at least one data byte.
- */
-static gboolean
-crfpmoc_parse_max_size (struct crfpmoc_ec_response_get_protocol_info *protocol_info,
-                        guint16                                      *max_insize,
-                        guint16                                      *max_outsize,
-                        GError                                      **error)
-{
-  const gsize header = sizeof (struct crfpmoc_ec_host_response);
-  const gsize min_out = offsetof (struct crfpmoc_ec_params_fp_template, data) + 4 + 1;
-  gsize max_param_cap;
-  gsize derived_in;
-  gsize derived_out;
-  guint16 req_size, resp_size;
-
-  crfpmoc_show_proto_info (protocol_info);
-
-  req_size = GUINT16_FROM_LE (protocol_info->max_request_packet_size);
-  resp_size = GUINT16_FROM_LE (protocol_info->max_response_packet_size);
-
-  if (resp_size < header || req_size < header)
-    {
-      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                   "Device reported packet sizes smaller than the protocol "
-                   "header (in %u, out %u, header %zu)",
-                   resp_size, req_size, header);
-      return FALSE;
-    }
-
-  max_param_cap = (GUINT32_FROM_LE (protocol_info->protocol_versions) & (1 << 3)) ?
-                  CROS_EC_PROTO3_MAX_PAYLOAD_SIZE : CRFPMOC_EC_PROTO2_MAX_PARAM_SIZE;
-
-  derived_in = MIN (max_param_cap, resp_size - header);
-  derived_out = MIN (max_param_cap, req_size - header);
-
-  if (derived_in == 0)
-    {
-      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                           "Device reported max incoming payload of zero bytes");
-      return FALSE;
-    }
-
-  if (derived_out < min_out)
-    {
-      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                   "Device reported max outgoing payload %zu too small to "
-                   "carry a template chunk (need at least %zu)",
-                   derived_out, min_out);
-      return FALSE;
-    }
-
-  if (max_insize)
-    *max_insize = derived_in;
-  if (max_outsize)
-    *max_outsize = derived_out;
-
-  return TRUE;
 }
 
 /* Stolen BSD sum algorithm. Used for debug to allow matching the
@@ -1019,8 +913,10 @@ crfpmoc_open_proto_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
 
   protocol_info = (struct crfpmoc_ec_response_get_protocol_info *) transfer->indata;
 
-  if (!crfpmoc_parse_max_size (protocol_info, &self->max_insize,
-                               &self->max_outsize, &error))
+  crfpmoc_show_proto_info (protocol_info);
+
+  if (!crfpmoc_proto_parse_max_size (protocol_info, &self->max_insize,
+                                     &self->max_outsize, &error))
     {
       g_prefix_error_literal (&error, "Failed to get max insize/outsize: ");
       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
@@ -1047,7 +943,7 @@ crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
       return;
     }
 
-  if (!crfpmoc_parse_fp_info (self, transfer->indata, transfer->version,
+  if (!crfpmoc_parse_fp_info (self, transfer->indata, transfer->insize, transfer->version,
                               &self->max_templates, &self->template_size, &error))
     {
       g_prefix_error_literal (&error, "Failed to get max templates and templates size: ");
@@ -1105,16 +1001,22 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
   fpi_device_open_complete (device, error);
 }
 
-static void
+/* Fill a buffer from kernel entropy (getrandom first, /dev/urandom as
+ * fallback). Returns FALSE if no kernel entropy source is available.
+ * The caller treats failure as fatal: a seed that is not
+ * cryptographically random would make enrolled templates decryptable by
+ * anyone who knows the fallback value.
+ */
+static gboolean
 crfpmoc_generate_random_seed (guint8 *seed, gsize len)
 {
-  g_return_if_fail (seed != NULL);
-  g_return_if_fail (len > 0);
+  g_return_val_if_fail (seed != NULL, FALSE);
+  g_return_val_if_fail (len > 0, FALSE);
 
 #if defined(__linux__)
   ssize_t ret = getrandom (seed, len, 0);
   if (ret == (ssize_t) len)
-    return;
+    return TRUE;
 #endif
 
   int fd = open ("/dev/urandom", O_RDONLY | O_CLOEXEC);
@@ -1130,25 +1032,22 @@ crfpmoc_generate_random_seed (guint8 *seed, gsize len)
         }
       close (fd);
       if (total == (ssize_t) len)
-        return;
+        return TRUE;
     }
 
-  for (gsize i = 0; i < len; i += sizeof (guint32))
-    {
-      guint32 val = g_random_int ();
-      gsize to_copy = MIN (sizeof (guint32), len - i);
-      memcpy (seed + i, &val, to_copy);
-    }
+  return FALSE;
 }
 
 /* Initialise the encryption seed and user context.
  * In emulation mode fixed test values are used so the recorded ioctl replay stays
  * deterministic. On real hardware, a secure random 32-byte seed is read from or
  * persisted to /var/lib/fprint/crfpmoc.key (mode 0600) so enrolled templates
- * remain decryptable across reboots.
+ * remain decryptable across reboots. If no valid persistent key exists and a
+ * new random seed cannot be generated and persisted, open fails closed so
+ * templates are never encrypted with a predictable fallback seed.
  */
-static void
-crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
+static gboolean
+crfpmoc_init_keys (FpiDeviceCrfpMoc *self, GError **error)
 {
   G_STATIC_ASSERT (sizeof (self->seed) == CRFPMOC_FP_CONTEXT_TPM_BYTES);
   G_STATIC_ASSERT (sizeof (self->context) == CRFPMOC_FP_CONTEXT_USERID_BYTES);
@@ -1162,7 +1061,7 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
     {
       fp_dbg ("Emulation mode active: using deterministic default seed");
       memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
-      return;
+      return TRUE;
     }
 
   g_autofree gchar *contents = NULL;
@@ -1175,7 +1074,7 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
         {
           fp_dbg ("Loaded persistent key from %s", CRFPMOC_KEY_FILE_PATH);
           memcpy (self->seed, contents, sizeof (self->seed));
-          return;
+          return TRUE;
         }
       else
         {
@@ -1189,15 +1088,20 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
     }
 
   guint8 new_seed[CRFPMOC_FP_CONTEXT_TPM_BYTES];
-  crfpmoc_generate_random_seed (new_seed, sizeof (new_seed));
+  if (!crfpmoc_generate_random_seed (new_seed, sizeof (new_seed)))
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "No kernel entropy available to generate the fingerprint encryption key");
+      return FALSE;
+    }
 
   g_autofree gchar *dirname = g_path_get_dirname (CRFPMOC_KEY_FILE_PATH);
   if (g_mkdir_with_parents (dirname, 0700) != 0 && errno != EEXIST)
     {
-      fp_warn ("Failed to create directory %s: %s; falling back to default seed",
-               dirname, g_strerror (errno));
-      memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
-      return;
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Failed to create key directory %s: %s",
+                   dirname, g_strerror (errno));
+      return FALSE;
     }
 
   mode_t old_umask = umask (0077);
@@ -1216,12 +1120,14 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
 
       fp_dbg ("Generated and stored persistent seed at %s", CRFPMOC_KEY_FILE_PATH);
       memcpy (self->seed, new_seed, sizeof (self->seed));
+      return TRUE;
     }
   else
     {
-      fp_warn ("Failed to write persistent key file %s: %s; falling back to default seed",
-               CRFPMOC_KEY_FILE_PATH, write_error->message);
-      memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Failed to persist fingerprint encryption key to %s: %s",
+                   CRFPMOC_KEY_FILE_PATH, write_error->message);
+      return FALSE;
     }
 }
 
@@ -1253,7 +1159,13 @@ crfpmoc_open (FpDevice *device)
       fp_dbg ("Created temporary ioctl file for recording: %s", ioctl_file);
     }
 
-  crfpmoc_init_keys (self);
+  if (!crfpmoc_init_keys (self, &error))
+    {
+      fp_warn ("crfpmoc_open: failed to initialise encryption keys: %s", error->message);
+      g_clear_fd (&self->emul_fd, NULL);
+      fpi_device_open_complete (device, g_steal_pointer (&error));
+      return;
+    }
 
   g_assert (self->task_ssm == NULL);
   self->task_ssm = fpi_ssm_new (device, crfpmoc_open_run_state, OPEN_STATES);
@@ -1264,21 +1176,26 @@ crfpmoc_open (FpDevice *device)
  * work on cancel/suspend/close. These teardown paths must not depend on
  * the main loop running (the current cancellable is already cancelled on
  * cancel, and close/suspend are expected to settle promptly), so a
- * blocking transfer is used instead of the async SSM machinery.
+ * blocking transfer with a bounded timeout is used instead of the async
+ * SSM machinery. crfpmoc_ec_transfer_submit_sync_timeout takes
+ * ownership of the transfer (freed on success, kept by the worker on
+ * timeout), so no autoptr is used here.
  */
+#define CRFPMOC_RESET_SYNC_TIMEOUT_MS 2000
+
 static void
 crfpmoc_reset_sync (FpDevice *device)
 {
   g_autoptr(GError) error = NULL;
-  g_autoptr(CrfpMocEcTransfer) transfer = NULL;
+  CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
                                           &(struct crfpmoc_ec_params_fp_mode){ .mode = 0 },
                                           sizeof (struct crfpmoc_ec_params_fp_mode),
                                           sizeof (struct crfpmoc_ec_response_fp_mode));
 
-  if (!crfpmoc_ec_transfer_submit_sync (transfer, &error))
-    fp_dbg ("crfpmoc_reset_sync: reset failed: %s", error->message);
+  if (!crfpmoc_ec_transfer_submit_sync_timeout (transfer, CRFPMOC_RESET_SYNC_TIMEOUT_MS, &error))
+    fp_warn ("crfpmoc_reset_sync: reset failed: %s", error->message);
 }
 
 static void
@@ -1309,8 +1226,12 @@ crfpmoc_close (FpDevice *device)
 
   fp_dbg ("Closing device");
 
-  crfpmoc_reset_sync (device);
+  /* Clear the emulation trace fd before issuing the reset: the reset may
+   * run in a worker thread after a timeout, and recording must not write
+   * to a closed fd. */
   g_clear_fd (&self->emul_fd, &error);
+
+  crfpmoc_reset_sync (device);
 
   fpi_device_close_complete (device, g_steal_pointer (&error));
 }
@@ -1344,7 +1265,7 @@ crfpmoc_commit_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
       return;
     }
 
-  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->version);
+  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->insize, transfer->version);
   if (!tinfo)
     {
       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "Missing template info in FP_INFO"));
@@ -1393,7 +1314,7 @@ crfpmoc_verify_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
       return;
     }
 
-  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->version);
+  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->insize, transfer->version);
   if (!tinfo)
     {
       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "Missing template info in FP_INFO"));
@@ -1659,7 +1580,7 @@ crfpmoc_enroll_capacity_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
       return;
     }
 
-  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->version);
+  tinfo = crfpmoc_get_template_info (transfer->indata, transfer->insize, transfer->version);
   if (!tinfo)
     {
       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "Missing template info in FP_INFO"));
@@ -2690,3 +2611,12 @@ fpi_device_crfpmoc_class_init (FpiDeviceCrfpMocClass *klass)
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
+
+/* The pure protocol parsing module is compiled into this translation
+ * unit: the packaged build lists driver sources explicitly in
+ * libfprint's meson.build, which the driver overlay cannot modify, so
+ * compiling the implementation here guarantees it is always built.
+ * The standalone unit test compiles crfpmoc-proto.c directly instead,
+ * so the exact same parsing code is exercised either way.
+ */
+#include "crfpmoc-proto.c"

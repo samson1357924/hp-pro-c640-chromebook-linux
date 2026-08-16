@@ -9,6 +9,7 @@ License:        LGPL-2.1-or-later
 URL:            https://github.com/samson1357924/crfpmoc
 Source0:        https://github.com/samson1357924/crfpmoc/archive/refs/tags/v%{version}.tar.gz
 Source1:        60-cros-fp.rules
+Source2:        crfpmoc-driver-overlay.tar.gz
 
 BuildRequires:  gcc
 BuildRequires:  meson
@@ -41,7 +42,7 @@ The %{name}-devel package contains libraries and header files for
 developing applications that use %{name}.
 
 %prep
-%autosetup -n crfpmoc-%{version}
+%autosetup -n crfpmoc-%{version} -a 2
 
 %build
 %meson -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false

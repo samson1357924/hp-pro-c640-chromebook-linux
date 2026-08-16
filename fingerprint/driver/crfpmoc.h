@@ -38,6 +38,7 @@
 #endif
 
 #include "drivers_api.h"
+#include "crfpmoc-proto-structs.h"
 
 G_DECLARE_FINAL_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FPI, DEVICE_CRFPMOC, FpDevice)
 
@@ -100,10 +101,12 @@ G_DECLARE_FINAL_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FPI, DEVICE_CRFPMOC,
 #define CRFPMOC_KEY_FILE_PATH "/var/lib/fprint/crfpmoc.key"
 
 /* Fixed seed and context used in emulation/mock mode for deterministic
- * ioctl replays, and as safe fallbacks when the key file is inaccessible.
- * On real hardware, a secure random 32-byte seed is persisted to
- * CRFPMOC_KEY_FILE_PATH with mode 0600 so that enrolled templates remain
- * decryptable across system reboots and daemon restarts.
+ * ioctl replays. On real hardware a secure random 32-byte seed is
+ * persisted to CRFPMOC_KEY_FILE_PATH with mode 0600 so that enrolled
+ * templates remain decryptable across system reboots and daemon
+ * restarts. If the key file cannot be loaded or a new random seed
+ * cannot be generated and persisted, device open fails closed instead
+ * of falling back to this predictable seed.
  */
 #define CRFPMOC_DEFAULT_SEED "seedseedseedseedseedseedseedseed"
 #define CRFPMOC_DEFAULT_CONTEXT "ctxctxctxctxctxctxctxctxctxctxct"
@@ -134,42 +137,6 @@ struct crfpmoc_ec_params_fp_frame
    */
   guint32 offset;
   guint32 size;
-} __attribute__((packed));
-
-struct crfpmoc_ec_params_fp_template
-{
-  guint32 offset;
-  guint32 size;
-  guint8  data[];
-} __attribute__((packed));
-
-struct crfpmoc_ec_response_get_protocol_info
-{
-  /* Fields which exist if at least protocol version 3 supported */
-  guint32 protocol_versions;
-  guint16 max_request_packet_size;
-  guint16 max_response_packet_size;
-  guint32 flags;
-} __attribute__((packed));
-
-/* crfpmoc_ec_host_response and crfpmoc_ec_host_request are only here for the size of the struct */
-struct crfpmoc_ec_host_response
-{
-  guint8  struct_version;
-  guint8  checksum;
-  guint16 result;
-  guint16 data_len;
-  guint16 reserved;
-} __attribute__((packed));
-
-struct crfpmoc_ec_host_request
-{
-  guint8  struct_version;
-  guint8  checksum;
-  guint16 command;
-  guint8  command_version;
-  guint8  reserved;
-  guint16 data_len;
 } __attribute__((packed));
 
 struct crfpmoc_ec_response_fp_encryption_status
@@ -231,52 +198,6 @@ struct crfpmoc_ec_params_fp_context_v1
   guint8  reserved[3]; /**< padding for alignment */
   guint32 userid[CRFPMOC_FP_CONTEXT_USERID_WORDS];
 } __attribute__((packed));
-
-/* ec_commands.h layout of the EC_CMD_FP_INFO response */
-struct crfpmoc_ec_response_fp_sensor_info
-{
-  guint32 vendor_id;
-  guint32 product_id;
-  guint32 model_id;
-  guint32 version;
-  guint16 num_capture_types;
-  guint16 errors;
-} __attribute__((packed));
-
-struct crfpmoc_ec_response_fp_template_info
-{
-  guint32 template_size;
-  guint16 template_max;
-  guint16 template_valid;
-  guint32 template_dirty;
-  guint32 template_version;
-} __attribute__((packed));
-
-/* v2 layout (16 bytes): frame_size@0, pixel_format@4, width@8, height@10, bpp@12 */
-struct crfpmoc_ec_response_fp_frame_params_v2
-{
-  guint32 frame_size;
-  guint32 pixel_format;
-  guint16 width;
-  guint16 height;
-  guint16 bpp;
-  guint16 fp_capture_type;
-} __attribute__((packed));
-
-/* v3 layout (20 bytes): frame_size@0, image_data_offset_bytes@4, pixel_format@8, width@12, height@14, bpp@16 */
-struct crfpmoc_ec_response_fp_frame_params_v3
-{
-  guint32 frame_size;
-  guint32 image_data_offset_bytes;
-  guint32 pixel_format;
-  guint16 width;
-  guint16 height;
-  guint16 bpp;
-  guint16 fp_capture_type;
-} __attribute__((packed));
-
-#define CRFPMOC_FP_INFO_BUFFER_SIZE 512
-#define CROS_EC_PROTO3_MAX_PAYLOAD_SIZE 536
 
 /* Note: used in crfpmoc_ec_response_get_next_data_v1 */
 struct crfpmoc_ec_response_motion_sense_fifo_info
@@ -442,9 +363,6 @@ struct crfpmoc_cros_ec_command_v2
 #define CRFPMOC_CROS_EC_DEV_IOCXCMD_V2 \
   _IOWR (CRFPMOC_CROS_EC_DEV_IOC_V2, 0, struct crfpmoc_cros_ec_command_v2)
 #define CRFPMOC_CROS_EC_DEV_IOCEVENTMASK_V2 _IO (CRFPMOC_CROS_EC_DEV_IOC_V2, 2)
-
-/* Parameter length was limited by the LPC interface */
-#define CRFPMOC_EC_PROTO2_MAX_PARAM_SIZE 0xfc
 
 /*
  * Host command response codes (16-bit).

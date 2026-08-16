@@ -16,9 +16,16 @@ provides=('libfprint' 'libfprint-2.so')
 conflicts=('libfprint')
 backup=('etc/udev/rules.d/60-cros-fp.rules')
 source=("git+https://github.com/samson1357924/crfpmoc.git#branch=master"
+        "crfpmoc-driver-overlay.tar.gz"
         "60-cros-fp.rules")
 sha256sums=('SKIP'
+            '7fa6c13437616bb6c52f10ed85dd8eae3dca290061e6d536ef4090db56589715'
             'SKIP')
+
+prepare() {
+    cd "${srcdir}/crfpmoc"
+    tar -xzf "${srcdir}/crfpmoc-driver-overlay.tar.gz"
+}
 
 build() {
     cd "${srcdir}/crfpmoc"
