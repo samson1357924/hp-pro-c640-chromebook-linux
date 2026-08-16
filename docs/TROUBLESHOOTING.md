@@ -86,9 +86,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
      from `/var/lib/fprint/crfpmoc.key`. The crfpmoc driver's keys handshake
      contains an `FP_CONTEXT` step that (a) re-establishes the crypto context and
      (b) triggers the FPMCU sensor reset/open (`fp_sensor_open`, ~175 ms) that
-     re-initializes the sensor. Commit `8f5ee65` ("Jump directly to KEYS_DONE
-     when encryption seed is already set") skipped that step whenever the seed was
-     already set, so after a reboot the sensor stayed uninitialized → every
+      re-initializes the sensor. A previous driver build (which jumped directly to
+      `KEYS_DONE` when the encryption seed was already set) skipped that step
+      whenever the seed was already set, so after a reboot the sensor stayed
+      uninitialized → every
      template operation failed with `EC_RES_UNAVAILABLE`. A second latent bug, a
      `RESET_SENSOR`/`FP_MODE_FINGER_UP` mode conflict that produced
      `INVALID_PARAM`, was also fixed by clearing the sensor mode (`FP_MODE=0`)
@@ -113,10 +114,12 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
      newer than 2026-08-15). Re-run `fingerprint/install-fingerprint.sh` if
      needed, then `sudo systemctl restart fprintd`.
   2. **Re-enroll your fingerprints — the old templates are undecryptable**:
+
      ```bash
      fprintd-delete "$USER"
      fprintd-enroll "$USER"
      ```
+
      (Place the same finger repeatedly when prompted; enroll both thumbs / index
      fingers as before.)
   3. After re-enrolling, verify works across reboots because the new templates
@@ -130,17 +133,19 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 * **Root cause**: only one host program should drive the FPMCU at a time. This
   project uses the crfpmoc libfprint driver (consumed by `fprintd`). A separate
   project, **ChocolateLoverRaj/rust-fp** (`/usr/local/bin/rust-fp-dbus-interface`
-  + its `rust-fp-dbus-interface.service`), also opens `/dev/cros_fp`. Because the
+   and its `rust-fp-dbus-interface.service`), also opens `/dev/cros_fp`. Because the
   seed/context/template state is a single global on the FPMCU, two programs
   issuing `EC_CMD_FP_SEED` / `EC_CMD_FP_CONTEXT` / enroll / verify will corrupt
   each other's encryption context and unlock state.
 * **Solution**: use only one stack. If `rust-fp` is installed, disable it and rely
-  on crfpmoc:
-  ```bash
-  sudo systemctl disable --now rust-fp-dbus-interface.service
-  sudo systemctl restart fprintd
-  ```
-  (Alternatively, remove the rust-fp binary and service and reboot.)
+   on crfpmoc:
+
+   ```bash
+   sudo systemctl disable --now rust-fp-dbus-interface.service
+   sudo systemctl restart fprintd
+   ```
+
+   (Alternatively, remove the rust-fp binary and service and reboot.)
 
 ---
 

@@ -80,8 +80,8 @@
      `/var/lib/fprint/crfpmoc.key` 重新送 `FP_SEED`。crfpmoc driver 的 keys 交握包含一個
      `FP_CONTEXT` 步驟，它會 (1) 重新建立加解密 context，並 (2) 觸發 FPMCU 感應器的
      reset/open（`fp_sensor_open`，約 175 ms）把感應器重新初始化。若該步驟在「seed 已設」時被跳過，
-     重開機後感應器就停在未初始化狀態，所有模板操作都會回傳 `EC_RES_UNAVAILABLE`。此問題由 commit
-     `8f5ee65`（「seed 已設時直接跳到 KEYS_DONE」）引入。另一個潛在 bug 是 `RESET_SENSOR` 與
+      重開機後感應器就停在未初始化狀態，所有模板操作都會回傳 `EC_RES_UNAVAILABLE`。此問題由某個舊版
+      driver（「seed 已設時直接跳到 KEYS_DONE」的那一版）引入。另一個潛在 bug 是 `RESET_SENSOR` 與
      `FP_MODE_FINGER_UP` 的模式衝突（會噴 `INVALID_PARAM`），已在下 `FP_CONTEXT_ASYNC` 前先發
      `FP_MODE=0` 清除模式來修掉。兩者都已在目前的 driver 修好（`crfpmoc_keys_enc_status_cb` 現在
      跳到 `KEYS_CLEAR_MODE`，這是 `KEYS` 子狀態機新增的一步）。
@@ -97,10 +97,12 @@
   1. 確認已安裝含兩項修復的 crfpmoc（driver 時間晚於 2026-08-15）；必要時重跑
      `fingerprint/install-fingerprint.sh`，再 `sudo systemctl restart fprintd`。
   2. **必須重新註冊指紋 —— 舊模板永久無法解密**：
+
      ```bash
      fprintd-delete "$USER"
      fprintd-enroll "$USER"
      ```
+
      （依提示重複按壓同一根手指；像之前一樣把兩隻拇指 / 食指都註冊起來。）
   3. 重新註冊後，跨重開機都能正常驗證，因為新模板是用目前穩定的 seed 檔加密的。
      **絕對不要刪除或重新產生 `/var/lib/fprint/crfpmoc.key`**（必須保持 `root:root`、`0600`）
@@ -114,11 +116,13 @@
   也會開啟 `/dev/cros_fp`。由於 seed/context/模板是 FPMCU 上的單一全域狀態，兩個程式同時下達
   `EC_CMD_FP_SEED` / `EC_CMD_FP_CONTEXT` / enroll / verify 會互相汙染對方的加解密 context 與解鎖狀態。
 * **解決方法**：只保留一套。若已安裝 rust-fp，停用它並改用 crfpmoc：
-  ```bash
-  sudo systemctl disable --now rust-fp-dbus-interface.service
-  sudo systemctl restart fprintd
-  ```
-  （或移除 rust-fp 的 binary 與 service 後重開機。）
+
+   ```bash
+   sudo systemctl disable --now rust-fp-dbus-interface.service
+   sudo systemctl restart fprintd
+   ```
+
+   （或移除 rust-fp 的 binary 與 service 後重開機。）
 
 ---
 
