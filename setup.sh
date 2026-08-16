@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/lib/logger.sh"
 # shellcheck source=lib/distro.sh
 source "$SCRIPT_DIR/lib/distro.sh"
 # shellcheck source=lib/backup.sh
-source "$ROOT_DIR/lib/backup.sh" 2> /dev/null || source "$SCRIPT_DIR/lib/backup.sh"
+source "$ROOT_DIR/lib/backup.sh"
 # shellcheck source=lib/syscheck.sh
 source "$SCRIPT_DIR/lib/syscheck.sh"
 

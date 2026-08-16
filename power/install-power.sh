@@ -61,11 +61,6 @@ uninstall_power() {
     rollback_component "power"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo rm -f /etc/tlp.d/99-hp-c640.conf
-        sudo rm -f /etc/modprobe.d/99-hp-c640-power.conf
-        sudo rm -f /etc/systemd/logind.conf.d/99-hp-c640-lid.conf
-        sudo rm -f /etc/wireplumber/wireplumber.conf.d/50-disable-suspend.conf
-
         sudo systemctl restart systemd-logind 2> /dev/null || true
     fi
     log_success "Power optimization profiles removed."
@@ -102,13 +97,17 @@ install_power() {
     local tlp_dst="/etc/tlp.d/99-hp-c640.conf"
     local tlp_src="$SCRIPT_DIR/tlp/99-hp-c640.conf"
     if [ -f "$tlp_src" ]; then
+        local tlp_existed=0
+        if [ -e "$tlp_dst" ]; then
+            tlp_existed=1
+        fi
         backup_file "$tlp_dst"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $tlp_src -> $tlp_dst"
         else
             sudo mkdir -p /etc/tlp.d
             sudo install -D -m 0644 "$tlp_src" "$tlp_dst"
-            manifest_add_entry "$tlp_dst" "power" "0"
+            manifest_add_entry "$tlp_dst" "power" "$tlp_existed"
             log_success "Deployed $tlp_dst"
         fi
     fi
@@ -118,12 +117,16 @@ install_power() {
     local modprobe_dst="/etc/modprobe.d/99-hp-c640-power.conf"
     local modprobe_src="$SCRIPT_DIR/modprobe.d/99-hp-c640-power.conf"
     if [ -f "$modprobe_src" ]; then
+        local modprobe_existed=0
+        if [ -e "$modprobe_dst" ]; then
+            modprobe_existed=1
+        fi
         backup_file "$modprobe_dst"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $modprobe_src -> $modprobe_dst"
         else
             sudo install -D -m 0644 "$modprobe_src" "$modprobe_dst"
-            manifest_add_entry "$modprobe_dst" "power" "0"
+            manifest_add_entry "$modprobe_dst" "power" "$modprobe_existed"
             log_success "Deployed $modprobe_dst"
         fi
     fi
@@ -132,13 +135,17 @@ install_power() {
     local logind_dst="/etc/systemd/logind.conf.d/99-hp-c640-lid.conf"
     local logind_src="$SCRIPT_DIR/systemd/logind.conf.d/99-hp-c640-lid.conf"
     if [ -f "$logind_src" ]; then
+        local logind_existed=0
+        if [ -e "$logind_dst" ]; then
+            logind_existed=1
+        fi
         backup_file "$logind_dst"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $logind_src -> $logind_dst"
         else
             sudo mkdir -p /etc/systemd/logind.conf.d
             sudo install -D -m 0644 "$logind_src" "$logind_dst"
-            manifest_add_entry "$logind_dst" "power" "0"
+            manifest_add_entry "$logind_dst" "power" "$logind_existed"
             log_success "Deployed $logind_dst"
         fi
     fi
@@ -148,13 +155,17 @@ install_power() {
     local wp_dst="/etc/wireplumber/wireplumber.conf.d/50-disable-suspend.conf"
     local wp_src="$SCRIPT_DIR/wireplumber/50-disable-suspend.conf"
     if [ -f "$wp_src" ]; then
+        local wp_existed=0
+        if [ -e "$wp_dst" ]; then
+            wp_existed=1
+        fi
         backup_file "$wp_dst"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $wp_src -> $wp_dst"
         else
             sudo mkdir -p /etc/wireplumber/wireplumber.conf.d
             sudo install -D -m 0644 "$wp_src" "$wp_dst"
-            manifest_add_entry "$wp_dst" "power" "0"
+            manifest_add_entry "$wp_dst" "power" "$wp_existed"
             log_success "Deployed $wp_dst"
         fi
     fi

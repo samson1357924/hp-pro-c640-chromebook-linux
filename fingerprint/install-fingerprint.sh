@@ -52,12 +52,14 @@ uninstall_fp() {
     rollback_component "fingerprint"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo rm -f /etc/udev/rules.d/60-cros-fp.rules
         sudo udevadm control --reload-rules 2> /dev/null || true
-        log_info "Removed /etc/udev/rules.d/60-cros-fp.rules"
+        log_info "Reloaded udev rules."
 
         # Revert PAM
         disable_pam_fingerprint || true
+
+        # Re-register restored stock libraries
+        sudo ldconfig
 
         log_info "To restore your distribution's stock libfprint package, run:"
         case "$DISTRO_FAMILY" in
@@ -89,6 +91,10 @@ install_fp() {
     # 2. Configure udev device permissions & user group
     log_step 2 6 "Configuring udev permissions for /dev/cros_fp..."
     local udev_rule_dst="/etc/udev/rules.d/60-cros-fp.rules"
+    local udev_rule_existed=0
+    if [ -e "$udev_rule_dst" ]; then
+        udev_rule_existed=1
+    fi
     backup_file "$udev_rule_dst"
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -96,7 +102,7 @@ install_fp() {
         log_dryrun "Add user '$real_user' to group plugdev"
     else
         sudo install -D -m 0644 "$SCRIPT_DIR/60-cros-fp.rules" "$udev_rule_dst"
-        manifest_add_entry "$udev_rule_dst" "fingerprint" "0"
+        manifest_add_entry "$udev_rule_dst" "fingerprint" "$udev_rule_existed"
 
         # Ensure plugdev group exists and add user
         if ! getent group plugdev > /dev/null 2>&1; then
@@ -171,9 +177,23 @@ install_fp() {
             /usr/local/share/gir-1.0/FPrint-2.0.gir || true
         sudo rm -rf /usr/local/include/libfprint-2 || true
 
+        # Back up any stock libfprint libraries that ninja install will overwrite,
+        # so uninstall can restore them instead of leaving the custom build in place
+        while IFS= read -r -d '' lib; do
+            backup_file "$lib"
+            manifest_add_entry "$lib" "fingerprint" "1"
+        done < <(find "$LIBDIR" -maxdepth 1 -name 'libfprint-2.so*' -print0 2> /dev/null)
+
         sudo ninja -C build install
-        manifest_add_entry "$LIBDIR/libfprint-2.so" "fingerprint" "1"
         sudo ldconfig
+
+        # Record libraries created by this install (no prior stock library
+        # existed), so uninstall can remove them
+        while IFS= read -r -d '' lib; do
+            if ! grep -qF "\"$lib\"" "$MANIFEST_FILE" 2> /dev/null; then
+                manifest_add_entry "$lib" "fingerprint" "0"
+            fi
+        done < <(find "$LIBDIR" -maxdepth 1 -name 'libfprint-2.so*' -print0 2> /dev/null)
 
         # Clean up temporary build tree if generated
         if [ "$is_temp_dir" = "1" ] && [ -d "$crfpmoc_dir" ]; then
