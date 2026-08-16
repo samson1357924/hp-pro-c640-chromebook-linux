@@ -24,16 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run markdownlint-cli2
-        uses: DavidAnson/markdownlint-cli2-action@v19
+        uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265 # v19.1.0
         with:
           globs: '**/*.md'
           config: '.markdownlint.yaml'
 
       - name: Run Lychee Link Checker
-        uses: lycheeverse/lychee-action@v2
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: >-
             --config lychee.toml
@@ -59,8 +59,8 @@ jobs:
             init_cmd: "apt-get update -y && apt-get install -y --no-install-recommends bash coreutils sudo ca-certificates git"
             check_pkgs_cmd: "apt-get install --dry-run -y"
 
-          - name: "Fedora 40"
-            image: "fedora:40"
+          - name: "Fedora 42"
+            image: "fedora:42"
             family: "fedora"
             init_cmd: "dnf install -y bash coreutils sudo git"
             check_pkgs_cmd: "dnf install --assumeyes --downloadonly --destdir=/tmp/ci-dnf-check -y"
@@ -77,7 +77,7 @@ jobs:
           ${{ matrix.distro.init_cmd }}
 
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Verify OS Classification
         run: |

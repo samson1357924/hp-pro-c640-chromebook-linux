@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install dependencies
         run: |
@@ -81,10 +81,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Arch Linux PKGBUILD Lint (namcap)
-        uses: docker://archlinux:latest
+        uses: docker://archlinux:base-devel
         with:
           args: >
             bash -c "
@@ -94,12 +94,17 @@ jobs:
             su builder -c '
               cd fingerprint/packaging &&
               echo \"=== Checking PKGBUILD with namcap ===\" &&
-              namcap PKGBUILD || true
+              namcap_output=\$(namcap PKGBUILD || true) &&
+              printf \"%s\n\" \"\$namcap_output\" &&
+              if printf \"%s\n\" \"\$namcap_output\" | grep -qE \"(^|[ :])E: \"; then
+                echo \"namcap found errors (E: lines above)\";
+                exit 1;
+              fi
             '
             "
 
       - name: Fedora RPM Spec Lint (rpmlint & rpmspec)
-        uses: docker://fedora:latest
+        uses: docker://fedora:42
         with:
           args: >
             bash -c "
@@ -108,5 +113,10 @@ jobs:
             echo \"=== Validating RPM Spec syntax ===\" &&
             rpmspec -q --srpm libfprint-crfpmoc.spec &&
             echo \"=== Running rpmlint on spec file ===\" &&
-            rpmlint libfprint-crfpmoc.spec || true
+            rpmlint_output=\$(rpmlint libfprint-crfpmoc.spec || true) &&
+            printf \"%s\n\" \"\$rpmlint_output\" &&
+            if printf \"%s\n\" \"\$rpmlint_output\" | grep -qE \"(^|[ :])E: \"; then
+              echo \"rpmlint found errors (E: lines above)\";
+              exit 1;
+            fi
             "
