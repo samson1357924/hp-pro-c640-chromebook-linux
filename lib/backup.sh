@@ -24,9 +24,9 @@ backup_file() {
         return 0
     fi
 
-    if [ -f "$target" ] || [ -d "$target" ]; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
         local timestamp
-        timestamp="$(date '+%Y%m%d_%H%M%S')"
+        timestamp="$(date '+%Y%m%d_%H%M%S%N')"
         local backup_path="$BACKUP_BASE_DIR/$timestamp$target"
         sudo mkdir -p "$(dirname "$backup_path")"
         sudo cp -a "$target" "$backup_path"
@@ -54,8 +54,11 @@ manifest_add_entry() {
     fi
 
     # Append entry using python with atomic file write
-    if command -v python3 > /dev/null 2>&1; then
-        sudo python3 -c '
+    if ! command -v python3 > /dev/null 2>&1; then
+        log_warn "python3 not found; install manifest cannot be updated. Rollback for this file will be unavailable."
+        return 1
+    fi
+    sudo python3 -c '
 import json, sys, os
 manifest_path = sys.argv[1]
 target = sys.argv[2]
@@ -84,7 +87,6 @@ with open(tmp_manifest, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
 ' "$MANIFEST_FILE" "$target" "$component" "$was_existing" "$timestamp"
-    fi
 }
 
 rollback_component() {
@@ -122,6 +124,7 @@ records = data.get("records", [])
 remaining_records = []
 backup_base = "/var/backups/cros-enablement"
 PROTECTED_DIRS = {"/", "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/home", "/root"}
+ALLOWED_PREFIXES = ("/etc/", "/usr/", "/lib/", "/lib64/", "/opt/")
 
 for rec in records:
     comp = rec.get("component", "")
@@ -132,12 +135,14 @@ for rec in records:
         remaining_records.append(rec)
         continue
     
-    if not target or os.path.realpath(target) in PROTECTED_DIRS:
-        print(f"  [SKIPPED DANGEROUS TARGET] {target}", file=sys.stderr)
+    real = os.path.realpath(target) if target else ""
+    if not target or real in PROTECTED_DIRS or not real.startswith(ALLOWED_PREFIXES):
+        print(f"  [SKIPPED OUT-OF-SCOPE TARGET] {target}", file=sys.stderr)
+        remaining_records.append(rec)
         continue
 
     print(f"Processing rollback for: {target} (component: {comp})")
-    if os.path.exists(target):
+    if os.path.lexists(target):
         if not was_existing:
             if os.path.isdir(target) and not os.path.islink(target):
                 shutil.rmtree(target, ignore_errors=True)
@@ -152,7 +157,14 @@ for rec in records:
             if matches:
                 latest_backup = matches[-1]
                 print(f"  [RESTORING PREVIOUS BACKUP] {latest_backup} -> {target}")
-                if os.path.isdir(latest_backup):
+                if os.path.lexists(target):
+                    if os.path.islink(target) or os.path.isfile(target):
+                        os.remove(target)
+                    else:
+                        shutil.rmtree(target, ignore_errors=True)
+                if os.path.islink(latest_backup):
+                    os.symlink(os.readlink(latest_backup), target)
+                elif os.path.isdir(latest_backup):
                     shutil.copytree(latest_backup, target, dirs_exist_ok=True)
                 else:
                     shutil.copy2(latest_backup, target)
@@ -164,6 +176,8 @@ with open(tmp_manifest, "w") as f:
     json.dump({"version":"1.0","records":remaining_records}, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
 ' "$MANIFEST_FILE" "$target_comp"
+    else
+        log_warn "python3 not found; automatic rollback unavailable. Files may need manual restoration."
     fi
 
     log_success "Rollback for component [$target_comp] finished!"

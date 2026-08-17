@@ -81,12 +81,6 @@ uninstall_audio() {
     rollback_component "audio"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        for rel in "${UCM_FILES[@]}"; do
-            if [ -f "$UCM_DST/$rel" ]; then
-                sudo rm -f "$UCM_DST/$rel"
-                log_info "Removed $UCM_DST/$rel"
-            fi
-        done
         # Clean up empty dirs
         sudo rmdir "$UCM_DST/conf.d/sof-rt5682" 2> /dev/null || true
     fi

@@ -34,22 +34,31 @@ install_ec_tools() {
     local bin_src="$ROOT_DIR/scripts/c640-ec-control.sh"
 
     log_step 1 2 "Installing c640-ec-control to $bin_dst..."
+    local bin_existed=0
+    if [ -e "$bin_dst" ]; then
+        bin_existed=1
+    fi
     backup_file "$bin_dst"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0755 $bin_src -> $bin_dst"
     else
         sudo install -D -m 0755 "$bin_src" "$bin_dst"
-        manifest_add_entry "$bin_dst" "ec" "0"
+        manifest_add_entry "$bin_dst" "ec" "$bin_existed"
         log_success "Installed $bin_dst"
     fi
 
     # Install udev rule for /dev/cros_ec if not present
     local udev_dst="/etc/udev/rules.d/60-cros-ec.rules"
+    local udev_existed=0
+    if [ -e "$udev_dst" ]; then
+        udev_existed=1
+    fi
+    backup_file "$udev_dst"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-ec.rules"
     else
         echo 'KERNEL=="cros_ec", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"' | sudo tee "$udev_dst" > /dev/null
-        manifest_add_entry "$udev_dst" "ec" "0"
+        manifest_add_entry "$udev_dst" "ec" "$udev_existed"
 
         # Ensure plugdev group exists and add user
         if ! getent group plugdev > /dev/null 2>&1; then
@@ -78,13 +87,30 @@ enable_battery_service() {
     local srv_dst="/etc/systemd/system/c640-battery-limit.service"
     local srv_src="$SCRIPT_DIR/systemd/c640-battery-limit.service"
 
+    # The service runs `c640-ec-control battery-limit 80`, which requires
+    # the ectool binary. Refuse to enable it if ectool is unavailable,
+    # otherwise the service would fail on every boot.
+    if ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+            log_dryrun "Require ectool for the battery limit service (would abort without it)"
+        else
+            log_error "ectool not found. The battery limit service requires ectool to talk to the ChromeOS EC."
+            log_info "Provide ectool (e.g. install a prebuilt binary at /usr/local/bin/ectool or add one to ec/bin/) and re-run with --enable-battery-limit."
+            return 1
+        fi
+    fi
+
     if [ -f "$srv_src" ]; then
+        local srv_existed=0
+        if [ -e "$srv_dst" ]; then
+            srv_existed=1
+        fi
         backup_file "$srv_dst"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Deploy and enable $srv_dst"
         else
             sudo install -D -m 0644 "$srv_src" "$srv_dst"
-            manifest_add_entry "$srv_dst" "ec" "0"
+            manifest_add_entry "$srv_dst" "ec" "$srv_existed"
             sudo systemctl daemon-reload
             sudo systemctl enable --now c640-battery-limit.service
             log_success "80% Battery protection service enabled!"
@@ -94,13 +120,13 @@ enable_battery_service() {
 
 uninstall_ec_tools() {
     log_section "Uninstalling ChromeOS EC Utilities"
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
+    fi
+
     rollback_component "ec"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
-        sudo rm -f /usr/local/bin/c640-ec-control \
-            /etc/systemd/system/c640-battery-limit.service \
-            /etc/udev/rules.d/60-cros-ec.rules
         sudo systemctl daemon-reload
     fi
     log_success "EC utilities removed."

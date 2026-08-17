@@ -43,12 +43,9 @@ uninstall_keyboard() {
     rollback_component "keyboard"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        if [ -f "$HWDB_DST" ]; then
-            sudo rm -f "$HWDB_DST"
-            sudo systemd-hwdb update 2> /dev/null || true
-            sudo udevadm trigger --subsystem-match=input 2> /dev/null || true
-            log_info "Removed $HWDB_DST and updated systemd-hwdb."
-        fi
+        sudo systemd-hwdb update 2> /dev/null || true
+        sudo udevadm trigger --subsystem-match=input 2> /dev/null || true
+        log_info "Updated systemd-hwdb and re-triggered input devices."
     fi
     log_success "Keyboard mapping uninstallation completed."
 }

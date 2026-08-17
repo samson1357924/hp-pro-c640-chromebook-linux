@@ -46,8 +46,15 @@ if [ -d "/sys/class/power_supply/BAT0" ]; then
     cat /sys/class/power_supply/BAT0/uevent > "$REPORT_DIR/fingerprint_ec/battery.txt" 2> /dev/null || true
 fi
 
-# 5. Dmesg Errors & Warnings
-dmesg -T -l err,warn > "$REPORT_DIR/system/dmesg_warnings.txt" 2> /dev/null || true
+# 5. Dmesg Errors & Warnings (redacted for privacy)
+dmesg -T -l err,warn 2> /dev/null | sed -E \
+    -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/<MAC>/g' \
+    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<IP>/g' \
+    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g' \
+    -e 's/::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g' \
+    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4}){3,}/<IP6>/g' \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<EMAIL>/g' \
+    > "$REPORT_DIR/system/dmesg_warnings.txt" || true
 
 # Compress into tar.gz
 tar -czf "$ROOT_DIR/$ARCHIVE_NAME" -C "$REPORT_DIR" .
@@ -55,3 +62,4 @@ rm -rf "$REPORT_DIR"
 
 log_success "Diagnostic report generated successfully: $ARCHIVE_NAME"
 echo "You can attach this file when opening issues or seeking community assistance."
+echo "NOTE: The bundle may still contain personal information (usernames, hostnames, serial numbers). Review it before sharing."
