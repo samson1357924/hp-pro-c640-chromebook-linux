@@ -6,19 +6,49 @@ and wake event management under Linux.
 
 ---
 
-## 1. S0ix (s2idle) vs S3 (Deep Sleep)
+## 1. s2idle (S0ix) vs S3 (Deep Sleep)
 
-Intel 10th Gen Comet Lake with Coreboot / MrChromebox UEFI firmware **only
-supports S0ix (`s2idle`)**, not legacy ACPI S3 (`deep`).
+On this machine (Ubuntu, kernel 7.0) **both** suspend modes are advertised by
+the firmware, and the default is **S3 deep sleep**:
 
 ```bash
 cat /sys/power/mem_sleep
-# Expected output format: [s2idle]
+# Output on the Dratini with the current firmware: s2idle [deep]
 ```
 
-In the S0ix state, the CPU cores stop running and the SoC enters the Package
-C10 (SLP_S0#) ultra-low-power state, achieving standby battery life comparable
-to S3 while retaining the benefit of millisecond-level instant wake-up.
+The bracket marks the current default. A recent suspend cycle confirms deep
+sleep is actually used and functional:
+
+```text
+PM: suspend entry (deep)
+```
+
+This contradicts the older assumption that Coreboot / MrChromebox UEFI
+firmware only exposes s2idle: check `/sys/power/mem_sleep` on your own
+installation instead of assuming, because the available modes depend on the
+exact firmware build and kernel.
+
+The two modes differ as follows:
+
+* **S3 (`deep`)**: the platform performs a true system sleep (SPM
+  transitions, memory kept in self-refresh). Low power, but resume takes a
+  few seconds.
+* **s2idle (S0ix Modern Standby)**: the kernel does not suspend to a
+  firmware-defined state; the CPU cores halt and the SoC attempts to reach
+  the Package C10 (SLP_S0#) ultra-low-power state, with millisecond-level
+  instant wake-up.
+
+To switch the default at runtime:
+
+```bash
+echo deep | sudo tee /sys/power/mem_sleep
+# or, for S0ix Modern Standby:
+echo s2idle | sudo tee /sys/power/mem_sleep
+```
+
+To make the choice persistent, add `mem_sleep_default=deep` (or `=s2idle`)
+to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub` and run
+`sudo update-grub`.
 
 ---
 

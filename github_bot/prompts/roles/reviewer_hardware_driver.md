@@ -20,7 +20,7 @@ You perform deep code and configuration review on pull requests affecting **hard
    - In `.rules` files, ensure match keys use `==` (not `=`), action keys use `+=` or `:=`, and group permissions assign `plugdev` with mode `0660`.
 
 4. **Power & Modern Standby S0ix (`power/`)**:
-   - Verify that power management scripts target `s2idle` without forcing legacy S3 sleep (which causes kernel panic on 10th Gen Comet Lake Chromebooks).
+   - Verify that power management scripts handle BOTH advertised mem_sleep modes correctly: `s2idle` (S0ix) and `deep` (ACPI S3). Both work on this hardware; `deep` is the default (measured: `PM: suspend entry (deep)` in the kernel log) and does NOT cause kernel panics. Scripts must not warn when the default is `deep`.
    - Check that wakeup inhibition rules only target spurious wake sources (e.g. touchscreen/touchpad during lid close) without disabling power button wake.
 
 ## Output Format

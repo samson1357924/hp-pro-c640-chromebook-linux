@@ -20,7 +20,9 @@ This command automatically:
 1. Removes the custom `sof-rt5682` UCM configuration files from `/usr/share/alsa/ucm2/`.
 2. Removes `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` and rebuilds the hardware database.
 3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
-4. Shows the commands to reinstall the distro's native `libfprint` package.
+4. Removes the power management tweaks (logind config and suspend helpers).
+5. Removes the EC tools and the 80% battery protection service.
+6. Shows the commands to reinstall the distro's native `libfprint` package.
 
 ---
 
@@ -44,7 +46,28 @@ This command automatically:
   ./keyboard/install-keyboard.sh --uninstall
   ```
 
+* **Remove only the power management tweaks** (logind config, suspend
+  helpers, TLP config, thermald service enablement):
+
+  ```bash
+  ./power/install-power.sh --uninstall
+  ```
+
+* **Remove only the EC tools and services** (including the 80% battery
+  protection `c640-battery-limit.service`):
+
+  ```bash
+  ./ec/install-ec.sh --uninstall
+  ```
+
 ---
+
+## 🔋 Note: 80% Battery Protection Service
+
+`./ec/install-ec.sh --enable-battery-limit` installs and starts
+`c640-battery-limit.service`, which keeps the battery at 80% charge to
+prolong its lifespan. It is removed automatically by
+`./ec/install-ec.sh --uninstall` and by `./setup.sh --uninstall`.
 
 ## 📦 Restore Distro Native Packages
 

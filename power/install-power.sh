@@ -33,10 +33,12 @@ check_power_status() {
     local mem_sleep
     mem_sleep=$(cat /sys/power/mem_sleep 2> /dev/null || echo "unknown")
     log_info "Supported mem_sleep modes: $mem_sleep"
-    if [[ "$mem_sleep" == *"[s2idle]"* ]]; then
-        log_success "  S0ix Modern Standby (s2idle) is currently active."
+    local mem_sleep_default="${mem_sleep##*[}"
+    mem_sleep_default="${mem_sleep_default%]*}"
+    if [[ "$mem_sleep" == *"s2idle"* ]]; then
+        log_success "  S0ix Modern Standby (s2idle) is available (default: $mem_sleep_default)."
     else
-        log_warn "  System is not defaulting to [s2idle]. S0ix requires s2idle."
+        log_warn "  S0ix (s2idle) is not advertised by /sys/power/mem_sleep; check firmware settings."
     fi
 
     log_info "PCIe ASPM Policy:"

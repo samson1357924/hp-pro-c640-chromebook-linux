@@ -1,4 +1,4 @@
-[English](../README.md) | [繁體中文](../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
 
 # 🔄 系統復原與解除安裝指南 (Uninstallation & Rollback)
 
@@ -21,7 +21,9 @@
 1. 移除 `/usr/share/alsa/ucm2/` 中的 `sof-rt5682` 自訂 UCM 設定檔。
 2. 移除 `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 並重整硬體資料庫。
 3. 移除 `/etc/udev/rules.d/60-cros-fp.rules`。
-4. 提示發行版重裝原生 `libfprint` 套件的指令。
+4. 移除電源管理調校（logind 設定與休眠輔助）。
+5. 移除 EC 工具與 80% 電池保護服務。
+6. 提示發行版重裝原生 `libfprint` 套件的指令。
 
 ---
 
@@ -45,7 +47,25 @@
   ./keyboard/install-keyboard.sh --uninstall
   ```
 
+* **僅移除電源管理調校**（logind 設定、休眠輔助、TLP 設定、thermald 服務啟用）：
+
+  ```bash
+  ./power/install-power.sh --uninstall
+  ```
+
+* **僅移除 EC 工具與服務**（含 80% 電池保護 `c640-battery-limit.service`）：
+
+  ```bash
+  ./ec/install-ec.sh --uninstall
+  ```
+
 ---
+
+## 🔋 附註：80% 電池保護服務
+
+`./ec/install-ec.sh --enable-battery-limit` 會安裝並啟動 `c640-battery-limit.service`，
+將電池充電上限維持在 80% 以延長壽命。執行 `./ec/install-ec.sh --uninstall` 或
+`./setup.sh --uninstall` 時會一併移除。
 
 ## 📦 發行版原生套件還原
 

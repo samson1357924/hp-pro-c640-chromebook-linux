@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
 
 # 🔬 深度技術解析：S0ix 睡眠模式、ASPM 節能與電源管理
 
@@ -6,16 +6,37 @@
 
 ---
 
-## 1. S0ix (s2idle) vs S3 (Deep Sleep)
+## 1. s2idle (S0ix) vs S3 (Deep Sleep)
 
-Intel 10th Gen Comet Lake 搭配 Coreboot / MrChromebox UEFI 韌體**僅支援 S0ix (`s2idle`)**，不支援傳統的 ACPI S3 (`deep`)。
+在本機（Ubuntu、kernel 7.0）上，韌體**同時提供**兩種休眠模式，且預設為 **S3 deep sleep**：
 
 ```bash
 cat /sys/power/mem_sleep
-# 輸出格式應為：[s2idle]
+# 本機（Dratini + 現行韌體）實際輸出：s2idle [deep]
 ```
 
-在 S0ix 狀態下，CPU 核心停止運作，SoC 進入 Package C10 (SLP_S0#) 超低功耗狀態，達到與 S3 相當之待機續航，同時兼具毫秒級瞬間喚醒之優點。
+方括號標示目前的預設模式。最近一次休眠記錄確認 deep sleep 確實被使用且功能正常：
+
+```text
+PM: suspend entry (deep)
+```
+
+這推翻了「Coreboot / MrChromebox UEFI 韌體僅提供 s2idle」的舊假設：可用模式取決於確切的韌體版本與核心，請在自身安裝環境讀取 `/sys/power/mem_sleep` 實測確認，不要直接沿用假設。
+
+兩種模式差異如下：
+
+* **S3 (`deep`)**：平台執行真正的系統休眠（記憶體自刷新、SPM 轉換、整機低功耗），但喚醒需數秒。
+* **s2idle (S0ix Modern Standby)**：核心不進入韌體定義的休眠狀態，而是停止 CPU 核心、讓 SoC 嘗試進入 Package C10 (SLP_S0#) 超低功耗狀態，具備毫秒級瞬間喚醒。
+
+執行期切換預設模式：
+
+```bash
+echo deep | sudo tee /sys/power/mem_sleep
+# 或改用 S0ix Modern Standby：
+echo s2idle | sudo tee /sys/power/mem_sleep
+```
+
+若要永久生效，請在 `/etc/default/grub` 的 `GRUB_CMDLINE_LINUX_DEFAULT` 加入 `mem_sleep_default=deep`（或 `=s2idle`）並執行 `sudo update-grub`。
 
 ---
 

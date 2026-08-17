@@ -162,8 +162,8 @@ sudo journalctl -u fprintd -f
 
 ## 🙏 致謝 (Credits)
 
-* **[Abhinav Baid](https://github.com/abhinavbaid)**,
-  **[Felix Niederer](https://github.com/felixniederer)**,
-  **[Michael Evans](https://github.com/michaeleevans)**,
+* **Abhinav Baid**,
+  **Felix Niederer**,
+  **Michael Evans**,
   **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** & **libfprint team**.
 * **[ChromiumOS EC Team](https://chromium.googlesource.com/chromiumos/platform/ec/)** & **[Chrultrabook Project](https://chrultrabook.com/)**.

@@ -45,9 +45,10 @@ If a claim cannot be grounded, write `NOT_ENOUGH_INFO`.
 
 ### 4. ⚡ Power Management & Modern Standby (S0ix / s2idle)
 - **Symptom: High battery drain during suspend**:
-  - Check 1: `/sys/power/mem_sleep` must show `[s2idle]` (S0ix).
-  - Check 2: Check Intel PMC Core residency with `sudo cat /sys/kernel/debug/pmc_core/slp_s0_residency_usec`. If residency is 0 after sleep, a peripheral blocked Package C10 entry.
-  - Check 3: Check wake-up inhibition for touchpad/touchscreen in `/etc/udev/rules.d/90-c640-power.rules`.
+  - Check 1: `/sys/power/mem_sleep` should advertise both `s2idle` and `deep`; the bracketed mode is the current default (e.g. `s2idle [deep]`). If the default is `deep` (S3), that is normal on Coreboot/MrChromebox firmware; the kernel does not panic on S3.
+  - Check 2: If high drain during suspend, check whether S0ix is in use: read the default from `/sys/power/mem_sleep`, optionally switch with `echo s2idle | sudo tee /sys/power/mem_sleep`.
+  - Check 3: Check Intel PMC Core residency with `sudo cat /sys/kernel/debug/pmc_core/slp_s0_residency_usec`. If residency is 0 after sleep, a peripheral blocked Package C10 entry.
+  - Check 4: Check wake-up inhibition for touchpad/touchscreen in `/etc/udev/rules.d/90-c640-power.rules`.
 
 ---
 

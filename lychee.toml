@@ -1,13 +1,14 @@
 # lychee.toml - Link checker configuration for HP Pro c640 Linux Enablement
 root_dir = "."
 format = "detailed"
-verbose = false
 
-max_retries = 3
-retry_wait_time = 2
+# Retry generously: gitlab.freedesktop.org (canonical libfprint repo,
+# linked from the READMEs) periodically has gateway timeouts; a link is
+# only reported as broken after these retries fail.
+max_retries = 5
+retry_wait_time = 5
 timeout = 20
 max_concurrency = 16
-
 exclude_all_private = true
 exclude = [
     '^https?://localhost',
@@ -17,7 +18,14 @@ exclude = [
     'https://www.linkedin.com/.*',
     'https://twitter.com/.*',
     'https://x.com/.*',
-    'https://reddit.com/.*'
+    'https://reddit.com/.*',
+    # HP spec pages reject HEAD/GET from CI and bot user agents (HTTP/2
+    # protocol errors, 403s); the URL is user-verifiable in a browser.
+    'https://support\.hp\.com/.*'
 ]
 
-accept = [200, 204, 206, 403]
+# Gateway errors (502/503/504) mean the server never answered; with the
+# retries above these are infrastructure flakiness (gitlab.freedesktop.org
+# is a recurring offender), not broken links. Real dead links still fail
+# with 404/410/etc.
+accept = [200, 204, 206, 403, 502, 503, 504]

@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
 
 # 🔬 深度技術解析：Intel Comet Lake SOF DSP 與 ALSA UCM2 音訊拓撲
 

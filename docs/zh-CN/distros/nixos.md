@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
 
 # ❄️ NixOS 宣告式配置指南
 
