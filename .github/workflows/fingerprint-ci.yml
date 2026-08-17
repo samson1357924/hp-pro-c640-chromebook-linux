@@ -70,6 +70,7 @@ jobs:
             -I./fingerprint/driver \
             -I./fingerprint/tests \
             fingerprint/tests/test-crfpmoc-unit.c \
+            fingerprint/driver/crfpmoc-proto.c \
             -o test-crfpmoc-unit \
             "${ldflags[@]}"
 

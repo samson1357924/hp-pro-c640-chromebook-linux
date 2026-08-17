@@ -59,7 +59,10 @@ build_raw_cmd (CrfpMocEcTransfer *transfer)
   g_autofree struct crfpmoc_cros_ec_command_v2 *s_cmd = NULL;
   gsize total;
 
-  total = sizeof (*s_cmd) + MAX (transfer->outsize, transfer->insize);
+  /* The kernel reads the request from data[0..outsize) and writes the
+   * response back to data[0..insize); the buffer must hold header plus
+   * both payloads. */
+  total = sizeof (*s_cmd) + transfer->outsize + transfer->insize;
   s_cmd = g_malloc0 (total);
   s_cmd->command = transfer->command;
   s_cmd->version = transfer->version;
@@ -116,8 +119,14 @@ do_ioctl_xcmd (CrfpMocEcTransfer                 *transfer,
       return -1;
     }
 
+  /* Record the actual number of response bytes received so callers can
+   * bounds-check the parsed response against what the device really
+   * sent (an EC that returns fewer bytes than requested must not be
+   * parsed as a full-size response). */
+  transfer->insize = MIN (r, transfer->insize);
+
   if (transfer->insize > 0 && transfer->indata)
-    memcpy (transfer->indata, s_cmd->data, MIN (r, transfer->insize));
+    memcpy (transfer->indata, s_cmd->data, transfer->insize);
 
   return r;
 }
@@ -145,7 +154,7 @@ command_thread_func (GTask        *task,
     {
       transfer->raw_cmd = g_steal_pointer (&s_cmd);
       transfer->raw_cmd_size = sizeof (struct crfpmoc_cros_ec_command_v2)
-                               + MAX (transfer->outsize, transfer->insize);
+                               + transfer->outsize + transfer->insize;
     }
 
   if (g_task_return_error_if_cancelled (task))
@@ -349,25 +358,121 @@ crfpmoc_ec_transfer_submit_finish (GAsyncResult *result,
   return ret;
 }
 
-gboolean
-crfpmoc_ec_transfer_submit_sync (CrfpMocEcTransfer *transfer,
-                                 GError           **error)
+typedef struct
 {
+  CrfpMocEcTransfer *transfer;
+  FpDevice          *device; /* ref held for the worker's lifetime */
+  gint               result;
+  GError            *error;
+  GMutex             mutex;
+  GCond              cond;
+  gboolean           done;
+  gint               refcount;
+} SyncXcmdData;
+
+static void
+sync_xcmd_data_unref (SyncXcmdData *data)
+{
+  if (g_atomic_int_dec_and_test (&data->refcount))
+    {
+      g_clear_error (&data->error);
+      g_mutex_clear (&data->mutex);
+      g_cond_clear (&data->cond);
+      g_object_unref (data->device);
+      crfpmoc_ec_transfer_free (data->transfer);
+      g_free (data);
+    }
+}
+
+static gpointer
+sync_xcmd_thread_func (gpointer data)
+{
+  SyncXcmdData *d = data;
   g_autofree struct crfpmoc_cros_ec_command_v2 *s_cmd = NULL;
-  int r;
+
+  s_cmd = build_raw_cmd (d->transfer);
+  d->result = do_ioctl_xcmd (d->transfer, s_cmd, &d->error);
+
+  if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (d->transfer->device)))
+    crfpmoc_umockdev_record (FPI_DEVICE_CRFPMOC (d->transfer->device), d->result,
+                             CRFPMOC_CROS_EC_DEV_IOCXCMD_V2, s_cmd);
+
+  g_mutex_lock (&d->mutex);
+  d->done = TRUE;
+  g_cond_signal (&d->cond);
+  g_mutex_unlock (&d->mutex);
+
+  sync_xcmd_data_unref (d);
+  return NULL;
+}
+
+/* Submit an EC command synchronously with a bounded wait, so a hung EC
+ * cannot block the fprintd main loop indefinitely (the kernel bounds the
+ * ioctl itself, but a worker thread keeps the main loop responsive).
+ *
+ * Ownership of transfer is always taken: on success it is freed after
+ * the worker finishes, on timeout the worker keeps it until the ioctl
+ * returns, so the caller must not touch transfer afterwards. The device
+ * is referenced for the worker's lifetime so it cannot be finalized
+ * while the worker still dereferences it after a timeout.
+ */
+gboolean
+crfpmoc_ec_transfer_submit_sync_timeout (CrfpMocEcTransfer *transfer,
+                                         guint              timeout_ms,
+                                         GError           **error)
+{
+  SyncXcmdData *d;
+  GThread *thread;
+  gboolean completed;
+  gint result;
+  g_autoptr(GError) local_error = NULL;
+  gboolean ok;
 
   g_assert (transfer != NULL);
 
+  guint16 command = transfer->command;
   crfpmoc_ec_transfer_log_cmd (transfer);
 
-  s_cmd = build_raw_cmd (transfer);
-  r = do_ioctl_xcmd (transfer, s_cmd, error);
+  d = g_new0 (SyncXcmdData, 1);
+  d->transfer = transfer;
+  d->device = g_object_ref (transfer->device);
+  d->refcount = 2; /* caller + worker thread */
+  g_mutex_init (&d->mutex);
+  g_cond_init (&d->cond);
 
-  if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (transfer->device)))
-    crfpmoc_umockdev_record (FPI_DEVICE_CRFPMOC (transfer->device), r,
-                             CRFPMOC_CROS_EC_DEV_IOCXCMD_V2, s_cmd);
+  thread = g_thread_new ("crfpmoc-xcmd-timeout", sync_xcmd_thread_func, d);
 
-  return r >= 0;
+  g_mutex_lock (&d->mutex);
+  gint64 deadline = g_get_monotonic_time () + (gint64) timeout_ms * 1000;
+  while (!d->done)
+    {
+      if (!g_cond_wait_until (&d->cond, &d->mutex, deadline))
+        break;
+    }
+  completed = d->done;
+  g_mutex_unlock (&d->mutex);
+
+  if (!completed)
+    {
+      g_thread_unref (thread);
+      sync_xcmd_data_unref (d);
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                   "EC command 0x%x did not complete within %u ms",
+                   command, timeout_ms);
+      return FALSE;
+    }
+
+  g_thread_join (thread);
+  result = d->result;
+  local_error = g_steal_pointer (&d->error);
+  ok = result >= 0;
+  sync_xcmd_data_unref (d);
+
+  if (ok)
+    return TRUE;
+
+  g_propagate_error (error, g_steal_pointer (&local_error));
+  return FALSE;
 }
 
 void

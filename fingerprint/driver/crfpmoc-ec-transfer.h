@@ -80,8 +80,9 @@ void crfpmoc_ec_transfer_submit_eventmask (CrfpMocEcTransfer        *transfer,
 gboolean crfpmoc_ec_transfer_submit_finish (GAsyncResult *result,
                                             GError      **error);
 
-gboolean crfpmoc_ec_transfer_submit_sync (CrfpMocEcTransfer *transfer,
-                                          GError           **error);
+gboolean crfpmoc_ec_transfer_submit_sync_timeout (CrfpMocEcTransfer *transfer,
+                                                  guint              timeout_ms,
+                                                  GError           **error);
 
 void crfpmoc_ssm_ec_transfer_cb (CrfpMocEcTransfer *transfer,
                                  GAsyncResult      *result,
