@@ -1,4 +1,4 @@
-[English](../README.md) | [繁體中文](../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
 
 # 📊 硬體相容性矩陣 (Hardware Compatibility Matrix)
 
@@ -22,7 +22,7 @@ HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hat
 | **視訊鏡頭** | 720p HD Camera (附隱私蓋) | `uvcvideo` | 🟢 **免設定** | 標準 USB UVC 鏡頭。 |
 | **雙 Type-C 輸出** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | 🟢 **免設定** | 雙孔皆支援 45W/65W PD 快充與 DP 1.2 螢幕輸出。 |
 | **鍵盤頂排按鍵** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **100% 正常** | 映射為上一頁/下一頁/重新整理/亮度/音量等標準媒體鍵。 |
-| **待機休眠** | Intel S0ix Modern Standby | ACPI `s2idle` | 🟢 **100% 正常** | 支援蓋螢幕休眠與按鍵/指紋快速喚醒。 |
+| **待機休眠** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **100% 正常** | 兩種模式皆可用；預設為 S3 `deep`（詳見電源深入解析）。支援蓋螢幕休眠與按鍵/指紋快速喚醒。 |
 
 ---
 

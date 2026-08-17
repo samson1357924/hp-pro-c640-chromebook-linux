@@ -135,11 +135,11 @@ Special thanks to the following open-source projects, contributors and
 communities that laid the foundation for cross-platform ChromeOS and Linux
 hardware support:
 
-* **[Abhinav Baid](https://github.com/abhinavbaid)**: Original author of the
+* **Abhinav Baid**: Original author of the
   `crfpmoc` (ChromeOS Match-on-Chip) libfprint driver.
-* **[Felix Niederer](https://github.com/felixniederer)**: Early maintenance and
+* **Felix Niederer**: Early maintenance and
   architecture contributions to the `crfpmoc` driver.
-* **[Michael Evans](https://github.com/michaeleevans)**: Protocol extension and multi-version fix contributions.
+* **Michael Evans**: Protocol extension and multi-version fix contributions.
 * **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** and the
   **[libfprint / freedesktop.org](https://gitlab.freedesktop.org/libfprint/libfprint)**
   team: A powerful and robust Linux biometric driver framework.

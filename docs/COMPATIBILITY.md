@@ -22,7 +22,7 @@ Lake-U platform):
 | **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | 🟢 **No setup needed** | Standard USB UVC camera. |
 | **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | 🟢 **No setup needed** | Both ports support 45W/65W PD fast charging and DP 1.2 display output. |
 | **Keyboard Top-Row Keys** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **100% Working** | Mapped to standard media keys such as Back/Forward/Reload/Brightness/Volume. |
-| **Standby / Sleep** | Intel S0ix Modern Standby | ACPI `s2idle` | 🟢 **100% Working** | Supports lid-close sleep and fast wake via keys/fingerprint. |
+| **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **100% Working** | Both modes advertised; S3 `deep` is the default (see the power deep-dive). Supports lid-close sleep and fast wake via keys/fingerprint. |
 
 ---
 

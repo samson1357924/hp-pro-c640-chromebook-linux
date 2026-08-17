@@ -121,9 +121,9 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 
 特別感謝以下開源專案、貢獻者與社群為 ChromeOS 與 Linux 跨平台硬體支援所奠定的基礎：
 
-* **[Abhinav Baid](https://github.com/abhinavbaid)**：原創 `crfpmoc` (ChromeOS Match-on-Chip) libfprint 驅動程式作者。
-* **[Felix Niederer](https://github.com/felixniederer)**：`crfpmoc` 驅動程式早期維護與架構貢獻。
-* **[Michael Evans](https://github.com/michaeleevans)**：協議擴展與多版本修復貢獻。
+* **Abhinav Baid**：原創 `crfpmoc` (ChromeOS Match-on-Chip) libfprint 驅動程式作者。
+* **Felix Niederer**：`crfpmoc` 驅動程式早期維護與架構貢獻。
+* **Michael Evans**：協議擴展與多版本修復貢獻。
 * **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** 及
   **[libfprint / freedesktop.org](https://gitlab.freedesktop.org/libfprint/libfprint)**
   團隊：強大且健全的 Linux 生物識別驅動框架。

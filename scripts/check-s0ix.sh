@@ -16,11 +16,15 @@ check_dmi_board || true
 
 # 1. Check mem_sleep mode
 MEM_SLEEP=$(cat /sys/power/mem_sleep 2> /dev/null || echo "unknown")
-log_info "[1/4] Current ACPI Sleep Mode (/sys/power/mem_sleep): $MEM_SLEEP"
-if [[ "$MEM_SLEEP" == *"[s2idle]"* ]]; then
-    log_success "  [OK] System is set to [s2idle] (S0ix Modern Standby)."
+log_info "[1/4] Supported ACPI Sleep Modes (/sys/power/mem_sleep): $MEM_SLEEP"
+if [[ "$MEM_SLEEP" == *"s2idle"* ]]; then
+    MEM_SLEEP_DEFAULT="${MEM_SLEEP##*[}"
+    MEM_SLEEP_DEFAULT="${MEM_SLEEP_DEFAULT%]*}"
+    log_success "  [OK] S0ix Modern Standby (s2idle) is supported; current default: $MEM_SLEEP_DEFAULT"
+    log_info "  Switch to S0ix for the session: echo s2idle | sudo tee /sys/power/mem_sleep"
+    log_info "  Make it persistent: add mem_sleep_default=s2idle to GRUB_CMDLINE_LINUX_DEFAULT, then sudo update-grub"
 else
-    log_warn "  [WARN] Default is not [s2idle]. Set via: echo s2idle | sudo tee /sys/power/mem_sleep"
+    log_warn "  [WARN] S0ix (s2idle) is not advertised; check firmware (Coreboot) settings."
 fi
 
 # 2. Check Intel PMC Core debugfs interface

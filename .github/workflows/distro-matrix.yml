@@ -32,14 +32,45 @@ jobs:
           globs: '**/*.md'
           config: '.markdownlint.yaml'
 
+      - name: Check Relative Markdown Links
+        run: |
+          set -euo pipefail
+          # Every relative link must resolve against its own file's directory.
+          # (lychee resolves relative links against --base, which does not
+          # match how these docs are organized, so this is checked here.)
+          fail=0
+          while IFS= read -r f; do
+            dir=$(dirname "$f")
+            while IFS= read -r t; do
+              [ -z "$t" ] && continue
+              t="${t%% *}"
+              case "$t" in
+                http://*|https://*|mailto:*|\#*) continue ;;
+              esac
+              t="${t%%#*}"
+              [ -z "$t" ] && continue
+              if [ ! -e "$dir/$t" ]; then
+                echo "BROKEN: $f -> $t"
+                fail=1
+              fi
+            done < <(grep -oE '\[[^]]*\]\([^)]*\)' "$f" | sed -E 's/^\[[^]]*\]\(([^)]*)\)/\1/')
+          done < <(find . -type f -name '*.md' -not -path './.git/*' \
+            -not -path './audio/upstream/*' -not -path './github_bot/prompts/*')
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Broken relative markdown links found"
+            exit 1
+          fi
+
       - name: Run Lychee Link Checker
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: >-
             --config lychee.toml
-            --base .
             "**/*.md"
-          fail: false
+          # Broken links now fail the check: the docs are the primary
+          # user-facing interface of this project. See lychee.toml for the
+          # (narrow) exclusion list and accepted status codes.
+          fail: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

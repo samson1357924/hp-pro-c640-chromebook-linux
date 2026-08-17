@@ -1,4 +1,4 @@
-[English](../README.md) | [繁體中文](../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
 
 # 🛠️ 疑難排解與避坑 FAQ (Troubleshooting & Pitfall Guide)
 
