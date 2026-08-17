@@ -25,7 +25,11 @@ exclude = [
     # ALSA site accepts TCP/TLS but never answers HTTP from CI and other
     # networks (documented recurring outages, e.g. adoptium/temurin-build#3932);
     # the URL is user-verifiable in a browser.
-    'https?://(www\.)?alsa-project\.org/.*'
+    'https?://(www\.)?alsa-project\.org/.*',
+    # pipewire.org (Fastly CDN) intermittently refuses connections from
+    # CI runner egress networks while working fine in browsers; the URL
+    # is user-verifiable in a browser.
+    'https?://(www\.)?pipewire\.org/.*'
 ]
 
 # Gateway errors (502/503/504) mean the server never answered; with the
