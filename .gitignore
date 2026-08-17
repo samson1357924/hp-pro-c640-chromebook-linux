@@ -55,6 +55,13 @@ core.*
 # Python caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+node_modules/
+.venv/
 
 # Linux Kernel out-of-tree artifacts
 *.ko

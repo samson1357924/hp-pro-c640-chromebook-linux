@@ -22,7 +22,7 @@ jobs:
     name: Validate UCM2 Profiles
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      image: fedora:42
     steps:
       - name: Install Build Dependencies & ALSA Tools
         run: |
@@ -30,7 +30,7 @@ jobs:
           dnf -y install alsa-lib alsa-ucm alsa-utils python3 python3-pip make git
 
       - name: Checkout Current Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: repo
 
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Current Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Validate Patch Formatting & Structure
         run: |
