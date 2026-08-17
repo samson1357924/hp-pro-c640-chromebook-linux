@@ -21,7 +21,11 @@ exclude = [
     'https://reddit.com/.*',
     # HP spec pages reject HEAD/GET from CI and bot user agents (HTTP/2
     # protocol errors, 403s); the URL is user-verifiable in a browser.
-    'https://support\.hp\.com/.*'
+    'https://support\.hp\.com/.*',
+    # ALSA site accepts TCP/TLS but never answers HTTP from CI and other
+    # networks (documented recurring outages, e.g. adoptium/temurin-build#3932);
+    # the URL is user-verifiable in a browser.
+    'https?://(www\.)?alsa-project\.org/.*'
 ]
 
 # Gateway errors (502/503/504) mean the server never answered; with the

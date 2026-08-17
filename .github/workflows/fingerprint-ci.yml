@@ -89,15 +89,23 @@ jobs:
         with:
           args: >
             bash -c "
-            pacman -Syu --noconfirm namcap pacman-contrib base-devel git &&
+            retry() {
+              local n=0
+              until \"$@\"; do
+                n=$((n+1))
+                [ \"$n\" -ge 4 ] && return 1
+                echo \"::warning::Command failed (attempt $n/4), retrying in 15s\";
+                sleep 15;
+              done
+            };
+            retry pacman -Syu --disable-download-timeout --noconfirm namcap pacman-contrib base-devel git &&
             useradd -m builder &&
-            chown -R builder:builder /github/workspace &&
             su builder -c '
               cd fingerprint/packaging &&
               echo \"=== Checking PKGBUILD with namcap ===\" &&
-              namcap_output=\$(namcap PKGBUILD || true) &&
-              printf \"%s\n\" \"\$namcap_output\" &&
-              if printf \"%s\n\" \"\$namcap_output\" | grep -qE \"(^|[ :])E: \"; then
+              namcap_output=$(namcap PKGBUILD || true) &&
+              printf \"%s\n\" \"$namcap_output\" &&
+              if printf \"%s\n\" \"$namcap_output\" | grep -qE \"(^|[ :])E: \"; then
                 echo \"namcap found errors (E: lines above)\";
                 exit 1;
               fi
@@ -114,9 +122,9 @@ jobs:
             echo \"=== Validating RPM Spec syntax ===\" &&
             rpmspec -q --srpm libfprint-crfpmoc.spec &&
             echo \"=== Running rpmlint on spec file ===\" &&
-            rpmlint_output=\$(rpmlint libfprint-crfpmoc.spec || true) &&
-            printf \"%s\n\" \"\$rpmlint_output\" &&
-            if printf \"%s\n\" \"\$rpmlint_output\" | grep -qE \"(^|[ :])E: \"; then
+            rpmlint_output=$(rpmlint libfprint-crfpmoc.spec || true) &&
+            printf \"%s\n\" \"$rpmlint_output\" &&
+            if printf \"%s\n\" \"$rpmlint_output\" | grep -qE \"(^|[ :])E: \"; then
               echo \"rpmlint found errors (E: lines above)\";
               exit 1;
             fi

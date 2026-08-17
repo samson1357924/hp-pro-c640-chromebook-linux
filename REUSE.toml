@@ -86,3 +86,16 @@ path = [
 ]
 SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
 SPDX-License-Identifier = "CC0-1.0"
+
+# Fingerprint driver overlay tarball (binary archive of LGPL-2.1-or-later
+# crfpmoc driver sources; PKGBUILD and spec carry their own SPDX headers)
+[[annotations]]
+path = "fingerprint/packaging/crfpmoc-driver-overlay.tar.gz"
+SPDX-FileCopyrightText = [
+    "2024 Abhinav Baid <abhinavbaid@gmail.com>",
+    "2024 Felix Niederer <felix@niederer.dev>",
+    "2025 Michael Evans <mike.67.442@gmail.com>",
+    "2026 Marco Trevisan (Treviño) <mail@3v1n0.net>",
+    "2026 Samson <https://github.com/samson1357924>"
+]
+SPDX-License-Identifier = "LGPL-2.1-or-later"

@@ -94,7 +94,7 @@ jobs:
             image: "fedora:42"
             family: "fedora"
             init_cmd: "dnf install -y bash coreutils sudo git"
-            check_pkgs_cmd: "dnf install --assumeyes --downloadonly --destdir=/tmp/ci-dnf-check -y"
+            check_pkgs_cmd: "dnf download --resolve --destdir=/tmp/ci-dnf-check"
 
           - name: "Arch Linux"
             image: "archlinux:base-devel"
