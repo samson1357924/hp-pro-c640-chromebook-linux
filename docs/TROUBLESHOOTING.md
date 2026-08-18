@@ -191,7 +191,9 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
 ### 12. Laptop doesn't suspend when the lid is closed
 
-* **Solution**: make sure `/etc/systemd/logind.conf` contains:
+* **Solution**: make sure `/etc/systemd/logind.conf.d/99-hp-c640-lid.conf`
+  (installed by `./power/install-power.sh`) or `/etc/systemd/logind.conf`
+  contains:
 
   ```ini
   [Login]
@@ -199,4 +201,133 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   HandleLidSwitchExternalPower=suspend
   ```
 
-  Then restart the service: `sudo systemctl restart systemd-logind`.
+* **⚠️ After changing logind config, REBOOT — do NOT `systemctl restart
+  systemd-logind`**:
+  restarting `systemd-logind` while a desktop session is active **logs out
+  every logged-in user** (the session leader is lost during deserialization,
+  which tears down the whole GNOME session, kills the user manager and can
+  even look like a system freeze). The new setting only takes effect at the
+  next login/boot anyway, so a reboot (or logging out and back in) is the
+  correct — and only safe — way to apply it.
+
+  ```bash
+  # DON'T do this:
+  sudo systemctl restart systemd-logind
+
+  # DO this instead — reboot and the lid rule is live:
+  sudo systemctl reboot
+  ```
+
+  *(Verified 2026-08-18: restarting systemd-logind caused a full session
+  logout storm that appeared as a system crash on an HP Pro c640.)*
+
+### 13. No fingerprint prompt on the lock screen after suspend/resume (or instantly after locking)
+
+* **Symptoms**: after lid-close suspend and reopen (or locking and interacting
+  immediately), the unlock dialog shows **no fingerprint hint and touching the
+  sensor does nothing**. Pressing `Esc` and re-entering the login screen makes
+  fingerprint work.
+* **Root cause**: a device-claim race between two PAM workers. On unlock, GDM
+  forks the `gdm-password` worker and the `gdm-fingerprint` worker
+  concurrently. Both PAM stacks used to contain `pam_fprintd`:
+  `gdm-password` pulls it from `common-auth` (if the fprintd profile is
+  enabled via `pam-auth-update`), `gdm-fingerprint` has
+  `auth required pam_fprintd.so`. fprintd allows **only one Claim** per
+  device; the password worker is forked first and wins, the fingerprint
+  worker gets `Authorization denied ... Device was already claimed`, the
+  whole fingerprint service fails, and GNOME Shell hides the fingerprint
+  prompt. Suspended sessions make it deterministic because reauth starts
+  ~400 ms after wake.
+* **Evidence**:
+
+  ```text
+  fprintd: Authorization denied to :1.142 to call method 'Claim' for device
+  'ChromeOS Fingerprint Match-on-Chip': Device was already claimed
+  ```
+
+  Upstream tracking: GNOME/gdm#1071, libfprint/fprintd#214,
+  GNOME/gnome-shell#7791 (all open as of 2026-08).
+* **Solution (installed by this project's installer since 2026-08-18)**:
+  keep `pam_fprintd` **out of `common-auth`** and enable fingerprint **only
+  for sudo** (`auth sufficient pam_fprintd.so` in `/etc/pam.d/sudo`). The
+  GDM login screen and lock screen keep working via the dedicated
+  `gdm-fingerprint` PAM service, which now always wins the claim.
+
+  ```bash
+  # what the installer does:
+  sudo pam-auth-update --remove fprintd
+  sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
+  ```
+
+  *(This also removes the previous race window for `sudo` — see section 8
+  for the single-stack rule.)*
+* **Manual recovery (if you are on an older install)**: press `Esc` to cancel
+  the failed unlock round, then unlock again — the fresh workers re-claim
+  cleanly. Or run `sudo systemctl restart fprintd` before unlocking.
+* **Residual issue after the PAM fix (FPMCU open fails right after resume)**:
+  even with the claim race gone, the *first* unlock attempt after resume can
+  still fail: the claim succeeds but the crfpmoc **device open fails
+  instantly** (the EC/FPMCU channel is not ready in the first ~2 s after S3
+  wake), `pam_fprintd` errors and the shell shows no fingerprint prompt (no
+  `already claimed` line is logged in this case — confirmed with
+  `G_MESSAGES_DEBUG=fprintd`, 2026-08-19: `claiming the device: 0` without
+  `claimed device 0`). Two complementary fixes ship with this project:
+  1. **Driver-level open retry (the real fix, since 2026-08-19)**: the
+     audited `crfpmoc` driver retries the open SSM with a bounded budget
+     (`CRFPMOC_OPEN_MAX_RETRIES` × 500 ms) when the EC channel reports I/O or
+     EC errors right after wake. A healthy open completes on the first
+     attempt with **zero added latency**; only a failed open waits.
+  2. **System-sleep hook hygiene**: `fingerprint/systemd/fprintd-sleep.sh`
+     stops fprintd before sleep so resume always gets a fresh daemon.
+
+  Verify after a lid cycle:
+
+  ```bash
+  journalctl -b -e -u fprintd | grep -E "claim|open|retry"
+  # expect: "claimed device 0" on the FIRST post-resume claim
+  #         (plus "retrying" lines only if the EC channel needed a moment)
+  ```
+
+  *(If it still fails, temporarily install
+  `Environment=G_MESSAGES_DEBUG=fprintd` in a fprintd.service drop-in and
+  repeat the lid cycle to capture the driver error.)*
+
+### 14. Screen stays dark after lid-open resume (until a key/click)
+
+* **Symptoms**: after lid close (S3 `deep`) and reopen, the system resumes
+  (`PM: suspend exit`) but the panel stays **dark** until a key press or
+  click. Not a hang — the lock screen works once any input arrives.
+* **Root cause (two candidate mechanisms, 2026-08-18)**:
+  1. **GNOME userspace re-blank** (most likely, matches the keypress-cure
+     signature): `gsd-power` blanks the panel on suspend; the screen-shield
+     lock animation stalls while the display is off, and when it completes
+     after resume the power plugin turns the monitor **back off**
+     (GNOME/mutter#4111, fix candidate gnome-shell!3742 — unmerged).
+  2. **i915 PSR resume bug** on Comet Lake (gitlab.freedesktop.org/drm/i915),
+     and/or kernel 7.0 eDP backlight regressions (drm/i915/kernel#16791,
+     #16825). Less likely because those are not cured by a keypress.
+* **Solution (this project)**: the `power/install-power.sh` modprobe quirk
+  `options i915 enable_psr=0 enable_fbc=1 enable_guc=2` is the repo's
+  candidate remedy for suspend/resume black screens. It was installed and
+  the device rebooted on 2026-08-19, but **it did not resolve the dark
+  panel** on this unit (still dark until keypress — user accepted the
+  behavior; see [VERIFICATION.md](verification.md)). Apply it and reboot if
+  you want to try it:
+
+  ```bash
+  ./power/install-power.sh   # or manually:
+  sudo install -D -m 0644 power/modprobe.d/99-hp-c640-power.conf \
+      /etc/modprobe.d/99-hp-c640-power.conf
+  sudo update-initramfs -u
+  sudo systemctl reboot
+  ```
+
+  > [!NOTE]
+  > On kernel ≥ 7.0 the installer automatically strips the removed
+  > `iwlwifi d0i3_disable` parameter (see the file's comment header).
+* **If the panel is still dark** after a lid cycle with `enable_psr=0`:
+  test `MUTTER_DEBUG_FORCE_KMS_MODE=simple` in `/etc/environment` (isolates
+  the atomic-KMS resume path, see drm/i915/kernel#16825), or watch
+  `busctl monitor` on `org.gnome.SettingsDaemon.Power` for a
+  turn-off-after-resume event (confirms the userspace re-blank hypothesis).
+  Report findings against GNOME/mutter#4111.

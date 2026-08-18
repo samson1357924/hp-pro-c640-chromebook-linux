@@ -10,19 +10,19 @@ Lake-U platform):
 
 | Hardware Component | Chip Model / Spec | Linux Kernel Driver | Support Status | Notes / Solutions |
 | :--- | :--- | :--- | :---: | :--- |
-| **Fingerprint Reader** | Fingerprint Cards FPC1025 (FPMCU MoC) | `/dev/cros_fp` (`cros_ec_spi`) | 🟢 **100% Working** | Uses this project's `crfpmoc` driver + PAM. Supports lock-screen unlock and `sudo`. |
-| **Built-in Stereo Speakers** | Maxim MAX98357A (I2S Amp) | `snd_soc_max98357a` | 🟢 **100% Working** | Output via ALSA UCM2 PCM 5, supports hardware volume control. |
-| **3.5mm Headphone Jack** | Realtek RT5682 (I2C) | `snd_soc_rt5682` | 🟢 **100% Working** | Supports automatic plug detection switching (JD1) and headset mic input. |
-| **Built-in Digital Microphones** | 2-channel PDM DMIC | `snd_soc_dmic` | 🟢 **100% Working** | UCM PCM Split divides into stereo Mic 1 and Mic 2. |
-| **Wi-Fi 6** | Intel Wi-Fi 6 AX201 (CNVi) | `iwlwifi` | 🟢 **No setup needed** | Built into the kernel, supports 802.11ax and WPA3. |
-| **Bluetooth 5.0** | Intel AX201 Bluetooth | `btusb` / `btintel` | 🟢 **No setup needed** | Supports BLE, A2DP audio and HID Bluetooth peripherals. |
-| **Touchpad** | ELAN I2C Touchpad | `i2c_hid` / `elan_i2c` | 🟢 **No setup needed** | Native multi-finger gestures and palm rejection. |
-| **Touchscreen (optional)** | Goodix / ELAN / G2Touch | `i2c_hid_acpi` | 🟢 **No setup needed** | Supports multi-touch and USI Stylus pen input. |
-| **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | 🟢 **No setup needed** | Supports Wayland/X11, VA-API hardware encode/decode (4K 60fps). |
-| **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | 🟢 **No setup needed** | Standard USB UVC camera. |
-| **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | 🟢 **No setup needed** | Both ports support 45W/65W PD fast charging and DP 1.2 display output. |
-| **Keyboard Top-Row Keys** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **100% Working** | Mapped to standard media keys such as Back/Forward/Reload/Brightness/Volume. |
-| **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **100% Working** | Both modes advertised; S3 `deep` is the default (see the power deep-dive). Supports lid-close sleep and fast wake via keys/fingerprint. |
+| **Fingerprint Reader** | Fingerprint Cards FPC1025 (FPMCU MoC) | `/dev/cros_fp` (`cros_ec_spi`) | 🟢 **Working** | This project's `crfpmoc` driver + PAM; lock-screen unlock and `sudo` **hardware-tested 2026-08-19**. |
+| **Built-in Stereo Speakers** | Maxim MAX98357A (I2S Amp) | `snd_soc_max98357a` | 🟢 **Working** | Output via ALSA UCM2 PCM 5; **hardware-tested** (Chromium playback). |
+| **3.5mm Headphone Jack** | Realtek RT5682 (I2C) | `snd_soc_rt5682` | ⚠️ **Driver bound** | Device present (PCM 0); **auto-switch on plug/unplug not captured in evidence**. |
+| **Built-in Digital Microphones** | 2-channel PDM DMIC | `snd_soc_dmic` | 🟢 **Working** | UCM PCM Split into stereo Mic 1 / Mic 2; **hardware-tested**. |
+| **Wi-Fi 6** | Intel Wi-Fi 6 AX201 (CNVi) | `iwlwifi` | ⚠️ **Driver bound** | Loads out of the box; **WPA3 / throughput not measured** on this device. |
+| **Bluetooth 5.0** | Intel AX201 Bluetooth | `btusb` / `btintel` | ⚠️ **Driver bound** | Controller present; **pairing / A2DP audio not captured in evidence**. |
+| **Touchpad** | ELAN I2C Touchpad | `i2c_hid` / `elan_i2c` | ⚠️ **Driver bound** | Module present; **multi-finger gestures / palm rejection not functionally tested**. |
+| **Touchscreen (optional)** | Goodix / ELAN / G2Touch | `i2c_hid_acpi` | ⚠️ **Driver bound** | Module present; **multi-touch / stylus input not functionally tested**. |
+| **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | ⚠️ **Driver bound** | Display works out of the box; **VA-API 4K 60fps decode not measured**. |
+| **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | ⚠️ **Driver bound** | Standard USB UVC camera; **capture not tested**. |
+| **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **Charging works** | PD charging nodes present; **DP 1.2 display output not verified**. |
+| **Keyboard Top-Row Keys** | ChromeOS Top-Row Keys | `udev hwdb` / `keyd` | 🟢 **Working** | Mapped to standard media keys; **hwdb verified** (backlight brightness untested). |
+| **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 lid cycle verified** | S3 `deep` default; real lid-close cycle tested 2026-08-18. **Key/fingerprint wake untested**; panel stays dark on lid open until a keypress (see [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)). |
 
 ---
 
@@ -30,9 +30,9 @@ Lake-U platform):
 
 * **Recommended Linux kernel**: Linux Kernel `>= 5.15` (recommend `>= 6.5` for the best SOF DSP and S0ix power performance).
 * **Audio server**: PipeWire `>= 0.3.65` (recommend PipeWire 1.0+ / WirePlumber 0.4.14+).
-* **Verified distros**:
-  * **Ubuntu 24.04 LTS / 26.04 LTS** (works perfectly)
-  * **Debian 12 (Bookworm) / 13 (Trixie)**
-  * **Fedora 39 / 40 / 41**
-  * **Arch Linux / EndeavourOS**
-  * **openSUSE Tumbleweed**
+* **Distro testing status** (see [VERIFICATION.md](verification.md) for what was actually
+  hardware-tested):
+  * 🟢 **Hardware-tested on real device**: **Ubuntu 26.04 LTS** (kernel `7.0.0-29-generic`,
+    PipeWire `1.6.2`, WirePlumber `0.5.13`, fprintd `1.94.5`)
+  * ⚠️ **Build-tested in CI only (no hardware test)**: Debian 12/13, Fedora 39-41,
+    Arch Linux / EndeavourOS, openSUSE Tumbleweed

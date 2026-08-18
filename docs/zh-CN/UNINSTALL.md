@@ -35,11 +35,14 @@
   ./audio/install-audio.sh --uninstall
   ```
 
-* **僅移除指紋 udev 規則**：
+* **僅移除指紋 udev 規則、PAM 設定與 system-sleep hook**：
 
   ```bash
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
+
+  *（會還原備份的 `libfprint`、`60-cros-fp.rules` 與 `/etc/pam.d/sudo`，
+  並移除 `fprintd-sleep.sh` system-sleep hook。）*
 
 * **僅移除鍵盤頂排映射**：
 
@@ -52,6 +55,12 @@
   ```bash
   ./power/install-power.sh --uninstall
   ```
+
+  > [!WARNING]
+  > 移除電源模組後請**重新開機**（或登出再登入）——**不要**執行
+  > `systemctl restart systemd-logind`。在有登入 session 的桌面環境中重啟
+  > `systemd-logind` 會登出所有人（session leader 在 deserialization 時遺失），
+  > 外觀上與系統當機完全相同（HP Pro c640 實測，2026-08-18）。
 
 * **僅移除 EC 工具與服務**（含 80% 電池保護 `c640-battery-limit.service`）：
 

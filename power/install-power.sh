@@ -62,8 +62,12 @@ uninstall_power() {
     log_section "Uninstalling Power Optimization Profiles"
     rollback_component "power"
 
+    # NOTE: do NOT restart systemd-logind here — with an active desktop session
+    # it logs everyone out (session leader is lost on deserialization), which
+    # appears as a system crash. The lid drop-in removal only takes effect at
+    # the next boot/login anyway.
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        sudo systemctl restart systemd-logind 2> /dev/null || true
+        log_info "Reboot (or log out and back in) for the lid-switch change to take effect."
     fi
     log_success "Power optimization profiles removed."
 }
@@ -114,7 +118,7 @@ install_power() {
         fi
     fi
 
-    # 3. Deploy i915 / iwlwifi modprobe quirks
+    # 3. Deploy i915 / iwlwifi modprobe quirks (anti-blackscreen & ASPM)
     log_step 3 4 "Deploying GPU & Wi-Fi power quirks (anti-blackscreen & ASPM)..."
     local modprobe_dst="/etc/modprobe.d/99-hp-c640-power.conf"
     local modprobe_src="$SCRIPT_DIR/modprobe.d/99-hp-c640-power.conf"
@@ -127,7 +131,22 @@ install_power() {
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $modprobe_src -> $modprobe_dst"
         else
-            sudo install -D -m 0644 "$modprobe_src" "$modprobe_dst"
+            # Kernel >= 7.0 removed the iwlwifi "d0i3_disable" parameter;
+            # keeping it would make modprobe fail and kill WiFi entirely.
+            # Filter it out when the running kernel no longer knows the param.
+            local kv="${KERNEL_RELEASE:-$(uname -r)}"
+            local filtered=""
+            if modinfo -F parm iwlwifi 2> /dev/null | grep -q -E "^d0i3_disable:"; then
+                filtered="$modprobe_src"
+            else
+                log_info "Kernel $kv has no iwlwifi d0i3_disable parameter; stripping it from modprobe config"
+                filtered="$(mktemp -t hp-c640-modprobe-XXXXXX)"
+                sed 's/d0i3_disable=[0-9]*//g; s/[[:space:]][[:space:]]*/ /g; s/ *$//' "$modprobe_src" > "$filtered"
+            fi
+            sudo install -D -m 0644 "$filtered" "$modprobe_dst"
+            if [ "$filtered" != "$modprobe_src" ]; then
+                rm -f "$filtered"
+            fi
             manifest_add_entry "$modprobe_dst" "power" "$modprobe_existed"
             log_success "Deployed $modprobe_dst"
         fi

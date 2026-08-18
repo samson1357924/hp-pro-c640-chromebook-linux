@@ -19,7 +19,7 @@ source=("git+https://github.com/samson1357924/crfpmoc.git#branch=master"
         "crfpmoc-driver-overlay.tar.gz"
         "60-cros-fp.rules")
 sha256sums=('SKIP'
-            'dd5064cbb3a6dce00f08827ab0d5491b6684967f25268f1c3888c5246c1c2c9f'
+            'f82a0195edf51211b0de6d8ab34aea988c780ec4eecd147dfcab61359be018dd'
             'SKIP')
 
 prepare() {
