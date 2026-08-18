@@ -52,10 +52,6 @@ uninstall_fp() {
     rollback_component "fingerprint"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        # Remove the system-sleep hook (stop fprintd before sleep)
-        sudo rm -f /usr/lib/systemd/system-sleep/fprintd-sleep.sh
-        log_info "Removed fprintd system-sleep hook."
-
         sudo udevadm control --reload-rules 2> /dev/null || true
         log_info "Reloaded udev rules."
 
@@ -74,7 +70,6 @@ uninstall_fp() {
             *) echo "  Reinstall libfprint package via your distribution's package manager." ;;
         esac
     else
-        log_dryrun "rm -f /usr/lib/systemd/system-sleep/fprintd-sleep.sh"
         log_dryrun "udevadm control --reload-rules"
         log_dryrun "disable_pam_fingerprint"
         log_dryrun "ldconfig"
@@ -179,8 +174,8 @@ install_fp() {
         # the audited driver also ships crfpmoc-proto.c (pure protocol
         # parsing, used by crfpmoc.c) — add it to the source list idempotently.
         local meson_build="$crfpmoc_dir/libfprint/meson.build"
-        if [ -f "$SCRIPT_DIR/driver/crfpmoc-proto.c" ] && [ -f "$meson_build" ] &&
-           ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "$meson_build"; then
+        if [ -f "$SCRIPT_DIR/driver/crfpmoc-proto.c" ] && [ -f "$meson_build" ] \
+            && ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "$meson_build"; then
             log_info "Adding crfpmoc-proto.c to libfprint meson.build..."
             sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" "$meson_build"
         fi

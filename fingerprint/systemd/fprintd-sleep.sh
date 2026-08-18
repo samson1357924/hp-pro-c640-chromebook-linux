@@ -16,7 +16,7 @@
 
 case "$1" in
     pre)
-        systemctl stop fprintd.service 2>/dev/null || true
+        systemctl stop fprintd.service 2> /dev/null || true
         ;;
     post)
         # No delay here: resume completes at full speed. The crfpmoc driver

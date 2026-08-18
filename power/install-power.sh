@@ -136,7 +136,7 @@ install_power() {
             # Filter it out when the running kernel no longer knows the param.
             local kv="${KERNEL_RELEASE:-$(uname -r)}"
             local filtered=""
-            if modinfo -F parm iwlwifi d0i3_disable > /dev/null 2>&1; then
+            if modinfo -F parm iwlwifi 2> /dev/null | grep -q -E "^d0i3_disable:"; then
                 filtered="$modprobe_src"
             else
                 log_info "Kernel $kv has no iwlwifi d0i3_disable parameter; stripping it from modprobe config"

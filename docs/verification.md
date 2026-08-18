@@ -1,4 +1,6 @@
-# ✅ Verification Matrix (實測驗證矩陣)
+[English](../README.md) | [繁體中文](../README.zh-CN.md)
+
+# ✅ Verification Matrix
 
 > **Honest status**: this document clearly separates what has been **actually
 > tested on a real HP Pro c640** (with exact software versions) from what is
@@ -8,7 +10,7 @@
 
 ---
 
-## 🖥️ Test Environment (實測環境)
+## 🖥️ Test Environment
 
 | Item | Value |
 | :--- | :--- |
@@ -23,7 +25,7 @@
 
 ---
 
-## ✅ Verified on This Device (已實測並驗證)
+## ✅ Verified on This Device
 
 Legend: 🟢 = verified working on the machine above; 📄 = evidence file in the
 diagnostic bundle.
@@ -92,7 +94,7 @@ diagnostic bundle.
 
 ---
 
-## ⚠️ Config-Only / NOT Yet Verified (尚未實測)
+## ⚠️ Config-Only / NOT Yet Verified
 
 These files are **config-only on the device above** — installed or
 available-but-not-enabled as the status column says. Anything not measured

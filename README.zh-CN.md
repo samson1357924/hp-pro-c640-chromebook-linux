@@ -3,8 +3,8 @@
 # HP Pro c640 Chromebook (Google Dratini) Linux 避坑全指南與硬體啟用方案
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform: ChromeOS / Linux](https://img.shields.io/badge/Platform-Chromebook%20Linux-green.svg)](docs/COMPATIBILITY.md)
-[![Hardware: Google Dratini / Hatch](https://img.shields.io/badge/Hardware-Google%20Dratini%20(Comet%20Lake)-orange.svg)](docs/COMPATIBILITY.md)
+[![Platform: ChromeOS / Linux](https://img.shields.io/badge/Platform-Chromebook%20Linux-green.svg)](docs/zh-CN/COMPATIBILITY.md)
+[![Hardware: Google Dratini / Hatch](https://img.shields.io/badge/Hardware-Google%20Dratini%20(Comet%20Lake)-orange.svg)](docs/zh-CN/COMPATIBILITY.md)
 
 本專案為 **HP Pro c640 Chromebook** (Google Board: **`dratini`** / Baseboard:
 **`hatch`** / Intel 10th Gen Comet Lake-U) 提供完整的 Linux 硬體啟用方案，包含
@@ -68,25 +68,31 @@ chmod +x setup.sh
 * ✅ **[實測驗證矩陣 (VERIFICATION.md)](docs/zh-CN/verification.md)**：哪些項目**已在
   真實 HP Pro c640 上實測**（含精確版本）、哪些僅提供設定檔 — 在相信任何
   「100% 正常」宣稱前請先閱讀。
-* 🚀 **[新手指南 (QUICKSTART.md)](docs/QUICKSTART.md)**：3 分鐘快速啟用流程與指令。
-* 📊 **[硬體相容性清單 (COMPATIBILITY.md)](docs/COMPATIBILITY.md)**：詳細晶片規格、內核需求。
-* 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/FIRMWARE.md)**：MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫** 與還原 ChromeOS 步驟。
-* 🛠️ **[疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](docs/TROUBLESHOOTING.md)**：十大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
-* 🔄 **[系統復原與解除安裝 (UNINSTALL.md)](docs/UNINSTALL.md)**：備份還原機制與原生套件復原。
+* 🚀 **[新手指南 (QUICKSTART.md)](docs/zh-CN/QUICKSTART.md)**：3 分鐘快速啟用流程與指令。
+* 📊 **[硬體相容性清單 (COMPATIBILITY.md)](docs/zh-CN/COMPATIBILITY.md)**：詳細晶片規格、內核需求。
+* 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/zh-CN/FIRMWARE.md)**：
+  MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫** 與還原 ChromeOS 步驟。
+* 🛠️ **[疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](docs/zh-CN/TROUBLESHOOTING.md)**：
+  十大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
+* 🔄 **[系統復原與解除安裝 (UNINSTALL.md)](docs/zh-CN/UNINSTALL.md)**：
+  備份還原機制與原生套件復原。
 
 ### 🔬 深度技術解析
 
-* 🖐️ **[ChromeOS Match-on-Chip 指紋驅動架構](docs/deep-dive/cros-fp-moc-driver.md)**：EC 通訊協議、50ms 狀態機輪詢與 TPM 金鑰安全。
-* 🔊 **[Intel SOF DSP 與 ALSA UCM2 音訊拓撲](docs/deep-dive/intel-sof-ucm-audio.md)**：PCM 映射、Phantom Jack 剖析與 PipeWire 路由。
-* 🔋 **[S0ix 睡眠模式與電源管理](docs/deep-dive/power-and-suspend.md)**：ASPM 節能、Wi-Fi WoWLAN 耗電優化。
+* 🖐️ **[ChromeOS Match-on-Chip 指紋驅動架構](docs/zh-CN/deep-dive/cros-fp-moc-driver.md)**：
+  EC 通訊協議、50ms 狀態機輪詢與 TPM 金鑰安全。
+* 🔊 **[Intel SOF DSP 與 ALSA UCM2 音訊拓撲](docs/zh-CN/deep-dive/intel-sof-ucm-audio.md)**：
+  PCM 映射、Phantom Jack 剖析與 PipeWire 路由。
+* 🔋 **[S0ix 睡眠模式與電源管理](docs/zh-CN/deep-dive/power-and-suspend.md)**：
+  ASPM 節能、Wi-Fi WoWLAN 耗電優化。
 
 ### 🐧 各發行版專屬指南
 
-* [Ubuntu & Debian 配置手冊](docs/distros/ubuntu-debian.md)
-* [Fedora & Silverblue 配置手冊](docs/distros/fedora.md)
-* [Arch Linux & EndeavourOS 配置手冊（含 PKGBUILD）](docs/distros/arch-linux.md)
-* [openSUSE Tumbleweed 配置手冊](docs/distros/opensuse.md)
-* [NixOS 宣告式配置手冊](docs/distros/nixos.md)
+* [Ubuntu & Debian 配置手冊](docs/zh-CN/distros/ubuntu-debian.md)
+* [Fedora & Silverblue 配置手冊](docs/zh-CN/distros/fedora.md)
+* [Arch Linux & EndeavourOS 配置手冊（含 PKGBUILD）](docs/zh-CN/distros/arch-linux.md)
+* [openSUSE Tumbleweed 配置手冊](docs/zh-CN/distros/opensuse.md)
+* [NixOS 宣告式配置手冊](docs/zh-CN/distros/nixos.md)
 
 ---
 

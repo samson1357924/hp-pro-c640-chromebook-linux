@@ -118,7 +118,7 @@ between speaker and headphone.
 
 ## 9. Fix
 
-Install the UCM profiles (see [../README.md](../README.md#installation-ucm-profiles)):
+Install the UCM profiles (see [../README.md](../README.md#step-2-install-ucm2-audio-profiles)):
 `./audio/install-audio-ucm.sh`, then `systemctl --user restart wireplumber`.
 
 ## 10. References

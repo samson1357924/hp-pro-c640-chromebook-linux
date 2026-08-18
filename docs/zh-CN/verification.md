@@ -4,7 +4,7 @@
 
 > **誠實狀態聲明**：本文件清楚區分**已在真實 HP Pro c640 上實測**的項目
 > （附上精確軟體版本），以及**僅提供設定檔、尚未驗證**的項目。README 與
-> [COMPATIBILITY.md](../COMPATIBILITY.md) 中若宣稱了下方證據無法背書的內容，
+> [COMPATIBILITY.md](COMPATIBILITY.md) 中若宣稱了下方證據無法背書的內容，
 > 應視為未實測。
 
 ---
@@ -38,7 +38,7 @@
 | 驅動原始碼與本 repo 一致 | 🟢 | `diff -r fingerprint/driver <build-tree>/drivers/crfpmoc` → 無差異 |
 | udev rules（已安裝版） | 🟢 | 2026-08-18 已安裝 repo 版（`GROUP="plugdev", MODE="0660", TAG+="uaccess"`），重開機後以 `getfacl` 驗證；舊 `0666` 版已備份 |
 | 單元測試 | 🟢 | `test-crfpmoc-unit`（`/usr/libexec/installed-tests/libfprint-2/`）4/4 全過：`fp_info_v3`、`fp_info_v1`、`enc_status_bitmask`、`payload_bounds` |
-| 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §13](../TROUBLESHOOTING.md) |
+| 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §13](TROUBLESHOOTING.md) |
 
 ### 2. 音訊 (Intel SOF DSP + ALSA UCM2 + PipeWire)
 
@@ -99,7 +99,7 @@
 
 | 模組 | 檔案 | 狀態 |
 | :--- | :--- | :---: |
-| **電源調校 — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 2026-08-19 已安裝並重開機（已過濾 d0i3、重建 initramfs）；**開蓋黑屏問題仍在**（仍須按鍵才亮——使用者已接受，見 [TROUBLESHOOTING.md §14](../TROUBLESHOOTING.md)） |
+| **電源調校 — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 2026-08-19 已安裝並重開機（已過濾 d0i3、重建 initramfs）；**開蓋黑屏問題仍在**（仍須按鍵才亮——使用者已接受，見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)） |
 | **電源調校 — wireplumber / logind** | `power/wireplumber/50-disable-suspend.conf`、`power/systemd/logind.conf.d/99-hp-c640-lid.conf` | 🟢 2026-08-18 已安裝（logind 盒蓋規則經真實 S3 週期驗證） |
 | **電源調校 — TLP** | `power/tlp/99-hp-c640.conf` | ❌ 未安裝 — **與運作中的 `power-profiles-daemon` 衝突**（見下方） |
 | **EC 控制** | `ec/install-ec.sh`、`scripts/c640-ec-control.sh`、`ec/systemd/c640-battery-limit.service` | ❌ 未安裝（無 `ectool`、無 `/usr/local/bin/c640-ec-control`）；本機電池上限改以 `charge_behaviour` sysfs + **另一支本機腳本**達成 |
