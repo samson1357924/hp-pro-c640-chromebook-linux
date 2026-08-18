@@ -111,6 +111,28 @@ fprintd-delete "$USER"
 * **Lock Screen**: Press `Super + L`, touch the sensor to unlock instantly.
 
 > [!NOTE]
+> **PAM strategy (single-stack, race-free)**: the installer deliberately
+> keeps `pam_fprintd` **out of `common-auth`** and enables it **only in
+> `/etc/pam.d/sudo`**. GDM login/lock-screen fingerprint runs through the
+> dedicated `gdm-fingerprint` PAM service. If fingerprint is enabled in
+> `common-auth` too (e.g. via `pam-auth-update --enable fprintd`), the
+> `gdm-password` worker and the `gdm-fingerprint` worker race to Claim the
+> device on unlock — the loser gets "Device was already claimed" and the
+> lock screen shows no fingerprint prompt (see
+> [TROUBLESHOOTING.md §13](../docs/TROUBLESHOOTING.md) and
+> GNOME/gdm#1071).
+
+> [!NOTE]
+> **Suspend/resume handling**: the installer ships a system-sleep hook
+> (`systemd/fprintd-sleep.sh` → `/usr/lib/systemd/system-sleep/`) that stops
+> fprintd before sleep, and the audited `crfpmoc` driver retries the device
+> open with a bounded budget right after wake (the ChromeOS EC/FPMCU channel
+> can be briefly unusable for ~2 s after S3). Without these, the first
+> lock-screen unlock after resume shows no fingerprint prompt (see
+> [TROUBLESHOOTING.md §13](../docs/TROUBLESHOOTING.md) and
+> GNOME/gnome-shell#7791).
+
+> [!NOTE]
 > **Initial Login vs Lock Screen (GNOME Keyring)**:
 > In Linux desktop environments (such as GNOME/GDM), unlocking your login
 > keyring (which decrypts stored Wi-Fi passwords and browser secrets) requires

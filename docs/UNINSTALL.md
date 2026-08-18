@@ -34,11 +34,15 @@ This command automatically:
   ./audio/install-audio.sh --uninstall
   ```
 
-* **Remove only the fingerprint udev rules**:
+* **Remove only the fingerprint udev rules, PAM config and system-sleep
+  hook**:
 
   ```bash
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
+
+  *(This restores the backed-up `libfprint`, `60-cros-fp.rules` and
+  `/etc/pam.d/sudo`, and removes the `fprintd-sleep.sh` system-sleep hook.)*
 
 * **Remove only the keyboard top-row mapping**:
 
@@ -52,6 +56,13 @@ This command automatically:
   ```bash
   ./power/install-power.sh --uninstall
   ```
+
+  > [!WARNING]
+  > After uninstalling the power module, **reboot** (or log out and back in)
+  > — do **not** run `systemctl restart systemd-logind`. With an active
+  > desktop session, restarting `systemd-logind` logs everyone out (the
+  > session leader is lost on deserialization), which looks exactly like a
+  > system crash (verified on an HP Pro c640, 2026-08-18).
 
 * **Remove only the EC tools and services** (including the 80% battery
   protection `c640-battery-limit.service`):

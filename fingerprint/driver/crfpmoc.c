@@ -64,8 +64,19 @@ struct _FpiDeviceCrfpMoc
   guint8   seed[CRFPMOC_FP_CONTEXT_TPM_BYTES];
   guint8   context[CRFPMOC_FP_CONTEXT_USERID_BYTES];
 
+  guint    open_retries;
+
   int      emul_fd;
 };
+
+/* The ChromeOS EC/FPMCU channel is briefly unusable right after S3 resume
+ * (empirically the first open attempt fails and the next one ~2 s later
+ * succeeds), so retry failed open attempts for a bounded time instead of
+ * failing the claim — otherwise the first lock-screen unlock after resume
+ * shows no fingerprint prompt. Retries only trigger when open fails; a
+ * healthy open completes on the first attempt with no added latency. */
+#define CRFPMOC_OPEN_MAX_RETRIES    8
+#define CRFPMOC_OPEN_RETRY_DELAY_MS 500
 
 G_DEFINE_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FP_TYPE_DEVICE)
 
@@ -979,6 +990,35 @@ crfpmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
     }
 }
 
+static void crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error);
+
+static gboolean
+crfpmoc_open_retry_cb (gpointer user_data)
+{
+  FpDevice *device = user_data;
+  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+  g_autoptr(GError) error = NULL;
+
+  /* The claim may have been cancelled (or the device closed) while the
+   * retry was pending — in that case abandon the retry and complete the
+   * open with a cancelled error so the caller can unwind cleanly. */
+  if (fpi_device_get_current_action (device) != FPI_DEVICE_ACTION_OPEN ||
+      g_cancellable_is_cancelled (fpi_device_get_cancellable (device)))
+    {
+      g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                           "Open retry aborted: device closed or claim cancelled");
+      self->open_retries = 0;
+      fpi_device_open_complete (device, g_steal_pointer (&error));
+      return G_SOURCE_REMOVE;
+    }
+
+  g_assert (self->task_ssm == NULL);
+  self->task_ssm = fpi_ssm_new (device, crfpmoc_open_run_state, OPEN_STATES);
+  crfpmoc_ssm_start (self, self->task_ssm, crfpmoc_open_ssm_done);
+
+  return G_SOURCE_REMOVE;
+}
+
 static void
 crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
@@ -986,6 +1026,33 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
   int fd;
 
   self->task_ssm = NULL;
+
+  /* The EC/FPMCU channel is briefly unusable right after S3 resume, so
+   * open attempts can fail with an I/O error or an EC error for a couple
+   * of seconds. Retry with a bounded budget instead of failing the claim:
+   * the lock screen would otherwise never offer fingerprint on the first
+   * unlock after resume. */
+  if (error &&
+      g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) == FALSE &&
+      !g_cancellable_is_cancelled (fpi_device_get_cancellable (device)) &&
+      (error->domain == G_IO_ERROR || error->domain == FP_DEVICE_ERROR) &&
+      self->open_retries < CRFPMOC_OPEN_MAX_RETRIES)
+    {
+      self->open_retries++;
+      fp_dbg ("crfpmoc_open_ssm_done: open attempt failed (%s); retrying in %u ms (%u/%u)",
+              error->message, CRFPMOC_OPEN_RETRY_DELAY_MS,
+              self->open_retries, CRFPMOC_OPEN_MAX_RETRIES);
+      g_timeout_add_full (G_PRIORITY_DEFAULT, CRFPMOC_OPEN_RETRY_DELAY_MS,
+                          crfpmoc_open_retry_cb, g_object_ref (device),
+                          g_object_unref);
+      return;
+    }
+
+  if (error)
+    fp_dbg ("crfpmoc_open_ssm_done: open failed after %u retries: %s",
+            self->open_retries, error->message);
+
+  self->open_retries = 0;
 
   if (!error)
     {
@@ -1137,6 +1204,8 @@ crfpmoc_open (FpDevice *device)
   g_autoptr(GError) error = NULL;
   FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
   const char *device_path;
+
+  self->open_retries = 0;
 
   device_path = fpi_device_get_udev_data (device, FPI_DEVICE_UDEV_SUBTYPE_MISC);
   fp_dbg ("Opening device %s", device_path);

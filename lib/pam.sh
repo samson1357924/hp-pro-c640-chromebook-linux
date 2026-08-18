@@ -23,15 +23,46 @@ configure_pam_fingerprint() {
 
     case "$DISTRO_FAMILY" in
         debian)
+            # IMPORTANT: do NOT use `pam-auth-update --enable fprintd` here.
+            # That profile injects pam_fprintd into /etc/pam.d/common-auth,
+            # which is included by gdm-password. On unlock GDM forks the
+            # gdm-password worker and the gdm-fingerprint worker concurrently;
+            # both would Claim the single fprintd device, the loser gets
+            # "Device was already claimed" and the lock screen shows no
+            # fingerprint prompt (GNOME/gdm#1071, fprintd#214).
+            # Fix: keep fprintd OUT of common-auth and enable it ONLY for sudo.
             if command -v pam-auth-update > /dev/null 2>&1; then
-                log_info "Enabling fprintd via pam-auth-update..."
-                sudo pam-auth-update --enable fprintd
-                log_success "PAM configuration updated via pam-auth-update."
+                log_info "Removing fprintd from common-auth (avoids the GDM unlock claim race)..."
+                sudo pam-auth-update --remove fprintd
+                log_success "fprintd removed from common-auth."
             else
                 log_warn "pam-auth-update not found. Please verify /etc/pam.d/common-auth manually."
             fi
+
+            local sudo_pam="/etc/pam.d/sudo"
+            if [ -f "$sudo_pam" ]; then
+                local fp_line="auth sufficient pam_fprintd.so max-tries=1 timeout=10"
+                if grep -q "^${fp_line}$" "$sudo_pam"; then
+                    log_info "pam_fprintd already configured in $sudo_pam."
+                else
+                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
+                    backup_file "$sudo_pam"
+                    manifest_add_entry "$sudo_pam" "fingerprint" "1"
+                    # Remove any other fingerprint PAM module lines first
+                    # (e.g. a stale rust-fp module) to keep a single stack.
+                    sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
+                    sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$sudo_pam"
+                    log_success "sudo fingerprint PAM configured."
+                fi
+            else
+                log_warn "$sudo_pam not found; sudo fingerprint not configured."
+            fi
             ;;
         fedora)
+            # NOTE (untested): authselect with-fingerprint puts pam_fprintd
+            # into system-auth, which gdm-password also includes — the same
+            # GDM unlock claim race (GNOME/gdm#1071) may occur. Not verified
+            # on this hardware.
             if command -v authselect > /dev/null 2>&1; then
                 log_info "Enabling fingerprint via authselect..."
                 sudo authselect enable-feature with-fingerprint
@@ -73,6 +104,12 @@ disable_pam_fingerprint() {
 
     case "$DISTRO_FAMILY" in
         debian)
+            local sudo_pam="/etc/pam.d/sudo"
+            if [ -f "$sudo_pam" ]; then
+                log_info "Removing pam_fprintd from $sudo_pam..."
+                sudo sed -i '/^auth sufficient pam_fprintd.so/d' "$sudo_pam"
+                log_success "sudo PAM fingerprint line removed."
+            fi
             if command -v pam-auth-update > /dev/null 2>&1; then
                 log_info "Disabling fprintd via pam-auth-update..."
                 sudo pam-auth-update --remove fprintd

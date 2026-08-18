@@ -167,7 +167,8 @@
 
 ### 12. 蓋上螢幕筆電不會休眠
 
-* **解決方法**：確保 `/etc/systemd/logind.conf` 中設定：
+* **解決方法**：確認 `/etc/systemd/logind.conf.d/99-hp-c640-lid.conf`
+  （由 `./power/install-power.sh` 安裝）或 `/etc/systemd/logind.conf` 中設定：
 
   ```ini
   [Login]
@@ -175,4 +176,117 @@
   HandleLidSwitchExternalPower=suspend
   ```
 
-  然後重啟服務：`sudo systemctl restart systemd-logind`。
+* **⚠️ 修改 logind 設定後請「重新開機」，不要執行 `systemctl restart
+  systemd-logind`**：
+  在桌面 session 進行中重啟 `systemd-logind` 會**登出所有已登入使用者**
+  （session leader 在 deserialization 時遺失，導致整個 GNOME session 崩潰、
+  使用者 manager 被強制結束，甚至看起來像系統當機）。而且新設定本來就要
+  下次登入/開機才生效，所以重新開機（或登出再登入）才是正確且唯一安全的
+  套用方式。
+
+  ```bash
+  # 不要這樣做：
+  sudo systemctl restart systemd-logind
+
+  # 請這樣做——重新開機後蓋螢幕規則即生效：
+  sudo systemctl reboot
+  ```
+
+  *（2026-08-18 實測：重啟 systemd-logind 在 HP Pro c640 上引發完整登出風暴，
+  外觀上如同系統當機。）*
+
+### 13. 休眠喚醒後（或鎖定後立刻）鎖定畫面沒有指紋提示
+
+* **症狀**：盒蓋休眠後打開（或鎖定後馬上操作），解鎖畫面**沒有指紋提示、
+  碰觸感應器無效**。按 `Esc` 重新進入登入畫面後指紋恢復正常。
+* **根因**：兩個 PAM worker 的裝置 Claim 競賽。解鎖時 GDM **同時** fork
+  `gdm-password` worker 與 `gdm-fingerprint` worker，兩者的 PAM stack 原本都
+  含 `pam_fprintd`：`gdm-password` 從 `common-auth` 引入（fprintd profile 經
+  `pam-auth-update` 啟用時），`gdm-fingerprint` 則有
+  `auth required pam_fprintd.so`。fprintd 一個裝置只允許**一個 Claim**；
+  password worker 先 fork、先搶到，fingerprint worker 收到
+  `Authorization denied ... Device was already claimed`，整個 fingerprint
+  服務失敗，GNOME Shell 便隱藏指紋提示。休眠後重認證在喚醒後 ~400ms 就開始，
+  使競賽結果變成必然。
+* **證據**：
+
+  ```text
+  fprintd: Authorization denied to :1.142 to call method 'Claim' for device
+  'ChromeOS Fingerprint Match-on-Chip': Device was already claimed
+  ```
+
+  上游追蹤：GNOME/gdm#1071、libfprint/fprintd#214、
+  GNOME/gnome-shell#7791（至 2026-08 皆未修復）。
+* **解決方法（2026-08-18 起本專案安裝器已內建）**：讓 `pam_fprintd` **不要
+  出現在 `common-auth`**，指紋只在 sudo 啟用（`/etc/pam.d/sudo` 加入
+  `auth sufficient pam_fprintd.so`）。GDM 登入畫面與鎖定畫面仍透過專屬的
+  `gdm-fingerprint` PAM 服務運作，從此必定搶到 Claim。
+
+  ```bash
+  # 安裝器實際執行的動作：
+  sudo pam-auth-update --remove fprintd
+  sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
+  ```
+
+  *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）*
+* **手動復原（舊安裝適用）**：按 `Esc` 取消失敗的解鎖回合再重新解鎖——
+  新 worker 會乾淨地重新 Claim。或先執行 `sudo systemctl restart fprintd`
+  再解鎖。
+* **PAM 修復後的殘留問題（喚醒後 FPMCU open 立即失敗）**：即使競賽已消除，
+  喚醒後的**第一次**解鎖仍可能失敗：claim 成功但 crfpmoc 的**裝置 open 瞬間
+  失敗**（S3 喚醒後頭 ~2 秒 EC/FPMCU 通道尚未就緒），`pam_fprintd` 回傳錯誤、
+  Shell 不顯示指紋提示（此情況沒有 `already claimed` 日誌——2026-08-19 以
+  `G_MESSAGES_DEBUG=fprintd` 證實：只有 `claiming the device: 0`、沒有
+  `claimed device 0`）。本專案提供兩道互補的修復：
+  1. **驅動層 open 重試（真正的修復，2026-08-19 起）**：audited `crfpmoc`
+     驅動在喚醒後 EC 通道回報 I/O 或 EC 錯誤時，以有限預算
+     （`CRFPMOC_OPEN_MAX_RETRIES` × 500ms）重試 open SSM。正常 open 第一次
+     即成功、**零額外延遲**；只有失敗的 open 才會等待。
+  2. **system-sleep hook 衛生機制**：`fingerprint/systemd/fprintd-sleep.sh`
+     在睡前停止 fprintd，確保喚醒後一定是全新 daemon。
+
+  盒蓋測試後驗證：
+
+  ```bash
+  journalctl -b -e -u fprintd | grep -E "claim|open|retry"
+  # 預期：喚醒後第一次 claim 就出現 "claimed device 0"
+  #       （若 EC 通道需要時間，才會看到 "retrying" 行）
+  ```
+
+  *（若仍失敗：在 fprintd.service drop-in 暫時加
+  `Environment=G_MESSAGES_DEBUG=fprintd`，再重複盒蓋測試以捕捉驅動錯誤。）*
+
+### 14. 開蓋喚醒後螢幕全黑（需按鍵/點擊才亮）
+
+* **症狀**：盒蓋休眠（S3 `deep`）後打開，系統已喚醒（`PM: suspend exit`）
+  但面板**全黑**，直到按鍵或點擊才亮。不是當機——輸入一到鎖定畫面即正常。
+* **根因（2026-08-18 兩個候選機制）**：
+  1. **GNOME 使用者層再次黑屏**（最可能，符合「按鍵即恢復」特徵）：
+     `gsd-power` 在休眠時關閉面板；螢幕護盾的鎖定動畫在顯示器關閉期間停滯，
+     resume 後動畫完成、電源外掛又把螢幕**關回去**（GNOME/mutter#4111，
+     修補候選 gnome-shell!3742——尚未合併）。
+  2. **Comet Lake 的 i915 PSR resume bug**（gitlab.freedesktop.org/drm/i915），
+     或 kernel 7.0 的 eDP 背光回歸（drm/i915/kernel#16791、#16825）。
+     可能性較低——那些 bug 不會因按鍵而恢復。
+* **解決方法（本專案）**：`power/install-power.sh` 的 modprobe 調校
+  `options i915 enable_psr=0 enable_fbc=1 enable_guc=2` 是 repo 針對
+  休眠/喚醒黑屏的候選對策。2026-08-19 已安裝並重開機，但**未解決本機的
+  黑屏問題**（仍須按鍵才亮——使用者已接受此行為；見
+  [VERIFICATION.md](verification.md)）。如想試用請套用後重開機：
+
+  ```bash
+  ./power/install-power.sh   # 或手動：
+  sudo install -D -m 0644 power/modprobe.d/99-hp-c640-power.conf \
+      /etc/modprobe.d/99-hp-c640-power.conf
+  sudo update-initramfs -u
+  sudo systemctl reboot
+  ```
+
+  > [!NOTE]
+  > kernel ≥ 7.0 時安裝器會自動移除已刪除的 `iwlwifi d0i3_disable`
+  > 參數（見該檔註解標頭）。
+* **若 `enable_psr=0` 後面板仍黑**：在 `/etc/environment` 試
+  `MUTTER_DEBUG_FORCE_KMS_MODE=simple`（隔離 atomic-KMS resume 路徑，見
+  drm/i915/kernel#16825），或用 `busctl monitor` 監看
+  `org.gnome.SettingsDaemon.Power` 是否有 resume 後再度關閉螢幕的事件
+  （可證實使用者層再黑屏假說）。回報至 GNOME/mutter#4111。

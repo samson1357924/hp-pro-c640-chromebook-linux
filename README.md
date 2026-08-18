@@ -28,14 +28,14 @@ automated installation scripts, and a comprehensive guide to avoiding pitfalls.
 
 | Hardware Component | Status | Driver / Solution | Notes & Support Level |
 | :--- | :---: | :--- | :--- |
-| **Fingerprint** | 🟢 **100% Working** | `crfpmoc` (custom `libfprint` MoC driver) | Supports GDM / instant lock-screen unlock and `sudo` PAM authorization. |
-| **Stereo Speakers & Microphone (Audio)** | 🟢 **100% Working** | Intel SOF DSP + ALSA UCM2 / PipeWire | Speakers (PCM 5), headphones (PCM 0) auto-switching, dual-microphone split. |
-| **Wi-Fi 6 & Bluetooth 5.0** | 🟢 **Works Out of the Box** | Intel AX201 (`iwlwifi` / `btusb`) | Works out of the box with the official Linux kernel, supports WPA3 and BLE. |
-| **Touchscreen & Touchpad** | 🟢 **Works Out of the Box** | `i2c_hid` / `elan_i2c` | Native multi-finger gestures and palm rejection support. |
-| **Intel UHD Display & Hardware Decoding** | 🟢 **Works Out of the Box** | `i915` (Wayland / X11) | Supports VA-API 4K 60fps hardware decoding. |
-| **Keyboard Backlight & Top-Row Function Keys** | 🟢 **100% Working** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1-F10 perfectly mapped to previous page, refresh, brightness, and volume. |
-| **Sleep/Resume** | 🟢 **100% Working** | ACPI S0ix (`s2idle`) | Supports lid-close sleep and quick wake via key or fingerprint. |
-| **Dual Type-C Output & Fast Charging** | 🟢 **Works Out of the Box** | USB-PD + DP 1.2 Alt Mode | Both ports support 45W/65W PD charging and dual-display video output. |
+| **Fingerprint** | 🟢 **100% Working** | `crfpmoc` (custom `libfprint` MoC driver) | Supports GDM / instant lock-screen unlock and `sudo` PAM authorization. *Evidence: see [VERIFICATION.md](docs/verification.md).* |
+| **Stereo Speakers & Microphone (Audio)** | 🟢 **Speakers & mic working** | Intel SOF DSP + ALSA UCM2 / PipeWire | Speakers (PCM 5), headphones (PCM 0), dual-microphone split working. **Headphone auto-switch on plug/unplug not captured in evidence** — see [VERIFICATION.md](docs/verification.md). |
+| **Wi-Fi 6 & Bluetooth 5.0** | ⚠️ **Driver bound** | Intel AX201 (`iwlwifi` / `btusb`) | Drivers bind out of the box; **WPA3/throughput not yet measured** on this device (see [VERIFICATION.md](docs/verification.md)). |
+| **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection functional test not captured** (see [VERIFICATION.md](docs/verification.md)). |
+| **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works out of the box; **VA-API 4K 60fps hardware decode not yet measured** (see [VERIFICATION.md](docs/verification.md)). |
+| **Keyboard Backlight & Top-Row Function Keys** | ⚠️ **Top-row verified** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1-F10 mapped to previous page, refresh, brightness, and volume (hwdb verified). **Backlight brightness not tested** — see [VERIFICATION.md](docs/verification.md). |
+| **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 suspend/resume cycle verified 2026-08-18 (zero errors). **Key/fingerprint wake untested**; known issue: panel stays dark on lid open until a keypress (see [VERIFICATION.md](docs/verification.md)). |
+| **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging nodes present; **external display via Type-C not yet verified** (see [VERIFICATION.md](docs/verification.md)). |
 
 ---
 
@@ -66,6 +66,9 @@ chmod +x setup.sh
 
 ## 📚 Documentation Suite
 
+* ✅ **[VERIFICATION.md (Tested vs Untested)](docs/verification.md)**: What was
+  **actually tested** on a real HP Pro c640 (with exact versions) vs config-only
+  items — read before trusting any "100% working" claim.
 * 🚀 **[QUICKSTART.md (Getting Started)](docs/QUICKSTART.md)**: 3-minute quick enablement flow and commands.
 * 📊 **[COMPATIBILITY.md (Hardware Compatibility)](docs/COMPATIBILITY.md)**: Detailed chip specifications and kernel requirements.
 * 🔧 **[FIRMWARE.md (Firmware Flashing & Recovery)](docs/FIRMWARE.md)**:

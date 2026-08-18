@@ -27,14 +27,14 @@
 
 | 硬體組件 | 運作狀態 | 驅動 / 解決方案 | 說明與支援度 |
 | :--- | :---: | :--- | :--- |
-| **指紋辨識** | 🟢 **100% 正常** | `crfpmoc` (特製 `libfprint` MoC 驅動) | 支援 GDM / 鎖定螢幕秒解鎖與 `sudo` PAM 授權。 |
-| **立體聲喇叭 & 麥克風** | 🟢 **100% 正常** | Intel SOF DSP + ALSA UCM2 / PipeWire | 喇叭 (PCM 5)、耳機 (PCM 0) 自動切換、雙麥克風分流。 |
-| **Wi-Fi 6 & 藍牙 5.0** | 🟢 **免設定** | Intel AX201 (`iwlwifi` / `btusb`) | Linux 官方核心開箱即用，支援 WPA3 與 BLE。 |
-| **觸控螢幕 & 觸控板** | 🟢 **免設定** | `i2c_hid` / `elan_i2c` | 多指手勢滑動與防掌觸原生支援。 |
-| **Intel UHD 顯示與硬解** | 🟢 **免設定** | `i915` (Wayland / X11) | 支援 VA-API 4K 60fps 硬體解碼。 |
-| **鍵盤背光 & 頂排功能鍵** | 🟢 **100% 正常** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1-F10 完美對應上一頁、重新整理、亮度、音量。 |
-| **待機休眠** | 🟢 **100% 正常** | ACPI S0ix (`s2idle`) | 支援蓋螢幕休眠與按鍵/指紋快速喚醒。 |
-| **雙 Type-C 輸出與快充** | 🟢 **免設定** | USB-PD + DP 1.2 Alt Mode | 雙孔皆支援 45W/65W PD 充電與雙螢幕視訊輸出。 |
+| **指紋辨識** | 🟢 **100% 正常** | `crfpmoc` (特製 `libfprint` MoC 驅動) | 支援 GDM / 鎖定螢幕秒解鎖與 `sudo` PAM 授權。*證據見 [VERIFICATION.md](docs/zh-CN/verification.md)。* |
+| **立體聲喇叭 & 麥克風** | 🟢 **喇叭與麥克風正常** | Intel SOF DSP + ALSA UCM2 / PipeWire | 喇叭 (PCM 5)、耳機 (PCM 0)、雙麥克風分流正常。**耳機插拔自動切換未納入證據** — 見 [VERIFICATION.md](docs/zh-CN/verification.md)。 |
+| **Wi-Fi 6 & 藍牙 5.0** | ⚠️ **驅動已綁定** | Intel AX201 (`iwlwifi` / `btusb`) | 驅動開箱即綁定；**WPA3/吞吐量尚未量測**（見 [VERIFICATION.md](docs/zh-CN/verification.md)）。 |
+| **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸功能測試未納入證據**（見 [VERIFICATION.md](docs/zh-CN/verification.md)）。 |
+| **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 硬解尚未量測**（見 [VERIFICATION.md](docs/zh-CN/verification.md)）。 |
+| **鍵盤背光 & 頂排功能鍵** | ⚠️ **頂排已驗證** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1-F10 對應上一頁、重新整理、亮度、音量（hwdb 已驗證）。**背光亮度未測試** — 見 [VERIFICATION.md](docs/zh-CN/verification.md)。 |
+| **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測真實盒蓋 S3 休眠/喚醒週期（零錯誤）。**按鍵/指紋喚醒未測試**；已知問題：開蓋後螢幕需按鍵才亮（見 [VERIFICATION.md](docs/zh-CN/verification.md)）。 |
+| **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電節點存在；**Type-C 外接螢幕尚未驗證**（見 [VERIFICATION.md](docs/zh-CN/verification.md)）。 |
 
 ---
 
@@ -65,6 +65,9 @@ chmod +x setup.sh
 
 ## 📚 完整文件目錄索引
 
+* ✅ **[實測驗證矩陣 (VERIFICATION.md)](docs/zh-CN/verification.md)**：哪些項目**已在
+  真實 HP Pro c640 上實測**（含精確版本）、哪些僅提供設定檔 — 在相信任何
+  「100% 正常」宣稱前請先閱讀。
 * 🚀 **[新手指南 (QUICKSTART.md)](docs/QUICKSTART.md)**：3 分鐘快速啟用流程與指令。
 * 📊 **[硬體相容性清單 (COMPATIBILITY.md)](docs/COMPATIBILITY.md)**：詳細晶片規格、內核需求。
 * 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/FIRMWARE.md)**：MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫** 與還原 ChromeOS 步驟。

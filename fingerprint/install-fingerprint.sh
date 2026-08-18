@@ -52,6 +52,10 @@ uninstall_fp() {
     rollback_component "fingerprint"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
+        # Remove the system-sleep hook (stop fprintd before sleep)
+        sudo rm -f /usr/lib/systemd/system-sleep/fprintd-sleep.sh
+        log_info "Removed fprintd system-sleep hook."
+
         sudo udevadm control --reload-rules 2> /dev/null || true
         log_info "Reloaded udev rules."
 
@@ -69,6 +73,12 @@ uninstall_fp() {
             suse) echo "  sudo zypper install --force libfprint-2-2" ;;
             *) echo "  Reinstall libfprint package via your distribution's package manager." ;;
         esac
+    else
+        log_dryrun "rm -f /usr/lib/systemd/system-sleep/fprintd-sleep.sh"
+        log_dryrun "udevadm control --reload-rules"
+        log_dryrun "disable_pam_fingerprint"
+        log_dryrun "ldconfig"
+        log_dryrun "Reinstall stock libfprint package via your distribution's package manager"
     fi
     log_success "Fingerprint driver uninstallation finished."
 }
@@ -118,6 +128,23 @@ install_fp() {
         [ -e /dev/cros_fp ] && sudo chmod 0660 /dev/cros_fp 2> /dev/null || true
     fi
 
+    # Install system-sleep hook: stop fprintd before sleep so the first
+    # unlock after resume gets a fresh daemon and a fully re-initialized
+    # FPMCU (see docs/TROUBLESHOOTING.md §13 / gnome-shell#7791).
+    local sleep_hook_dst="/usr/lib/systemd/system-sleep/fprintd-sleep.sh"
+    local sleep_hook_existed=0
+    if [ -e "$sleep_hook_dst" ]; then
+        sleep_hook_existed=1
+    fi
+    backup_file "$sleep_hook_dst"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Install $SCRIPT_DIR/systemd/fprintd-sleep.sh -> $sleep_hook_dst"
+    else
+        sudo install -D -m 0755 "$SCRIPT_DIR/systemd/fprintd-sleep.sh" "$sleep_hook_dst"
+        manifest_add_entry "$sleep_hook_dst" "fingerprint" "$sleep_hook_existed"
+        log_success "Installed fprintd system-sleep hook."
+    fi
+
     # 3. Prepare crfpmoc build tree
     log_step 3 6 "Preparing crfpmoc libfprint build tree..."
     local crfpmoc_dir="${CRFPMOC_DIR:-}"
@@ -141,9 +168,22 @@ install_fp() {
     fi
 
     # Sync bundled driver source into the build tree
-    if [ -d "$SCRIPT_DIR/driver" ] && [ -d "$crfpmoc_dir/libfprint/drivers/crfpmoc" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Sync $SCRIPT_DIR/driver/* -> $crfpmoc_dir/libfprint/drivers/crfpmoc/"
+        log_dryrun "Patch meson.build: add crfpmoc-proto.c to crfpmoc sources (if not already listed)"
+    elif [ -d "$SCRIPT_DIR/driver" ] && [ -d "$crfpmoc_dir/libfprint/drivers/crfpmoc" ]; then
         log_info "Syncing local audited driver source files to build tree..."
         cp -f "$SCRIPT_DIR"/driver/crfpmoc* "$crfpmoc_dir/libfprint/drivers/crfpmoc/" 2> /dev/null || true
+
+        # Upstream meson.build only lists crfpmoc.c + crfpmoc-ec-transfer.c;
+        # the audited driver also ships crfpmoc-proto.c (pure protocol
+        # parsing, used by crfpmoc.c) — add it to the source list idempotently.
+        local meson_build="$crfpmoc_dir/libfprint/meson.build"
+        if [ -f "$SCRIPT_DIR/driver/crfpmoc-proto.c" ] && [ -f "$meson_build" ] &&
+           ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "$meson_build"; then
+            log_info "Adding crfpmoc-proto.c to libfprint meson.build..."
+            sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" "$meson_build"
+        fi
     fi
 
     # 4. Build & Install libfprint
@@ -207,7 +247,10 @@ install_fp() {
         log_dryrun "systemctl restart fprintd"
         log_dryrun "configure_pam_fingerprint"
     else
-        sudo rm -f /etc/systemd/system/fprintd.service.d/cros-fp.conf || true
+        # NOTE: deliberately do NOT create any fprintd.service.d drop-in.
+        # The device-claim race on unlock (GNOME/gdm#1071) is fixed at the
+        # PAM layer by configure_pam_fingerprint (fprintd out of common-auth,
+        # fingerprint in sudo only) — see docs/TROUBLESHOOTING.md §13.
         sudo systemctl daemon-reload
         sudo systemctl restart fprintd.service 2> /dev/null || sudo systemctl restart fprintd 2> /dev/null || true
         configure_pam_fingerprint
