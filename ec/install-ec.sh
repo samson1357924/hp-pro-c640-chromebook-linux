@@ -77,6 +77,7 @@ install_ec_tools() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-ec.rules"
     else
+        sudo mkdir -p "$(dirname "$udev_dst")"
         echo 'KERNEL=="cros_ec", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"' | sudo tee "$udev_dst" > /dev/null
 
         # Ensure plugdev group exists and add user
