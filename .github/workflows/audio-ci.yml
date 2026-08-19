@@ -22,7 +22,7 @@ jobs:
     name: Validate UCM2 Profiles
     runs-on: ubuntu-latest
     container:
-      image: fedora:42
+      image: fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
     steps:
       - name: Install Build Dependencies & ALSA Tools
         run: |

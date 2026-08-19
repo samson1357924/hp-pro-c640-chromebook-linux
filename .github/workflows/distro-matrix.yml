@@ -85,19 +85,19 @@ jobs:
       matrix:
         distro:
           - name: "Ubuntu 24.04 (Noble)"
-            image: "ubuntu:24.04"
+            image: "ubuntu:24.04@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb"
             family: "debian"
             init_cmd: "apt-get update -y && apt-get install -y --no-install-recommends bash coreutils sudo ca-certificates git"
             check_pkgs_cmd: "apt-get install --dry-run -y"
 
           - name: "Fedora 42"
-            image: "fedora:42"
+            image: "fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814"
             family: "fedora"
             init_cmd: "dnf install -y bash coreutils sudo git"
             check_pkgs_cmd: "dnf download --resolve --destdir=/tmp/ci-dnf-check"
 
           - name: "Arch Linux"
-            image: "archlinux:base-devel"
+            image: "archlinux:base-devel@sha256:e33eeaf71d95aa2bfd73ceec8fc21e134166d2d526b77d9fecbb4ebd9c927eb1"
             family: "arch"
             init_cmd: "pacman -Syu --noconfirm --needed bash coreutils sudo git"
             check_pkgs_cmd: "pacman -Sp --needed"
@@ -130,7 +130,7 @@ jobs:
 
       - name: Test Setup CLI Dry-Run
         run: |
-          chmod +x setup.sh lib/*.sh scripts/*.sh audio/*.sh keyboard/*.sh fingerprint/*.sh
+          chmod +x setup.sh lib/*.sh scripts/*.sh audio/*.sh keyboard/*.sh fingerprint/*.sh ec/*.sh power/*.sh
           ./setup.sh --all --dry-run
           ./setup.sh --check --dry-run
           ./setup.sh --uninstall --dry-run

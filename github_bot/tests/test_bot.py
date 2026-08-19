@@ -162,6 +162,7 @@ class TestMediaOcr(unittest.TestCase):
 class TestStreamAndMessagePrep(unittest.TestCase):
     def test_parse_sse_stream_openai(self) -> None:
         import io
+
         from llm_client import _parse_sse_stream
         sse_data = (
             b": ping\n\n"
@@ -175,6 +176,7 @@ class TestStreamAndMessagePrep(unittest.TestCase):
 
     def test_parse_sse_stream_cpa(self) -> None:
         import io
+
         from llm_client import _parse_sse_stream
         sse_data = (
             b'data: {"type":"response.output_text.delta","delta":"Line 1\\n"}\n\n'

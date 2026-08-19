@@ -85,7 +85,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Arch Linux PKGBUILD Lint (namcap)
-        uses: docker://archlinux:base-devel
+        uses: docker://archlinux:base-devel@sha256:e33eeaf71d95aa2bfd73ceec8fc21e134166d2d526b77d9fecbb4ebd9c927eb1
         with:
           args: >
             bash -c "
@@ -113,7 +113,7 @@ jobs:
             "
 
       - name: Fedora RPM Spec Lint (rpmlint & rpmspec)
-        uses: docker://fedora:42
+        uses: docker://fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
         with:
           args: >
             bash -c "
