@@ -19,6 +19,8 @@ REDACT_HOSTNAME="$(printf '%s' "$REDACT_HOSTNAME" | sed 's/[][\.|$(){}?+*^]/\\&/
 REDACT_ARGS=(
     -E
     -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/<MAC>/g'
+    -e 's/([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}/<MAC>/g'
+    -e 's/([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}/<MAC>/g'
     -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<IP>/g'
     -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g'
     -e 's/::[0-9][0-9A-Fa-f]{0,3}(:[0-9A-Fa-f]{1,4})*/<IP6>/g'
@@ -26,18 +28,22 @@ REDACT_ARGS=(
     -e 's/::[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})+/<IP6>/g'
     -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4}){3,}/<IP6>/g'
     -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<EMAIL>/g'
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9-]*/<EMAIL>/g'
     -e 's|/home/[A-Za-z0-9._-]+|/home/<USER>|g'
-    -e 's/[Ss]erial[[:space:]]+[Nn]umber[[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{3,}/<SERIAL>/g'
-    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][Nn][Uu][Mm][Bb][Ee][Rr][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{3,}/<SERIAL>/g'
-    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]*[:=][[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{3,}/<SERIAL>/g'
-    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]+[A-Za-z0-9][A-Za-z0-9_-]{3,}/<SERIAL>/g'
+    -e 's/[Ss]erial[[:space:]]+[Nn]umber[[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][Nn][Uu][Mm][Bb][Ee][Rr][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss]erial[[:space:]]+[Nn][Oo]\.?[[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's|([Ss])/[Nn][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}|<SERIAL>|g'
+    -e 's/[Ss][Nn][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]*[:=][[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]+[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
 )
 if [ -n "$REDACT_HOSTNAME" ]; then
     REDACT_ARGS+=(
-        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}([^A-Za-z0-9_])/\\1<HOSTNAME>\\2/g"
-        -e "s/^${REDACT_HOSTNAME}([^A-Za-z0-9_])/<HOSTNAME>\\1/g"
-        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}\$/<HOSTNAME>\\1/g"
-        -e "s/^${REDACT_HOSTNAME}\$/<HOSTNAME>/g"
+        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}([^A-Za-z0-9_])/\\1<HOSTNAME>\\2/Ig"
+        -e "s/^${REDACT_HOSTNAME}([^A-Za-z0-9_])/<HOSTNAME>\\1/Ig"
+        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}\$/<HOSTNAME>\\1/Ig"
+        -e "s/^${REDACT_HOSTNAME}\$/<HOSTNAME>/Ig"
     )
 fi
 
