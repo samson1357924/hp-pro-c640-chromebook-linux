@@ -132,19 +132,19 @@ install_packages() {
 get_fingerprint_build_deps() {
     case "$DISTRO_FAMILY" in
         debian)
-            echo "build-essential meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
+            echo "build-essential git ca-certificates meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
             ;;
         fedora)
-            echo "gcc meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
+            echo "gcc git ca-certificates meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
             ;;
         arch)
-            echo "base-devel meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection fprintd"
+            echo "base-devel git meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection fprintd"
             ;;
         suse)
-            echo "patterns-devel-base-devel_basis meson ninja pkg-config glib2-devel libgusb-devel libpixman-1-0-devel libgudev-1_0-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
+            echo "patterns-devel-base-devel_basis git meson ninja pkg-config glib2-devel libgusb-devel libpixman-1-0-devel libgudev-1_0-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
             ;;
         *)
-            echo "meson ninja gcc pkg-config glib2 libgusb pixman libgudev fprintd"
+            echo "meson ninja gcc git pkg-config glib2 libgusb pixman libgudev fprintd"
             ;;
     esac
 }

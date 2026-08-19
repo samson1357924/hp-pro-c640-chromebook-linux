@@ -97,7 +97,7 @@ jobs:
             check_pkgs_cmd: "dnf download --resolve --destdir=/tmp/ci-dnf-check"
 
           - name: "Arch Linux"
-            image: "archlinux:base-devel@sha256:e33eeaf71d95aa2bfd73ceec8fc21e134166d2d526b77d9fecbb4ebd9c927eb1"
+            image: "archlinux:base-devel@sha256:aecf5b39bd3139a951090dfb3d940f9317e4c5fca038c65fb49ac03910f7133e"
             family: "arch"
             init_cmd: "pacman -Syu --noconfirm --needed bash coreutils sudo git"
             check_pkgs_cmd: "pacman -Sp --needed"
