@@ -51,7 +51,9 @@ This command automatically:
   ```
 
   *(This restores the backed-up `libfprint` libraries and `60-cros-fp.rules`,
-  removes `/var/lib/fprint/crfpmoc.key` and the plugdev membership the
+  reverts the `pam_fprintd` PAM changes (`/etc/pam.d/sudo` back to stock,
+  fprintd out of `common-auth`), removes the `fprintd-sleep.sh` system-sleep
+  hook, removes `/var/lib/fprint/crfpmoc.key` and the plugdev membership the
   installer added, and rolls the service states back.)*
 
 * **Remove only the keyboard top-row mapping**:

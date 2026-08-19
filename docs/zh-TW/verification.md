@@ -39,6 +39,7 @@
 | udev rules（已安裝版） | 🟢 | 2026-08-18 已安裝 repo 版（`GROUP="plugdev", MODE="0660", TAG+="uaccess"`），重開機後以 `getfacl` 驗證；舊 `0666` 版已備份 |
 | 單元測試 | 🟢 | `test-crfpmoc-unit`（`/usr/libexec/installed-tests/libfprint-2/`）4/4 全過：`fp_info_v3`、`fp_info_v1`、`enc_status_bitmask`、`payload_bounds` |
 | 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §13](TROUBLESHOOTING.md) |
+| `sudo` PAM 授權 | 🟢 | `fprintd` 僅存在於 `/etc/pam.d/sudo`（2026-08-18 Claim 競賽修復——不在 `common-auth`）；`sudo -k` 後執行 `sudo whoami` 會跳出指紋提示並接受驗證（測試方法見 [fingerprint/README.md §Test](fingerprint/README.md)）。PAM 堆疊與上述鎖定畫面修復同一 session 驗證 |
 
 ### 2. 音訊 (Intel SOF DSP + ALSA UCM2 + PipeWire)
 
@@ -48,7 +49,7 @@
 | UCM 設定與 repo 完全一致 | 🟢 | `/usr/share/alsa/ucm2/conf.d/sof-rt5682/` 與 `audio/ucm/ucm2/` diff → **無差異** |
 | 喇叭 (PCM 5) | 🟢 | 📄 `audio/aplay.txt`：`device 5: Speakers`；wpctl 預設 sink = `Speaker` |
 | 耳機 (PCM 0) | ⚠️ | 📄 `audio/aplay.txt`：`device 0: Port1`；wpctl 列出 `Headphones` sink — **插拔自動切換未納入證據** |
-| HDMI/DP 輸出 (PCM 2/3/4) | 🟢 | 📄 `audio/aplay.txt`：HDMI1/2/3；wpctl 列出 3 個 HDMI sink |
+| HDMI/DP 輸出 (PCM 2/3/4) | ⚠️ | 📄 `audio/aplay.txt`：HDMI1/2/3；wpctl 列出 3 個 HDMI sink — **外接顯示器輸出未驗證**（測試期間未連接 HDMI/DP 螢幕） |
 | 雙麥克風 split (Mic 1/Mic 2) | 🟢 | 📄 `audio/wpctl.txt`：`Mic1__source.split` + `Mic2__source.split` filter 運作中 |
 | 耳機麥克風 | 🟢 | 📄 `audio/wpctl.txt`：`Headset Microphone` source 存在 |
 | 核心警告 | 🟢 | 📄 `system/dmesg_warnings.txt` — **空檔**（0 行） |
@@ -110,7 +111,7 @@
 | **觸控螢幕 / 觸控板 / 背光** | 內建核心驅動（`elan_i2c`、`cros_kbd_led_backlight`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢/背光功能測試證據** |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §14） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
-| **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 只驗證可建置性，不驗證硬體 |
+| **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
 
 > [!NOTE]
 > **`power/modprobe.d/99-hp-c640-power.conf` 於 kernel ≥ 7.0**：`iwlwifi

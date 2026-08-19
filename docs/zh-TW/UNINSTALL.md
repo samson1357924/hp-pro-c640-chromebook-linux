@@ -47,7 +47,9 @@
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
 
-  *（會還原備份的 `libfprint` 函式庫與 `60-cros-fp.rules`、移除
+  *（會還原備份的 `libfprint` 函式庫與 `60-cros-fp.rules`、將
+  `pam_fprintd` 的 PAM 變更還原（`/etc/pam.d/sudo` 回到 stock、fprintd
+  移出 `common-auth`）、移除 `fprintd-sleep.sh` system-sleep hook、移除
   `/var/lib/fprint/crfpmoc.key` 與安裝器新增的 plugdev 成員資格，並還原
   服務狀態。）*
 

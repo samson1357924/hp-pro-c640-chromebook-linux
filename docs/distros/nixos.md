@@ -13,7 +13,13 @@ the following settings into your `/etc/nixos/configuration.nix` or Nix Flake.
 let
   # libfprint built from the public 3v1n0/libfprint `feature/crfpmoc`
   # branch (pinned commit), with the audited driver overlay from this repo
-  # applied. Replace <REPO> with the path of your clone.
+  # applied. The overlay is fetched via builtins.fetchGit (works inside the
+  # Nix build sandbox — `postUnpack` cannot see files outside /nix/store),
+  # pinned to a repo commit that contains fingerprint/driver/.
+  overlaySrc = builtins.fetchGit {
+    url = "https://github.com/samson1357924/hp-pro-c640-chromebook-linux";
+    rev = "648a4d08fe6bf7128c515b8097217d9612356b6a";
+  };
   libfprint-crfpmoc = pkgs.libfprint.overrideAttrs (old: {
     pname = "libfprint-crfpmoc";
     version = "1.94.10-crfpmoc";
@@ -22,8 +28,10 @@ let
       sha256 = "2ef9a45508259e09bc92e0f5fd4ea1f2271f3a9235a2cfbc76c9ca27a9ee71f4";
     };
     postUnpack = ''
-      cp -r <REPO>/fingerprint/driver/. "$sourceRoot/libfprint/drivers/crfpmoc/"
+      cp -r ${overlaySrc}/fingerprint/driver/. "$sourceRoot/libfprint/drivers/crfpmoc/"
     '';
+    # Nix single-quoted strings keep `\n` as a literal backslash-n, which is
+    # exactly what sed expects here (insert a new line in the substitution).
     postPatch = ''
       sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
     '';
@@ -50,6 +58,8 @@ in
   };
 
   # 4. ChromeOS /dev/cros_fp udev permissions
+  #    (add your user to `plugdev`: `users.users.<you>.extraGroups = [ "plugdev" ];`)
+  users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
   '';

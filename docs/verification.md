@@ -41,6 +41,7 @@ diagnostic bundle.
 | udev rules (installed) | 🟢 | 2026-08-18: repo rule installed (`GROUP="plugdev", MODE="0660", TAG+="uaccess"`), verified via `getfacl` after reboot — old `0666` version backed up |
 | Unit tests | 🟢 | `test-crfpmoc-unit` binary (in `/usr/libexec/installed-tests/libfprint-2/`) passes 4/4: `fp_info_v3`, `fp_info_v1`, `enc_status_bitmask`, `payload_bounds` |
 | Lock-screen fingerprint after suspend/resume | 🟢 | **Fully verified 2026-08-19**: (1) PAM claim race fixed 2026-08-18 (fprintd out of `common-auth`, kept in `gdm-fingerprint` + `sudo` only — was "Device was already claimed", GNOME/gdm#1071); (2) FPMCU open failure right after wake fixed by driver-level open retry (`CRFPMOC_OPEN_MAX_RETRIES` × 500 ms in crfpmoc.c) + system-sleep hook (`fprintd-sleep.sh` stops fprintd pre-sleep). User lid-cycle test: **first unlock has fingerprint prompt, zero resume delay, no retry lines in logs**. See [TROUBLESHOOTING.md §13](TROUBLESHOOTING.md) |
+| `sudo` PAM authorization | 🟢 | `fprintd` lives in `/etc/pam.d/sudo` only (claim-race fix 2026-08-18 — not in `common-auth`); after `sudo -k`, `sudo whoami` prompts for and accepts the fingerprint (test method in [fingerprint/README.md §Test](fingerprint/README.md)). PAM stack verified in same session as lock-screen fix above |
 
 ### 2. Audio (Intel SOF DSP + ALSA UCM2 + PipeWire)
 
@@ -50,7 +51,7 @@ diagnostic bundle.
 | UCM profiles identical to repo | 🟢 | `diff` of `/usr/share/alsa/ucm2/conf.d/sof-rt5682/` vs `audio/ucm/ucm2/` → **no differences** |
 | Speakers (PCM 5) | 🟢 | 📄 `audio/aplay.txt`: `device 5: Speakers`; wpctl default sink = `Speaker` |
 | Headphones (PCM 0) | ⚠️ | 📄 `audio/aplay.txt`: `device 0: Port1`; wpctl lists `Headphones` sink — **auto-switch on plug/unplug not captured in evidence** |
-| HDMI/DP outputs (PCM 2/3/4) | 🟢 | 📄 `audio/aplay.txt`: HDMI1/2/3 listed; wpctl lists 3 HDMI sinks |
+| HDMI/DP outputs (PCM 2/3/4) | ⚠️ | 📄 `audio/aplay.txt`: HDMI1/2/3 listed; wpctl lists 3 HDMI sinks — **external display output not verified** (no HDMI/DP display was connected during testing) |
 | Dual-microphone split (Mic 1/Mic 2) | 🟢 | 📄 `audio/wpctl.txt`: `Mic1__source.split` + `Mic2__source.split` filters active |
 | Headset microphone | 🟢 | 📄 `audio/wpctl.txt`: `Headset Microphone` source present |
 | Kernel warnings | 🟢 | 📄 `system/dmesg_warnings.txt` — **empty** (0 lines) |
@@ -113,7 +114,7 @@ should be considered "provided for your distro, verify on your own hardware":
 | **Touchscreen / touchpad / backlight** | stock kernel drivers (`elan_i2c`, `cros_kbd_led_backlight`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture/backlight test in evidence** |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §14) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
-| **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** was tested; CI validates buildability, not hardware |
+| **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
 
 > [!NOTE]
 > **`power/modprobe.d/99-hp-c640-power.conf` on kernel ≥ 7.0**: the

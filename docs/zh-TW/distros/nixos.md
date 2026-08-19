@@ -13,8 +13,14 @@ NixOS 採用不可變（Immutable）與純宣告式（Declarative）系統架構
 
 let
   # 以公開的 3v1n0/libfprint `feature/crfpmoc` 分支（固定 commit）建置
-  # libfprint，並套用本 repo 的審核版 driver overlay。
-  # 請將 <REPO> 換成你的 clone 路徑。
+  # libfprint，並套用本 repo 的審核版 driver overlay。overlay 以
+  # builtins.fetchGit 取得（Nix build sandbox 內無法讀取 /nix/store 以外的
+  # 路徑，`postUnpack` 看不到你的 clone），並固定在本 repo 包含
+  # fingerprint/driver/ 的 commit。
+  overlaySrc = builtins.fetchGit {
+    url = "https://github.com/samson1357924/hp-pro-c640-chromebook-linux";
+    rev = "648a4d08fe6bf7128c515b8097217d9612356b6a";
+  };
   libfprint-crfpmoc = pkgs.libfprint.overrideAttrs (old: {
     pname = "libfprint-crfpmoc";
     version = "1.94.10-crfpmoc";
@@ -23,8 +29,10 @@ let
       sha256 = "2ef9a45508259e09bc92e0f5fd4ea1f2271f3a9235a2cfbc76c9ca27a9ee71f4";
     };
     postUnpack = ''
-      cp -r <REPO>/fingerprint/driver/. "$sourceRoot/libfprint/drivers/crfpmoc/"
+      cp -r ${overlaySrc}/fingerprint/driver/. "$sourceRoot/libfprint/drivers/crfpmoc/"
     '';
+    # Nix 單引號字串會保留 `\n`（反斜線+n 原樣），正是 sed 此處需要的
+    # （在取代式中插入新行）。
     postPatch = ''
       sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
     '';
@@ -51,6 +59,8 @@ in
   };
 
   # 4. ChromeOS /dev/cros_fp udev 權限
+  #    （把使用者加入 `plugdev`：`users.users.<you>.extraGroups = [ "plugdev" ];`）
+  users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
   '';
