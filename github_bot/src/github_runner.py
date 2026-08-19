@@ -22,7 +22,6 @@ from agent_orchestrator import (
 )
 from llm_client import LLMClient
 
-
 BOT_DIR = Path(__file__).resolve().parents[1]
 
 
@@ -33,6 +32,34 @@ class GitHubAPIClient:
         self.repo = repo
         self.token = token
         self.base_url = f"https://api.github.com/repos/{repo}"
+        self._bot_login: str | None = None
+
+    def _resolve_bot_login(self) -> str | None:
+        """Login of the token owner (the bot account posting comments in CI).
+
+        GITHUB_ACTOR is the workflow *triggerer*, not the comment author
+        (comments are posted by e.g. github-actions[bot]), so we resolve the
+        real identity from the token. Returns None if resolution fails; in
+        that case sticky updates are skipped (posting a new comment is safe).
+        """
+        if self._bot_login is not None:
+            return self._bot_login
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"token {self.token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "hp-pro-c640-linux-ai-bot/1.0",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                me = json.loads(resp.read().decode("utf-8"))
+            self._bot_login = (me or {}).get("login")
+        except Exception as exc:
+            print(f"[GitHubAPI Warning] Could not resolve token identity, sticky updates disabled: {exc}", file=sys.stderr)
+        return self._bot_login
 
     def _request(
         self,
@@ -83,17 +110,18 @@ class GitHubAPIClient:
 
     def publish_sticky_comment(self, issue_number: int, body: str, marker: str) -> None:
         """Find an existing bot comment with the matching marker and update it in-place."""
-        bot_login = os.environ.get("GITHUB_ACTOR", "")
-        comments = self.get_issue_comments(issue_number)
-        for c in comments:
-            c_body = c.get("body", "")
-            c_author = (c.get("user") or {}).get("login", "")
-            if marker in c_body and (not bot_login or c_author == bot_login):
-                cid = c.get("id")
-                if cid:
-                    print(f"Updating existing bot comment #{cid} with marker {marker}")
-                    self._request(f"issues/comments/{cid}", method="PATCH", data={"body": body})
-                    return
+        bot_login = self._resolve_bot_login()
+        if bot_login:
+            comments = self.get_issue_comments(issue_number)
+            for c in comments:
+                c_body = c.get("body", "")
+                c_author = (c.get("user") or {}).get("login", "")
+                if marker in c_body and c_author == bot_login:
+                    cid = c.get("id")
+                    if cid:
+                        print(f"Updating existing bot comment #{cid} with marker {marker}")
+                        self._request(f"issues/comments/{cid}", method="PATCH", data={"body": body})
+                        return
 
         print(f"Publishing new comment on issue/PR #{issue_number}")
         self._request(f"issues/{issue_number}/comments", method="POST", data={"body": body})
@@ -132,6 +160,11 @@ def _env_int(name: str, default: int = 0) -> int:
         return int(os.environ.get(name, "") or default)
     except ValueError:
         return default
+
+
+def _flatten_file_names(files: list[str]) -> list[str]:
+    """Make filenames safe to embed in a single-line prompt (no newline injection)."""
+    return [f.replace("\r", "\\r").replace("\n", "\\n") for f in files]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,14 +210,16 @@ def main(argv: list[str] | None = None) -> int:
 
         if api_client and pr_number:
             diff_text = api_client.get_pr_diff(pr_number)
-            changed_files = api_client.get_pr_files(pr_number)
+            changed_files = _flatten_file_names(api_client.get_pr_files(pr_number))
         else:
             # Fallback to local git diff
             base_sha = os.environ.get("REVIEW_BASE_REF", "origin/main")
             head_sha = os.environ.get("REVIEW_HEAD_REF", "HEAD")
             try:
                 diff_text = subprocess.check_output(["git", "diff", f"{base_sha}...{head_sha}"], text=True, errors="replace")
-                changed_files = subprocess.check_output(["git", "diff", "--name-only", f"{base_sha}...{head_sha}"], text=True, errors="replace").splitlines()
+                changed_files = _flatten_file_names(
+                    subprocess.check_output(["git", "diff", "--name-only", f"{base_sha}...{head_sha}"], text=True, errors="replace").splitlines()
+                )
             except Exception as exc:
                 raise RuntimeError(
                     f"Unable to obtain the PR diff for review (base={base_sha}, head={head_sha}). "

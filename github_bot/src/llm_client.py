@@ -95,10 +95,17 @@ def sanitize_model_name_for_display(model_id: str) -> str:
 
 
 def _redact_url(url: str) -> str:
-    """Strip scheme, hostname and credentials from a URL for safe error messages."""
+    """Strip credentials, path and query from a URL for safe error messages.
+
+    Handles both scheme'd URLs (https://user:pass@host:port/v1?key=...) and
+    scheme-less endpoints (host.example/v1/chat/completions).
+    """
     try:
         parsed = urllib.parse.urlparse(url)
-        return f"{parsed.scheme}://{parsed.hostname or '<host>'}{parsed.path or '/'}"
+        if parsed.scheme:
+            return f"{parsed.scheme}://{parsed.hostname or '<host>'}"
+        host = (parsed.path or "").split("/", 1)[0] or "<host>"
+        return f"{host}"
     except ValueError:
         return "<redacted-url>"
 
