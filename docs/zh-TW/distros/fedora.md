@@ -1,4 +1,4 @@
-[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
 # 🐧 Fedora 專屬配置指南
 
@@ -50,8 +50,21 @@ sudo udevadm trigger --subsystem-match=input
 ```bash
 # 使用本專案腳本編譯並安裝至 /usr/lib64
 ./fingerprint/install-fingerprint.sh
+```
 
-# 啟用 Fedora PAM 指紋模組
-sudo authselect enable-feature with-fingerprint
+> [!IMPORTANT]
+> 請**不要**執行 `authselect enable-feature with-fingerprint`。該 feature
+> 會把 `pam_fprintd` 注入 `system-auth`（`gdm-password` 會引入它）；解鎖時
+> GDM 同時 fork `gdm-password` 與 `gdm-fingerprint` worker 爭搶唯一的
+> fprintd 裝置，鎖定畫面的指紋提示會消失（GNOME/gdm#1071）。只為
+> **sudo** 啟用指紋：
+
+```bash
+# 確認 with-fingerprint feature 保持停用
+sudo authselect disable-feature with-fingerprint
 sudo authselect apply-changes
+
+# 僅為 sudo 啟用指紋
+echo 'auth sufficient pam_fprintd.so' | sudo tee /etc/pam.d/sudo
+sudo chmod 0644 /etc/pam.d/sudo
 ```

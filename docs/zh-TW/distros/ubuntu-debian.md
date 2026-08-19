@@ -1,4 +1,4 @@
-[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
 # 🐧 Ubuntu & Debian 專屬配置指南
 
@@ -57,5 +57,15 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 # 執行自動安裝腳本進行編譯與安裝
 ./fingerprint/install-fingerprint.sh
-sudo pam-auth-update --enable fprintd
+```
+
+> [!IMPORTANT]
+> 請**不要**執行 `pam-auth-update --enable fprintd`。該設定檔會把
+> `pam_fprintd` 注入 `common-auth`（`gdm-password` 會引入它）；解鎖時 GDM
+> 同時 fork `gdm-password` 與 `gdm-fingerprint` worker 爭搶唯一的 fprintd
+> 裝置，鎖定畫面的指紋提示會消失（GNOME/gdm#1071）。安裝腳本只會在
+> `/etc/pam.d/sudo` 啟用指紋；若你已在 `common-auth` 啟用，請移除：
+
+```bash
+sudo pam-auth-update --remove fprintd
 ```

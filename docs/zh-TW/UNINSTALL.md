@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-TW.md)
 
 # 🔄 系統復原與解除安裝指南 (Uninstallation & Rollback)
 
@@ -23,7 +23,13 @@
 3. 移除 `/etc/udev/rules.d/60-cros-fp.rules`。
 4. 移除電源管理調校（logind 設定與休眠輔助）。
 5. 移除 EC 工具與 80% 電池保護服務。
-6. 提示發行版重裝原生 `libfprint` 套件的指令。
+6. 從**本專案首次安裝前的最早備份**還原每個檔案（重裝會保留第一次備份，
+   因此 rollback 永遠還原到專案介入前的狀態）。
+7. 還原安裝器曾修改的 systemd 服務啟用/運作狀態（`thermald`、`tlp`、
+   `c640-battery-limit.service` 等），並移除**安裝器新增的 plugdev 群組成員**
+   （安裝前已存在、或仍被其他 udev 規則引用的成員資格會被保留）。
+8. 移除指紋加密種子 `/var/lib/fprint/crfpmoc.key`，並提示發行版重裝原生
+   `libfprint` 套件的指令。
 
 ---
 
@@ -41,8 +47,9 @@
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
 
-  *（會還原備份的 `libfprint`、`60-cros-fp.rules` 與 `/etc/pam.d/sudo`，
-  並移除 `fprintd-sleep.sh` system-sleep hook。）*
+  *（會還原備份的 `libfprint` 函式庫與 `60-cros-fp.rules`、移除
+  `/var/lib/fprint/crfpmoc.key` 與安裝器新增的 plugdev 成員資格，並還原
+  服務狀態。）*
 
 * **僅移除鍵盤頂排映射**：
 

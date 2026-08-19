@@ -55,11 +55,13 @@ sudo udevadm trigger --subsystem-match=input
 
 ### (4) Configure PAM Fingerprint Authentication
 
-Edit `/etc/pam.d/system-auth` and add the following line above `pam_unix.so`:
-
-```text
-auth      sufficient pam_fprintd.so
-```
+> [!IMPORTANT]
+> Keep `pam_fprintd` **out of `/etc/pam.d/system-auth`**. `system-auth` is
+> included by `gdm-password`; on unlock GDM forks the `gdm-password` and
+> `gdm-fingerprint` workers concurrently and both try to Claim the single
+> fprintd device — the loser gets "Device was already claimed" and the lock
+> screen shows no fingerprint prompt (GNOME/gdm#1071). Enable fingerprint
+> **only for sudo**:
 
 Edit `/etc/pam.d/sudo` and add the following line at the top:
 

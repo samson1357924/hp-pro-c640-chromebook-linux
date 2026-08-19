@@ -47,5 +47,16 @@ sudo udevadm trigger --subsystem-match=input
 
 ```bash
 ./fingerprint/install-fingerprint.sh
-sudo pam-config -a --fprintd
+```
+
+> [!IMPORTANT]
+> Do **not** run `pam-config -a --fprintd`: it injects `pam_fprintd` into
+> `common-auth`, which `gdm-password` includes — on unlock GDM forks the
+> `gdm-password` and `gdm-fingerprint` workers concurrently and both try to
+> Claim the single fprintd device, so the lock screen shows no fingerprint
+> prompt (GNOME/gdm#1071). Keep fingerprint **only in `/etc/pam.d/sudo`**:
+
+```bash
+sudo cp /etc/pam.d/sudo /etc/pam.d/sudo.bak
+sudo sed -i '1i auth sufficient pam_fprintd.so' /etc/pam.d/sudo
 ```

@@ -1,6 +1,6 @@
 # 🛠️ Troubleshooting & Pitfall Guide
 
-This article covers the ten most common problems and their root-cause solutions
+This article covers the fourteen most common problems and their root-cause solutions
 when installing and using Linux on the **HP Pro c640 Chromebook (Google
 `dratini`)**.
 

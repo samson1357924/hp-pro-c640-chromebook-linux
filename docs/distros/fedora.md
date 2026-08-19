@@ -48,8 +48,22 @@ sudo udevadm trigger --subsystem-match=input
 ```bash
 # Compile and install to /usr/lib64 using this project's script
 ./fingerprint/install-fingerprint.sh
+```
 
-# Enable the Fedora PAM fingerprint module
-sudo authselect enable-feature with-fingerprint
+> [!IMPORTANT]
+> Do **not** run `authselect enable-feature with-fingerprint`. That feature
+> injects `pam_fprintd` into `system-auth`, which `gdm-password` includes —
+> on unlock GDM forks the `gdm-password` and `gdm-fingerprint` workers
+> concurrently and both try to Claim the single fprintd device, so the lock
+> screen shows no fingerprint prompt (GNOME/gdm#1071). Keep fingerprint
+> **only in `/etc/pam.d/sudo`**:
+
+```bash
+# Make sure the with-fingerprint feature stays disabled
+sudo authselect disable-feature with-fingerprint
 sudo authselect apply-changes
+
+# Enable fingerprint for sudo only
+echo 'auth sufficient pam_fprintd.so' | sudo tee /etc/pam.d/sudo
+sudo chmod 0644 /etc/pam.d/sudo
 ```

@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-TW.md)
 
 # 📊 硬體相容性矩陣 (Hardware Compatibility Matrix)
 
@@ -32,4 +32,5 @@ HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hat
 * **音效伺服器**：PipeWire `>= 0.3.65` (推薦 PipeWire 1.0+ / WirePlumber 0.4.14+)。
 * **發行版實測狀態**（實際硬體驗證內容請見 [VERIFICATION.md](verification.md)）：
   * 🟢 **已於實機硬體驗證**：**Ubuntu 26.04 LTS**（kernel `7.0.0-29-generic`、PipeWire `1.6.2`、WirePlumber `0.5.13`、fprintd `1.94.5`）
-  * ⚠️ **僅 CI 建置驗證（無硬體實測）**：Debian 12/13、Fedora 39-41、Arch Linux / EndeavourOS、openSUSE Tumbleweed
+  * ⚠️ **僅 CI 建置驗證（無硬體實測）**：Ubuntu 24.04、Fedora 42、Arch Linux
+    （distro-matrix dry-run 與依賴解析），以及打包檢查（Arch `namcap`、Fedora `rpmlint`）
