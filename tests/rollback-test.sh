@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 # tests/rollback-test.sh - Sandboxed tests for lib/backup.sh backup/rollback
 # primitives (install plan backup, manifest schema 2.0, service & group
 # restoration). Run as root or with passwordless sudo:
