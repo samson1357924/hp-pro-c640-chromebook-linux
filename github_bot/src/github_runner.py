@@ -22,7 +22,6 @@ from agent_orchestrator import (
 )
 from llm_client import LLMClient
 
-
 BOT_DIR = Path(__file__).resolve().parents[1]
 
 

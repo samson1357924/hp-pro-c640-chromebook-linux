@@ -77,6 +77,36 @@ jobs:
           echo "Running standalone unit test..."
           ./test-crfpmoc-unit --verbose
 
+  pinned-upstream-path:
+    name: Pinned Upstream Build Path (3v1n0/libfprint @ 5644259)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git meson ninja-build pkg-config \
+            libglib2.0-dev libgudev-1.0-dev libgusb-dev libpixman-1-dev \
+            libnss3-dev gobject-introspection libgirepository1.0-dev
+
+      - name: Replay pinned clone + overlay + meson patch (configure-only)
+        run: |
+          set -euo pipefail
+          PIN=56442591a5c302a906289f30988fb50fc3d82ed6
+          git clone --depth 1 --branch feature/crfpmoc --single-branch \
+            https://gitlab.freedesktop.org/3v1n0/libfprint.git crfpmoc-build
+          git -C crfpmoc-build fetch --depth 1 origin "$PIN"
+          git -C crfpmoc-build checkout --detach FETCH_HEAD
+          test "$(git -C crfpmoc-build rev-parse HEAD)" = "$PIN"
+          cp -f fingerprint/driver/crfpmoc* crfpmoc-build/libfprint/drivers/crfpmoc/
+          test -f crfpmoc-build/libfprint/drivers/crfpmoc/crfpmoc-proto.c
+          sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" crfpmoc-build/libfprint/meson.build
+          grep -q "crfpmoc-proto.c" crfpmoc-build/libfprint/meson.build
+          meson setup crfpmoc-build/build --prefix=/usr \
+            -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
+
   packaging-lint:
     name: Packaging Lint & Validation
     runs-on: ubuntu-24.04
@@ -85,7 +115,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Arch Linux PKGBUILD Lint (namcap)
-        uses: docker://archlinux:base-devel
+        uses: docker://archlinux:base-devel@sha256:aecf5b39bd3139a951090dfb3d940f9317e4c5fca038c65fb49ac03910f7133e
         with:
           args: >
             bash -c "
@@ -113,7 +143,7 @@ jobs:
             "
 
       - name: Fedora RPM Spec Lint (rpmlint & rpmspec)
-        uses: docker://fedora:42
+        uses: docker://fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
         with:
           args: >
             bash -c "

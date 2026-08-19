@@ -134,20 +134,21 @@ get_fingerprint_build_deps() {
         debian)
             # libudev-dev provides udev.pc, which meson requires to resolve
             # the udevdir (the crfpmoc build uses the 'udev' helper); it is
-            # also pulled in transitively via libgudev-1.0-dev.
-            echo "build-essential meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libudev-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
+            # also pulled in transitively via libgudev-1.0-dev. git +
+            # ca-certificates are needed for the pinned upstream clone.
+            echo "build-essential git ca-certificates meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libudev-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
             ;;
         fedora)
-            echo "gcc meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
+            echo "gcc git ca-certificates meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
             ;;
         arch)
-            echo "base-devel meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection fprintd"
+            echo "base-devel git meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection fprintd"
             ;;
         suse)
-            echo "patterns-devel-base-devel_basis meson ninja pkg-config glib2-devel libgusb-devel libpixman-1-0-devel libgudev-1_0-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
+            echo "patterns-devel-base-devel_basis git meson ninja pkg-config glib2-devel libgusb-devel libpixman-1-0-devel libgudev-1_0-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
             ;;
         *)
-            echo "meson ninja gcc pkg-config glib2 libgusb pixman libgudev fprintd"
+            echo "meson ninja gcc git pkg-config glib2 libgusb pixman libgudev fprintd"
             ;;
     esac
 }

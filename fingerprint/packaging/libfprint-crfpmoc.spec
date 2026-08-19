@@ -6,9 +6,9 @@ Release:        1%{?dist}
 Summary:        Toolkit for fingerprint readers with ChromeOS Match-on-Chip support
 
 License:        LGPL-2.1-or-later
-URL:            https://github.com/samson1357924/crfpmoc
-Source0:        https://github.com/samson1357924/crfpmoc/archive/refs/tags/v%{version}.tar.gz
-Source1:        60-cros-fp.rules
+URL:            https://gitlab.freedesktop.org/3v1n0/libfprint
+Source0:        https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/56442591a5c302a906289f30988fb50fc3d82ed6/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz
+Source1:        ../60-cros-fp.rules
 Source2:        crfpmoc-driver-overlay.tar.gz
 
 BuildRequires:  gcc
@@ -42,7 +42,10 @@ The %{name}-devel package contains libraries and header files for
 developing applications that use %{name}.
 
 %prep
-%autosetup -n crfpmoc-%{version} -a 2
+%autosetup -n libfprint-56442591a5c302a906289f30988fb50fc3d82ed6 -a 2
+# The driver overlay ships crfpmoc-proto.c but upstream libfprint/meson.build
+# only lists crfpmoc.c + crfpmoc-ec-transfer.c — add it idempotently.
+sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
 
 %build
 %meson -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false

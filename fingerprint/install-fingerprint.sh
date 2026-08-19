@@ -162,12 +162,18 @@ install_fp() {
     else
         if [ "${DRY_RUN:-0}" = "1" ]; then
             crfpmoc_dir="/tmp/crfpmoc-dryrun"
-            log_dryrun "Would clone crfpmoc into secure temporary directory"
+            log_dryrun "Would clone 3v1n0/libfprint (feature/crfpmoc) into secure temporary directory"
         else
             crfpmoc_dir="$(mktemp -d -t crfpmoc-build-XXXXXX)"
             is_temp_dir=1
-            log_info "Cloning crfpmoc upstream into secure directory: $crfpmoc_dir..."
-            git clone --depth 1 https://github.com/samson1357924/crfpmoc.git "$crfpmoc_dir"
+            log_info "Cloning crfpmoc libfprint (pinned 3v1n0/libfprint feature/crfpmoc @ 5644259) into secure directory: $crfpmoc_dir..."
+            git clone --depth 1 --branch feature/crfpmoc --single-branch https://gitlab.freedesktop.org/3v1n0/libfprint.git "$crfpmoc_dir"
+            git -C "$crfpmoc_dir" fetch --depth 1 origin 56442591a5c302a906289f30988fb50fc3d82ed6 || {
+                log_error "Failed to fetch pinned commit 56442591a5c302a906289f30988fb50fc3d82ed6 of 3v1n0/libfprint (feature/crfpmoc)."
+                log_info "The pinned commit may have been rewritten upstream; verify against https://gitlab.freedesktop.org/3v1n0/libfprint."
+                exit 1
+            }
+            git -C "$crfpmoc_dir" checkout --detach FETCH_HEAD
         fi
     fi
 

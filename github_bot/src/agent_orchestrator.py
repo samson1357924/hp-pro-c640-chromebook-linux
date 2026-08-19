@@ -147,7 +147,7 @@ class AgentOrchestrator:
             f"{scanner_markdown}\n\n"
             f"---\n\n"
             + "\n\n---\n\n".join(role_reports)
-            + f"\n\n---\n*Automated review by HP Pro c640 Multi-Agent Bot (OpenCode & CPA)*"
+            + "\n\n---\n*Automated review by HP Pro c640 Multi-Agent Bot (OpenCode & CPA)*"
         )
         return assembled
 
