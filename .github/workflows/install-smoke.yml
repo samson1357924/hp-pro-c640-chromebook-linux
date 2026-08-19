@@ -126,12 +126,12 @@ jobs:
           fi
           # manifest must be fully drained (no records/services/groups left)
           python3 -c '
-            import json, sys
-            d = json.load(open("/var/lib/cros-enablement/install-manifest.json"))
-            for key in ("records", "services", "groups"):
-                if d.get(key):
-                    print(f"::error::manifest {key} not empty after uninstall: {d[key]}")
-                    sys.exit(1)
+          import json, sys
+          d = json.load(open("/var/lib/cros-enablement/install-manifest.json"))
+          for key in ("records", "services", "groups"):
+              if d.get(key):
+                  print(f"::error::manifest {key} not empty after uninstall: {d[key]}")
+                  sys.exit(1)
           '
 
   rollback-tests:
