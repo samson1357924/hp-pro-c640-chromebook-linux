@@ -64,6 +64,11 @@ class AgentOrchestrator:
             f"<untrusted_data>\n{trimmed}\n</untrusted_data>\n"
         )
 
+    @staticmethod
+    def _sanitize_title(title: str, max_chars: int = 500) -> str:
+        """Flatten untrusted titles into a single line before interpolation."""
+        return (title or "").replace("\r", " ").replace("\n", " ")[:max_chars]
+
     # -------------------------------------------------------------------------
     # PR Review Pipeline
     # -------------------------------------------------------------------------
@@ -104,7 +109,7 @@ class AgentOrchestrator:
             max_body_chars = int(self.config.get("maxIssueBodyChars", 40000))
             user_payload = (
                 f"# Pull Request Details\n"
-                f"- **Title**: {context.title or 'N/A'}\n"
+                f"- **Title**: {self._sanitize_title(context.title) or 'N/A'}\n"
                 f"- **Base Ref**: {context.base_ref}\n"
                 f"- **Head Ref**: {context.head_ref}\n"
                 f"- **Changed Files**: {', '.join(context.changed_files)}\n\n"
@@ -172,7 +177,7 @@ class AgentOrchestrator:
         user_payload = (
             f"# GitHub Issue #{context.issue_number or 'N/A'}\n"
             f"- **Author**: @{context.author or 'unknown'}\n"
-            f"- **Title**: {context.title}\n\n"
+            f"- **Title**: {self._sanitize_title(context.title)}\n\n"
             f"{self._untrusted_section('Issue Description', context.body, max_body_chars)}"
         )
         if ocr_text:
@@ -208,8 +213,8 @@ class AgentOrchestrator:
                 f"- BLOCKING_MISSING: Automated triage unavailable ({exc})\n"
                 f"- NEXT_ACTION_REPORTER: Please attach diagnostic logs via `./scripts/sysreport.sh`\n"
                 f"- NEXT_ACTION_MAINTAINER: Manual review required\n\n"
-                f"SUMMARY\nIssue received: {context.title}. Automated triage agent encountered error: {exc}.\n\n"
-                f"EVIDENCE_USED\n- Issue Title: {context.title}\n\n"
+                f"SUMMARY\nIssue received: {self._sanitize_title(context.title)}. Automated triage agent encountered error: {exc}.\n\n"
+                f"EVIDENCE_USED\n- Issue Title: {self._sanitize_title(context.title)}\n\n"
                 f"ROOT_CAUSE_HYPOTHESES\n- NOT_ENOUGH_INFO\n\n"
                 f"REPORTER_NEXT_STEPS\n- Run `./scripts/detect-hardware.sh` or `./audio/diagnose-audio.sh` and attach the output.\n\n"
                 f"MAINTAINER_NEXT_STEPS\n- Review issue manually once logs are provided.\n\n"
@@ -254,7 +259,7 @@ class AgentOrchestrator:
 
         system_instruction = f"{self.soul_prompt}\n\n---\n\n{role_prompt}"
         user_payload = (
-            f"# Subject\n**Title**: {title}\n\n"
+            f"# Subject\n**Title**: {self._sanitize_title(title)}\n\n"
             f"{self._untrusted_section('Content', body)}"
             f"{self._untrusted_section('Context / Diff', diff_or_context, 60000)}"
         )

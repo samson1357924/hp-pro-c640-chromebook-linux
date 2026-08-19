@@ -83,10 +83,12 @@ class GitHubAPIClient:
 
     def publish_sticky_comment(self, issue_number: int, body: str, marker: str) -> None:
         """Find an existing bot comment with the matching marker and update it in-place."""
+        bot_login = os.environ.get("GITHUB_ACTOR", "")
         comments = self.get_issue_comments(issue_number)
         for c in comments:
             c_body = c.get("body", "")
-            if marker in c_body:
+            c_author = (c.get("user") or {}).get("login", "")
+            if marker in c_body and (not bot_login or c_author == bot_login):
                 cid = c.get("id")
                 if cid:
                     print(f"Updating existing bot comment #{cid} with marker {marker}")
@@ -111,6 +113,17 @@ def parse_event_payload() -> dict[str, Any]:
         except Exception:
             pass
     return {}
+
+
+def _comment_body_from_event(payload: dict[str, Any]) -> str:
+    """Extract the comment body for issue_comment / review_comment events.
+
+    The comment object lives at the event root for both event types.
+    """
+    comment = payload.get("comment") or {}
+    if isinstance(comment, dict):
+        return comment.get("body", "") or ""
+    return ""
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -201,8 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.mode == "triage":
         issue_data = event_payload.get("issue") or {}
         issue_number = issue_data.get("number") or _env_int("ISSUE_NUMBER") or None
-        title = os.environ.get("ISSUE_TITLE") or issue_data.get("title", "")
-        body = os.environ.get("ISSUE_BODY") or issue_data.get("body", "")
+        title = issue_data.get("title", "")
+        body = issue_data.get("body", "")
         author = issue_data.get("user", {}).get("login", "")
 
         comments: list[dict[str, Any]] = []
@@ -231,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_client.add_issue_labels(issue_number, suggested_labels)
 
     elif args.mode in {"comment", "explain"}:
-        comment_body = os.environ.get("COMMENT_BODY", "")
+        comment_body = _comment_body_from_event(event_payload)
         issue_data = event_payload.get("issue") or {}
         issue_number = issue_data.get("number") or _env_int("ISSUE_NUMBER") or None
         is_pr = bool(issue_data.get("pull_request"))
