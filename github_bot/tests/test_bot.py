@@ -245,6 +245,19 @@ class TestMediaOcrSsrGuard(unittest.TestCase):
         self.assertIn("&lt;/untrusted_data&gt;", escaped)
         self.assertEqual(escaped.count("</untrusted_data>"), 1)
 
+    def test_sanitize_title_flattens_control_characters(self) -> None:
+        from agent_orchestrator import AgentOrchestrator
+        sanitized = AgentOrchestrator._sanitize_title("Normal title\nsecond line\n\npayload")
+        self.assertEqual(sanitized, "Normal title second line  payload")
+        self.assertNotIn("\n", sanitized)
+
+    def test_comment_body_from_event(self) -> None:
+        from github_runner import _comment_body_from_event
+        self.assertEqual(_comment_body_from_event({"comment": {"body": "/review"}}), "/review")
+        self.assertEqual(_comment_body_from_event({"comment": {"body": "plain"}}), "plain")
+        self.assertEqual(_comment_body_from_event({"issue": {"body": "not a comment"}}), "")
+        self.assertEqual(_comment_body_from_event({}), "")
+
 
 class TestGithubRunnerFlows(unittest.TestCase):
     def setUp(self) -> None:
@@ -255,9 +268,6 @@ class TestGithubRunnerFlows(unittest.TestCase):
         os.environ.pop("GITHUB_TOKEN", None)
         os.environ.pop("PR_NUMBER", None)
         os.environ.pop("ISSUE_NUMBER", None)
-        os.environ.pop("COMMENT_BODY", None)
-        os.environ.pop("ISSUE_TITLE", None)
-        os.environ.pop("ISSUE_BODY", None)
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -273,8 +283,10 @@ class TestGithubRunnerFlows(unittest.TestCase):
 
     def test_comment_review_dispatch_on_pr(self) -> None:
         import github_runner
-        self._write_event({"issue": {"number": 42, "pull_request": {"url": "https://api.github.com/repos/x/y/pulls/42"}}})
-        os.environ["COMMENT_BODY"] = "/review"
+        self._write_event({
+            "comment": {"body": "/review"},
+            "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/repos/x/y/pulls/42"}},
+        })
         real_main = github_runner.main
         dispatched: list[list[str]] = []
 
@@ -291,8 +303,7 @@ class TestGithubRunnerFlows(unittest.TestCase):
 
     def test_comment_triage_dispatch_on_issue(self) -> None:
         import github_runner
-        self._write_event({"issue": {"number": 7, "title": "t", "body": "b"}})
-        os.environ["COMMENT_BODY"] = "/review"
+        self._write_event({"comment": {"body": "/review"}, "issue": {"number": 7, "title": "t", "body": "b"}})
         real_main = github_runner.main
         dispatched: list[list[str]] = []
 
@@ -305,6 +316,37 @@ class TestGithubRunnerFlows(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(dispatched), 1)
         self.assertIn("--mode=triage", dispatched[0])
+
+    def test_comment_body_read_from_event_not_env(self) -> None:
+        import github_runner
+        os.environ["COMMENT_BODY"] = "/explain"
+        self._write_event({"comment": {"body": "/review"}, "issue": {"number": 9, "pull_request": {"url": "x"}}})
+        real_main = github_runner.main
+        dispatched: list[list[str]] = []
+
+        def fake_main(argv: list[str] | None = None) -> int:
+            dispatched.append(list(argv or []))
+            return 0
+
+        with mock.patch.object(github_runner, "main", fake_main):
+            rc = real_main(["--mode=comment", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("--mode=review", dispatched[0])
+
+    def test_triage_reads_title_and_body_from_event(self) -> None:
+        import github_runner
+        os.environ["ISSUE_TITLE"] = "ENV-SPECIFIED TITLE"
+        os.environ["ISSUE_BODY"] = "env body"
+        self._write_event({"issue": {"number": 5, "title": "Real title", "body": "Real body", "user": {"login": "sam"}}})
+        with mock.patch("github_runner.AgentOrchestrator") as mock_orch:
+            instance = mock_orch.return_value
+            instance.run_issue_triage.return_value = ("REPORT", ["bug"])
+            rc = github_runner.main(["--mode=triage", "--dry-run"])
+        self.assertEqual(rc, 0)
+        ctx = instance.run_issue_triage.call_args.args[0]
+        self.assertEqual(ctx.title, "Real title")
+        self.assertEqual(ctx.body, "Real body")
+        self.assertEqual(ctx.author, "sam")
 
     def test_review_mode_resolves_pr_number_from_issue_comment_event(self) -> None:
         import github_runner

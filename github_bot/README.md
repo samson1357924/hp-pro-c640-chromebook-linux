@@ -71,3 +71,27 @@ ISSUE_TITLE="[Bug]: No sound after installing Ubuntu 24.04" \
 ISSUE_BODY="Sound card shows Dummy Output in settings. aplay -l shows card 0 sofrt5682." \
 python3 github_bot/src/github_runner.py --mode=triage --dry-run
 ```
+
+---
+
+## Environment Interface
+
+The runner reads everything from the environment (no CLI overrides for
+secrets or target selectors):
+
+| Variable | Used for | Required |
+|---|---|---|
+| `GITHUB_TOKEN` | GitHub REST API auth (comments, labels, PR metadata) | in CI |
+| `GITHUB_REPOSITORY` | Repo slug (`owner/repo`) for API calls | in CI |
+| `GITHUB_EVENT_PATH` | JSON event payload from the Actions trigger | in CI |
+| `PR_NUMBER` / `ISSUE_NUMBER` | Target selector for slash-command dispatches | in CI |
+| `REVIEW_BASE_REF` / `REVIEW_HEAD_REF` | Local git diff range when no API token is available | local only |
+| `CPA_BASE_URL`, `CPA_API_KEY` | CPA LLM provider (secrets) | for CPA |
+| `OPENCODE_API_KEY` | OpenCode Zen LLM provider (secret) | for OpenCode |
+| `.env` | Any of the above; auto-loaded from the repo root or `github_bot/` | optional |
+
+Provider/model definitions live in `github_bot/config/LLM_config.example.json`
+(copy it to `LLM_config.json`; `${VAR}` placeholders are interpolated from the
+environment). The bot resolves its own identity via `GET /user` with
+`GITHUB_TOKEN` to decide which comments are its own sticky comments — the
+`GITHUB_ACTOR` of the triggering workflow is never trusted for that purpose.

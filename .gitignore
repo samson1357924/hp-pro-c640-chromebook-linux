@@ -15,6 +15,7 @@ meson-logs/
 # Packaging & distribution
 *.deb
 *.rpm
+*.tar
 *.tar.gz
 *.tar.xz
 *.tgz
@@ -47,6 +48,7 @@ id_ed25519*
 # Shell history & misc
 .bash_history
 .zsh_history
+nohup.out
 Thumbs.db
 core
 core.*

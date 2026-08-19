@@ -12,6 +12,45 @@ source "$ROOT_DIR/lib/logger.sh"
 REPORT_DIR=$(mktemp -d -t c640-sysreport-XXXXXX)
 ARCHIVE_NAME="c640-diagnostic-$(date '+%Y%m%d_%H%M%S').tar.gz"
 
+# sed rules applied to every collected text file before bundling so personal
+# information (MAC/IP/email/hostname/home dirs/serial numbers) never ships.
+REDACT_HOSTNAME="$(hostname 2> /dev/null || true)"
+REDACT_HOSTNAME="$(printf '%s' "$REDACT_HOSTNAME" | sed 's/[][\.|$(){}?+*^]/\\&/g')"
+REDACT_ARGS=(
+    -E
+    -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/<MAC>/g'
+    -e 's/([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}/<MAC>/g'
+    -e 's/([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}/<MAC>/g'
+    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<IP>/g'
+    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g'
+    -e 's/::[0-9][0-9A-Fa-f]{0,3}(:[0-9A-Fa-f]{1,4})*/<IP6>/g'
+    -e 's/::[Ff]{4}:([0-9]{1,3}\.){3}[0-9]{1,3}/<IP6>/g'
+    -e 's/::[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})+/<IP6>/g'
+    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4}){3,}/<IP6>/g'
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<EMAIL>/g'
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9-]*/<EMAIL>/g'
+    -e 's|/home/[A-Za-z0-9._-]+|/home/<USER>|g'
+    -e 's/[Ss]erial[[:space:]]+[Nn]umber[[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][Nn][Uu][Mm][Bb][Ee][Rr][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss]erial[[:space:]]+[Nn][Oo]\.?[[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's|([Ss])/[Nn][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}|<SERIAL>|g'
+    -e 's/[Ss][Nn][[:space:]]*[:=]?[[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]*[:=][[:space:]]*[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+    -e 's/[Ss][Ee][Rr][Ii][Aa][Ll][[:space:]]+[A-Za-z0-9][A-Za-z0-9_-]{2,}/<SERIAL>/g'
+)
+if [ -n "$REDACT_HOSTNAME" ]; then
+    REDACT_ARGS+=(
+        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}([^A-Za-z0-9_])/\\1<HOSTNAME>\\2/Ig"
+        -e "s/^${REDACT_HOSTNAME}([^A-Za-z0-9_])/<HOSTNAME>\\1/Ig"
+        -e "s/([^A-Za-z0-9_])${REDACT_HOSTNAME}\$/<HOSTNAME>\\1/Ig"
+        -e "s/^${REDACT_HOSTNAME}\$/<HOSTNAME>/Ig"
+    )
+fi
+
+redact() {
+    sed "${REDACT_ARGS[@]}"
+}
+
 log_section "Generating HP Pro c640 Linux Diagnostic Bundle"
 log_info "Collecting system information into temporary folder: $REPORT_DIR..."
 
@@ -46,15 +85,19 @@ if [ -d "/sys/class/power_supply/BAT0" ]; then
     cat /sys/class/power_supply/BAT0/uevent > "$REPORT_DIR/fingerprint_ec/battery.txt" 2> /dev/null || true
 fi
 
-# 5. Dmesg Errors & Warnings (redacted for privacy)
-dmesg -T -l err,warn 2> /dev/null | sed -E \
-    -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/<MAC>/g' \
-    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<IP>/g' \
-    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g' \
-    -e 's/::[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*/<IP6>/g' \
-    -e 's/[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4}){3,}/<IP6>/g' \
-    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<EMAIL>/g' \
-    > "$REPORT_DIR/system/dmesg_warnings.txt" || true
+# 5. Dmesg Errors & Warnings
+dmesg -T -l err,warn 2> /dev/null > "$REPORT_DIR/system/dmesg_warnings.txt" || true
+
+# 6. Uniform privacy redaction across every collected file
+log_info "Redacting personal information (MAC/IP/email/hostname/home/serial)..."
+while IFS= read -r -d '' f; do
+    tmp="${f}.redact.$$"
+    if redact < "$f" > "$tmp" 2> /dev/null; then
+        mv -f "$tmp" "$f"
+    else
+        rm -f "$tmp"
+    fi
+done < <(find "$REPORT_DIR" -type f -print0)
 
 # Compress into tar.gz
 tar -czf "$ROOT_DIR/$ARCHIVE_NAME" -C "$REPORT_DIR" .
@@ -62,4 +105,4 @@ rm -rf "$REPORT_DIR"
 
 log_success "Diagnostic report generated successfully: $ARCHIVE_NAME"
 echo "You can attach this file when opening issues or seeking community assistance."
-echo "NOTE: The bundle may still contain personal information (usernames, hostnames, serial numbers). Review it before sharing."
+echo "NOTE: The bundle is redacted, but double-check it before sharing."

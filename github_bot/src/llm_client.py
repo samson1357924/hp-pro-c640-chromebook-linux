@@ -94,6 +94,22 @@ def sanitize_model_name_for_display(model_id: str) -> str:
     return cleaned
 
 
+def _redact_url(url: str) -> str:
+    """Strip credentials, path and query from a URL for safe error messages.
+
+    Handles both scheme'd URLs (https://user:pass@host:port/v1?key=...) and
+    scheme-less endpoints (host.example/v1/chat/completions).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme:
+            return f"{parsed.scheme}://{parsed.hostname or '<host>'}"
+        host = (parsed.path or "").split("/", 1)[0] or "<host>"
+        return f"{host}"
+    except ValueError:
+        return "<redacted-url>"
+
+
 class LLMClient:
     """Multi-provider LLM client for OpenCode Zen and CPA endpoints."""
 
@@ -386,9 +402,9 @@ class LLMClient:
                 return self._fallback_openai_call(
                     base_url, api_key, model_id, prepared_messages, temperature, max_tokens, timeout, min_chars, required_markers
                 )
-            raise LLMClientError(f"HTTP {exc.code} from {endpoint}: {detail[:500]}") from exc
+            raise LLMClientError(f"HTTP {exc.code} from {_redact_url(endpoint)}: {detail[:500]}") from exc
         except Exception as exc:
-            raise LLMClientError(f"LLM request to {endpoint} failed: {exc}") from exc
+            raise LLMClientError(f"LLM request to {_redact_url(endpoint)} failed: {exc}") from exc
 
         rejection = unusable_completion_reason(
             content,

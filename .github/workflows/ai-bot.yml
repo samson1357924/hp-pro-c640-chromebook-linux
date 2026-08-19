@@ -36,7 +36,10 @@ jobs:
     name: Multi-Agent AI Review & Triage
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'issues' ||
+      (
+        github.event_name == 'issues' &&
+        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+      ) ||
       (
         github.event_name == 'pull_request_target' &&
         (
@@ -148,9 +151,6 @@ jobs:
           CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMENT_BODY: ${{ github.event.comment.body || '' }}
-          ISSUE_TITLE: ${{ github.event.issue.title || '' }}
-          ISSUE_BODY: ${{ github.event.issue.body || '' }}
           PYTHONPATH: github_bot/src
         run: |
           set -euo pipefail
