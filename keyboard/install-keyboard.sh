@@ -55,11 +55,7 @@ install_keyboard() {
     check_dmi_board || true
 
     log_step 1 3 "Installing hwdb mapping to $HWDB_DST..."
-    local existed=0
-    if [ -f "$HWDB_DST" ]; then
-        existed=1
-        backup_file "$HWDB_DST"
-    fi
+    backup_file_manifest_aware "$HWDB_DST" "keyboard"
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0644 $HWDB_SRC -> $HWDB_DST"
@@ -67,7 +63,6 @@ install_keyboard() {
         log_dryrun "sudo udevadm trigger --subsystem-match=input"
     else
         sudo install -D -m 0644 "$HWDB_SRC" "$HWDB_DST"
-        manifest_add_entry "$HWDB_DST" "keyboard" "$existed"
 
         log_step 2 3 "Updating systemd-hwdb database..."
         sudo systemd-hwdb update

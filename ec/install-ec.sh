@@ -33,7 +33,7 @@ install_ec_tools() {
     local bin_dst="/usr/local/bin/c640-ec-control"
     local bin_src="$ROOT_DIR/scripts/c640-ec-control.sh"
 
-    log_step 1 2 "Installing c640-ec-control to $bin_dst..."
+    log_step 1 3 "Installing c640-ec-control to $bin_dst..."
     local bin_existed=0
     if [ -e "$bin_dst" ]; then
         bin_existed=1
@@ -47,6 +47,42 @@ install_ec_tools() {
         log_success "Installed $bin_dst"
     fi
 
+    # Install runtime libraries required by c640-ec-control (logger + syscheck).
+    # Without these the installed binary fails on every boot (missing libs).
+    local lib_dst_dir="/usr/local/lib/c640-ec"
+    log_step 2 3 "Installing runtime libraries to $lib_dst_dir..."
+    local lib_files=("logger.sh" "syscheck.sh")
+    for lib in "${lib_files[@]}"; do
+        local lib_dst="$lib_dst_dir/$lib"
+        local lib_existed=0
+        if [ -e "$lib_dst" ]; then
+            lib_existed=1
+        fi
+        backup_file "$lib_dst"
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+            log_dryrun "Install -D -m 0644 $ROOT_DIR/lib/$lib -> $lib_dst"
+        else
+            sudo install -D -m 0644 "$ROOT_DIR/lib/$lib" "$lib_dst"
+            manifest_add_entry "$lib_dst" "ec" "$lib_existed"
+            log_success "Installed $lib_dst"
+        fi
+    done
+
+    # Deploy bundled ectool if the user placed one in ec/bin/ (optional)
+    if [ -f "$ROOT_DIR/ec/bin/ectool" ]; then
+        local ectool_dst="/usr/local/bin/ectool"
+        local ectool_existed=0
+        [ -e "$ectool_dst" ] && ectool_existed=1
+        backup_file "$ectool_dst"
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+            log_dryrun "Install -D -m 0755 $ROOT_DIR/ec/bin/ectool -> $ectool_dst"
+        else
+            sudo install -D -m 0755 "$ROOT_DIR/ec/bin/ectool" "$ectool_dst"
+            manifest_add_entry "$ectool_dst" "ec" "$ectool_existed"
+            log_success "Installed $ectool_dst"
+        fi
+    fi
+
     # Install udev rule for /dev/cros_ec if not present
     local udev_dst="/etc/udev/rules.d/60-cros-ec.rules"
     local udev_existed=0
@@ -54,6 +90,7 @@ install_ec_tools() {
         udev_existed=1
     fi
     backup_file "$udev_dst"
+    log_step 3 3 "Installing udev rule for /dev/cros_ec..."
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-ec.rules"
     else
@@ -67,7 +104,11 @@ install_ec_tools() {
         local real_user
         real_user="$(get_real_user)"
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
-            sudo usermod -aG plugdev "$real_user" || true
+            if id -u "$real_user" > /dev/null 2>&1; then
+                sudo usermod -aG plugdev "$real_user" || true
+            else
+                log_warn "User '$real_user' does not exist; skipping plugdev membership."
+            fi
         fi
 
         sudo udevadm control --reload-rules 2> /dev/null || true
@@ -111,6 +152,7 @@ enable_battery_service() {
         else
             sudo install -D -m 0644 "$srv_src" "$srv_dst"
             manifest_add_entry "$srv_dst" "ec" "$srv_existed"
+            manifest_add_service "c640-battery-limit.service" "ec"
             sudo systemctl daemon-reload
             sudo systemctl enable --now c640-battery-limit.service
             log_success "80% Battery protection service enabled!"
@@ -125,6 +167,7 @@ uninstall_ec_tools() {
     fi
 
     rollback_component "ec"
+    remove_group_membership "plugdev" "$(get_real_user)" "ec"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemctl daemon-reload

@@ -1,0 +1,120 @@
+name: Install Smoke Tests
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'ec/**'
+      - 'scripts/c640-ec-control.sh'
+      - 'lib/**'
+      - 'setup.sh'
+      - 'tests/**'
+      - '.github/workflows/install-smoke.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'ec/**'
+      - 'scripts/c640-ec-control.sh'
+      - 'lib/**'
+      - 'setup.sh'
+      - 'tests/**'
+      - '.github/workflows/install-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ec-install-smoke:
+    name: EC Install / Runtime / Uninstall Smoke Test
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
+      options: --user root
+    steps:
+      - name: Prepare Minimal Container Environment
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends bash coreutils sudo python3
+
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Stub Boot-Time Tools (systemctl / udevadm / ectool)
+        run: |
+          set -euo pipefail
+          for tool in systemctl udevadm; do
+            printf '#!/bin/bash\nexit 0\n' > "/usr/local/bin/$tool"
+            chmod +x "/usr/local/bin/$tool"
+          done
+          printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/ectool
+          chmod +x /usr/local/bin/ectool
+
+      - name: Dry-Run Coverage (no side effects)
+        run: |
+          set -euo pipefail
+          ./ec/install-ec.sh --install --dry-run
+          ./ec/install-ec.sh --enable-battery-limit --dry-run
+
+      - name: Install EC Tools (real root, simulates target system)
+        run: |
+          set -euo pipefail
+          ./ec/install-ec.sh --install
+          ./ec/install-ec.sh --enable-battery-limit
+
+      - name: "Assert Installed Layout Is Self-Sufficient (regression: missing libs)"
+        run: |
+          set -euo pipefail
+          test -x /usr/local/bin/c640-ec-control
+          test -f /usr/local/lib/c640-ec/logger.sh
+          test -f /usr/local/lib/c640-ec/syscheck.sh
+          /usr/local/bin/c640-ec-control help > /dev/null
+          /usr/local/bin/c640-ec-control status > /dev/null 2>&1 || true
+          test -f /etc/systemd/system/c640-battery-limit.service
+
+      - name: Assert CLI Validation
+        run: |
+          set -euo pipefail
+          if /usr/local/bin/c640-ec-control battery-limit 10 > /dev/null 2>&1; then
+            echo "::error::battery-limit accepted out-of-range value 10"
+            exit 1
+          fi
+          if /usr/local/bin/c640-ec-control kblight 101 > /dev/null 2>&1; then
+            echo "::error::kblight accepted out-of-range value 101"
+            exit 1
+          fi
+
+      - name: Assert Repo (Dev) Layout Still Works
+        run: |
+          set -euo pipefail
+          ./scripts/c640-ec-control.sh help > /dev/null
+
+      - name: Uninstall Round-Trip (manifest rollback)
+        run: |
+          set -euo pipefail
+          ./ec/install-ec.sh --uninstall
+          test ! -e /usr/local/bin/c640-ec-control
+          test ! -e /usr/local/lib/c640-ec/logger.sh
+          test ! -e /usr/local/lib/c640-ec/syscheck.sh
+          test ! -e /etc/systemd/system/c640-battery-limit.service
+          test ! -e /etc/udev/rules.d/60-cros-ec.rules
+
+  rollback-tests:
+    name: Backup / Rollback Sandbox Tests
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
+      options: --user root
+    steps:
+      - name: Prepare Minimal Container Environment
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends bash coreutils sudo python3
+
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Run Rollback Sandbox Tests
+        run: |
+          bash tests/rollback-test.sh

@@ -6,10 +6,25 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Resolve lib dir for both layouts:
+#   repo/dev:   <repo>/lib
+#   installed:  /usr/local/lib/c640-ec (deployed by ec/install-ec.sh)
+LIB_DIR=""
+for cand in "$ROOT_DIR/lib" "/usr/local/lib/c640-ec"; do
+    if [ -f "$cand/logger.sh" ] && [ -f "$cand/syscheck.sh" ]; then
+        LIB_DIR="$cand"
+        break
+    fi
+done
+if [ -z "$LIB_DIR" ]; then
+    echo "c640-ec-control: required libraries (lib/logger.sh, lib/syscheck.sh) not found; re-run ./ec/install-ec.sh" >&2
+    exit 1
+fi
+
 # shellcheck source=lib/logger.sh
-source "$ROOT_DIR/lib/logger.sh"
+source "$LIB_DIR/logger.sh"
 # shellcheck source=lib/syscheck.sh
-source "$ROOT_DIR/lib/syscheck.sh"
+source "$LIB_DIR/syscheck.sh"
 
 show_help() {
     echo "HP Pro c640 ChromeOS Embedded Controller (EC) Control Utility"
@@ -32,7 +47,7 @@ check_ectool() {
     if ! command -v ectool > /dev/null 2>&1; then
         if [ -x "/usr/local/bin/ectool" ]; then
             ECTOOL_BIN="/usr/local/bin/ectool"
-        elif [ -x "$ROOT_DIR/ec/bin/ectool" ]; then
+        elif [ "$LIB_DIR" = "$ROOT_DIR/lib" ] && [ -x "$ROOT_DIR/ec/bin/ectool" ]; then
             ECTOOL_BIN="$ROOT_DIR/ec/bin/ectool"
         else
             log_warn "ectool binary not found in PATH."
@@ -155,6 +170,10 @@ set_fan_speed() {
 
 set_kblight() {
     local pct="${1:-50}"
+    if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -lt 0 ] || [ "$pct" -gt 100 ]; then
+        log_error "Keyboard backlight must be an integer between 0 and 100 (got: $pct)."
+        exit 1
+    fi
     if [ -f "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
         local max
         max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "100")

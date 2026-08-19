@@ -105,17 +105,12 @@ install_audio() {
             exit 1
         fi
 
-        local existed=0
-        if [ -f "$dst_file" ]; then
-            existed=1
-            backup_file "$dst_file"
-        fi
+        backup_file_manifest_aware "$dst_file" "audio"
 
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $src_file -> $dst_file"
         else
             sudo install -D -m 0644 "$src_file" "$dst_file"
-            manifest_add_entry "$dst_file" "audio" "$existed"
         fi
         log_success "Installed $rel"
     done

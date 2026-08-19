@@ -64,54 +64,68 @@ show_help() {
     echo ""
 }
 
+make_executable() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "chmod +x $*"
+        return 0
+    fi
+    chmod +x "$@"
+}
+
 run_keyboard() {
-    chmod +x "$SCRIPT_DIR/keyboard/install-keyboard.sh"
+    make_executable "$SCRIPT_DIR/keyboard/install-keyboard.sh"
     "$SCRIPT_DIR/keyboard/install-keyboard.sh" --install
 }
 
 run_fingerprint() {
-    chmod +x "$SCRIPT_DIR/fingerprint/install-fingerprint.sh"
+    make_executable "$SCRIPT_DIR/fingerprint/install-fingerprint.sh"
     "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --install
 }
 
 run_audio() {
-    chmod +x "$SCRIPT_DIR/audio/install-audio.sh"
+    make_executable "$SCRIPT_DIR/audio/install-audio.sh"
     "$SCRIPT_DIR/audio/install-audio.sh" --install
 }
 
 run_power() {
-    chmod +x "$SCRIPT_DIR/power/install-power.sh"
+    make_executable "$SCRIPT_DIR/power/install-power.sh"
     "$SCRIPT_DIR/power/install-power.sh" --install
 }
 
 run_ec() {
-    chmod +x "$SCRIPT_DIR/ec/install-ec.sh"
+    make_executable "$SCRIPT_DIR/ec/install-ec.sh"
     "$SCRIPT_DIR/ec/install-ec.sh" --install
 }
 
 run_check() {
-    chmod +x "$SCRIPT_DIR/scripts/detect-hardware.sh"
+    make_executable "$SCRIPT_DIR/scripts/detect-hardware.sh"
     "$SCRIPT_DIR/scripts/detect-hardware.sh"
 }
 
 run_sysreport() {
-    chmod +x "$SCRIPT_DIR/scripts/sysreport.sh"
+    make_executable "$SCRIPT_DIR/scripts/sysreport.sh"
     "$SCRIPT_DIR/scripts/sysreport.sh"
 }
 
 run_uninstall() {
     log_section "Uninstalling All HP Pro c640 Linux Enablement Components"
-    chmod +x "$SCRIPT_DIR/keyboard/install-keyboard.sh" \
+    make_executable "$SCRIPT_DIR/keyboard/install-keyboard.sh" \
         "$SCRIPT_DIR/audio/install-audio.sh" \
         "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" \
         "$SCRIPT_DIR/power/install-power.sh" \
-        "$SCRIPT_DIR/ec/install-ec.sh" 2> /dev/null || true
+        "$SCRIPT_DIR/ec/install-ec.sh"
 
-    "$SCRIPT_DIR/keyboard/install-keyboard.sh" --uninstall || true
-    "$SCRIPT_DIR/audio/install-audio.sh" --uninstall || true
-    "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --uninstall || true
-    "$SCRIPT_DIR/power/install-power.sh" --uninstall || true
-    "$SCRIPT_DIR/ec/install-ec.sh" --uninstall || true
+    local failed=0
+    "$SCRIPT_DIR/keyboard/install-keyboard.sh" --uninstall || failed=1
+    "$SCRIPT_DIR/audio/install-audio.sh" --uninstall || failed=1
+    "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --uninstall || failed=1
+    "$SCRIPT_DIR/power/install-power.sh" --uninstall || failed=1
+    "$SCRIPT_DIR/ec/install-ec.sh" --uninstall || failed=1
+
+    if [ "$failed" -ne 0 ]; then
+        log_error "One or more components failed to uninstall; check the log above."
+        return 1
+    fi
     log_success "All components uninstalled."
 }
 

@@ -11,9 +11,204 @@ SCRIPT_DIR_BACKUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/logger.sh
 source "$SCRIPT_DIR_BACKUP/logger.sh"
 
-BACKUP_BASE_DIR="/var/backups/cros-enablement"
-MANIFEST_DIR="/var/lib/cros-enablement"
+BACKUP_BASE_DIR="${CROS_ENABLEMENT_BACKUP_DIR:-/var/backups/cros-enablement}"
+MANIFEST_DIR="${CROS_ENABLEMENT_MANIFEST_DIR:-/var/lib/cros-enablement}"
 MANIFEST_FILE="$MANIFEST_DIR/install-manifest.json"
+
+manifest_has_target() {
+    # $1=target; returns 0 if already tracked in the manifest, 1 otherwise
+    [ -f "$MANIFEST_FILE" ] || return 1
+    python3 -c '
+import json, sys, os
+mp, t = sys.argv[1], sys.argv[2]
+if not os.path.exists(mp):
+    sys.exit(1)
+d = json.load(open(mp))
+sys.exit(0 if any(r.get("target") == t for r in d.get("records", [])) else 1)
+' "$MANIFEST_FILE" "$1" 2> /dev/null || return 1
+}
+
+backup_file_manifest_aware() {
+    # $1=target $2=component
+    # On re-install of an already-tracked target, keep the ORIGINAL backup
+    # (first backup) instead of overwriting it with our custom version, so
+    # rollback can always restore the pre-customization file.
+    local target="$1" component="$2"
+    if manifest_has_target "$target"; then
+        log_info "Reinstall: keeping original backup for $target"
+        return 0
+    fi
+    local existed=0
+    [ -e "$target" ] || [ -L "$target" ] && existed=1
+    backup_file "$target"
+    manifest_add_entry "$target" "$component" "$existed"
+}
+
+backup_meson_install_plan() {
+    # $1 = build dir, $2 = component
+    # meson writes the full install plan (absolute destinations incl. soname
+    # symlinks, .pc, .gir, .typelib, headers) into build/meson-info/
+    # intro-installed.json. Back up / record every destination that ninja
+    # install will write, so uninstall can restore or remove all of them.
+    local builddir="$1" component="$2"
+    local plan="$builddir/meson-info/intro-installed.json"
+    if [ ! -f "$plan" ]; then
+        if command -v meson > /dev/null 2>&1; then
+            meson introspect --installed "$builddir" > "$plan" 2> /dev/null \
+                || log_warn "meson introspect failed; install plan unavailable"
+        else
+            log_warn "No install plan and meson unavailable; rollback coverage for $component will be partial."
+            return 0
+        fi
+    fi
+    if [ ! -f "$plan" ]; then
+        log_warn "No install plan for $builddir; rollback coverage for $component will be partial."
+        return 0
+    fi
+    local dest
+    local skip_prefixes
+    skip_prefixes="${CROS_ENABLEMENT_INSTALLED_TESTS_PREFIXES:-/usr/libexec/installed-tests/ /usr/share/installed-tests/}"
+    while IFS= read -r dest; do
+        [ -z "$dest" ] && continue
+        backup_file_manifest_aware "$dest" "$component"
+    done < <(python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+skip = tuple(sys.argv[2].split())
+for dest in plan.values():
+    if isinstance(dest, str) and not dest.startswith(skip):
+        print(dest)
+' "$plan" "$skip_prefixes")
+}
+
+manifest_add_service() {
+    # $1=unit $2=component — record the enable/active state of a systemd
+    # unit at install time so rollback can restore it on uninstall.
+    [ "${DRY_RUN:-0}" = "1" ] && {
+        log_dryrun "Would record service state: $1"
+        return 0
+    }
+    systemctl cat "$1" > /dev/null 2>&1 || return 0
+    local enabled active
+    systemctl is-enabled "$1" > /dev/null 2>&1 && enabled=1 || enabled=0
+    systemctl is-active "$1" > /dev/null 2>&1 && active=1 || active=0
+    sudo mkdir -p "$MANIFEST_DIR"
+    sudo python3 -c '
+import json, sys, os
+mp, name, comp, enabled, active = sys.argv[1:6]
+data = {"version":"2.0","records":[],"services":[],"groups":[]}
+if os.path.exists(mp):
+    try:
+        with open(mp) as f:
+            data = json.load(f)
+    except Exception:
+        pass
+data.setdefault("version", "2.0")
+data.setdefault("records", [])
+data.setdefault("services", [])
+data.setdefault("groups", [])
+data["services"] = [s for s in data["services"] if not (s.get("name") == name and s.get("component") == comp)]
+data["services"].append({
+    "name": name, "component": comp,
+    "was_enabled": enabled == "1", "was_active": active == "1"
+})
+tmp = mp + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, mp)
+' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active"
+}
+
+manifest_add_group() {
+    # $1=group $2=user $3=component — record whether the user was already a
+    # member of the group before we added them, so uninstall only removes
+    # memberships we created.
+    [ -z "$2" ] || [ "$2" = "root" ] && return 0
+    [ "${DRY_RUN:-0}" = "1" ] && {
+        log_dryrun "Would record group: $2@$1"
+        return 0
+    }
+    local was_member=0
+    id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1
+    sudo mkdir -p "$MANIFEST_DIR"
+    sudo python3 -c '
+import json, sys, os
+mp, group, user, comp, member = sys.argv[1:6]
+data = {"version":"2.0","records":[],"services":[],"groups":[]}
+if os.path.exists(mp):
+    try:
+        with open(mp) as f:
+            data = json.load(f)
+    except Exception:
+        pass
+data.setdefault("version", "2.0")
+data.setdefault("records", [])
+data.setdefault("services", [])
+data.setdefault("groups", [])
+data["groups"] = [g for g in data["groups"] if not (g.get("group") == group and g.get("user") == user and g.get("component") == comp)]
+data["groups"].append({
+    "group": group, "user": user, "component": comp,
+    "was_member": member == "1"
+})
+tmp = mp + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, mp)
+' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member"
+}
+
+remove_group_membership() {
+    # $1=group $2=user $3=component — call AFTER rollback_component (so udev
+    # rules are gone and the reference check is accurate).
+    [ -z "$2" ] || [ "$2" = "root" ] && return 0
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Would evaluate group membership removal: $2@$1"
+        return 0
+    fi
+    [ -f "$MANIFEST_FILE" ] || return 0
+    # Only remove membership if WE recorded adding it (user was not already
+    # a member before our install).
+    local ours
+    ours=$(python3 -c '
+import json, sys, os
+mp, group, user, comp = sys.argv[1:5]
+if not os.path.exists(mp):
+    sys.exit(1)
+d = json.load(open(mp))
+for g in d.get("groups", []):
+    if g.get("group") == group and g.get("user") == user and g.get("component") == comp:
+        sys.exit(0 if not g.get("was_member") else 1)
+sys.exit(1)
+' "$MANIFEST_FILE" "$1" "$2" "$3" 2> /dev/null) && ours="1" || ours="0"
+    if [ "$ours" != "1" ]; then
+        log_info "User '$2' was already in group '$1' before install; keeping membership."
+        return 0
+    fi
+    # Keep membership if another udev rule (e.g. from another component
+    # still installed) references the group.
+    if grep -rl "GROUP=\"$1\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .; then
+        log_info "udev rules still reference group '$1'; keeping '$2' in it."
+        return 0
+    fi
+    if sudo gpasswd -d "$2" "$1" 2> /dev/null; then
+        log_info "Removed '$2' from group '$1'."
+    else
+        log_warn "Could not remove '$2' from group '$1'."
+    fi
+    sudo python3 -c '
+import json, sys, os
+mp, group, user, comp = sys.argv[1:5]
+if not os.path.exists(mp):
+    sys.exit(0)
+d = json.load(open(mp))
+d.setdefault("groups", [])
+d["groups"] = [g for g in d["groups"] if not (g.get("group") == group and g.get("user") == user and g.get("component") == comp)]
+tmp = mp + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, mp)
+' "$MANIFEST_FILE" "$1" "$2" "$3"
+}
 
 backup_file() {
     local target="$1"
@@ -50,7 +245,7 @@ manifest_add_entry() {
 
     # Create empty json if not exists
     if [ ! -f "$MANIFEST_FILE" ]; then
-        echo '{"version":"1.0","records":[]}' | sudo tee "$MANIFEST_FILE" > /dev/null
+        echo '{"version":"2.0","records":[],"services":[],"groups":[]}' | sudo tee "$MANIFEST_FILE" > /dev/null
     fi
 
     # Append entry using python with atomic file write
@@ -66,15 +261,19 @@ comp = sys.argv[3]
 existing = sys.argv[4] == "1"
 ts = sys.argv[5]
 
-data = {"version":"1.0","records":[]}
+data = {"version":"2.0","records":[],"services":[],"groups":[]}
 if os.path.exists(manifest_path):
     try:
         with open(manifest_path, "r") as f:
             data = json.load(f)
     except Exception:
-        data = {"version":"1.0","records":[]}
+        data = {"version":"2.0","records":[],"services":[],"groups":[]}
 
-data["records"] = [r for r in data.get("records", []) if r.get("target") != target]
+data.setdefault("version", "2.0")
+data.setdefault("records", [])
+data.setdefault("services", [])
+data.setdefault("groups", [])
+data["records"] = [r for r in data["records"] if r.get("target") != target]
 data["records"].append({
     "target": target,
     "component": comp,
@@ -104,11 +303,19 @@ rollback_component() {
     fi
 
     if command -v python3 > /dev/null 2>&1; then
+        local allowed_prefixes
+        allowed_prefixes="${CROS_ENABLEMENT_ALLOWED_PREFIXES:-/etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/}"
         sudo python3 -c '
-import json, os, sys, shutil, glob
+import json, os, sys, shutil, glob, fnmatch
 
 manifest_path = sys.argv[1]
 target_comp = sys.argv[2]
+backup_base = sys.argv[3]
+allowed_prefixes = tuple(sys.argv[4].split())
+
+def in_scope(path):
+    # Literal prefix (system defaults like /etc/) or glob pattern (tests)
+    return any(path.startswith(p) or fnmatch.fnmatch(path, p) for p in allowed_prefixes)
 
 if not os.path.exists(manifest_path):
     sys.exit(0)
@@ -120,11 +327,32 @@ except Exception as e:
     print(f"Error reading manifest: {e}", file=sys.stderr)
     sys.exit(1)
 
+# Restore systemd service states BEFORE touching files, so units are still
+# present when systemctl disable/start is called.
+data.setdefault("services", [])
+services = data["services"]
+restored_services = []
+for svc in services:
+    if target_comp != "all" and svc.get("component") != target_comp:
+        continue
+    name = svc.get("name")
+    if not name:
+        continue
+    print(f"Restoring service state: {name}")
+    if svc.get("was_enabled"):
+        os.system(f"systemctl enable {name} 2>/dev/null")
+    else:
+        os.system(f"systemctl disable {name} 2>/dev/null")
+    if svc.get("was_active"):
+        os.system(f"systemctl start {name} 2>/dev/null")
+    else:
+        os.system(f"systemctl stop {name} 2>/dev/null")
+    restored_services.append(svc)
+data["services"] = [s for s in services if s not in restored_services]
+
 records = data.get("records", [])
 remaining_records = []
-backup_base = "/var/backups/cros-enablement"
 PROTECTED_DIRS = {"/", "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/home", "/root"}
-ALLOWED_PREFIXES = ("/etc/", "/usr/", "/lib/", "/lib64/", "/opt/")
 
 for rec in records:
     comp = rec.get("component", "")
@@ -136,7 +364,7 @@ for rec in records:
         continue
     
     real = os.path.realpath(target) if target else ""
-    if not target or real in PROTECTED_DIRS or not real.startswith(ALLOWED_PREFIXES):
+    if not target or real in PROTECTED_DIRS or not in_scope(real):
         print(f"  [SKIPPED OUT-OF-SCOPE TARGET] {target}", file=sys.stderr)
         remaining_records.append(rec)
         continue
@@ -151,31 +379,34 @@ for rec in records:
                 os.remove(target)
                 print(f"  [REMOVED FILE] {target}")
         else:
-            # Search for latest backup and restore
+            # Restore the OLDEST backup (matches[0]): for legacy manifests
+            # that may hold multiple backups of the same target, the first
+            # one is the pre-customization original.
             pattern = os.path.join(backup_base, "*", target.lstrip("/"))
             matches = sorted(glob.glob(pattern))
             if matches:
-                latest_backup = matches[-1]
-                print(f"  [RESTORING PREVIOUS BACKUP] {latest_backup} -> {target}")
+                original_backup = matches[0]
+                print(f"  [RESTORING PREVIOUS BACKUP] {original_backup} -> {target}")
                 if os.path.lexists(target):
                     if os.path.islink(target) or os.path.isfile(target):
                         os.remove(target)
                     else:
                         shutil.rmtree(target, ignore_errors=True)
-                if os.path.islink(latest_backup):
-                    os.symlink(os.readlink(latest_backup), target)
-                elif os.path.isdir(latest_backup):
-                    shutil.copytree(latest_backup, target, dirs_exist_ok=True)
+                if os.path.islink(original_backup):
+                    os.symlink(os.readlink(original_backup), target)
+                elif os.path.isdir(original_backup):
+                    shutil.copytree(original_backup, target, dirs_exist_ok=True)
                 else:
-                    shutil.copy2(latest_backup, target)
+                    shutil.copy2(original_backup, target)
             else:
                 print(f"  [NOTE] {target} existed prior to install. Left intact.")
 
 tmp_manifest = manifest_path + ".tmp"
+data["records"] = remaining_records
 with open(tmp_manifest, "w") as f:
-    json.dump({"version":"1.0","records":remaining_records}, f, indent=2)
+    json.dump(data, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
-' "$MANIFEST_FILE" "$target_comp"
+' "$MANIFEST_FILE" "$target_comp" "$BACKUP_BASE_DIR" "$allowed_prefixes"
     else
         log_warn "python3 not found; automatic rollback unavailable. Files may need manual restoration."
     fi
