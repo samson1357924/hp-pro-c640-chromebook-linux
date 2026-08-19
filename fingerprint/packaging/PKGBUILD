@@ -17,19 +17,19 @@ conflicts=('libfprint')
 backup=('etc/udev/rules.d/60-cros-fp.rules')
 source=("git+https://gitlab.freedesktop.org/3v1n0/libfprint.git#commit=56442591a5c302a906289f30988fb50fc3d82ed6"
         "crfpmoc-driver-overlay.tar.gz"
-        "60-cros-fp.rules")
+        "../60-cros-fp.rules")
 sha256sums=('SKIP'
             'f82a0195edf51211b0de6d8ab34aea988c780ec4eecd147dfcab61359be018dd'
-            'SKIP')
+            '9f07f108632226d10dd3ee785f1284350c37166d2b9514210a13bd2895457a9f')
 
 prepare() {
     cd "${srcdir}/libfprint"
     tar -xzf "${srcdir}/crfpmoc-driver-overlay.tar.gz"
     # The overlay ships the audited driver including crfpmoc-proto.c, but
-    # upstream meson.build only lists crfpmoc.c + crfpmoc-ec-transfer.c —
+    # upstream libfprint/meson.build only lists crfpmoc.c + crfpmoc-ec-transfer.c —
     # add it to the source list idempotently (mirrors install-fingerprint.sh).
-    if [ -f "meson.build" ] && ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "meson.build"; then
-        sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" "meson.build"
+    if [ -f "libfprint/meson.build" ] && ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "libfprint/meson.build"; then
+        sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" "libfprint/meson.build"
     fi
 }
 
