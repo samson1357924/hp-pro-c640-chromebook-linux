@@ -25,6 +25,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    # container runs default to `sh` (dash) unless bash is forced
+    shell: bash
+
 jobs:
   ec-install-smoke:
     name: EC Install / Runtime / Uninstall Smoke Test
@@ -146,4 +151,9 @@ jobs:
 
       - name: Run Rollback Sandbox Tests
         run: |
+          # shellcheck disable=SC2016 # $1 is literal stub content
+          # systemctl stub so rollback_component's service restore works
+          # (container has no systemd; python subprocess.run needs systemctl)
+          printf '%s\n' '#!/bin/bash' 'case "$1" in' '  is-enabled|is-active|is-system-running|is-failed) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
+          chmod +x /usr/local/bin/systemctl
           bash tests/rollback-test.sh

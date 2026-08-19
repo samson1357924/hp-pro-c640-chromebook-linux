@@ -104,7 +104,7 @@ jobs:
           test -f crfpmoc-build/libfprint/drivers/crfpmoc/crfpmoc-proto.c
           sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" crfpmoc-build/libfprint/meson.build
           grep -q "crfpmoc-proto.c" crfpmoc-build/libfprint/meson.build
-          meson setup crfpmoc-build/build --prefix=/usr \
+          meson setup crfpmoc-build/build crfpmoc-build --prefix=/usr \
             -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
 
   packaging-lint:
