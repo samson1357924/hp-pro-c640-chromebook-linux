@@ -113,7 +113,7 @@ run_uninstall() {
         "$SCRIPT_DIR/audio/install-audio.sh" \
         "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" \
         "$SCRIPT_DIR/power/install-power.sh" \
-        "$SCRIPT_DIR/ec/install-ec.sh"
+        "$SCRIPT_DIR/ec/install-ec.sh" || true
 
     local failed=0
     "$SCRIPT_DIR/keyboard/install-keyboard.sh" --uninstall || failed=1

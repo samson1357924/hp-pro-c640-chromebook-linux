@@ -34,16 +34,11 @@ install_ec_tools() {
     local bin_src="$ROOT_DIR/scripts/c640-ec-control.sh"
 
     log_step 1 3 "Installing c640-ec-control to $bin_dst..."
-    local bin_existed=0
-    if [ -e "$bin_dst" ]; then
-        bin_existed=1
-    fi
-    backup_file "$bin_dst"
+    backup_file_manifest_aware "$bin_dst" "ec"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0755 $bin_src -> $bin_dst"
     else
         sudo install -D -m 0755 "$bin_src" "$bin_dst"
-        manifest_add_entry "$bin_dst" "ec" "$bin_existed"
         log_success "Installed $bin_dst"
     fi
 
@@ -54,16 +49,11 @@ install_ec_tools() {
     local lib_files=("logger.sh" "syscheck.sh")
     for lib in "${lib_files[@]}"; do
         local lib_dst="$lib_dst_dir/$lib"
-        local lib_existed=0
-        if [ -e "$lib_dst" ]; then
-            lib_existed=1
-        fi
-        backup_file "$lib_dst"
+        backup_file_manifest_aware "$lib_dst" "ec"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $ROOT_DIR/lib/$lib -> $lib_dst"
         else
             sudo install -D -m 0644 "$ROOT_DIR/lib/$lib" "$lib_dst"
-            manifest_add_entry "$lib_dst" "ec" "$lib_existed"
             log_success "Installed $lib_dst"
         fi
     done
@@ -71,31 +61,23 @@ install_ec_tools() {
     # Deploy bundled ectool if the user placed one in ec/bin/ (optional)
     if [ -f "$ROOT_DIR/ec/bin/ectool" ]; then
         local ectool_dst="/usr/local/bin/ectool"
-        local ectool_existed=0
-        [ -e "$ectool_dst" ] && ectool_existed=1
-        backup_file "$ectool_dst"
+        backup_file_manifest_aware "$ectool_dst" "ec"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0755 $ROOT_DIR/ec/bin/ectool -> $ectool_dst"
         else
             sudo install -D -m 0755 "$ROOT_DIR/ec/bin/ectool" "$ectool_dst"
-            manifest_add_entry "$ectool_dst" "ec" "$ectool_existed"
             log_success "Installed $ectool_dst"
         fi
     fi
 
     # Install udev rule for /dev/cros_ec if not present
     local udev_dst="/etc/udev/rules.d/60-cros-ec.rules"
-    local udev_existed=0
-    if [ -e "$udev_dst" ]; then
-        udev_existed=1
-    fi
-    backup_file "$udev_dst"
+    backup_file_manifest_aware "$udev_dst" "ec"
     log_step 3 3 "Installing udev rule for /dev/cros_ec..."
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-ec.rules"
     else
         echo 'KERNEL=="cros_ec", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"' | sudo tee "$udev_dst" > /dev/null
-        manifest_add_entry "$udev_dst" "ec" "$udev_existed"
 
         # Ensure plugdev group exists and add user
         if ! getent group plugdev > /dev/null 2>&1; then
@@ -105,7 +87,10 @@ install_ec_tools() {
         real_user="$(get_real_user)"
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             if id -u "$real_user" > /dev/null 2>&1; then
+                local was_member=0
+                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
                 sudo usermod -aG plugdev "$real_user" || true
+                manifest_add_group "plugdev" "$real_user" "ec" "$was_member"
             else
                 log_warn "User '$real_user' does not exist; skipping plugdev membership."
             fi
@@ -142,16 +127,11 @@ enable_battery_service() {
     fi
 
     if [ -f "$srv_src" ]; then
-        local srv_existed=0
-        if [ -e "$srv_dst" ]; then
-            srv_existed=1
-        fi
-        backup_file "$srv_dst"
+        backup_file_manifest_aware "$srv_dst" "ec"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Deploy and enable $srv_dst"
         else
             sudo install -D -m 0644 "$srv_src" "$srv_dst"
-            manifest_add_entry "$srv_dst" "ec" "$srv_existed"
             manifest_add_service "c640-battery-limit.service" "ec"
             sudo systemctl daemon-reload
             sudo systemctl enable --now c640-battery-limit.service

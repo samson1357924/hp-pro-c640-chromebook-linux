@@ -120,16 +120,19 @@ os.replace(tmp, mp)
 }
 
 manifest_add_group() {
-    # $1=group $2=user $3=component — record whether the user was already a
-    # member of the group before we added them, so uninstall only removes
+    # $1=group $2=user $3=component [$4=was_member override: 0/1] — record
+    # whether the user was already a member of the group BEFORE we added
+    # them (snapshot it before usermod), so uninstall only removes
     # memberships we created.
     [ -z "$2" ] || [ "$2" = "root" ] && return 0
     [ "${DRY_RUN:-0}" = "1" ] && {
         log_dryrun "Would record group: $2@$1"
         return 0
     }
-    local was_member=0
-    id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1
+    local was_member="${4:-0}"
+    if [ "$was_member" != "0" ] && [ "$was_member" != "1" ]; then
+        id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1 || was_member=0
+    fi
     sudo mkdir -p "$MANIFEST_DIR"
     sudo python3 -c '
 import json, sys, os
@@ -193,7 +196,8 @@ sys.exit(1)
     if sudo gpasswd -d "$2" "$1" 2> /dev/null; then
         log_info "Removed '$2' from group '$1'."
     else
-        log_warn "Could not remove '$2' from group '$1'."
+        log_warn "Could not remove '$2' from group '$1'; keeping manifest record for retry."
+        return 0
     fi
     sudo python3 -c '
 import json, sys, os
@@ -339,14 +343,15 @@ for svc in services:
     if not name:
         continue
     print(f"Restoring service state: {name}")
+    import subprocess
     if svc.get("was_enabled"):
-        os.system(f"systemctl enable {name} 2>/dev/null")
+        subprocess.run(["systemctl", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        os.system(f"systemctl disable {name} 2>/dev/null")
+        subprocess.run(["systemctl", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if svc.get("was_active"):
-        os.system(f"systemctl start {name} 2>/dev/null")
+        subprocess.run(["systemctl", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        os.system(f"systemctl stop {name} 2>/dev/null")
+        subprocess.run(["systemctl", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     restored_services.append(svc)
 data["services"] = [s for s in services if s not in restored_services]
 

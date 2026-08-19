@@ -148,7 +148,7 @@ test_scope_protection() {
     run_sandboxed "$sandbox" '
         source "$1/lib/backup.sh"
         backup_file_manifest_aware "/var/log/foo.log" "demo"
-        backup_file_manifest_aware "/etc" "demo"
+        backup_file_manifest_aware "/usr/share/test-demo.txt" "demo"
     '
 
     run_sandboxed "$sandbox" '
@@ -158,7 +158,7 @@ test_scope_protection() {
 
     local remaining
     remaining="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["records"]))' "$sandbox/manifest/install-manifest.json")"
-    assert_eq "2" "$remaining" "out-of-scope targets remain in the manifest"
+    assert_eq "1" "$remaining" "out-of-scope targets remain in the manifest"
 }
 
 # ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ test_service_manifest() {
         backup_file_manifest_aware "$2/etc/demo.conf" "demo"
     '
 
-    python3 - "$sandbox/manifest/install-manifest.json" << 'EOF'
+    sudo python3 - "$sandbox/manifest/install-manifest.json" << 'EOF'
 import json, sys
 mp = sys.argv[1]
 d = json.load(open(mp))

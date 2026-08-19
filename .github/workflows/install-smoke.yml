@@ -36,7 +36,7 @@ jobs:
       - name: Prepare Minimal Container Environment
         run: |
           apt-get update -y
-          apt-get install -y --no-install-recommends bash coreutils sudo python3
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
 
       - name: Checkout Code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -110,7 +110,7 @@ jobs:
       - name: Prepare Minimal Container Environment
         run: |
           apt-get update -y
-          apt-get install -y --no-install-recommends bash coreutils sudo python3
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
 
       - name: Checkout Code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

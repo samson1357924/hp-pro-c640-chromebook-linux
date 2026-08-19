@@ -111,7 +111,7 @@ configure_pam_fingerprint() {
                     log_info "Enabling fingerprint for sudo only in $sudo_pam..."
                     backup_file_manifest_aware "$sudo_pam" "fingerprint"
                     sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
-                    sudo sed -i '/^auth[[:space:]]\+include[[:space:]]\+system-auth/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$sudo_pam"
+                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
                     log_success "sudo fingerprint PAM configured."
                 fi
             else

@@ -84,7 +84,8 @@ show_status() {
 
         echo "  - Charge Status: $status ($capacity%)"
         if [ "$energy_design" -gt 0 ]; then
-            health=$((energy_full * 100 / energy_design))
+            local health
+            (( health = energy_full * 100 / energy_design ))
             echo "  - Battery Health: $health% ($((energy_full / 1000)) mWh / $((energy_design / 1000)) mWh design)"
         fi
     fi
@@ -177,7 +178,8 @@ set_kblight() {
     if [ -f "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
         local max
         max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "100")
-        local val=$((pct * max / 100))
+        local val
+        (( val = pct * max / 100 ))
         if [ -w "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
             echo "$val" > /sys/class/leds/chromeos::kbd_backlight/brightness
         else
