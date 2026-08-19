@@ -47,8 +47,8 @@ jobs:
           # shellcheck disable=SC2016 # $1 is literal stub content, not this script's arg
           # systemctl: is-enabled/is-active must FAIL like on a fresh system
           # (unit not yet enabled/started), so manifest service records are
-          # truthful; everything else is a no-op.
-          printf '%s\n' '#!/bin/bash' 'case "$1" in' '  is-enabled|is-active|is-system-running|is-failed|daemon-reload) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
+          # truthful; everything else (incl. daemon-reload) is a no-op.
+          printf '%s\n' '#!/bin/bash' 'case "$1" in' '  is-enabled|is-active|is-system-running|is-failed) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
           chmod +x /usr/local/bin/systemctl
           printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/udevadm
           chmod +x /usr/local/bin/udevadm
@@ -95,8 +95,8 @@ jobs:
             echo "::error::kblight 0 must be accepted (range 0-100)"
             exit 1
           fi
-          if /usr/local/bin/c640-ec-control fan 0 > /dev/null 2>&1; then
-            echo "::error::fan accepted non-positive value 0"
+          if /usr/local/bin/c640-ec-control fan-speed 0 > /dev/null 2>&1; then
+            echo "::error::fan-speed accepted non-positive value 0"
             exit 1
           fi
 
@@ -108,7 +108,7 @@ jobs:
       - name: Uninstall Round-Trip (manifest rollback)
         run: |
           set -euo pipefail
-          ./ec/install-ec.sh --uninstall
+          USER=smoketest ./ec/install-ec.sh --uninstall
           test ! -e /usr/local/bin/c640-ec-control
           test ! -e /usr/local/lib/c640-ec/logger.sh
           test ! -e /usr/local/lib/c640-ec/syscheck.sh

@@ -162,7 +162,7 @@ set_fan_auto() {
 
 set_fan_speed() {
     local rpm="${1:-3000}"
-    if ! [[ "$rpm" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$rpm" =~ ^[1-9][0-9]*$ ]]; then
         log_error "Fan speed must be a positive integer (got: $rpm)."
         exit 1
     fi
