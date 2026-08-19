@@ -92,6 +92,14 @@ This command automatically:
 prolong its lifespan. It is removed automatically by
 `./ec/install-ec.sh --uninstall` and by `./setup.sh --uninstall`.
 
+> [!NOTE]
+> **State left behind after uninstall**: the EC charge threshold set by the
+> battery-limit service persists in the EC controller until you reset it
+> explicitly (`./scripts/c640-ec-control.sh battery-full`). The `plugdev`
+> group itself is not removed (other components or system packages may rely
+> on it), only installer-created memberships are dropped. `/dev/cros_ec`
+> keeps mode `0660` until the device is re-plugged or the machine reboots.
+
 ## 📦 Restore Distro Native Packages
 
 If you compiled and installed the `crfpmoc` `libfprint`, you can reinstall the
