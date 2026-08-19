@@ -132,7 +132,10 @@ install_packages() {
 get_fingerprint_build_deps() {
     case "$DISTRO_FAMILY" in
         debian)
-            echo "build-essential meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
+            # libudev-dev provides udev.pc, which meson requires to resolve
+            # the udevdir (the crfpmoc build uses the 'udev' helper); it is
+            # also pulled in transitively via libgudev-1.0-dev.
+            echo "build-essential meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libudev-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
             ;;
         fedora)
             echo "gcc meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"

@@ -1,0 +1,149 @@
+name: Install Smoke Tests
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'ec/**'
+      - 'scripts/c640-ec-control.sh'
+      - 'lib/**'
+      - 'setup.sh'
+      - 'tests/**'
+      - '.github/workflows/install-smoke.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'ec/**'
+      - 'scripts/c640-ec-control.sh'
+      - 'lib/**'
+      - 'setup.sh'
+      - 'tests/**'
+      - '.github/workflows/install-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ec-install-smoke:
+    name: EC Install / Runtime / Uninstall Smoke Test
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
+      options: --user root
+    steps:
+      - name: Prepare Minimal Container Environment
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
+
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Stub Boot-Time Tools (systemctl / udevadm / ectool)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # $1 is literal stub content, not this script's arg
+          # systemctl: is-enabled/is-active must FAIL like on a fresh system
+          # (unit not yet enabled/started), so manifest service records are
+          # truthful; everything else (incl. daemon-reload) is a no-op.
+          printf '%s\n' '#!/bin/bash' 'case "$1" in' '  is-enabled|is-active|is-system-running|is-failed) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
+          chmod +x /usr/local/bin/systemctl
+          printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/udevadm
+          chmod +x /usr/local/bin/udevadm
+          printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/ectool
+          chmod +x /usr/local/bin/ectool
+
+      - name: Dry-Run Coverage (no side effects)
+        run: |
+          set -euo pipefail
+          ./ec/install-ec.sh --install --dry-run
+          ./ec/install-ec.sh --enable-battery-limit --dry-run
+
+      - name: Install EC Tools (real root, simulates target system)
+        run: |
+          set -euo pipefail
+          # Non-root USER exercises the plugdev was_member snapshot path.
+          useradd -m smoketest
+          USER=smoketest ./ec/install-ec.sh --install
+          USER=smoketest ./ec/install-ec.sh --enable-battery-limit
+
+      - name: "Assert Installed Layout Is Self-Sufficient (regression: missing libs)"
+        run: |
+          set -euo pipefail
+          test -x /usr/local/bin/c640-ec-control
+          test -f /usr/local/lib/c640-ec/logger.sh
+          test -f /usr/local/lib/c640-ec/syscheck.sh
+          /usr/local/bin/c640-ec-control help > /dev/null
+          /usr/local/bin/c640-ec-control status > /dev/null 2>&1 || true
+          test -f /etc/systemd/system/c640-battery-limit.service
+
+      - name: Assert CLI Validation
+        run: |
+          set -euo pipefail
+          if /usr/local/bin/c640-ec-control battery-limit 10 > /dev/null 2>&1; then
+            echo "::error::battery-limit accepted out-of-range value 10"
+            exit 1
+          fi
+          if /usr/local/bin/c640-ec-control kblight 101 > /dev/null 2>&1; then
+            echo "::error::kblight accepted out-of-range value 101"
+            exit 1
+          fi
+          # 0 is a valid brightness (regression: (( )) arithmetic exit trap)
+          if ! /usr/local/bin/c640-ec-control kblight 0 > /dev/null 2>&1; then
+            echo "::error::kblight 0 must be accepted (range 0-100)"
+            exit 1
+          fi
+          if /usr/local/bin/c640-ec-control fan-speed 0 > /dev/null 2>&1; then
+            echo "::error::fan-speed accepted non-positive value 0"
+            exit 1
+          fi
+
+      - name: Assert Repo (Dev) Layout Still Works
+        run: |
+          set -euo pipefail
+          ./scripts/c640-ec-control.sh help > /dev/null
+
+      - name: Uninstall Round-Trip (manifest rollback)
+        run: |
+          set -euo pipefail
+          USER=smoketest ./ec/install-ec.sh --uninstall
+          test ! -e /usr/local/bin/c640-ec-control
+          test ! -e /usr/local/lib/c640-ec/logger.sh
+          test ! -e /usr/local/lib/c640-ec/syscheck.sh
+          test ! -e /etc/systemd/system/c640-battery-limit.service
+          test ! -e /etc/udev/rules.d/60-cros-ec.rules
+          # installer-created plugdev membership must be removed
+          if id -nG smoketest | tr ' ' '\n' | grep -qx plugdev; then
+            echo "::error::plugdev membership created by installer was not removed"
+            exit 1
+          fi
+          # manifest must be fully drained (no records/services/groups left)
+          python3 -c '
+            import json, sys
+            d = json.load(open("/var/lib/cros-enablement/install-manifest.json"))
+            for key in ("records", "services", "groups"):
+                if d.get(key):
+                    print(f"::error::manifest {key} not empty after uninstall: {d[key]}")
+                    sys.exit(1)
+          '
+
+  rollback-tests:
+    name: Backup / Rollback Sandbox Tests
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
+      options: --user root
+    steps:
+      - name: Prepare Minimal Container Environment
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
+
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Run Rollback Sandbox Tests
+        run: |
+          bash tests/rollback-test.sh

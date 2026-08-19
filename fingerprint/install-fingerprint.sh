@@ -49,7 +49,14 @@ check_fp_status() {
 
 uninstall_fp() {
     log_section "Uninstalling Custom crfpmoc Driver"
+    # The encryption seed is created at driver runtime (first device open),
+    # not at install time, so it can only be cleaned up on uninstall.
+    if [ -f /var/lib/fprint/crfpmoc.key ]; then
+        manifest_add_entry /var/lib/fprint/crfpmoc.key "fingerprint" "0"
+        log_warn "Will remove /var/lib/fprint/crfpmoc.key (enrolled prints must be re-enrolled after reinstall)"
+    fi
     rollback_component "fingerprint"
+    remove_group_membership "plugdev" "$(get_real_user)" "fingerprint"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo udevadm control --reload-rules 2> /dev/null || true
@@ -83,7 +90,12 @@ install_fp() {
 
     # 0. Preflight checks
     check_dmi_board || true
-    check_cros_fp_device || true
+    if ! check_cros_fp_device; then
+        if [ "${DRY_RUN:-0}" != "1" ]; then
+            log_error "Preflight failed: /dev/cros_fp not found. Aborting install (run --check for details)."
+            return 1
+        fi
+    fi
 
     local real_user
     real_user="$(get_real_user)"
@@ -96,26 +108,28 @@ install_fp() {
     # 2. Configure udev device permissions & user group
     log_step 2 6 "Configuring udev permissions for /dev/cros_fp..."
     local udev_rule_dst="/etc/udev/rules.d/60-cros-fp.rules"
-    local udev_rule_existed=0
-    if [ -e "$udev_rule_dst" ]; then
-        udev_rule_existed=1
-    fi
-    backup_file "$udev_rule_dst"
+    backup_file_manifest_aware "$udev_rule_dst" "fingerprint"
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install 60-cros-fp.rules to $udev_rule_dst"
         log_dryrun "Add user '$real_user' to group plugdev"
     else
         sudo install -D -m 0644 "$SCRIPT_DIR/60-cros-fp.rules" "$udev_rule_dst"
-        manifest_add_entry "$udev_rule_dst" "fingerprint" "$udev_rule_existed"
 
         # Ensure plugdev group exists and add user
         if ! getent group plugdev > /dev/null 2>&1; then
             sudo groupadd plugdev 2> /dev/null || true
         fi
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
-            sudo usermod -aG plugdev "$real_user" || true
-            log_success "Added user '$real_user' to 'plugdev' group."
+            if id -u "$real_user" > /dev/null 2>&1; then
+                local was_member=0
+                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
+                sudo usermod -aG plugdev "$real_user" || true
+                manifest_add_group "plugdev" "$real_user" "fingerprint" "$was_member"
+                log_success "Added user '$real_user' to 'plugdev' group."
+            else
+                log_warn "User '$real_user' does not exist; skipping plugdev membership."
+            fi
         fi
 
         sudo udevadm control --reload-rules 2> /dev/null || true
@@ -127,16 +141,11 @@ install_fp() {
     # unlock after resume gets a fresh daemon and a fully re-initialized
     # FPMCU (see docs/TROUBLESHOOTING.md §13 / gnome-shell#7791).
     local sleep_hook_dst="/usr/lib/systemd/system-sleep/fprintd-sleep.sh"
-    local sleep_hook_existed=0
-    if [ -e "$sleep_hook_dst" ]; then
-        sleep_hook_existed=1
-    fi
-    backup_file "$sleep_hook_dst"
+    backup_file_manifest_aware "$sleep_hook_dst" "fingerprint"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install $SCRIPT_DIR/systemd/fprintd-sleep.sh -> $sleep_hook_dst"
     else
         sudo install -D -m 0755 "$SCRIPT_DIR/systemd/fprintd-sleep.sh" "$sleep_hook_dst"
-        manifest_add_entry "$sleep_hook_dst" "fingerprint" "$sleep_hook_existed"
         log_success "Installed fprintd system-sleep hook."
     fi
 
@@ -212,23 +221,14 @@ install_fp() {
             /usr/local/share/gir-1.0/FPrint-2.0.gir || true
         sudo rm -rf /usr/local/include/libfprint-2 || true
 
-        # Back up any stock libfprint libraries that ninja install will overwrite,
-        # so uninstall can restore them instead of leaving the custom build in place
-        while IFS= read -r -d '' lib; do
-            backup_file "$lib"
-            manifest_add_entry "$lib" "fingerprint" "1"
-        done < <(find "$LIBDIR" -maxdepth 1 -name 'libfprint-2.so*' -print0 2> /dev/null)
+        # Back up every file that ninja install will write (libraries with
+        # soname symlinks, pkgconfig, GIR/typelib, headers, metainfo, udev
+        # rules) from meson's install plan, so uninstall can restore or
+        # remove all of them — not just libfprint-2.so*.
+        backup_meson_install_plan "$crfpmoc_dir/build" "fingerprint"
 
         sudo ninja -C build install
         sudo ldconfig
-
-        # Record libraries created by this install (no prior stock library
-        # existed), so uninstall can remove them
-        while IFS= read -r -d '' lib; do
-            if ! grep -qF "\"$lib\"" "$MANIFEST_FILE" 2> /dev/null; then
-                manifest_add_entry "$lib" "fingerprint" "0"
-            fi
-        done < <(find "$LIBDIR" -maxdepth 1 -name 'libfprint-2.so*' -print0 2> /dev/null)
 
         # Clean up temporary build tree if generated
         if [ "$is_temp_dir" = "1" ] && [ -d "$crfpmoc_dir" ]; then

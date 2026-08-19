@@ -103,17 +103,12 @@ install_power() {
     local tlp_dst="/etc/tlp.d/99-hp-c640.conf"
     local tlp_src="$SCRIPT_DIR/tlp/99-hp-c640.conf"
     if [ -f "$tlp_src" ]; then
-        local tlp_existed=0
-        if [ -e "$tlp_dst" ]; then
-            tlp_existed=1
-        fi
-        backup_file "$tlp_dst"
+        backup_file_manifest_aware "$tlp_dst" "power"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $tlp_src -> $tlp_dst"
         else
             sudo mkdir -p /etc/tlp.d
             sudo install -D -m 0644 "$tlp_src" "$tlp_dst"
-            manifest_add_entry "$tlp_dst" "power" "$tlp_existed"
             log_success "Deployed $tlp_dst"
         fi
     fi
@@ -123,31 +118,14 @@ install_power() {
     local modprobe_dst="/etc/modprobe.d/99-hp-c640-power.conf"
     local modprobe_src="$SCRIPT_DIR/modprobe.d/99-hp-c640-power.conf"
     if [ -f "$modprobe_src" ]; then
-        local modprobe_existed=0
-        if [ -e "$modprobe_dst" ]; then
-            modprobe_existed=1
-        fi
-        backup_file "$modprobe_dst"
+        backup_file_manifest_aware "$modprobe_dst" "power"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $modprobe_src -> $modprobe_dst"
         else
-            # Kernel >= 7.0 removed the iwlwifi "d0i3_disable" parameter;
-            # keeping it would make modprobe fail and kill WiFi entirely.
-            # Filter it out when the running kernel no longer knows the param.
-            local kv="${KERNEL_RELEASE:-$(uname -r)}"
-            local filtered=""
-            if modinfo -F parm iwlwifi 2> /dev/null | grep -q -E "^d0i3_disable:"; then
-                filtered="$modprobe_src"
-            else
-                log_info "Kernel $kv has no iwlwifi d0i3_disable parameter; stripping it from modprobe config"
-                filtered="$(mktemp -t hp-c640-modprobe-XXXXXX)"
-                sed 's/d0i3_disable=[0-9]*//g; s/[[:space:]][[:space:]]*/ /g; s/ *$//' "$modprobe_src" > "$filtered"
-            fi
-            sudo install -D -m 0644 "$filtered" "$modprobe_dst"
-            if [ "$filtered" != "$modprobe_src" ]; then
-                rm -f "$filtered"
-            fi
-            manifest_add_entry "$modprobe_dst" "power" "$modprobe_existed"
+            # NOTE: the shipped config no longer contains the iwlwifi
+            # "d0i3_disable" parameter (removed upstream in kernel 7.0), so
+            # it is safe to deploy as-is on every kernel version.
+            sudo install -D -m 0644 "$modprobe_src" "$modprobe_dst"
             log_success "Deployed $modprobe_dst"
         fi
     fi
@@ -156,17 +134,12 @@ install_power() {
     local logind_dst="/etc/systemd/logind.conf.d/99-hp-c640-lid.conf"
     local logind_src="$SCRIPT_DIR/systemd/logind.conf.d/99-hp-c640-lid.conf"
     if [ -f "$logind_src" ]; then
-        local logind_existed=0
-        if [ -e "$logind_dst" ]; then
-            logind_existed=1
-        fi
-        backup_file "$logind_dst"
+        backup_file_manifest_aware "$logind_dst" "power"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $logind_src -> $logind_dst"
         else
             sudo mkdir -p /etc/systemd/logind.conf.d
             sudo install -D -m 0644 "$logind_src" "$logind_dst"
-            manifest_add_entry "$logind_dst" "power" "$logind_existed"
             log_success "Deployed $logind_dst"
         fi
     fi
@@ -176,22 +149,20 @@ install_power() {
     local wp_dst="/etc/wireplumber/wireplumber.conf.d/50-disable-suspend.conf"
     local wp_src="$SCRIPT_DIR/wireplumber/50-disable-suspend.conf"
     if [ -f "$wp_src" ]; then
-        local wp_existed=0
-        if [ -e "$wp_dst" ]; then
-            wp_existed=1
-        fi
-        backup_file "$wp_dst"
+        backup_file_manifest_aware "$wp_dst" "power"
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $wp_src -> $wp_dst"
         else
             sudo mkdir -p /etc/wireplumber/wireplumber.conf.d
             sudo install -D -m 0644 "$wp_src" "$wp_dst"
-            manifest_add_entry "$wp_dst" "power" "$wp_existed"
             log_success "Deployed $wp_dst"
         fi
     fi
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
+        # Record pre-install service state so uninstall can restore it.
+        manifest_add_service "thermald" "power"
+        manifest_add_service "tlp" "power"
         sudo systemctl enable --now thermald 2> /dev/null || true
         sudo systemctl enable --now tlp 2> /dev/null || true
     fi
