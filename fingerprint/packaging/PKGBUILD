@@ -25,10 +25,16 @@ sha256sums=('SKIP'
 prepare() {
     cd "${srcdir}/libfprint"
     tar -xzf "${srcdir}/crfpmoc-driver-overlay.tar.gz"
+    # The overlay ships the audited driver including crfpmoc-proto.c, but
+    # upstream meson.build only lists crfpmoc.c + crfpmoc-ec-transfer.c —
+    # add it to the source list idempotently (mirrors install-fingerprint.sh).
+    if [ -f "meson.build" ] && ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" "meson.build"; then
+        sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" "meson.build"
+    fi
 }
 
 build() {
-    cd "${srcdir}/crfpmoc"
+    cd "${srcdir}/libfprint"
     arch-meson build \
         -Ddrivers=default \
         -Dintrospection=true \
@@ -38,7 +44,7 @@ build() {
 }
 
 package() {
-    cd "${srcdir}/crfpmoc"
+    cd "${srcdir}/libfprint"
     DESTDIR="${pkgdir}" ninja -C build install
     install -Dm644 "${srcdir}/60-cros-fp.rules" "${pkgdir}/usr/lib/udev/rules.d/60-cros-fp.rules"
 }

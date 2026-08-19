@@ -43,6 +43,9 @@ developing applications that use %{name}.
 
 %prep
 %autosetup -n libfprint-56442591a5c302a906289f30988fb50fc3d82ed6 -a 2
+# The driver overlay ships crfpmoc-proto.c but upstream meson.build only
+# lists crfpmoc.c + crfpmoc-ec-transfer.c — add it idempotently.
+sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" meson.build
 
 %build
 %meson -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
