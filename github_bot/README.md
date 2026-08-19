@@ -28,7 +28,7 @@ Production multi-agent GitHub review and issue triage bot for
 4. **📋 Multi-Agent PR Review Pipeline**:
    - `hardware_driver`: C driver, ALSA UCM2, udev, hwdb, EC fan/battery limits.
    - `script_safety`: ShellCheck, root/user separation (`get_real_user`), backup manifest tracking.
-   - `docs_public`: Bilingual sync between `README.md` and `README.zh-CN.md`, REUSE/SPDX licensing, MarkdownLint.
+   - `docs_public`: Bilingual sync between `README.md` and `README.zh-TW.md`, REUSE/SPDX licensing, MarkdownLint.
    - `explainer_agent`: Plain-language maintainer summary.
 
 5. **🎯 Decision-First Issue Triage (0–100 Quality Scoring)**:

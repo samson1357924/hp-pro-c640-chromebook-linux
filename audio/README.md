@@ -3,7 +3,9 @@
 Audio on the HP Pro c640 Chromebook is **fully working** once the ALSA UCM
 profiles are installed (vendored in [audio/ucm/](ucm/README.md)): the `HiFi`
 profile becomes available, internal stereo Speakers is the default sink, and
-headphone/microphone/HDMI all work seamlessly.
+the microphone array works. Headphone routing (PCM 0) is wired with JD1
+auto-detection, but **plug/unplug auto-switching is not captured in the
+verification evidence** (see [VERIFICATION.md](../docs/verification.md)).
 
 ---
 
@@ -18,11 +20,11 @@ headphone/microphone/HDMI all work seamlessly.
 
 | PCM Index | Device Role | Hardware Codec | ALSA Device | Status / Routing |
 | :---: | :--- | :--- | :--- | :--- |
-| **PCM 0** | Port1 Headphone & Headset Mic | Realtek `rt5682` | `hw:0,0` | 🟢 3.5mm jack with auto-detection (JD1) |
+| **PCM 0** | Port1 Headphone & Headset Mic | Realtek `rt5682` | `hw:0,0` | ⚠️ device present (JD1 wired); auto-switch on plug/unplug **not captured in evidence** |
 | **PCM 1** | Internal Stereo DMIC (Split) | Intel cAVS DMIC | `hw:0,1` | 🟢 Split into `Mic1` & `Mic2` stereo streams |
-| **PCM 2** | HDMI / DisplayPort 1 | Intel HDA HDMI | `hw:0,2` | 🟢 Type-C DP Alt Mode / HDMI port |
-| **PCM 3** | HDMI / DisplayPort 2 | Intel HDA HDMI | `hw:0,3` | 🟢 Type-C DP Alt Mode |
-| **PCM 4** | HDMI / DisplayPort 3 | Intel HDA HDMI | `hw:0,4` | 🟢 Type-C DP Alt Mode |
+| **PCM 2** | HDMI / DisplayPort 1 | Intel HDA HDMI | `hw:0,2` | ⚠️ listed in aplay; external display output **not verified** |
+| **PCM 3** | HDMI / DisplayPort 2 | Intel HDA HDMI | `hw:0,3` | ⚠️ listed in aplay; external display output **not verified** |
+| **PCM 4** | HDMI / DisplayPort 3 | Intel HDA HDMI | `hw:0,4` | ⚠️ listed in aplay; external display output **not verified** |
 | **PCM 5** | Internal Stereo Speakers | Maxim `max98357a` | `hw:0,5` | 🟢 Default sink with hardware volume control |
 | **PCM 8** | DMIC 16kHz | Intel cAVS DMIC | `hw:0,8` | 🟢 Low-power speech processing |
 

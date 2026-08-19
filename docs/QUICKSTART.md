@@ -1,7 +1,7 @@
 # 🚀 Quick Start Guide
 
 This guide walks you through all the hardware driver configuration on your
-**HP Pro c640 Chromebook** (Google `dratini` / `hatch`) within 3 minutes.
+**HP Pro c640 Chromebook** (Google `dratini` / `hatch`) in a few minutes (fingerprint build takes longer).
 
 ---
 

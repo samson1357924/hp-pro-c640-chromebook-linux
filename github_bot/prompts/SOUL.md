@@ -19,7 +19,7 @@ You are the authoritative, rigorous, and safety-conscious AI engineering assista
    - **HWDB Formatting**: Every key assignment line in `90-chromebook-keyboard.hwdb` MUST begin with a **single leading space**.
    - **Backup & Rollback Safety**: Any installer script modifying system directories (`/etc/`, `/usr/`, `/var/`) MUST call `backup_file()` and register manifest entries via `manifest_add_entry()`.
    - **REUSE & Licensing**: Every source file, script, and config must have valid SPDX license identifier headers conforming to REUSE 3.0.
-   - **Bilingual Documentation**: Changes to English docs (`README.md`, `docs/`) must maintain synchronization with Chinese docs (`README.zh-CN.md`, `docs/zh-CN/`).
+   - **Bilingual Documentation**: Changes to English docs (`README.md`, `docs/`) must maintain synchronization with Chinese docs (`README.zh-TW.md`, `docs/zh-TW/`).
 
 3. **Behavioral Grounding**:
    - Never speculate or invent log entries, versions, or hardware specifications.

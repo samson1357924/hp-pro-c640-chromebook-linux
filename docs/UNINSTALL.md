@@ -22,7 +22,16 @@ This command automatically:
 3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
 4. Removes the power management tweaks (logind config and suspend helpers).
 5. Removes the EC tools and the 80% battery protection service.
-6. Shows the commands to reinstall the distro's native `libfprint` package.
+6. Restores every file from the **first backup taken before this project ever
+   touched it** (re-installs keep the original backup, so rollback always
+   restores the pre-project state).
+7. Restores the enabled/active state of systemd services the installer
+   modified (`thermald`, `tlp`, `c640-battery-limit.service`, …) and removes
+   **plugdev group memberships that the installer added** (memberships that
+   existed before installation, or still required by other udev rules, are
+   kept).
+8. Removes the fingerprint encryption seed `/var/lib/fprint/crfpmoc.key` and
+   shows the commands to reinstall the distro's native `libfprint` package.
 
 ---
 
@@ -41,8 +50,11 @@ This command automatically:
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
 
-  *(This restores the backed-up `libfprint`, `60-cros-fp.rules` and
-  `/etc/pam.d/sudo`, and removes the `fprintd-sleep.sh` system-sleep hook.)*
+  *(This restores the backed-up `libfprint` libraries and `60-cros-fp.rules`,
+  reverts the `pam_fprintd` PAM changes (`/etc/pam.d/sudo` back to stock,
+  fprintd out of `common-auth`), removes the `fprintd-sleep.sh` system-sleep
+  hook, removes `/var/lib/fprint/crfpmoc.key` and the plugdev membership the
+  installer added, and rolls the service states back.)*
 
 * **Remove only the keyboard top-row mapping**:
 
@@ -79,6 +91,14 @@ This command automatically:
 `c640-battery-limit.service`, which keeps the battery at 80% charge to
 prolong its lifespan. It is removed automatically by
 `./ec/install-ec.sh --uninstall` and by `./setup.sh --uninstall`.
+
+> [!NOTE]
+> **State left behind after uninstall**: the EC charge threshold set by the
+> battery-limit service persists in the EC controller until you reset it
+> explicitly (`./scripts/c640-ec-control.sh battery-full`). The `plugdev`
+> group itself is not removed (other components or system packages may rely
+> on it), only installer-created memberships are dropped. `/dev/cros_ec`
+> keeps mode `0660` until the device is re-plugged or the machine reboots.
 
 ## 📦 Restore Distro Native Packages
 

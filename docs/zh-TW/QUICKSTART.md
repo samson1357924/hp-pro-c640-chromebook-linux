@@ -1,8 +1,8 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-TW.md)
 
 # 🚀 快速上手指南 (Quick Start Guide)
 
-本指南將在 3 分鐘內引導您在 **HP Pro c640 Chromebook** (Google `dratini` / `hatch`) 上完成所有硬體驅動配置。
+本指南將在幾分鐘內引導您（指紋驅動編譯時間較長）在 **HP Pro c640 Chromebook** (Google `dratini` / `hatch`) 上完成所有硬體驅動配置。
 
 ---
 

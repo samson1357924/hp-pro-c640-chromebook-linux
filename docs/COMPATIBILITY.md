@@ -34,5 +34,6 @@ Lake-U platform):
   hardware-tested):
   * 🟢 **Hardware-tested on real device**: **Ubuntu 26.04 LTS** (kernel `7.0.0-29-generic`,
     PipeWire `1.6.2`, WirePlumber `0.5.13`, fprintd `1.94.5`)
-  * ⚠️ **Build-tested in CI only (no hardware test)**: Debian 12/13, Fedora 39-41,
-    Arch Linux / EndeavourOS, openSUSE Tumbleweed
+  * ⚠️ **Build-tested in CI only (no hardware test)**: Ubuntu 24.04, Fedora 42,
+    Arch Linux (distro-matrix dry-run + dependency resolution), plus packaging
+    lint (Arch `namcap`, Fedora `rpmlint`)

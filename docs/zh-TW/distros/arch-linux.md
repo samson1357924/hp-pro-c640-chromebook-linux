@@ -1,4 +1,4 @@
-[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
 # 🐧 Arch Linux & EndeavourOS 專屬配置指南
 
@@ -57,11 +57,12 @@ sudo udevadm trigger --subsystem-match=input
 
 ### (4) 設定 PAM 指紋驗證
 
-編輯 `/etc/pam.d/system-auth`，在 `pam_unix.so` 上方加入：
-
-```text
-auth      sufficient pam_fprintd.so
-```
+> [!IMPORTANT]
+> 請**不要**把 `pam_fprintd` 加入 `/etc/pam.d/system-auth`。`system-auth`
+> 會被 `gdm-password` 引入；解鎖時 GDM 會同時 fork `gdm-password` 與
+> `gdm-fingerprint` worker，兩者爭搶唯一的 fprintd 裝置，失敗的一方會得到
+> "Device was already claimed"，鎖定畫面就不會出現指紋提示
+> （GNOME/gdm#1071）。只為 **sudo** 啟用指紋即可：
 
 編輯 `/etc/pam.d/sudo`，在頂端加入：
 

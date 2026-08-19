@@ -16,7 +16,7 @@ in accordance with open-source licensing standards.
 * **Upstream Projects**:
   * [libfprint (freedesktop.org)](https://gitlab.freedesktop.org/libfprint/libfprint)
   * [crfpmoc-driver by Abhinav Baid (libfprint MR #493)](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/493)
-  * [libfprint cros-fp branch by Marco Trevisan (Treviño)](https://github.com/3v1n0/libfprint)
+  * [libfprint `feature/crfpmoc` branch by Marco Trevisan (Treviño)](https://gitlab.freedesktop.org/3v1n0/libfprint)
 * **Copyright Holders**:
   * Copyright (C) 2024 Abhinav Baid `<abhinavbaid@gmail.com>`
   * Copyright (C) 2024 Felix Niederer `<felix@niederer.dev>`

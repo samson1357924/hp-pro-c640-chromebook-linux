@@ -1,9 +1,9 @@
-[English](../../README.md) | [繁體中文](../../README.zh-CN.md)
+[English](../../README.md) | [繁體中文](../../README.zh-TW.md)
 
 # 🛠️ 疑難排解與避坑 FAQ (Troubleshooting & Pitfall Guide)
 
 本文整理了在 **HP Pro c640 Chromebook (Google `dratini`)** 安裝與使用 Linux 時
-最常遇到的十大問題與根本解決之道。
+最常遇到的十四大問題與根本解決之道。
 
 ---
 

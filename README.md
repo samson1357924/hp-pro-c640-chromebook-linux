@@ -1,4 +1,4 @@
-[English](README.md) | [繁體中文](README.zh-CN.md)
+[English](README.md) | [繁體中文](README.zh-TW.md)
 
 # HP Pro c640 Chromebook (Google Dratini) Linux: The Complete Pitfall-Avoidance Guide and Hardware Enablement Plan
 
@@ -28,7 +28,7 @@ automated installation scripts, and a comprehensive guide to avoiding pitfalls.
 
 | Hardware Component | Status | Driver / Solution | Notes & Support Level |
 | :--- | :---: | :--- | :--- |
-| **Fingerprint** | 🟢 **100% Working** | `crfpmoc` (custom `libfprint` MoC driver) | Supports GDM / instant lock-screen unlock and `sudo` PAM authorization. *Evidence: see [VERIFICATION.md](docs/verification.md).* |
+| **Fingerprint** | 🟢 **Working** | `crfpmoc` (custom `libfprint` MoC driver) | Lock-screen unlock and `sudo` PAM authorization verified on this device. **GDM cold-boot login still requires the user password** (GNOME keyring decrypts on first login); see [VERIFICATION.md](docs/verification.md). |
 | **Stereo Speakers & Microphone (Audio)** | 🟢 **Speakers & mic working** | Intel SOF DSP + ALSA UCM2 / PipeWire | Speakers (PCM 5), headphones (PCM 0), dual-microphone split working. **Headphone auto-switch on plug/unplug not captured in evidence** — see [VERIFICATION.md](docs/verification.md). |
 | **Wi-Fi 6 & Bluetooth 5.0** | ⚠️ **Driver bound** | Intel AX201 (`iwlwifi` / `btusb`) | Drivers bind out of the box; **WPA3/throughput not yet measured** on this device (see [VERIFICATION.md](docs/verification.md)). |
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection functional test not captured** (see [VERIFICATION.md](docs/verification.md)). |
@@ -54,7 +54,7 @@ chmod +x setup.sh
 
 | Requirement | Command |
 | :--- | :--- |
-| **Full Installation (keyboard + audio + fingerprint)** | `./setup.sh --all` |
+| **Full Installation (keyboard + audio + fingerprint + power + EC)** | `./setup.sh --all` |
 | **Install audio UCM configuration only** | `./setup.sh --audio` (or `./audio/install-audio.sh`) |
 | **Install fingerprint driver and PAM only** | `./setup.sh --fingerprint` (or `./fingerprint/install-fingerprint.sh`) |
 | **Install top-row keyboard mapping only** | `./setup.sh --keyboard` (or `./keyboard/install-keyboard.sh`) |
@@ -69,13 +69,13 @@ chmod +x setup.sh
 * ✅ **[VERIFICATION.md (Tested vs Untested)](docs/verification.md)**: What was
   **actually tested** on a real HP Pro c640 (with exact versions) vs config-only
   items — read before trusting any "100% working" claim.
-* 🚀 **[QUICKSTART.md (Getting Started)](docs/QUICKSTART.md)**: 3-minute quick enablement flow and commands.
+* 🚀 **[QUICKSTART.md (Getting Started)](docs/QUICKSTART.md)**: quick enablement flow and commands.
 * 📊 **[COMPATIBILITY.md (Hardware Compatibility)](docs/COMPATIBILITY.md)**: Detailed chip specifications and kernel requirements.
 * 🔧 **[FIRMWARE.md (Firmware Flashing & Recovery)](docs/FIRMWARE.md)**:
   MrChromebox UEFI flashing, **disconnecting the battery cable to remove the
   Cr50 hardware write-protect (HW WP)**, and steps to restore ChromeOS.
 * 🛠️ **[TROUBLESHOOTING.md (Troubleshooting & Pitfall FAQ)](docs/TROUBLESHOOTING.md)**:
-  Reference table for the ten most common faults and how to avoid them (Dummy
+  Reference table for the fourteen most common faults and how to avoid them (Dummy
   Output, Intel ME enablement requirements, S0ix power tuning, etc.).
 * 🔄 **[UNINSTALL.md (System Recovery & Uninstall)](docs/UNINSTALL.md)**: Backup/restore mechanism and native package restoration.
 

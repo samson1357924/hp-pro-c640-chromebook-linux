@@ -1,21 +1,22 @@
-# ❄️ NixOS Declarative Configuration Guide
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
-NixOS uses an immutable and purely declarative system architecture. Integrate
-the following settings into your `/etc/nixos/configuration.nix` or Nix Flake.
+# ❄️ NixOS 宣告式配置指南
+
+NixOS 採用不可變（Immutable）與純宣告式（Declarative）系統架構，請將以下設定整合至您的 `/etc/nixos/configuration.nix` 或 Nix Flake。
 
 ---
 
-## 1. Complete Hardware Enablement Example (`hp-pro-c640.nix`)
+## 1. 完整硬體啟用配置範例 (`hp-pro-c640.nix`)
 
 ```nix
 { config, pkgs, ... }:
 
 let
-  # libfprint built from the public 3v1n0/libfprint `feature/crfpmoc`
-  # branch (pinned commit), with the audited driver overlay from this repo
-  # applied. The overlay is fetched via builtins.fetchGit (works inside the
-  # Nix build sandbox — `postUnpack` cannot see files outside /nix/store),
-  # pinned to a repo commit that contains fingerprint/driver/.
+  # 以公開的 3v1n0/libfprint `feature/crfpmoc` 分支（固定 commit）建置
+  # libfprint，並套用本 repo 的審核版 driver overlay。overlay 以
+  # builtins.fetchGit 取得（Nix build sandbox 內無法讀取 /nix/store 以外的
+  # 路徑，`postUnpack` 看不到你的 clone），並固定在本 repo 包含
+  # fingerprint/driver/ 的 commit。
   overlaySrc = builtins.fetchGit {
     url = "https://github.com/samson1357924/hp-pro-c640-chromebook-linux";
     rev = "648a4d08fe6bf7128c515b8097217d9612356b6a";
@@ -30,15 +31,15 @@ let
     postUnpack = ''
       cp -r ${overlaySrc}/fingerprint/driver/. "$sourceRoot/libfprint/drivers/crfpmoc/"
     '';
-    # Nix single-quoted strings keep `\n` as a literal backslash-n, which is
-    # exactly what sed expects here (insert a new line in the substitution).
+    # Nix 單引號字串會保留 `\n`（反斜線+n 原樣），正是 sed 此處需要的
+    # （在取代式中插入新行）。
     postPatch = ''
       sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
     '';
   });
 in
 {
-  # 1. Enable the audio server (PipeWire + WirePlumber)
+  # 1. 啟用音訊伺服器 (PipeWire + WirePlumber)
   services.pipewire = {
     enable = true;
     alsa.enable = true;
@@ -48,27 +49,27 @@ in
   hardware.pulseaudio.enable = false;
   security.rtkit.enable = true;
 
-  # 2. Enable Intel SOF firmware
+  # 2. 啟用 Intel SOF 韌體
   hardware.firmware = [ pkgs.sof-firmware ];
 
-  # 3. Enable the fingerprint service with the crfpmoc driver
+  # 3. 啟用指紋識別服務（含 crfpmoc 驅動）
   services.fprintd = {
     enable = true;
     package = pkgs.fprintd.override { libfprint = libfprint-crfpmoc; };
   };
 
-  # 4. ChromeOS /dev/cros_fp udev permissions
-  #    (add your user to `plugdev`: `users.users.<you>.extraGroups = [ "plugdev" ];`)
+  # 4. ChromeOS /dev/cros_fp udev 權限
+  #    （把使用者加入 `plugdev`：`users.users.<you>.extraGroups = [ "plugdev" ];`）
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
   '';
 
-  # 5. Fingerprint for sudo only (NOT for GDM login: the GDM unlock claim
-  # race makes the lock-screen prompt disappear, GNOME/gdm#1071)
+  # 5. 只為 sudo 啟用指紋（不要加入 GDM：解鎖時 GDM 的 claim race
+  # 會讓鎖定畫面指紋提示消失，GNOME/gdm#1071）
   security.pam.services.sudo.fprintAuth = true;
 
-  # 6. Keyboard top-row mapping (udev hwdb)
+  # 6. 鍵盤頂排映射 (udev hwdb)
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
@@ -86,7 +87,7 @@ in
      KEYBOARD_KEY_ef=brightnessup
   '';
 
-  # 7. S0ix sleep and power management
+  # 7. S0ix 睡眠與電源管理
   boot.kernelParams = [ "pcie_aspm=force" ];
   services.logind = {
     lidSwitch = "suspend";
@@ -96,8 +97,6 @@ in
 ```
 
 > [!NOTE]
-> The `crfpmoc` driver source is vendored in this repository
-> (`fingerprint/driver/`), so the overlay is applied at build time; only the
-> public upstream `libfprint` base is fetched. If the pinned commit moves,
-> update `src` and re-prefetch the tarball hash with
-> `nix-prefetch-url <archive-url>`.
+> `crfpmoc` 驅動原始碼已內建於本 repo（`fingerprint/driver/`），建置時只
+> 需抓取公開的 `libfprint` 基底。若固定 commit 有變動，請更新 `src` 並用
+> `nix-prefetch-url <archive-url>` 重新取得 tarball 雜湊。

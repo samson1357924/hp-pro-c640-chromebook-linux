@@ -1,4 +1,4 @@
-[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
 # 🐧 openSUSE 專屬配置指南
 
@@ -49,5 +49,15 @@ sudo udevadm trigger --subsystem-match=input
 
 ```bash
 ./fingerprint/install-fingerprint.sh
-sudo pam-config -a --fprintd
+```
+
+> [!IMPORTANT]
+> 請**不要**執行 `pam-config -a --fprintd`：它會把 `pam_fprintd` 注入
+> `common-auth`（`gdm-password` 會引入它）；解鎖時 GDM 同時 fork
+> `gdm-password` 與 `gdm-fingerprint` worker 爭搶唯一的 fprintd 裝置，鎖定
+> 畫面的指紋提示會消失（GNOME/gdm#1071）。只為 **sudo** 啟用指紋：
+
+```bash
+sudo cp /etc/pam.d/sudo /etc/pam.d/sudo.bak
+sudo sed -i '1i auth sufficient pam_fprintd.so' /etc/pam.d/sudo
 ```

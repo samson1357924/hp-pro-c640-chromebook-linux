@@ -1,4 +1,4 @@
-[English](../../../README.md) | [繁體中文](../../../README.zh-CN.md)
+[English](../../../README.md) | [繁體中文](../../../README.zh-TW.md)
 
 # 🔬 深度技術解析：ChromeOS Match-on-Chip (MoC) 指紋驅動架構
 

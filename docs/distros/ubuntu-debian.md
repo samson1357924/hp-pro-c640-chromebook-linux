@@ -55,5 +55,17 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 # Run the automated install script to compile and install
 ./fingerprint/install-fingerprint.sh
-sudo pam-auth-update --enable fprintd
+```
+
+> [!IMPORTANT]
+> Do **not** run `pam-auth-update --enable fprintd`. That profile injects
+> `pam_fprintd` into `common-auth`, which `gdm-password` includes — on
+> unlock GDM forks the `gdm-password` and `gdm-fingerprint` workers
+> concurrently and both try to Claim the single fprintd device, so the lock
+> screen shows no fingerprint prompt (GNOME/gdm#1071). The installer keeps
+> fingerprint **only in `/etc/pam.d/sudo`**; if you already enabled it in
+> `common-auth`, remove it:
+
+```bash
+sudo pam-auth-update --remove fprintd
 ```
