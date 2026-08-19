@@ -46,13 +46,16 @@ configure_pam_fingerprint() {
                     log_info "pam_fprintd already configured in $sudo_pam."
                 else
                     log_info "Enabling fingerprint for sudo only in $sudo_pam..."
-                    backup_file "$sudo_pam"
-                    manifest_add_entry "$sudo_pam" "fingerprint" "1"
+                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
                     # Remove any other fingerprint PAM module lines first
                     # (e.g. a stale rust-fp module) to keep a single stack.
                     sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
-                    sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$sudo_pam"
-                    log_success "sudo fingerprint PAM configured."
+                    sudo sed -i '0,/^@include common-auth$/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
+                    if grep -q "^${fp_line}$" "$sudo_pam"; then
+                        log_success "sudo fingerprint PAM configured."
+                    else
+                        log_warn "@include common-auth anchor not found in $sudo_pam; sudo fingerprint NOT configured."
+                    fi
                 fi
             else
                 log_warn "$sudo_pam not found; sudo fingerprint not configured."
@@ -81,8 +84,12 @@ configure_pam_fingerprint() {
                     # Remove any other fingerprint PAM module lines first
                     # (e.g. a stale rust-fp module) to keep a single stack.
                     sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
-                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$sudo_pam"
-                    log_success "sudo fingerprint PAM configured."
+                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
+                    if grep -q "^${fp_line}$" "$sudo_pam"; then
+                        log_success "sudo fingerprint PAM configured."
+                    else
+                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
+                    fi
                 fi
             else
                 log_warn "$sudo_pam not found; sudo fingerprint not configured."
@@ -112,7 +119,11 @@ configure_pam_fingerprint() {
                     backup_file_manifest_aware "$sudo_pam" "fingerprint"
                     sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
                     sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
-                    log_success "sudo fingerprint PAM configured."
+                    if grep -q "^${fp_line}$" "$sudo_pam"; then
+                        log_success "sudo fingerprint PAM configured."
+                    else
+                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
+                    fi
                 fi
             else
                 log_warn "$sudo_pam not found; sudo fingerprint not configured."

@@ -84,6 +84,8 @@ for dest in plan.values():
 manifest_add_service() {
     # $1=unit $2=component — record the enable/active state of a systemd
     # unit at install time so rollback can restore it on uninstall.
+    # First record wins: a reinstall must not overwrite the state captured
+    # at the original install, or rollback would undo installer-created state.
     [ "${DRY_RUN:-0}" = "1" ] && {
         log_dryrun "Would record service state: $1"
         return 0
@@ -107,11 +109,11 @@ data.setdefault("version", "2.0")
 data.setdefault("records", [])
 data.setdefault("services", [])
 data.setdefault("groups", [])
-data["services"] = [s for s in data["services"] if not (s.get("name") == name and s.get("component") == comp)]
-data["services"].append({
-    "name": name, "component": comp,
-    "was_enabled": enabled == "1", "was_active": active == "1"
-})
+if not any(s.get("name") == name and s.get("component") == comp for s in data["services"]):
+    data["services"].append({
+        "name": name, "component": comp,
+        "was_enabled": enabled == "1", "was_active": active == "1"
+    })
 tmp = mp + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
@@ -123,7 +125,8 @@ manifest_add_group() {
     # $1=group $2=user $3=component [$4=was_member override: 0/1] — record
     # whether the user was already a member of the group BEFORE we added
     # them (snapshot it before usermod), so uninstall only removes
-    # memberships we created.
+    # memberships we created. First record wins: a reinstall must not
+    # overwrite the membership state captured at the original install.
     [ -z "$2" ] || [ "$2" = "root" ] && return 0
     [ "${DRY_RUN:-0}" = "1" ] && {
         log_dryrun "Would record group: $2@$1"
@@ -148,11 +151,11 @@ data.setdefault("version", "2.0")
 data.setdefault("records", [])
 data.setdefault("services", [])
 data.setdefault("groups", [])
-data["groups"] = [g for g in data["groups"] if not (g.get("group") == group and g.get("user") == user and g.get("component") == comp)]
-data["groups"].append({
-    "group": group, "user": user, "component": comp,
-    "was_member": member == "1"
-})
+if not any(g.get("group") == group and g.get("user") == user and g.get("component") == comp for g in data["groups"]):
+    data["groups"].append({
+        "group": group, "user": user, "component": comp,
+        "was_member": member == "1"
+    })
 tmp = mp + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
@@ -405,6 +408,9 @@ for rec in records:
                     shutil.copy2(original_backup, target)
             else:
                 print(f"  [NOTE] {target} existed prior to install. Left intact.")
+                # Keep the record so a later rollback run can still restore
+                # the original once the backup becomes available.
+                remaining_records.append(rec)
 
 tmp_manifest = manifest_path + ".tmp"
 data["records"] = remaining_records

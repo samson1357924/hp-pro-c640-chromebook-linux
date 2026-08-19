@@ -115,7 +115,6 @@ install_fp() {
         log_dryrun "Add user '$real_user' to group plugdev"
     else
         sudo install -D -m 0644 "$SCRIPT_DIR/60-cros-fp.rules" "$udev_rule_dst"
-        manifest_add_group "plugdev" "$real_user" "fingerprint"
 
         # Ensure plugdev group exists and add user
         if ! getent group plugdev > /dev/null 2>&1; then
@@ -123,7 +122,10 @@ install_fp() {
         fi
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             if id -u "$real_user" > /dev/null 2>&1; then
+                local was_member=0
+                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
                 sudo usermod -aG plugdev "$real_user" || true
+                manifest_add_group "plugdev" "$real_user" "fingerprint" "$was_member"
                 log_success "Added user '$real_user' to 'plugdev' group."
             else
                 log_warn "User '$real_user' does not exist; skipping plugdev membership."

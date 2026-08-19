@@ -85,7 +85,7 @@ show_status() {
         echo "  - Charge Status: $status ($capacity%)"
         if [ "$energy_design" -gt 0 ]; then
             local health
-            (( health = energy_full * 100 / energy_design ))
+            health=$(( energy_full * 100 / energy_design ))
             echo "  - Battery Health: $health% ($((energy_full / 1000)) mWh / $((energy_design / 1000)) mWh design)"
         fi
     fi
@@ -162,6 +162,10 @@ set_fan_auto() {
 
 set_fan_speed() {
     local rpm="${1:-3000}"
+    if ! [[ "$rpm" =~ ^[0-9]+$ ]]; then
+        log_error "Fan speed must be a positive integer (got: $rpm)."
+        exit 1
+    fi
     log_info "Setting fan target speed to $rpm RPM..."
     if check_ectool; then
         run_ec pwmsetfanrpm "$rpm"
@@ -179,7 +183,7 @@ set_kblight() {
         local max
         max=$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "100")
         local val
-        (( val = pct * max / 100 ))
+        val=$(( pct * max / 100 ))
         if [ -w "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
             echo "$val" > /sys/class/leds/chromeos::kbd_backlight/brightness
         else

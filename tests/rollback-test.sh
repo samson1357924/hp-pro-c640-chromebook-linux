@@ -311,6 +311,84 @@ test_legacy_manifest() {
 }
 
 # ---------------------------------------------------------------------------
+# 10. reinstall: first group record wins (installer-created membership must
+#     be removed on uninstall even after a reinstall overwrote the state)
+# ---------------------------------------------------------------------------
+test_group_reinstall_first_wins() {
+    local sandbox="/tmp/rollback-test-group-reinstall"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        manifest_add_group "plugdev" "testuser" "demo"
+    '
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        # reinstall: user is now a member (state WE created) — must NOT
+        # overwrite the original was_member=false record
+        manifest_add_group "plugdev" "testuser" "demo" "1"
+    '
+
+    local was_member
+    was_member="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("groups", [])[0]["was_member"])' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "False" "$was_member" "first group record wins over reinstall"
+    assert_eq "1" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("groups", [])))' "$sandbox/manifest/install-manifest.json")" "only one group record after reinstall"
+}
+
+# ---------------------------------------------------------------------------
+# 11. reinstall: first service record wins (rollback must not re-enable a
+#     unit that was disabled before the original install)
+# ---------------------------------------------------------------------------
+test_service_reinstall_first_wins() {
+    local sandbox="/tmp/rollback-test-svc-reinstall"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+
+    printf '#!/usr/bin/env bash\ncase "$1" in\n  cat) exit 0 ;;\n  is-enabled|is-active) [ -e "${STUB_UNIT_STATE_FILE:-}" ] && exit 0 || exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/systemctl"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        manifest_add_service "demo.service" "demo"
+    '
+    # install enables+starts the unit; a reinstall must not re-record that
+    touch "$sandbox/unit-enabled"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_UNIT_STATE_FILE="$2/unit-enabled"
+        source "$1/lib/backup.sh"
+        manifest_add_service "demo.service" "demo"
+    '
+
+    local state
+    state="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])).get("services", [])[0]; print(s["was_enabled"], s["was_active"])' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "False False" "$state" "first service record wins over reinstall"
+    assert_eq "1" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' "$sandbox/manifest/install-manifest.json")" "only one service record after reinstall"
+}
+
+# ---------------------------------------------------------------------------
+# 12. gpasswd failure keeps the manifest record (so a later uninstall can
+#     retry the removal)
+# ---------------------------------------------------------------------------
+test_group_remove_keeps_record_on_failure() {
+    local sandbox="/tmp/rollback-test-grp-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        manifest_add_group "cros-testgrp" "nobody" "demo"
+        # nobody is not a member of the (nonexistent) group -> gpasswd fails
+        remove_group_membership "cros-testgrp" "nobody" "demo"
+    '
+
+    local groups
+    groups="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("groups", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_contains '"group": "cros-testgrp"' "$groups" "group record kept when gpasswd fails"
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -322,6 +400,9 @@ test_meson_plan
 test_service_manifest
 test_group_manifest
 test_legacy_manifest
+test_group_reinstall_first_wins
+test_service_reinstall_first_wins
+test_group_remove_keeps_record_on_failure
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
