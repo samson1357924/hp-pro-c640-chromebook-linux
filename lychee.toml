@@ -32,8 +32,8 @@ exclude = [
     'https?://(www\.)?pipewire\.org/.*'
 ]
 
-# Gateway errors (502/503/504) mean the server never answered; with the
-# retries above these are infrastructure flakiness (gitlab.freedesktop.org
+# Gateway / Server errors (500/502/503/504) mean the server had a temporary issue;
+# with the retries above these are infrastructure flakiness (gitlab.freedesktop.org
 # is a recurring offender), not broken links. Real dead links still fail
 # with 404/410/etc.
-accept = [200, 204, 206, 403, 502, 503, 504]
+accept = [200, 204, 206, 403, 500, 502, 503, 504]
