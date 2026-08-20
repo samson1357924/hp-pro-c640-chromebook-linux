@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+
+site_name: HP Pro c640 Chromebook Linux
+site_description: Complete Linux hardware enablement for HP Pro c640 (Google Dratini / Hatch, Comet Lake) — fingerprint crfpmoc, SOF audio UCM2, keyboard hwdb, power & EC tuning.
+site_author: Samson
+site_url: https://samson1357924.github.io/hp-pro-c640-chromebook-linux/
+repo_url: https://github.com/samson1357924/hp-pro-c640-chromebook-linux
+repo_name: samson1357924/hp-pro-c640-chromebook-linux
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 Samson — REUSE 3.0 (MIT / LGPL-2.1-or-later / BSD-3-Clause / CC0-1.0)
+
+theme:
+  name: material
+  custom_dir: overrides
+  language: en
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    logo: logo
+  favicon: assets/favicon.png
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - toc.follow
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.action.edit
+    - content.action.view
+
+plugins:
+  - search:
+      lang:
+        - en
+        - zh
+      separator: '[\s\u200b\-\_]+'
+  - i18n:
+      docs_structure: folder
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+          nav:
+            - Home: index.md
+            - Getting Started:
+                - Quick Start: QUICKSTART.md
+                - Compatibility: COMPATIBILITY.md
+                - Firmware: FIRMWARE.md
+            - Verification & Help:
+                - Verification: verification.md
+                - Troubleshooting: TROUBLESHOOTING.md
+                - Uninstall: UNINSTALL.md
+            - Deep Dive:
+                - MoC Fingerprint Driver: deep-dive/cros-fp-moc-driver.md
+                - SOF Audio Topology: deep-dive/intel-sof-ucm-audio.md
+                - Power & Suspend: deep-dive/power-and-suspend.md
+            - Distros:
+                - Ubuntu / Debian: distros/ubuntu-debian.md
+                - Fedora: distros/fedora.md
+                - Arch Linux: distros/arch-linux.md
+                - openSUSE: distros/opensuse.md
+                - NixOS: distros/nixos.md
+        - locale: zh-TW
+          name: 繁體中文
+          build: true
+          nav:
+            - 首頁: index.md
+            - 開始使用:
+                - 快速開始: QUICKSTART.md
+                - 硬體相容性: COMPATIBILITY.md
+                - 韌體刷機: FIRMWARE.md
+            - 驗證與協助:
+                - 實測驗證: verification.md
+                - 疑難排解: TROUBLESHOOTING.md
+                - 解除安裝: UNINSTALL.md
+            - 深度解析:
+                - MoC 指紋驅動: deep-dive/cros-fp-moc-driver.md
+                - SOF 音訊拓樸: deep-dive/intel-sof-ucm-audio.md
+                - 電源與休眠: deep-dive/power-and-suspend.md
+            - 發行版指南:
+                - Ubuntu / Debian: distros/ubuntu-debian.md
+                - Fedora: distros/fedora.md
+                - Arch Linux: distros/arch-linux.md
+                - openSUSE: distros/opensuse.md
+                - NixOS: distros/nixos.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.emoji
+  - toc:
+      permalink: true
+  - attr_list
+  - def_list
+  - md_in_html
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/samson1357924/hp-pro-c640-chromebook-linux
+      name: GitHub
+  generator: false
+  alternate:
+    - name: English
+      link: /hp-pro-c640-chromebook-linux/
+      lang: en
+    - name: 繁體中文
+      link: /hp-pro-c640-chromebook-linux/zh-TW/
+      lang: zh-TW
+
+extra_css:
+  - stylesheets/extra.css
+
+nav: # fallback for non-i18n builds
+  - Home: index.md
+  - Getting Started:
+      - Quick Start: QUICKSTART.md
+      - Compatibility: COMPATIBILITY.md
+      - Firmware: FIRMWARE.md
+  - Verification & Help:
+      - Verification: verification.md
+      - Troubleshooting: TROUBLESHOOTING.md
+      - Uninstall: UNINSTALL.md
+  - Deep Dive:
+      - MoC Fingerprint Driver: deep-dive/cros-fp-moc-driver.md
+      - SOF Audio Topology: deep-dive/intel-sof-ucm-audio.md
+      - Power & Suspend: deep-dive/power-and-suspend.md
+  - Distros:
+      - Ubuntu / Debian: distros/ubuntu-debian.md
+      - Fedora: distros/fedora.md
+      - Arch Linux: distros/arch-linux.md
+      - openSUSE: distros/opensuse.md
+      - NixOS: distros/nixos.md
+
+exclude_docs: |
+  ^\.nojekyll$

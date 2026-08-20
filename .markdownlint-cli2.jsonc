@@ -3,6 +3,8 @@
   "config": ".markdownlint.yaml",
   "ignores": [
     "audio/upstream/**",
-    "github_bot/prompts/**"
+    "github_bot/prompts/**",
+    "site/**",
+    ".cache/**"
   ]
 }

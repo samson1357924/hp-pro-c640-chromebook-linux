@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+
+mkdocs>=1.6
+mkdocs-material>=9.5
+mkdocs-static-i18n>=1.0
+pymdown-extensions>=10.0
