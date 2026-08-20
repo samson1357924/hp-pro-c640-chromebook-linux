@@ -55,7 +55,8 @@ chmod +x setup.sh
 | :--- | :--- |
 | **完整安裝（鍵盤 + 音效 + 指紋 + 電源 + EC）** | `./setup.sh --all` |
 | **僅安裝音訊 UCM 設定檔** | `./setup.sh --audio` (或 `./audio/install-audio.sh`) |
-| **僅安裝指紋驅動與 PAM** | `./setup.sh --fingerprint` (或 `./fingerprint/install-fingerprint.sh`) |
+| **僅安裝指紋驅動與 PAM（混合 A+C 模式）** | `./setup.sh --fingerprint` (或 `./fingerprint/install-fingerprint.sh`) |
+| **強制從源碼編譯安裝指紋驅動（Plan A）** | `./setup.sh --source` (或 `./fingerprint/install-fingerprint.sh --source`) |
 | **僅安裝頂排鍵盤映射** | `./setup.sh --keyboard` (或 `./keyboard/install-keyboard.sh`) |
 | **執行系統硬體綜合診斷** | `./setup.sh --check` (或 `./scripts/detect-hardware.sh`) |
 | **預覽模式（不改動系統檔案）** | `./setup.sh --all --dry-run` |
@@ -101,12 +102,13 @@ chmod +x setup.sh
 ### 🖐️ 指紋辨識模組 (`fingerprint/`)
 
 HP Pro c640 搭載 FPC1025 Match-on-Chip 感應器，透過 ChromeOS EC 控制器
-(`/dev/cros_fp`) 溝通。本專案整合了經過深度審計與修復的 **`crfpmoc`** 驅動：
+(`/dev/cros_fp`) 溝通。本專案整合了經過深度審計與修復的 **`crfpmoc`** 驅動，並支援 **混合 A+C 架構**：
 
+* **混合快速安裝**：自動自 GitHub Releases 下載對應發行版預編譯包（`.deb`、`.rpm`、`.pkg.tar.zst`），秒級安裝；離線或無套件時自動無縫切換為本地源碼編譯（Plan A）。
 * 採用 50ms 延遲狀態機輪詢，徹底解決 Linux 核心缺少中斷導致的 epoll 飢餓問題。
 * 弱指標記憶體守護，杜絕 Use-After-Free 隱患。
 * `/var/lib/fprint/crfpmoc.key` 獨立隨機加密種子（權限 `0600`）。
-* 提供 Arch PKGBUILD 與 RPM Spec 原生打包檔。
+* 提供 Debian `.deb`、Arch PKGBUILD、RPM Spec 與獨立源碼包。
 
 ### 🔊 音效子系統 (`audio/`)
 
@@ -157,4 +159,5 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 | **硬體按鍵資料庫與說明** | `keyboard/90-*.hwdb`, `docs/` | **CC0-1.0 / MIT** | [`LICENSES/CC0-1.0.txt`](LICENSES/CC0-1.0.txt) |
 
 > [!NOTE]
-> 各上游著作權人聲明（Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA Project, ChromiumOS Authors）、致謝清單與衍生修改記錄請詳閱 [**`CREDITS.md`**](CREDITS.md)。
+> 各上游著作權人聲明（Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA Project,
+> ChromiumOS Authors）、致謝清單與衍生修改記錄請詳閱 [**`CREDITS.md`**](CREDITS.md)。

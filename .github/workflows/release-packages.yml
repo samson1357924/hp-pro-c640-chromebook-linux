@@ -1,0 +1,177 @@
+name: Release Packaging & Artifact Distribution
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish assets to GitHub Release'
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: 'Release tag name (e.g. v1.94.10)'
+        required: false
+        type: string
+        default: 'v1.94.10'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deb:
+    name: Build Debian/Ubuntu Package (.deb)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git meson ninja-build pkg-config \
+            libglib2.0-dev libgudev-1.0-dev libgusb-dev libpixman-1-dev \
+            libnss3-dev gobject-introspection libgirepository1.0-dev dpkg-dev
+
+      - name: Build .deb package
+        run: |
+          chmod +x fingerprint/packaging/build-deb.sh
+          ./fingerprint/packaging/build-deb.sh "${{ github.workspace }}/dist"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: deb-package
+          path: dist/*.deb
+
+  build-rpm:
+    name: Build Fedora/RHEL RPM Package (.rpm)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build RPM in Fedora container
+        uses: docker://fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
+        with:
+          args: >
+            bash -c "
+            set -euo pipefail &&
+            dnf install -y rpm-build gcc meson ninja-build git \
+              glib2-devel libgusb-devel pixman-devel libgudev-devel \
+              json-glib-devel gobject-introspection-devel nss-devel systemd-devel &&
+            mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} &&
+            cp fingerprint/packaging/crfpmoc-driver-overlay.tar.gz /root/rpmbuild/SOURCES/ &&
+            cp fingerprint/60-cros-fp.rules /root/rpmbuild/SOURCES/ &&
+            curl -sSLo /root/rpmbuild/SOURCES/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz \
+              https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/56442591a5c302a906289f30988fb50fc3d82ed6/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz &&
+            rpmbuild -ba fingerprint/packaging/libfprint-crfpmoc.spec &&
+            mkdir -p dist &&
+            find /root/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
+            "
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: rpm-package
+          path: dist/*.rpm
+
+  build-arch:
+    name: Build Arch Linux Package (.pkg.tar.zst)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build Arch package in Arch container
+        uses: docker://archlinux:base-devel@sha256:aecf5b39bd3139a951090dfb3d940f9317e4c5fca038c65fb49ac03910f7133e
+        with:
+          args: >
+            bash -c "
+            set -euo pipefail &&
+            pacman -Syu --noconfirm base-devel git meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection nss &&
+            useradd -m builder &&
+            mkdir -p /home/builder/build &&
+            cp -r fingerprint/packaging/* fingerprint/60-cros-fp.rules /home/builder/build/ &&
+            chown -R builder:builder /home/builder/build &&
+            su builder -c '
+              cd /home/builder/build &&
+              makepkg --noconfirm -s
+            ' &&
+            mkdir -p dist &&
+            find /home/builder/build -name '*.pkg.tar.zst' -exec cp {} dist/ \;
+            "
+
+      - name: Upload Arch artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst
+
+  build-source:
+    name: Build Standalone Source Tarball
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Create source tarball
+        run: |
+          chmod +x fingerprint/packaging/create-source-tarball.sh
+          ./fingerprint/packaging/create-source-tarball.sh "${{ github.workspace }}/dist"
+
+      - name: Upload Source Tarball artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: source-tarball
+          path: dist/*.tar.gz
+
+  publish-release:
+    name: Publish Release Assets
+    needs: [build-deb, build-rpm, build-arch, build-source]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd release-assets
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Determine Release Tag
+        id: get_tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.0.8
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          files: |
+            release-assets/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
