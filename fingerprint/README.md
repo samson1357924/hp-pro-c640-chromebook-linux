@@ -1,3 +1,5 @@
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
 # Fingerprint Setup (ChromeOS Match-on-Chip `crfpmoc`)
 
 This module provides complete instructions, driver source reference,

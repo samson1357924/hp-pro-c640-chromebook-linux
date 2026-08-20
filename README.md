@@ -56,7 +56,8 @@ chmod +x setup.sh
 | :--- | :--- |
 | **Full Installation (keyboard + audio + fingerprint + power + EC)** | `./setup.sh --all` |
 | **Install audio UCM configuration only** | `./setup.sh --audio` (or `./audio/install-audio.sh`) |
-| **Install fingerprint driver and PAM only** | `./setup.sh --fingerprint` (or `./fingerprint/install-fingerprint.sh`) |
+| **Install fingerprint driver and PAM (Hybrid A+C)** | `./setup.sh --fingerprint` (or `./fingerprint/install-fingerprint.sh`) |
+| **Force compile fingerprint driver from source (Plan A)** | `./setup.sh --source` (or `./fingerprint/install-fingerprint.sh --source`) |
 | **Install top-row keyboard mapping only** | `./setup.sh --keyboard` (or `./keyboard/install-keyboard.sh`) |
 | **Run system hardware comprehensive diagnostics** | `./setup.sh --check` (or `./scripts/detect-hardware.sh`) |
 | **Preview mode (no system files modified)** | `./setup.sh --all --dry-run` |
@@ -104,13 +105,14 @@ chmod +x setup.sh
 
 The HP Pro c640 is equipped with an FPC1025 Match-on-Chip sensor that
 communicates through the ChromeOS EC controller (`/dev/cros_fp`). This project
-integrates the deeply audited and fixed **`crfpmoc`** driver:
+integrates the deeply audited and fixed **`crfpmoc`** driver with a **Hybrid A+C Architecture**:
 
+* **Hybrid Fast Installation**: Automatically installs prebuilt native packages (`.deb`, `.rpm`, `.pkg.tar.zst`) from GitHub Releases; seamlessly falls back to source compilation (Plan A) when offline.
 * Uses 50ms-delay state-machine polling to fully resolve the epoll starvation
   issue caused by the missing interrupt in the Linux kernel.
 * Weak-pointer memory guarding to eliminate Use-After-Free hazards.
 * `/var/lib/fprint/crfpmoc.key` independent random encryption seed (permissions `0600`).
-* Provides Arch PKGBUILD and RPM Spec native packaging files.
+* Provides Debian `.deb`, Arch PKGBUILD, RPM Spec, and standalone source packaging.
 
 ### 🔊 Audio Subsystem (`audio/`)
 
