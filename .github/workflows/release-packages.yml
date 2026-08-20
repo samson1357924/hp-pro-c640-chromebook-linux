@@ -65,7 +65,7 @@ jobs:
             set -euo pipefail &&
             dnf install -y rpm-build rpmdevtools curl gcc gcc-c++ meson ninja-build git \
               glib2-devel libgusb-devel pixman-devel libgudev-devel \
-              json-glib-devel gobject-introspection-devel nss-devel systemd-devel &&
+              json-glib-devel gobject-introspection-devel nss-devel openssl-devel systemd-devel &&
             RPM_TOPDIR=$(rpm --eval '%{_topdir}') &&
             mkdir -p "${RPM_TOPDIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} &&
             cp fingerprint/packaging/crfpmoc-driver-overlay.tar.gz "${RPM_TOPDIR}/SOURCES/" &&

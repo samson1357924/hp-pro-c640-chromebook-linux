@@ -139,7 +139,7 @@ get_fingerprint_build_deps() {
             echo "build-essential git ca-certificates meson ninja-build pkg-config libglib2.0-dev libgusb-dev libpixman-1-dev libgudev-1.0-dev libudev-dev libjson-glib-dev libgirepository1.0-dev gobject-introspection fprintd libpam-fprintd"
             ;;
         fedora)
-            echo "gcc gcc-c++ git ca-certificates meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
+            echo "gcc gcc-c++ git ca-certificates meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel openssl-devel fprintd fprintd-pam"
             ;;
         arch)
             echo "base-devel git meson ninja pkgconf glib2 glib2-devel libgusb pixman libgudev json-glib gobject-introspection fprintd"

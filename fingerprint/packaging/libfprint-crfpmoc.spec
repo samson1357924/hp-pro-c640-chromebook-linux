@@ -21,6 +21,8 @@ BuildRequires:  pkgconfig(pixman-1)
 BuildRequires:  pkgconfig(gudev-1.0)
 BuildRequires:  pkgconfig(json-glib-1.0)
 BuildRequires:  pkgconfig(nss)
+BuildRequires:  pkgconfig(openssl)
+BuildRequires:  systemd-devel
 BuildRequires:  gobject-introspection-devel
 
 Provides:       libfprint = %{version}-%{release}
