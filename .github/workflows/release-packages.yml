@@ -66,10 +66,10 @@ jobs:
             dnf install -y rpm-build gcc meson ninja-build git \
               glib2-devel libgusb-devel pixman-devel libgudev-devel \
               json-glib-devel gobject-introspection-devel nss-devel systemd-devel &&
-            RPM_TOPDIR=\$(rpm --eval '%{_topdir}') &&
+            RPM_TOPDIR=$(rpm --eval '%{_topdir}') &&
             mkdir -p \"\${RPM_TOPDIR}\"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} &&
             cp fingerprint/packaging/crfpmoc-driver-overlay.tar.gz \"\${RPM_TOPDIR}/SOURCES/\" &&
-            cp fingerprint/60-cros-fp.rules \"\${RPM_TOPDIR}/SOURCES/\" &&
+            cp fingerprint/packaging/60-cros-fp.rules \"\${RPM_TOPDIR}/SOURCES/\" &&
             curl -sSLo \"\${RPM_TOPDIR}/SOURCES/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz\" \
               https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/56442591a5c302a906289f30988fb50fc3d82ed6/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz &&
             rpmbuild -ba fingerprint/packaging/libfprint-crfpmoc.spec &&

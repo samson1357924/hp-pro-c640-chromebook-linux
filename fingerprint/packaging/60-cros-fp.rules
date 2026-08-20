@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# ChromeOS Fingerprint MCU Device Node Permission
+KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
