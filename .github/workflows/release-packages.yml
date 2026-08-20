@@ -152,7 +152,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd release-assets
-          sha256sum * > SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Determine Release Tag
