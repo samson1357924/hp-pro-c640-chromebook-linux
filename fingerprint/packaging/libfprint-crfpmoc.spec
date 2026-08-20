@@ -8,7 +8,7 @@ Summary:        Toolkit for fingerprint readers with ChromeOS Match-on-Chip supp
 License:        LGPL-2.1-or-later
 URL:            https://gitlab.freedesktop.org/3v1n0/libfprint
 Source0:        https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/56442591a5c302a906289f30988fb50fc3d82ed6/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz
-Source1:        ../60-cros-fp.rules
+Source1:        60-cros-fp.rules
 Source2:        crfpmoc-driver-overlay.tar.gz
 
 BuildRequires:  gcc

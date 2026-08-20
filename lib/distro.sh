@@ -142,7 +142,7 @@ get_fingerprint_build_deps() {
             echo "gcc git ca-certificates meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel pixman-devel libgudev-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"
             ;;
         arch)
-            echo "base-devel git meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection fprintd"
+            echo "base-devel git meson ninja pkgconf glib2 glib2-devel libgusb pixman libgudev json-glib gobject-introspection fprintd"
             ;;
         suse)
             echo "patterns-devel-base-devel_basis git meson ninja pkg-config glib2-devel libgusb-devel libpixman-1-0-devel libgudev-1_0-devel json-glib-devel gobject-introspection-devel fprintd fprintd-pam"

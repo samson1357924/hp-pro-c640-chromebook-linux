@@ -66,14 +66,15 @@ jobs:
             dnf install -y rpm-build gcc meson ninja-build git \
               glib2-devel libgusb-devel pixman-devel libgudev-devel \
               json-glib-devel gobject-introspection-devel nss-devel systemd-devel &&
-            mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} &&
-            cp fingerprint/packaging/crfpmoc-driver-overlay.tar.gz /root/rpmbuild/SOURCES/ &&
-            cp fingerprint/60-cros-fp.rules /root/rpmbuild/SOURCES/ &&
-            curl -sSLo /root/rpmbuild/SOURCES/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz \
+            RPM_TOPDIR=\$(rpm --eval '%{_topdir}') &&
+            mkdir -p \"\${RPM_TOPDIR}\"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} &&
+            cp fingerprint/packaging/crfpmoc-driver-overlay.tar.gz \"\${RPM_TOPDIR}/SOURCES/\" &&
+            cp fingerprint/60-cros-fp.rules \"\${RPM_TOPDIR}/SOURCES/\" &&
+            curl -sSLo \"\${RPM_TOPDIR}/SOURCES/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz\" \
               https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/56442591a5c302a906289f30988fb50fc3d82ed6/libfprint-56442591a5c302a906289f30988fb50fc3d82ed6.tar.gz &&
             rpmbuild -ba fingerprint/packaging/libfprint-crfpmoc.spec &&
             mkdir -p dist &&
-            find /root/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
+            find \"\${RPM_TOPDIR}/RPMS\" -name '*.rpm' -exec cp {} dist/ \;
             "
 
       - name: Upload RPM artifact
@@ -95,17 +96,18 @@ jobs:
           args: >
             bash -c "
             set -euo pipefail &&
-            pacman -Syu --noconfirm base-devel git meson ninja pkgconf glib2 libgusb pixman libgudev json-glib gobject-introspection nss &&
+            pacman -Syu --noconfirm base-devel git meson ninja pkgconf glib2 glib2-devel libgusb pixman libgudev json-glib gobject-introspection nss systemd &&
             useradd -m builder &&
-            mkdir -p /home/builder/build &&
-            cp -r fingerprint/packaging/* fingerprint/60-cros-fp.rules /home/builder/build/ &&
-            chown -R builder:builder /home/builder/build &&
+            mkdir -p /home/builder/packaging &&
+            cp -r fingerprint/packaging/* /home/builder/packaging/ &&
+            cp fingerprint/60-cros-fp.rules /home/builder/ &&
+            chown -R builder:builder /home/builder &&
             su builder -c '
-              cd /home/builder/build &&
+              cd /home/builder/packaging &&
               makepkg --noconfirm -s
             ' &&
             mkdir -p dist &&
-            find /home/builder/build -name '*.pkg.tar.zst' -exec cp {} dist/ \;
+            find /home/builder/packaging -name '*.pkg.tar.zst' -exec cp {} dist/ \;
             "
 
       - name: Upload Arch artifact
