@@ -63,7 +63,7 @@ jobs:
           args: >
             bash -c "
             set -euo pipefail &&
-            dnf install -y rpm-build rpmdevtools curl gcc meson ninja-build git \
+            dnf install -y rpm-build rpmdevtools curl gcc gcc-c++ meson ninja-build git \
               glib2-devel libgusb-devel pixman-devel libgudev-devel \
               json-glib-devel gobject-introspection-devel nss-devel systemd-devel &&
             RPM_TOPDIR=$(rpm --eval '%{_topdir}') &&

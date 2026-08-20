@@ -12,6 +12,7 @@ Source1:        60-cros-fp.rules
 Source2:        crfpmoc-driver-overlay.tar.gz
 
 BuildRequires:  gcc
+BuildRequires:  gcc-c++
 BuildRequires:  meson
 BuildRequires:  ninja-build
 BuildRequires:  pkgconfig(glib-2.0) >= 2.56.0
