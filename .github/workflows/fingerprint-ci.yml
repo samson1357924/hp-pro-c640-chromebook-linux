@@ -159,3 +159,11 @@ jobs:
               exit 1;
             fi
             "
+
+      - name: Validate Debian Packaging Script & Control Metadata
+        run: |
+          set -euo pipefail
+          echo "=== Testing build-deb.sh syntax and help ==="
+          bash -n fingerprint/packaging/build-deb.sh
+          bash -n fingerprint/packaging/create-source-tarball.sh
+          bash -n fingerprint/packaging/update-overlay-tarball.sh

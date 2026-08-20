@@ -19,6 +19,7 @@ path = [
     "power/**",
     "ec/**",
     "fingerprint/install-fingerprint.sh",
+    "fingerprint/packaging/*.sh",
     "audio/install-audio.sh",
     "audio/install-audio-ucm.sh",
     "audio/diagnose-audio.sh",

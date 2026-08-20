@@ -153,6 +153,27 @@ get_fingerprint_build_deps() {
     esac
 }
 
+# Return distro-specific runtime dependencies for libfprint / crfpmoc
+get_fingerprint_runtime_deps() {
+    case "$DISTRO_FAMILY" in
+        debian)
+            echo "fprintd libpam-fprintd curl ca-certificates"
+            ;;
+        fedora)
+            echo "fprintd fprintd-pam curl ca-certificates"
+            ;;
+        arch)
+            echo "fprintd curl ca-certificates"
+            ;;
+        suse)
+            echo "fprintd fprintd-pam curl ca-certificates"
+            ;;
+        *)
+            echo "fprintd curl ca-certificates"
+            ;;
+    esac
+}
+
 # Return user session UID and username
 get_real_user() {
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then

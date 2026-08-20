@@ -19,7 +19,7 @@ source=("git+https://gitlab.freedesktop.org/3v1n0/libfprint.git#commit=56442591a
         "crfpmoc-driver-overlay.tar.gz"
         "../60-cros-fp.rules")
 sha256sums=('SKIP'
-            'f82a0195edf51211b0de6d8ab34aea988c780ec4eecd147dfcab61359be018dd'
+            '458357ee16c1d22b8330feb377b8e7d63db2010d57312cd3b9edf884da22b97a'
             '9f07f108632226d10dd3ee785f1284350c37166d2b9514210a13bd2895457a9f')
 
 prepare() {

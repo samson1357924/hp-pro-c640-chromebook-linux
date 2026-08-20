@@ -40,22 +40,31 @@ character device interface.
 
 ## 🛠️ Installation & Management
 
-### Automated Installation (Cross-Distro)
+### Automated Installation (Hybrid A+C Architecture)
 
 The included installation script automatically detects your distribution
-(Ubuntu/Debian, Fedora, Arch, openSUSE), installs dependencies, builds
-libfprint, installs udev rules, and configures PAM:
+(Ubuntu/Debian, Fedora, Arch, openSUSE), checks for fast prebuilt packages from
+GitHub Releases, and seamlessly falls back to building from source (Plan A) if
+offline or unsupported:
 
 ```bash
 chmod +x install-fingerprint.sh
+# Default Hybrid mode (checks prebuilt package first, falls back to source build):
 ./install-fingerprint.sh
+
+# Force building from source (Plan A: pinned commit + audited driver overlay):
+./install-fingerprint.sh --source
 ```
 
 **Supported Options**:
 
-* `./install-fingerprint.sh --check` : Inspect fingerprint device status and list registered prints.
-* `./install-fingerprint.sh --dry-run` : Preview installation steps without making system changes.
-* `./install-fingerprint.sh --uninstall` : Revert udev rules and restore distro stock packages.
+* `./install-fingerprint.sh --install` (or `-i`): Default hybrid installation.
+* `./install-fingerprint.sh --source` (or `--build`): Force building from source.
+* `./install-fingerprint.sh --prebuilt` (or `--pkg`): Force prebuilt package only.
+* `./install-fingerprint.sh --release-tag <TAG>`: Specify release tag to fetch from.
+* `./install-fingerprint.sh --check` (or `-c`): Inspect fingerprint device status and list registered prints.
+* `./install-fingerprint.sh --dry-run` (or `-n`): Preview installation steps without making system changes.
+* `./install-fingerprint.sh --uninstall` (or `-u`): Revert udev rules, remove packages, and restore distro stock packages.
 
 ---
 
@@ -63,8 +72,10 @@ chmod +x install-fingerprint.sh
 
 For users who prefer native package management over direct source installation:
 
+* **Debian / Ubuntu**: Run [`packaging/build-deb.sh`](packaging/build-deb.sh) to build `.deb` package (`dpkg -i`).
 * **Arch Linux / EndeavourOS**: Use the provided [`packaging/PKGBUILD`](packaging/PKGBUILD) with `makepkg -si`.
 * **Fedora / openSUSE**: Use [`packaging/libfprint-crfpmoc.spec`](packaging/libfprint-crfpmoc.spec) with `rpmbuild`.
+* **Standalone Source Tarball**: Generate a self-contained source archive with [`packaging/create-source-tarball.sh`](packaging/create-source-tarball.sh).
 
 ---
 

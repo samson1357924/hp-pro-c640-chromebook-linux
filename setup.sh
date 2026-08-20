@@ -52,7 +52,8 @@ show_help() {
     echo "Options:"
     echo "  --all, -a            Run complete setup (Keyboard + Audio + Fingerprint + Power)"
     echo "  --audio, -u          Install ALSA UCM2 audio profiles"
-    echo "  --fingerprint, -f    Build & install crfpmoc libfprint driver"
+    echo "  --fingerprint, -f    Install crfpmoc libfprint driver (Hybrid: prebuilt package with source fallback)"
+    echo "  --source, --build    Force building fingerprint driver from source (Plan A)"
     echo "  --keyboard, -k       Install Chromebook top-row function keys mapping"
     echo "  --power, -p          Install power management & S0ix modern standby tuning"
     echo "  --ec                 Install ChromeOS EC control utility (c640-ec-control)"
@@ -79,7 +80,11 @@ run_keyboard() {
 
 run_fingerprint() {
     make_executable "$SCRIPT_DIR/fingerprint/install-fingerprint.sh"
-    "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --install
+    if [ "${FP_FORCE_SOURCE:-0}" = "1" ]; then
+        "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --source
+    else
+        "$SCRIPT_DIR/fingerprint/install-fingerprint.sh" --install
+    fi
 }
 
 run_audio() {
@@ -143,6 +148,11 @@ while [ $# -gt 0 ]; do
             ;;
         --fingerprint | -f | --fp | 3)
             MODE="fingerprint"
+            shift
+            ;;
+        --source | --build | --build-from-source)
+            MODE="fingerprint"
+            export FP_FORCE_SOURCE=1
             shift
             ;;
         --keyboard | -k | --kbd | 4)
