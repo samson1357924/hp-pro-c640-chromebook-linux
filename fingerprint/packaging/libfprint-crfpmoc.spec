@@ -51,20 +51,22 @@ developing applications that use %{name}.
 sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
 
 %build
-%meson -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
+%meson -Dinstalled-tests=false -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
 %meson_build
 
 %install
 %meson_install
 install -D -p -m 0644 %{SOURCE1} %{buildroot}%{_udevrulesdir}/60-cros-fp.rules
+rm -rf %{buildroot}%{_datadir}/installed-tests
 
 %files
 %license COPYING
 %doc README.md
 %{_libdir}/libfprint-2.so.*
 %{_libdir}/girepository-1.0/FPrint-2.0.typelib
-%{_udevrulesdir}/60-cros-fp.rules
+%{_udevrulesdir}/*.rules
 %{_udevhwdbdir}/*
+%{_datadir}/metainfo/*.metainfo.xml
 
 %files devel
 %{_includedir}/libfprint-2/
