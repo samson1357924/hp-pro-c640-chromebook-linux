@@ -107,7 +107,9 @@ The HP Pro c640 is equipped with an FPC1025 Match-on-Chip sensor that
 communicates through the ChromeOS EC controller (`/dev/cros_fp`). This project
 integrates the deeply audited and fixed **`crfpmoc`** driver with a **Hybrid A+C Architecture**:
 
-* **Hybrid Fast Installation**: Automatically installs prebuilt native packages (`.deb`, `.rpm`, `.pkg.tar.zst`) from GitHub Releases; seamlessly falls back to source compilation (Plan A) when offline.
+* **Hybrid Fast Installation**: Automatically installs prebuilt native
+  packages (`.deb`, `.rpm`, `.pkg.tar.zst`) from GitHub Releases; seamlessly
+  falls back to source compilation (Plan A) when offline.
 * Uses 50ms-delay state-machine polling to fully resolve the epoll starvation
   issue caused by the missing interrupt in the Linux kernel.
 * Weak-pointer memory guarding to eliminate Use-After-Free hazards.

@@ -66,7 +66,8 @@ chmod +x install-fingerprint.sh
 * `./install-fingerprint.sh --release-tag <TAG>`: Specify release tag to fetch from.
 * `./install-fingerprint.sh --check` (or `-c`): Inspect fingerprint device status and list registered prints.
 * `./install-fingerprint.sh --dry-run` (or `-n`): Preview installation steps without making system changes.
-* `./install-fingerprint.sh --uninstall` (or `-u`): Revert udev rules, remove packages, and restore distro stock packages.
+* `./install-fingerprint.sh --uninstall` (or `-u`): Revert udev rules, remove packages,
+  and restore distro stock packages.
 
 ---
 
@@ -74,10 +75,14 @@ chmod +x install-fingerprint.sh
 
 For users who prefer native package management over direct source installation:
 
-* **Debian / Ubuntu**: Run [`packaging/build-deb.sh`](packaging/build-deb.sh) to build `.deb` package (`dpkg -i`).
-* **Arch Linux / EndeavourOS**: Use the provided [`packaging/PKGBUILD`](packaging/PKGBUILD) with `makepkg -si`.
-* **Fedora / openSUSE**: Use [`packaging/libfprint-crfpmoc.spec`](packaging/libfprint-crfpmoc.spec) with `rpmbuild`.
-* **Standalone Source Tarball**: Generate a self-contained source archive with [`packaging/create-source-tarball.sh`](packaging/create-source-tarball.sh).
+* **Debian / Ubuntu**: Run [`packaging/build-deb.sh`](packaging/build-deb.sh) to build
+  `.deb` package (`dpkg -i`).
+* **Arch Linux / EndeavourOS**: Use the provided [`packaging/PKGBUILD`](packaging/PKGBUILD)
+  with `makepkg -si`.
+* **Fedora / openSUSE**: Use [`packaging/libfprint-crfpmoc.spec`](packaging/libfprint-crfpmoc.spec)
+  with `rpmbuild`.
+* **Standalone Source Tarball**: Generate a self-contained source archive with
+  [`packaging/create-source-tarball.sh`](packaging/create-source-tarball.sh).
 
 ---
 
@@ -201,4 +206,5 @@ sudo journalctl -u fprintd -f
   **Felix Niederer**,
   **Michael Evans**,
   **[Marco Trevisan (Treviño)](https://github.com/3v1n0)** & **libfprint team**.
-* **[ChromiumOS EC Team](https://chromium.googlesource.com/chromiumos/platform/ec/)** & **[Chrultrabook Project](https://chrultrabook.com/)**.
+* **[ChromiumOS EC Team](https://chromium.googlesource.com/chromiumos/platform/ec/)**
+  & **[Chrultrabook Project](https://chrultrabook.com/)**.

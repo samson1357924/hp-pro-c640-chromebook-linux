@@ -159,4 +159,5 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 | **硬體按鍵資料庫與說明** | `keyboard/90-*.hwdb`, `docs/` | **CC0-1.0 / MIT** | [`LICENSES/CC0-1.0.txt`](LICENSES/CC0-1.0.txt) |
 
 > [!NOTE]
-> 各上游著作權人聲明（Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA Project, ChromiumOS Authors）、致謝清單與衍生修改記錄請詳閱 [**`CREDITS.md`**](CREDITS.md)。
+> 各上游著作權人聲明（Abhinav Baid, WeirdTreeThing, Marco Trevisan, ALSA Project,
+> ChromiumOS Authors）、致謝清單與衍生修改記錄請詳閱 [**`CREDITS.md`**](CREDITS.md)。
