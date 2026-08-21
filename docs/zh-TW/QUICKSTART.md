@@ -1,4 +1,4 @@
-[English](../../README.md) | [繁體中文](../../README.zh-TW.md)
+[English](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/README.md) | [繁體中文](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/README.zh-TW.md)
 
 # 🚀 快速上手指南 (Quick Start Guide)
 
