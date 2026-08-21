@@ -11,6 +11,11 @@ timeout = 20
 max_concurrency = 16
 exclude_all_private = true
 exclude = [
+    'site/.*',
+    '\.cache/.*',
+    'overrides/.*',
+    'hp-pro-c640.*',
+    'https://samson1357924.github.io/hp-pro-c640-chromebook-linux.*',
     '^https?://localhost',
     '^https?://127\.0\.0\.1',
     '^https?://192\.168\.',

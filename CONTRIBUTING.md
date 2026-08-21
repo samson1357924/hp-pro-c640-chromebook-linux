@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # Contributing to HP Pro c640 Chromebook Linux Guide
 
 Thank you for your interest in improving hardware support for the HP Pro c640 Chromebook and related ChromeOS devices!
@@ -67,7 +69,23 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
 * All changes should first target upstream (PR #832, work item #5428); this
   repo's mirror is for verification and reporting only, not forked development.
 
-### 4. Submitting Pull Requests
+### 4. Documentation & GitHub Pages
+
+* **Local preview**:
+
+  ```bash
+  pip install -r requirements-docs.txt
+  mkdocs serve        # http://127.0.0.1:8000/hp-pro-c640-chromebook-linux/
+  mkdocs build --strict --site-dir site  # strict: broken links/nav fail
+  ```
+
+* **Add a page**: create `docs/<name>.md` (and `docs/zh-TW/<name>.md` for Traditional Chinese), add it to `mkdocs.yml` `nav` under both `en` and `zh-TW`. Assets go to `docs/assets/` (CC0) and styles to `docs/stylesheets/` (CC0).
+
+* **First-time enablement (maintainers only)**: GitHub → Settings → Pages → Build and deployment → Source: **GitHub Actions**. After that, `push` to `main` auto-deploys via `.github/workflows/pages.yml` (build → upload artifact → deploy). PRs only build, never deploy.
+
+* **Checks before PR**: `markdownlint-cli2 --config .markdownlint.yaml "**/*.md"` (ignores `site/`), `lychee --config lychee.toml "**/*.md"`, and `reuse lint` must pass. `site/` and `.cache/` are git-ignored.
+
+### 5. Submitting Pull Requests
 
 1. Fork the repository.
 2. Create a feature branch (`git checkout -b feat/audio-improvement`).

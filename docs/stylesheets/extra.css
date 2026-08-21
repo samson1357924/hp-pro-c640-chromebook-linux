@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: CC0-1.0
+ * SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+ */
+
+/* Hero */
+.mdx-hero {
+    margin: 0 -0.8rem;
+    padding: 1.2rem 0.8rem 1.6rem;
+    background: linear-gradient(135deg, var(--md-primary-fg-color) 0%, #3f51b5 55%, #1e293b 100%);
+    color: white;
+    border-radius: 0 0 12px 12px;
+}
+.mdx-hero__content h1,
+.mdx-hero__content h2 {
+    color: white;
+    font-weight: 700;
+    margin-bottom: 0.6rem;
+}
+.mdx-hero__content p {
+    opacity: 0.92;
+}
+.mdx-hero .md-button {
+    margin-top: 0.6rem;
+    margin-right: 0.5rem;
+}
+
+/* Cards grid polish */
+.grid.cards > ul > li {
+    border-radius: 10px;
+}
+
+/* Tables: hardware status */
+.md-typeset table:not([class]) {
+    font-size: 0.75rem;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.md-typeset table:not([class]) th {
+    background: var(--md-primary-fg-color);
+    color: white;
+    white-space: nowrap;
+}
+.md-typeset table:not([class]) td {
+    vertical-align: top;
+}
+.md-typeset table:not([class]) td:nth-child(2) {
+    white-space: nowrap;
+    text-align: center;
+}
+
+/* Responsive: horizontal scroll for wide tables */
+.md-typeset__table {
+    width: 100%;
+    overflow-x: auto;
+    display: block;
+}
+
+/* Admonition: honest status */
+.md-typeset .admonition.note {
+    border-color: #3f51b5;
+}
+
+/* Mermaid */
+.mermaid {
+    background: var(--md-default-bg-color);
+    border-radius: 8px;
+    padding: 0.8rem;
+}
+
+/* Print */
+@media print {
+    .mdx-hero, nav.md-nav, .md-header, .md-footer, .md-search {
+        display: none !important;
+    }
+    .md-typeset table {
+        break-inside: avoid;
+    }
+    .md-typeset a::after {
+        content: " (" attr(href) ")";
+        font-size: 0.7em;
+        opacity: 0.7;
+    }
+}
+
+/* Slate scheme tweaks: ensure emoji status visible */
+[data-md-color-scheme="slate"] .md-typeset table:not([class]) th {
+    background: #3949ab;
+}
+
+/* Language switcher visibility */
+.md-status--success { color: #00c853; }
+.md-status--warning { color: #ffab00; }
+
+/* Ensure code copy button visible in slate */
+[data-md-color-scheme="slate"] .md-typeset .highlight {
+    background: #1e1e2e;
+}
+
+/* Hide GitHub-only language switcher on Pages (first paragraph with README link) */
+.md-content p:first-child:has(a[href*="README"]) {
+    display: none;
+}

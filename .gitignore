@@ -72,6 +72,13 @@ node_modules/
 modules.order
 Module.symvers
 
+# GitHub Pages / MkDocs
+site/
+.cache/
+.jekyll-cache/
+_site/
+public/
+
 # Editor & System
 .DS_Store
 .vscode/

@@ -83,7 +83,19 @@ path = [
     ".markdownlint.yaml",
     ".markdownlint-cli2.jsonc",
     ".shellcheckrc",
-    "lychee.toml"
+    "lychee.toml",
+    "mkdocs.yml",
+    "requirements-docs.txt"
+]
+SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
+SPDX-License-Identifier = "CC0-1.0"
+
+# MkDocs overrides and assets
+[[annotations]]
+path = [
+    "overrides/**",
+    "docs/stylesheets/**",
+    "docs/assets/**"
 ]
 SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
 SPDX-License-Identifier = "CC0-1.0"

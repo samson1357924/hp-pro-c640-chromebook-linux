@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: ChromeOS / Linux](https://img.shields.io/badge/Platform-Chromebook%20Linux-green.svg)](docs/COMPATIBILITY.md)
 [![Hardware: Google Dratini / Hatch](https://img.shields.io/badge/Hardware-Google%20Dratini%20(Comet%20Lake)-orange.svg)](docs/COMPATIBILITY.md)
+[![Docs: GitHub Pages](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/actions/workflows/pages.yml/badge.svg)](https://samson1357924.github.io/hp-pro-c640-chromebook-linux/)
 
 This project provides a complete Linux hardware enablement plan for the **HP
 Pro c640 Chromebook** (Google Board: **`dratini`** / Baseboard: **`hatch`** /

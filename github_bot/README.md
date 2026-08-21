@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD060 -->
+
 # HP Pro c640 Chromebook Linux GitHub AI Bot
 
 Production multi-agent GitHub review and issue triage bot for

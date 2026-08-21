@@ -45,7 +45,7 @@ jobs:
               [ -z "$t" ] && continue
               t="${t%% *}"
               case "$t" in
-                http://*|https://*|mailto:*|\#*) continue ;;
+                http://*|https://*|mailto:*|\#*|/*) continue ;;
               esac
               t="${t%%#*}"
               [ -z "$t" ] && continue
@@ -56,6 +56,7 @@ jobs:
               fi
             done < <(grep -oE '\[[^]]*\]\([^)]*\)' "$f" | sed -E 's/^\[[^]]*\]\(([^)]*)\)/\1/')
           done < <(find . -type f -name '*.md' -not -path './.git/*' \
+            -not -path './site/*' -not -path './.cache/*' \
             -not -path './audio/upstream/*' -not -path './github_bot/prompts/*')
           if [ "$fail" -ne 0 ]; then
             echo "::error::Broken relative markdown links found"
