@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # HP Pro c640 Chromebook (Google Dratini) Linux
 
 <div class="mdx-hero" markdown>

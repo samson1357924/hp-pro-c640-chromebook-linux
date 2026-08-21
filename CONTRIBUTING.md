@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # Contributing to HP Pro c640 Chromebook Linux Guide
 
 Thank you for your interest in improving hardware support for the HP Pro c640 Chromebook and related ChromeOS devices!
