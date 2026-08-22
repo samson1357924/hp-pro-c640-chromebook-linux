@@ -75,3 +75,93 @@ cat /proc/acpi/wakeup
 # 停用特定設備喚醒 (例如 TPAD):
 # echo TPAD | sudo tee /proc/acpi/wakeup
 ```
+
+---
+
+## 3. ChromeOS EC v1 (Dratini) 電源與充電控制架構
+
+**HP Pro c640 Chromebook** (Comet Lake-U / `dratini`) 搭載 Nuvoton NPCX796F Embedded Controller (EC)，
+運行 ChromeOS EC 韌體（版本 `dratini_v2.0.2851`）。
+
+### EC API 世代差異與硬體 AC 旁路
+
+* **EC v2/v3 (較新款 Chromebook 與 Framework)**：支援韌體層級的電池維持器
+  (`chargecontrol normal <lower> <upper>`)，由 EC 內部硬體自動維持電量區間。
+* **EC v1 (HP Pro c640 Dratini)**：實作標準三狀態充電控制：
+  * `normal` (0)：正常充電至 100%。
+  * `idle` (1)：**硬體 AC 旁路模式 (AC Bypass)**（停止對電池充電，電池電流為 **0 mA**，整機直接由變壓器供電）。
+  * `discharge` (2)：插電時強制由電池放電。
+
+因為本機 EC 韌體屬於 v1 架構，不支援 Sustainer 區間指令（會回傳 `ERROR: Old EC doesn't support sustainer`），
+因此充電門檻必須由作業系統層級主動判定與管理。
+
+### 雙軌容錯控制：sysfs + ectool
+
+本專案實作了核心與硬體雙軌相容機制：
+
+1. **Linux 核心 sysfs (`cros_charge_control`)**：寫入 `inhibit-charge` 或 `auto` 至
+   `/sys/class/power_supply/BAT0/charge_behaviour`。
+2. **EC 原生 Host Command (`ectool`)**：透過 `/dev/cros_ec` LPC 介面發送
+   `ectool chargecontrol idle` 或 `normal`。
+
+---
+
+## 4. 休眠與開機「0 空窗保護機制」 (Zero-Window Gap Protection)
+
+傳統電池門檻輪詢腳本在「冷開機」與「S3 休眠」時容易出現過充空窗：
+
+1. **開機啟動空窗**：傳統 systemd 服務在 `After=multi-user.target` 啟動時距離核心初始化約有 18~20 秒延遲，
+   可能導致開機期間短暫全速充電。
+2. **S3 休眠輪詢凍結**：進入 S3 休眠時，使用者空間的輪詢行程 (`sleep 30`) 會被 cgroup freezer 凍結；
+   若休眠期間插上變壓器，可能造成未受控充電。
+
+### 解決方案：sysinit Target + systemd-sleep 喚醒鉤子
+
+* **開機提早啟動**：`c640-battery-limit.service` 設定為 `After=sysinit.target`，在開機 ~1.5 秒內即刻就緒。
+* **喚醒即時鉤子**：`/usr/lib/systemd/system-sleep/c640-ec-sleep.sh` 在系統自 S3/S0ix 喚醒瞬間
+  （`post` 鉤子）於 <0.05 秒內重新評估電量並下達 `inhibit-charge` / `idle`。
+* **硬體 S3 保持特性**：經實機測試驗證，處於 `idle` (0 mA) 狀態的 EC 晶片在經歷 S3 deep sleep 休眠後，
+  喚醒時仍持續精確維持 0 mA AC 旁路，不發生狀態丟失。
+
+---
+
+## 5. Standalone `ectool` 建置與使用指南
+
+若要在標準 Linux (Ubuntu, Debian, Fedora, Arch) 上與 ChromeOS EC 直接通訊：
+
+### 原始碼編譯 (`DHowett/ectool`)
+
+```bash
+# 安裝編譯依賴
+sudo apt install -y cmake build-essential pkg-config libftdi1-dev libusb-1.0-0-dev
+
+# 下載並編譯
+git clone --depth=1 https://github.com/DHowett/ectool.git
+cd ectool
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+
+# 安裝
+sudo install -D -m 0755 src/ectool /usr/local/bin/ectool
+```
+
+### `c640-ec-control` 常用指令
+
+```bash
+# 查看完整 EC 儀表板（電池詳細數據、風扇轉速、主機板 3 處熱敏電阻溫度、鍵盤背光）
+c640-ec-control status
+
+# 設定 90% 充電上限保護
+c640-ec-control battery-limit 90
+
+# 強制切換為純 AC 旁路供電（電池 0 mA 靜止）
+c640-ec-control battery-idle
+
+# 恢復 100% 完整充電模式
+c640-ec-control battery-full
+
+# 風扇靜音模式（打字 0 RPM 靜音） / 恢復自動溫控
+c640-ec-control fan-silent
+c640-ec-control fan-auto
+```

@@ -20,7 +20,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  --install, -i           Install c640-ec-control utility (default)"
-    echo "  --enable-battery-limit  Enable automatic 80% battery protection service"
+    echo "  --enable-battery-limit  Enable automatic 90% battery protection service and sleep hook"
     echo "  --uninstall, -u         Uninstall EC tools and services"
     echo "  --dry-run, -n           Preview steps without execution"
     echo "  --help, -h              Show this help message"
@@ -106,24 +106,24 @@ install_ec_tools() {
     log_section "c640-ec-control installed successfully! 🔋"
     echo "You can now run:"
     echo "    c640-ec-control status"
-    echo "    c640-ec-control battery-limit 80"
+    echo "    c640-ec-control battery-limit 90"
 }
 
 enable_battery_service() {
-    log_section "Enabling 80% Battery Protection Service"
+    log_section "Enabling 90% Battery Protection Service & Sleep Hook"
     local srv_dst="/etc/systemd/system/c640-battery-limit.service"
     local srv_src="$SCRIPT_DIR/systemd/c640-battery-limit.service"
+    local sleep_dst="/usr/lib/systemd/system-sleep/c640-ec-sleep.sh"
+    local sleep_src="$SCRIPT_DIR/systemd/c640-ec-sleep.sh"
 
-    # The service runs `c640-ec-control battery-limit 80`, which requires
-    # the ectool binary. Refuse to enable it if ectool is unavailable,
-    # otherwise the service would fail on every boot.
-    if ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+    # Deploy system-sleep hook for instant resume protection
+    if [ -f "$sleep_src" ]; then
+        backup_file_manifest_aware "$sleep_dst" "ec"
         if [ "${DRY_RUN:-0}" = "1" ]; then
-            log_dryrun "Require ectool for the battery limit service (would abort without it)"
+            log_dryrun "Install -D -m 0755 $sleep_src -> $sleep_dst"
         else
-            log_error "ectool not found. The battery limit service requires ectool to talk to the ChromeOS EC."
-            log_info "Provide ectool (e.g. install a prebuilt binary at /usr/local/bin/ectool or add one to ec/bin/) and re-run with --enable-battery-limit."
-            return 1
+            sudo install -D -m 0755 "$sleep_src" "$sleep_dst"
+            log_success "Installed $sleep_dst (resume hook)"
         fi
     fi
 
@@ -136,7 +136,7 @@ enable_battery_service() {
             manifest_add_service "c640-battery-limit.service" "ec"
             sudo systemctl daemon-reload
             sudo systemctl enable --now c640-battery-limit.service
-            log_success "80% Battery protection service enabled!"
+            log_success "90% Battery protection service and resume hook enabled!"
         fi
     fi
 }
@@ -144,6 +144,10 @@ enable_battery_service() {
 uninstall_ec_tools() {
     log_section "Uninstalling ChromeOS EC Utilities"
     if [ "${DRY_RUN:-0}" != "1" ]; then
+        if [ -x "/usr/local/bin/c640-ec-control" ]; then
+            /usr/local/bin/c640-ec-control battery-full 2> /dev/null || true
+            /usr/local/bin/c640-ec-control fan-auto 2> /dev/null || true
+        fi
         sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
     fi
 

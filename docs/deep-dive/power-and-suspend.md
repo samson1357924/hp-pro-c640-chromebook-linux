@@ -88,3 +88,95 @@ cat /proc/acpi/wakeup
 # Disable wake for a specific device (e.g. TPAD):
 # echo TPAD | sudo tee /proc/acpi/wakeup
 ```
+
+---
+
+## 3. ChromeOS EC v1 (Dratini) Power & Charge Control Architecture
+
+The **HP Pro c640 Chromebook** (Comet Lake-U / `dratini`) features a Nuvoton NPCX796F Embedded
+Controller (EC) running ChromeOS EC firmware (version `dratini_v2.0.2851`).
+
+### EC API Generations & Hardware AC Bypass
+
+* **EC v2/v3 (Newer Chromebooks & Framework)**: Supports firmware-level battery sustainer
+  (`chargecontrol normal <lower> <upper>`), where the EC autonomously holds a percentage window in hardware.
+* **EC v1 (HP Pro c640 Dratini)**: Implements standard 3-state charge control:
+  * `normal` (0): Charges battery up to 100%.
+  * `idle` (1): **Hardware AC Bypass Mode** (stops charging, battery draws **0 mA**,
+    motherboard is powered directly by AC).
+  * `discharge` (2): Forces discharge from battery while plugged in.
+
+Because EC v1 rejects autonomous sustainer commands (`ERROR: Old EC doesn't support sustainer`),
+the Linux operating system must manage the percentage threshold.
+
+### Dual-Track Control: sysfs + ectool
+
+This project implements a dual-track fail-safe mechanism:
+
+1. **Linux Kernel sysfs (`cros_charge_control`)**: Writing `inhibit-charge` or `auto` to
+   `/sys/class/power_supply/BAT0/charge_behaviour`.
+2. **Direct EC Host Command (`ectool`)**: Issuing `ectool chargecontrol idle` or `normal`
+   over the `/dev/cros_ec` LPC interface.
+
+---
+
+## 4. Zero-Window Gap Protection (Boot & Suspend)
+
+A common issue with battery threshold scripts is overcharging during system boot and S3 sleep transitions:
+
+1. **Cold Boot Window**: Standard systemd services running `After=multi-user.target` start ~18-20 seconds
+   after kernel initialization, leaving a brief charging window on boot.
+2. **S3 Sleep & Polling Freeze**: During S3 suspend, user-space polling processes (`sleep 30`) are frozen
+   by the cgroup freezer. If AC is connected during sleep or state resets, overcharging can occur.
+
+### Solution: sysinit Target + systemd-sleep Resume Hook
+
+* **Early Boot Service**: `c640-battery-limit.service` is configured with `After=sysinit.target`,
+  starting within ~1.5 seconds of boot.
+* **Resume Hook**: `/usr/lib/systemd/system-sleep/c640-ec-sleep.sh` immediately re-evaluates battery capacity
+  upon S3/S0ix resume (`post` hook), asserting `inhibit-charge` / `idle` in <0.05 seconds.
+* **Hardware S3 Persistence**: Measured in hardware verification tests: an EC placed in `idle` (0 mA)
+  maintains 0 mA AC bypass throughout S3 deep sleep without dropping state.
+
+---
+
+## 5. Standalone `ectool` Build & Usage Guide
+
+To communicate directly with the ChromeOS EC on standard Linux (Ubuntu, Debian, Fedora, Arch):
+
+### Build from Source (`DHowett/ectool`)
+
+```bash
+# Install dependencies
+sudo apt install -y cmake build-essential pkg-config libftdi1-dev libusb-1.0-0-dev
+
+# Clone and compile
+git clone --depth=1 https://github.com/DHowett/ectool.git
+cd ectool
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+
+# Install
+sudo install -D -m 0755 src/ectool /usr/local/bin/ectool
+```
+
+### Quick Commands with `c640-ec-control`
+
+```bash
+# View complete EC status (Battery, Fan RPM, 3x Board Thermals, Keyboard Backlight)
+c640-ec-control status
+
+# Set battery limit to 90%
+c640-ec-control battery-limit 90
+
+# Force immediate pure AC bypass (0 mA battery draw)
+c640-ec-control battery-idle
+
+# Restore 100% full charging
+c640-ec-control battery-full
+
+# Fan silent mode (0 RPM for quiet typing) / restore auto
+c640-ec-control fan-silent
+c640-ec-control fan-auto
+```

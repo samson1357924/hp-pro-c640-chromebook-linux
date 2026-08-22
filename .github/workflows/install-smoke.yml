@@ -83,6 +83,7 @@ jobs:
           /usr/local/bin/c640-ec-control help > /dev/null
           /usr/local/bin/c640-ec-control status > /dev/null 2>&1 || true
           test -f /etc/systemd/system/c640-battery-limit.service
+          test -f /usr/lib/systemd/system-sleep/c640-ec-sleep.sh
 
       - name: Assert CLI Validation
         run: |
@@ -118,6 +119,7 @@ jobs:
           test ! -e /usr/local/lib/c640-ec/logger.sh
           test ! -e /usr/local/lib/c640-ec/syscheck.sh
           test ! -e /etc/systemd/system/c640-battery-limit.service
+          test ! -e /usr/lib/systemd/system-sleep/c640-ec-sleep.sh
           test ! -e /etc/udev/rules.d/60-cros-ec.rules
           # installer-created plugdev membership must be removed
           if id -nG smoketest | tr ' ' '\n' | grep -qx plugdev; then

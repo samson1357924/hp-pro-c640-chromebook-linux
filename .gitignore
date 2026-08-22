@@ -72,6 +72,10 @@ node_modules/
 modules.order
 Module.symvers
 
+# EC binaries
+ec/bin/*
+!ec/bin/.gitkeep
+
 # GitHub Pages / MkDocs
 site/
 .cache/

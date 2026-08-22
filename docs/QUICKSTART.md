@@ -29,7 +29,7 @@ chmod +x setup.sh
 | **Install only the fingerprint driver and PAM** | `./setup.sh --fingerprint` or `./fingerprint/install-fingerprint.sh` |
 | **Install only the keyboard top-row mapping** | `./setup.sh --keyboard` or `./keyboard/install-keyboard.sh` |
 | **Install only the power management tweaks** | `./power/install-power.sh` |
-| **Enable the 80% battery protection service** | `./ec/install-ec.sh --enable-battery-limit` |
+| **Enable the 90% battery protection service** | `./ec/install-ec.sh --enable-battery-limit` |
 | **Comprehensive hardware diagnostics** | `./setup.sh --check` or `./scripts/detect-hardware.sh` |
 | **Preview all changes (dry-run)** | `./setup.sh --all --dry-run` |
 | **One-click uninstall and rollback** | `./setup.sh --uninstall` |
@@ -61,6 +61,21 @@ speaker-test -c 2 -t wav
 
 # Check the current audio device status
 wpctl status
+```
+
+---
+
+## 🔋 Check EC & Battery Protection
+
+```bash
+# Inspect complete EC health dashboard
+c640-ec-control status
+
+# Set battery limit to 90% (with automatic AC bypass)
+c640-ec-control battery-limit 90
+
+# Quiet typing fan silent mode
+c640-ec-control fan-silent
 ```
 
 ---

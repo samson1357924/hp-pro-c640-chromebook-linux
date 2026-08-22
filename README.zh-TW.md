@@ -34,6 +34,7 @@
 | **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸功能測試未納入證據**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 硬解尚未量測**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **鍵盤背光 & 頂排功能鍵** | ⚠️ **頂排已驗證** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1-F10 對應上一頁、重新整理、亮度、音量（hwdb 已驗證）。**背光亮度未測試** — 見 [VERIFICATION.md](docs/zh-TW/verification.md)。 |
+| **EC 電池保護與風扇控制** | 🟢 **正常** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% 上限守護服務、0 mA AC 旁路、S3 休眠喚醒鉤子、風扇靜音模式。 |
 | **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測真實盒蓋 S3 休眠/喚醒週期（零錯誤）。**按鍵/指紋喚醒未測試**；已知問題：開蓋後螢幕需按鍵才亮（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電節點存在；**Type-C 外接螢幕尚未驗證**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 
@@ -75,7 +76,7 @@ chmod +x setup.sh
 * 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/zh-TW/FIRMWARE.md)**：
   MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫** 與還原 ChromeOS 步驟。
 * 🛠️ **[疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](docs/zh-TW/TROUBLESHOOTING.md)**：
-  十四大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
+  十五大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
 * 🔄 **[系統復原與解除安裝 (UNINSTALL.md)](docs/zh-TW/UNINSTALL.md)**：
   備份還原機制與原生套件復原。
 
@@ -126,6 +127,14 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 * **方案 B（進階雙模）**：提供 `keyd` 設定檔
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf))，支援 Search 鍵「短按
   CapsLock、長按 Super」，按住 Super 轉換頂排為標準 F1-F10。
+
+### 🔋 ChromeOS EC 控制與電池保護 (`ec/`)
+
+透過 `/dev/cros_ec` 與 ChromeOS Embedded Controller 進行硬體級通訊：
+
+* **90% 電池壽命保護守護服務**：透過硬體 AC 旁路供電（`idle` 模式，0 mA 電流），徹底杜絕長時間插電過充與微循環老化。
+* **休眠 0 空窗防護**：專屬 `systemd-sleep` 喚醒鉤子，確保在 S3 深度睡眠喚醒時立即套用保護，不發生延遲充電。
+* **EC 健康儀表板與溫控**：即時讀取電池健康度、風扇轉速、主機板 3 處熱敏電阻溫度，並支援 0-RPM 靜音打字模式。
 
 ---
 

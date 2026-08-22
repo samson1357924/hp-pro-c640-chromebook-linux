@@ -28,7 +28,7 @@ chmod +x setup.sh
 | **僅安裝指紋驅動與 PAM** | `./setup.sh --fingerprint` 或 `./fingerprint/install-fingerprint.sh` |
 | **僅安裝鍵盤頂排映射** | `./setup.sh --keyboard` 或 `./keyboard/install-keyboard.sh` |
 | **僅安裝電源管理調校** | `./power/install-power.sh` |
-| **啟用 80% 電池保護服務** | `./ec/install-ec.sh --enable-battery-limit` |
+| **啟用 90% 電池保護服務** | `./ec/install-ec.sh --enable-battery-limit` |
 | **系統硬體綜合診斷** | `./setup.sh --check` 或 `./scripts/detect-hardware.sh` |
 | **預覽所有變更 (Dry-Run)** | `./setup.sh --all --dry-run` |
 | **一鍵解除安裝與還原** | `./setup.sh --uninstall` |
@@ -60,6 +60,21 @@ speaker-test -c 2 -t wav
 
 # 查看當前音效設備狀態
 wpctl status
+```
+
+---
+
+## 🔋 EC 與電池保護測試
+
+```bash
+# 查看完整 EC 健康度儀表板（電池、風扇、全板溫度）
+c640-ec-control status
+
+# 設定 90% 充電上限保護（具備自動 AC 旁路）
+c640-ec-control battery-limit 90
+
+# 打字靜音模式（風扇 0 RPM）
+c640-ec-control fan-silent
 ```
 
 ---

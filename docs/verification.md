@@ -83,7 +83,7 @@ diagnostic bundle.
 | **Current default** | ⚠️ | **`deep` (S3) is the current default**, not s2idle (README now says "S3 deep default, s2idle available") |
 | Actual suspend/resume cycle | 🟢 | **Tested 2026-08-18**: lid close → `PM: suspend entry (deep)` → `ACPI: PM: Preparing to enter system sleep state S3` → open lid → `Waking up from system sleep state S3` → `PM: suspend exit`, zero errors (journalctl -k). Also confirms the lid-close rule from `power/systemd/logind.conf.d/` is live. |
 | S0ix residency / ASPM tuning | ❌ | **Not measured** (no PMC `slp_s0_residency` evidence) |
-| Battery charge control | 🟢 | 📄 `fingerprint_ec/battery.txt`: `CHARGE_BEHAVIOUR=inhibit-charge` @ 90% (set via local helper, **not** the repo's `c640-ec-control` yet) |
+| Battery charge control | 🟢 | `c640-ec-control` & `c640-battery-limit.service`: `CHARGE_BEHAVIOUR=inhibit-charge` @ 90% (0 mA hardware AC bypass; dual-track sysfs + `ectool` LPC control verified; 0-window sleep hook tested across S3 suspend) |
 
 ### 6. Display / Graphics
 
@@ -106,7 +106,7 @@ should be considered "provided for your distro, verify on your own hardware":
 | **Power tuning — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 installed + rebooted 2026-08-19 (d0i3 stripped, initramfs rebuilt); **dark-panel-after-resume persists** (screen still dark until keypress — user accepted; see [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)) |
 | **Power tuning — wireplumber / logind** | `power/wireplumber/50-disable-suspend.conf`, `power/systemd/logind.conf.d/99-hp-c640-lid.conf` | 🟢 installed 2026-08-18 (logind lid rule verified via a real S3 lid cycle) |
 | **Power tuning — TLP** | `power/tlp/99-hp-c640.conf` | ❌ not installed — **conflicts with the active `power-profiles-daemon`** (see ⚠️ below) |
-| **EC control** | `ec/install-ec.sh`, `scripts/c640-ec-control.sh`, `ec/systemd/c640-battery-limit.service` | ❌ not installed (no `ectool`, no `/usr/local/bin/c640-ec-control`); local battery limit works via `charge_behaviour` sysfs + a **different** local helper |
+| **EC control & battery protection** | `ec/install-ec.sh`, `scripts/c640-ec-control.sh`, `ec/systemd/c640-battery-limit.service`, `ec/systemd/c640-ec-sleep.sh` | 🟢 installed + hardware-verified 2026-08-23 (standalone `ectool` LPC handshake, status dashboard, 90% battery daemon, 0 mA idle bypass, and S3 resume hook verified) |
 | **Fingerprint system-sleep hook** | `fingerprint/systemd/fprintd-sleep.sh` | 🟢 installed + verified 2026-08-19 (lid-cycle test: first unlock has fingerprint prompt, zero resume delay, no retry lines) |
 | **Fingerprint udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 installed 2026-08-18, verified via `getfacl` after reboot |
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | ❌ option A (hwdb) used instead |

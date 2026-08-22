@@ -81,7 +81,7 @@
 | **目前預設值** | ⚠️ | **目前預設是 `deep` (S3)，不是 s2idle**（README 已改為「預設 S3 deep，s2idle 可用」） |
 | 實際休眠/喚醒週期 | 🟢 | **2026-08-18 實測**：盒蓋 → `PM: suspend entry (deep)` → `ACPI: PM: Preparing to enter system sleep state S3` → 開蓋 → `Waking up from system sleep state S3` → `PM: suspend exit`，零錯誤（journalctl -k）。同時證明 `power/systemd/logind.conf.d/` 的盒蓋規則已生效。 |
 | S0ix residency / ASPM 調校 | ❌ | **未量測**（無 PMC `slp_s0_residency` 證據） |
-| 電池充電控制 | 🟢 | 📄 `fingerprint_ec/battery.txt`：`CHARGE_BEHAVIOUR=inhibit-charge` @ 90%（由本機輔助腳本設定，**非** repo 的 `c640-ec-control`） |
+| 電池充電控制 | 🟢 | `c640-ec-control` 與 `c640-battery-limit.service`：`CHARGE_BEHAVIOUR=inhibit-charge` @ 90%（0 mA 硬體 AC 旁路；雙軌 sysfs + `ectool` LPC 控制已驗證；S3 休眠 0 空窗喚醒鉤子已實測） |
 
 ### 6. 顯示 / 圖形
 
@@ -103,7 +103,7 @@
 | **電源調校 — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 2026-08-19 已安裝並重開機（已過濾 d0i3、重建 initramfs）；**開蓋黑屏問題仍在**（仍須按鍵才亮——使用者已接受，見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)） |
 | **電源調校 — wireplumber / logind** | `power/wireplumber/50-disable-suspend.conf`、`power/systemd/logind.conf.d/99-hp-c640-lid.conf` | 🟢 2026-08-18 已安裝（logind 盒蓋規則經真實 S3 週期驗證） |
 | **電源調校 — TLP** | `power/tlp/99-hp-c640.conf` | ❌ 未安裝 — **與運作中的 `power-profiles-daemon` 衝突**（見下方） |
-| **EC 控制** | `ec/install-ec.sh`、`scripts/c640-ec-control.sh`、`ec/systemd/c640-battery-limit.service` | ❌ 未安裝（無 `ectool`、無 `/usr/local/bin/c640-ec-control`）；本機電池上限改以 `charge_behaviour` sysfs + **另一支本機腳本**達成 |
+| **EC 控制與電池保護** | `ec/install-ec.sh`、`scripts/c640-ec-control.sh`、`ec/systemd/c640-battery-limit.service`、`ec/systemd/c640-ec-sleep.sh` | 🟢 2026-08-23 已安裝並實機驗證（standalone `ectool` LPC 通訊、健康度儀表板、90% 電池守護服務、0 mA 旁路斷充與 S3 喚醒鉤子皆通過實測） |
 | **指紋 system-sleep hook** | `fingerprint/systemd/fprintd-sleep.sh` | 🟢 2026-08-19 已安裝並驗證（盒蓋測試：第一次解鎖即有指紋、喚醒零延遲、日誌無 retry 行） |
 | **指紋 udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 2026-08-18 已安裝，重開機後以 `getfacl` 驗證 |
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | ❌ 使用 hwdb 選項 A |

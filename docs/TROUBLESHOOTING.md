@@ -1,6 +1,6 @@
 # 🛠️ Troubleshooting & Pitfall Guide
 
-This article covers the fourteen most common problems and their root-cause solutions
+This article covers the fifteen most common problems and their root-cause solutions
 when installing and using Linux on the **HP Pro c640 Chromebook (Google
 `dratini`)**.
 
@@ -331,3 +331,25 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   `busctl monitor` on `org.gnome.SettingsDaemon.Power` for a
   turn-off-after-resume event (confirms the userspace re-blank hypothesis).
   Report findings against GNOME/mutter#4111.
+
+### 15. Battery charges past 90% or `ERROR: Old EC doesn't support sustainer`
+
+* **Symptoms**: attempting to configure `ectool chargecontrol normal 80 90` outputs
+  `ERROR: Old EC doesn't support sustainer`, or the battery charges past the target limit
+  after a reboot or S3 sleep.
+* **Root cause**:
+  1. HP Pro c640 (Dratini) runs ChromeOS EC v1 firmware (`dratini_v2.0.2851`). EC v1 only supports
+     state commands (`normal`, `idle`, `discharge`), not firmware-autonomous percentage windows.
+  2. During S3 sleep or boot, simple polling daemons without sleep hooks leave a brief window where
+     the EC reverts to `normal` charging.
+* **Solution**:
+  1. Use the project's enhanced `c640-battery-limit.service` and `c640-ec-sleep.sh`:
+
+     ```bash
+     ./ec/install-ec.sh --enable-battery-limit
+     ```
+
+  2. The service uses an active daemon (`battery-daemon 90`) with immediate `sysinit.target` early
+     boot startup and a `systemd-sleep` resume hook to enforce 0 mA AC bypass (`idle` / `inhibit-charge`)
+     without relying on the unsupported firmware sustainer.
+  3. Verify with `c640-ec-control status` or `ectool battery` (Present current should be `0 mA`).

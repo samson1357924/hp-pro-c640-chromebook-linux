@@ -3,7 +3,7 @@
 # 🛠️ 疑難排解與避坑 FAQ (Troubleshooting & Pitfall Guide)
 
 本文整理了在 **HP Pro c640 Chromebook (Google `dratini`)** 安裝與使用 Linux 時
-最常遇到的十四大問題與根本解決之道。
+最常遇到的十五大問題與根本解決之道。
 
 ---
 
@@ -290,3 +290,22 @@
   drm/i915/kernel#16825），或用 `busctl monitor` 監看
   `org.gnome.SettingsDaemon.Power` 是否有 resume 後再度關閉螢幕的事件
   （可證實使用者層再黑屏假說）。回報至 GNOME/mutter#4111。
+
+### 15. 電池充過 90% 或出現 `ERROR: Old EC doesn't support sustainer`
+
+* **症狀**：下達 `ectool chargecontrol normal 80 90` 出現 `ERROR: Old EC doesn't support sustainer`，
+  或是系統在重開機、S3 休眠喚醒後充超過 90%。
+* **根本原因**：
+  1. HP Pro c640 (Dratini) 搭載 ChromeOS EC v1 韌體 (`dratini_v2.0.2851`)。EC v1 僅支援硬體狀態切換
+     (`normal`, `idle`, `discharge`)，韌體內部不支援自動維持百分比區間的 Sustainer 演算法。
+  2. 在 S3 休眠期間或剛開機時，缺乏喚醒鉤子與開機提早啟動會留下暫態空窗，導致短暫以預設 normal 模式充電。
+* **解決方案**：
+  1. 使用專案強化後的 `c640-battery-limit.service` 與 `c640-ec-sleep.sh`：
+
+     ```bash
+     ./ec/install-ec.sh --enable-battery-limit
+     ```
+
+  2. 該服務採用守護程式 (`battery-daemon 90`) 搭配 `sysinit.target` 開機提早啟動與 `systemd-sleep` 喚醒鉤子，
+     主動下達 0 mA AC 旁路 (`idle` / `inhibit-charge`)，無需依賴 EC Sustainer 即可精準控電。
+  3. 執行 `c640-ec-control status` 或 `ectool battery` 驗證（目前充電電流應為 `0 mA`）。
