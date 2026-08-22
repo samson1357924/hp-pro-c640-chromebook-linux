@@ -45,6 +45,7 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection not captured** (see [verification.md](verification.md)). |
 | **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works; **VA-API 4K60 not measured** (see [verification.md](verification.md)). |
 | **Keyboard Backlight & Top-Row Keys** | ⚠️ **Top-row verified** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1–F10 mapped (hwdb verified). **Backlight not tested** — see [verification.md](verification.md). |
+| **EC Battery Protection & Fan Control** | 🟢 **Working** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% limit daemon with 0 mA AC bypass, S3 sleep resume hook, fan silent mode. |
 | **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 cycle verified 2026-08-18. **Key/fingerprint wake untested**; panel stays dark until keypress (see [verification.md](verification.md)). |
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging present; **external display via Type-C not verified** (see [verification.md](verification.md)). |
 
@@ -100,7 +101,7 @@ chmod +x setup.sh
     Honest tested-vs-untested matrix, troubleshooting and recovery.
 
     [:octicons-arrow-right-24: Verification Matrix](verification.md) — **read this first**
-    [:octicons-arrow-right-24: Troubleshooting (14 pitfalls)](TROUBLESHOOTING.md)
+    [:octicons-arrow-right-24: Troubleshooting (15 pitfalls)](TROUBLESHOOTING.md)
     [:octicons-arrow-right-24: Uninstall & Restore](UNINSTALL.md)
 
 - :material-microscope: **Deep Dive**

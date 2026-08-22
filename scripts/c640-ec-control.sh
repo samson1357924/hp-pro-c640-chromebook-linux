@@ -33,7 +33,9 @@ show_help() {
     echo ""
     echo "Commands:"
     echo "  status               Show comprehensive EC dashboard (Battery, Fan, Thermal, Backlight)"
-    echo "  battery-limit [PCT]  Set battery charge threshold (e.g. 80 for 75-80% threshold mode)"
+    echo "  battery-limit [PCT]  Set and evaluate battery charge limit (default: 90, range: 20-95)"
+    echo "  battery-eval [PCT]   One-shot evaluation of charge limit (used by sleep hooks)"
+    echo "  battery-daemon [PCT] Run charge limit protection daemon loop (used by systemd)"
     echo "  battery-full         Restore 100% full charging mode"
     echo "  battery-idle         Bypass battery and run strictly on AC power"
     echo "  fan-silent           Set fan to zero-RPM silent mode for quiet typing"
@@ -76,15 +78,18 @@ show_status() {
 
     log_info "=== Battery Status (/sys/class/power_supply/BAT0) ==="
     if [ -d "/sys/class/power_supply/BAT0" ]; then
-        local status capacity health energy_full energy_design
+        local status capacity health energy_full energy_design behaviour
         status=$(cat /sys/class/power_supply/BAT0/status 2> /dev/null || echo "Unknown")
         capacity=$(cat /sys/class/power_supply/BAT0/capacity 2> /dev/null || echo "Unknown")
         energy_full=$(cat /sys/class/power_supply/BAT0/energy_full 2> /dev/null || echo "0")
         energy_design=$(cat /sys/class/power_supply/BAT0/energy_full_design 2> /dev/null || echo "0")
+        behaviour=$(cat /sys/class/power_supply/BAT0/charge_behaviour 2> /dev/null || echo "N/A")
 
         echo "  - Charge Status: $status ($capacity%)"
+        echo "  - Charge Behaviour: $behaviour"
+        [[ "$energy_design" =~ ^[0-9]+$ ]] || energy_design=0
+        [[ "$energy_full" =~ ^[0-9]+$ ]] || energy_full=0
         if [ "$energy_design" -gt 0 ]; then
-            local health
             health=$((energy_full * 100 / energy_design))
             echo "  - Battery Health: $health% ($((energy_full / 1000)) mWh / $((energy_design / 1000)) mWh design)"
         fi
@@ -95,8 +100,10 @@ show_status() {
         local fan_rpm
         fan_rpm=$(run_ec pwmgetfanrpm 2> /dev/null || echo "N/A")
         echo "  - Fan Speed: $fan_rpm"
+        echo "  - Thermal Sensors:"
+        run_ec temps all 2> /dev/null | sed 's/^/    /' || true
     else
-        echo "  - Direct EC Fan monitoring requires ectool."
+        echo "  - Direct EC Fan and thermal monitoring requires ectool."
     fi
 
     log_info "=== Keyboard Backlight Status ==="
@@ -108,40 +115,116 @@ show_status() {
     fi
 }
 
-set_battery_limit() {
-    local pct="${1:-80}"
+set_sysfs_charge_behaviour() {
+    local want="$1"
+    local bat="/sys/class/power_supply/BAT0"
+    if [ -f "$bat/charge_behaviour" ]; then
+        local cur active
+        cur=$(cat "$bat/charge_behaviour" 2> /dev/null || echo "")
+        active=$(echo "$cur" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+        [ -z "$active" ] && active=$(echo "$cur" | awk '{print $1}')
+        if [ "$active" != "$want" ]; then
+            if [ -w "$bat/charge_behaviour" ]; then
+                echo "$want" > "$bat/charge_behaviour" 2> /dev/null || true
+            else
+                echo "$want" | sudo tee "$bat/charge_behaviour" > /dev/null 2>&1 || true
+            fi
+        fi
+    fi
+}
+
+eval_battery_limit() {
+    local pct="${1:-90}"
     if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -lt 20 ] || [ "$pct" -gt 95 ]; then
         log_error "Battery limit must be an integer between 20 and 95 (got: $pct)."
         exit 1
     fi
 
-    local lower=$((pct - 5))
-    [ "$lower" -lt 15 ] && lower=15
+    local online="0"
+    for ac_path in /sys/class/power_supply/AC /sys/class/power_supply/ADP1 /sys/class/power_supply/ACAD; do
+        if [ -f "$ac_path/online" ]; then
+            online=$(cat "$ac_path/online" 2> /dev/null || echo "0")
+            break
+        fi
+    done
 
-    log_info "Configuring Battery Charge Threshold: $lower% -> $pct%..."
-    if check_ectool; then
-        run_ec chargecontrol normal "$lower" "$pct"
-        log_success "Battery limit set to $pct% (recharge at $lower%). AC Bypass enabled!"
+    local cap
+    cap=$(cat /sys/class/power_supply/BAT0/capacity 2> /dev/null || echo "0")
+    [[ "$cap" =~ ^[0-9]+$ ]] || cap=0
+    [[ "$online" =~ ^[0-9]+$ ]] || online=0
+
+    if [ "$online" = "1" ]; then
+        if [ "$cap" -ge "$pct" ]; then
+            # Target reached/exceeded: switch to AC bypass (stop charging)
+            set_sysfs_charge_behaviour "inhibit-charge"
+            if check_ectool 2> /dev/null; then
+                run_ec chargecontrol idle > /dev/null 2>&1 || true
+            fi
+        else
+            # Below target: charge normally
+            set_sysfs_charge_behaviour "auto"
+            if check_ectool 2> /dev/null; then
+                run_ec chargecontrol normal > /dev/null 2>&1 || true
+            fi
+        fi
     else
-        log_error "ectool is required to configure ChromeOS EC charge control. Run ./ec/install-ec.sh first."
+        # Unplugged: reset to auto/normal so it's ready when AC is reconnected
+        set_sysfs_charge_behaviour "auto"
+        if check_ectool 2> /dev/null; then
+            run_ec chargecontrol normal > /dev/null 2>&1 || true
+        fi
+    fi
+}
+
+daemon_battery_limit() {
+    local pct="${1:-90}"
+    if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -lt 20 ] || [ "$pct" -gt 95 ]; then
+        log_error "Battery limit must be an integer between 20 and 95 (got: $pct)."
         exit 1
     fi
+
+    cleanup_daemon() {
+        log_info "Stopping battery daemon; restoring normal charging..."
+        set_battery_full
+        exit 0
+    }
+    trap cleanup_daemon SIGTERM SIGINT
+
+    log_info "Starting c640 battery protection daemon (Limit: $pct%)..."
+    while true; do
+        eval_battery_limit "$pct" || true
+        sleep 30
+    done
+}
+
+set_battery_limit() {
+    local pct="${1:-90}"
+    if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -lt 20 ] || [ "$pct" -gt 95 ]; then
+        log_error "Battery limit must be an integer between 20 and 95 (got: $pct)."
+        exit 1
+    fi
+
+    log_info "Evaluating and applying battery limit ($pct%)..."
+    eval_battery_limit "$pct"
+    log_success "Battery limit set to $pct%. AC Bypass active when capacity >= $pct%."
 }
 
 set_battery_full() {
     log_info "Restoring standard 100% full charging mode..."
-    if check_ectool; then
-        run_ec chargecontrol normal
-        log_success "Battery charge control restored to 100% standard mode."
+    set_sysfs_charge_behaviour "auto"
+    if check_ectool 2> /dev/null; then
+        run_ec chargecontrol normal 2> /dev/null || true
     fi
+    log_success "Battery charge control restored to 100% standard mode."
 }
 
 set_battery_idle() {
     log_info "Switching to pure AC Bypass mode (battery idle)..."
-    if check_ectool; then
-        run_ec chargecontrol idle
-        log_success "Battery charging paused; running strictly on AC power."
+    set_sysfs_charge_behaviour "inhibit-charge"
+    if check_ectool 2> /dev/null; then
+        run_ec chargecontrol idle 2> /dev/null || true
     fi
+    log_success "Battery charging paused; running strictly on AC power."
 }
 
 set_fan_silent() {
@@ -201,7 +284,13 @@ case "${1:-status}" in
         show_status
         ;;
     battery-limit)
-        set_battery_limit "${2:-80}"
+        set_battery_limit "${2:-90}"
+        ;;
+    battery-eval)
+        eval_battery_limit "${2:-90}"
+        ;;
+    battery-daemon)
+        daemon_battery_limit "${2:-90}"
         ;;
     battery-full)
         set_battery_full

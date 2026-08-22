@@ -45,6 +45,7 @@
 | **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸未納入證據**（見 [verification.md](verification.md)）。 |
 | **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 未量測**（見 [verification.md](verification.md)）。 |
 | **鍵盤背光 & 頂排功能鍵** | ⚠️ **頂排已驗證** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1–F10 已映射（hwdb 已驗證）。**背光未測試** — 見 [verification.md](verification.md)。 |
+| **EC 電池保護與風扇控制** | 🟢 **正常運作** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% 上限守護服務、0 mA AC 旁路、S3 休眠喚醒鉤子、風扇靜音模式。 |
 | **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測盒蓋 S3 休眠/喚醒（零錯誤）。**按鍵/指紋喚醒未測試**；開蓋後需按鍵才亮（見 [verification.md](verification.md)）。 |
 | **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電正常；**Type-C 外接螢幕未驗證**（見 [verification.md](verification.md)）。 |
 
@@ -100,7 +101,7 @@ chmod +x setup.sh
     誠實的已測/未測矩陣、疑難排解與復原。
 
     [:octicons-arrow-right-24: 實測驗證矩陣](verification.md) — **請優先閱讀**
-    [:octicons-arrow-right-24: 疑難排解（14 坑）](TROUBLESHOOTING.md)
+    [:octicons-arrow-right-24: 疑難排解（15 坑）](TROUBLESHOOTING.md)
     [:octicons-arrow-right-24: 解除安裝與還原](UNINSTALL.md)
 
 - :material-microscope: **深度解析**

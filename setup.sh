@@ -37,7 +37,7 @@ show_menu() {
     echo "  [3] Fingerprint Driver Only (crfpmoc + fprintd + PAM)"
     echo "  [4] Keyboard Top-Row Mapping Only (systemd-hwdb)"
     echo "  [5] Power Management & S0ix Modern Standby Tuning"
-    echo "  [6] ChromeOS EC Control (Battery 80% limit & Fan tuning)"
+    echo "  [6] ChromeOS EC Control (Battery 90% limit & Fan tuning)"
     echo "  [7] Full Hardware & Diagnostics Check"
     echo "  [8] Generate Diagnostic Bundle (sysreport.tar.gz)"
     echo "  [9] Uninstall / Rollback All Components"

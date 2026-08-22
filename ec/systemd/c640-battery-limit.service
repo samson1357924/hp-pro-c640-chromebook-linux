@@ -1,11 +1,16 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+
 [Unit]
-Description=HP Pro c640 Battery Charge Limit (80% Protection)
-After=multi-user.target
+Description=HP Pro c640 Battery Charge Protection Daemon (90% Limit)
+After=sysinit.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/c640-ec-control battery-limit 80
-RemainAfterExit=yes
+Type=simple
+ExecStart=/usr/local/bin/c640-ec-control battery-daemon 90
+ExecStop=/usr/local/bin/c640-ec-control battery-full
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

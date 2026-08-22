@@ -21,7 +21,7 @@ This command automatically:
 2. Removes `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` and rebuilds the hardware database.
 3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
 4. Removes the power management tweaks (logind config and suspend helpers).
-5. Removes the EC tools and the 80% battery protection service.
+5. Removes the EC tools, the 90% battery protection service, and the sleep hook.
 6. Restores every file from the **first backup taken before this project ever
    touched it** (re-installs keep the original backup, so rollback always
    restores the pre-project state).
@@ -76,8 +76,8 @@ This command automatically:
   > session leader is lost on deserialization), which looks exactly like a
   > system crash (verified on an HP Pro c640, 2026-08-18).
 
-* **Remove only the EC tools and services** (including the 80% battery
-  protection `c640-battery-limit.service`):
+* **Remove only the EC tools and services** (including the 90% battery
+  protection `c640-battery-limit.service` and `c640-ec-sleep.sh`):
 
   ```bash
   ./ec/install-ec.sh --uninstall
@@ -85,20 +85,20 @@ This command automatically:
 
 ---
 
-## 🔋 Note: 80% Battery Protection Service
+## 🔋 Note: 90% Battery Protection Service
 
 `./ec/install-ec.sh --enable-battery-limit` installs and starts
-`c640-battery-limit.service`, which keeps the battery at 80% charge to
+`c640-battery-limit.service`, which keeps the battery at 90% charge to
 prolong its lifespan. It is removed automatically by
 `./ec/install-ec.sh --uninstall` and by `./setup.sh --uninstall`.
 
 > [!NOTE]
-> **State left behind after uninstall**: the EC charge threshold set by the
-> battery-limit service persists in the EC controller until you reset it
-> explicitly (`./scripts/c640-ec-control.sh battery-full`). The `plugdev`
-> group itself is not removed (other components or system packages may rely
-> on it), only installer-created memberships are dropped. `/dev/cros_ec`
-> keeps mode `0660` until the device is re-plugged or the machine reboots.
+> **State left behind after uninstall**: uninstallation automatically
+> restores standard 100% full charging (`battery-full`) and automatic fan
+> control (`fan-auto`). The `plugdev` group itself is not removed (other
+> components or system packages may rely on it), only installer-created
+> memberships are dropped. `/dev/cros_ec` keeps mode `0660` until the device
+> is re-plugged or the machine reboots.
 
 ## 📦 Restore Distro Native Packages
 

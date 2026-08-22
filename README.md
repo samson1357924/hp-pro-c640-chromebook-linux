@@ -35,6 +35,7 @@ automated installation scripts, and a comprehensive guide to avoiding pitfalls.
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection functional test not captured** (see [VERIFICATION.md](docs/verification.md)). |
 | **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works out of the box; **VA-API 4K 60fps hardware decode not yet measured** (see [VERIFICATION.md](docs/verification.md)). |
 | **Keyboard Backlight & Top-Row Function Keys** | ⚠️ **Top-row verified** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1-F10 mapped to previous page, refresh, brightness, and volume (hwdb verified). **Backlight brightness not tested** — see [VERIFICATION.md](docs/verification.md). |
+| **EC Battery Protection & Fan Control** | 🟢 **Working** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% limit daemon with 0 mA AC bypass, S3 sleep resume hook, fan silent mode. |
 | **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 suspend/resume cycle verified 2026-08-18 (zero errors). **Key/fingerprint wake untested**; known issue: panel stays dark on lid open until a keypress (see [VERIFICATION.md](docs/verification.md)). |
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging nodes present; **external display via Type-C not yet verified** (see [VERIFICATION.md](docs/verification.md)). |
 
@@ -77,7 +78,7 @@ chmod +x setup.sh
   MrChromebox UEFI flashing, **disconnecting the battery cable to remove the
   Cr50 hardware write-protect (HW WP)**, and steps to restore ChromeOS.
 * 🛠️ **[TROUBLESHOOTING.md (Troubleshooting & Pitfall FAQ)](docs/TROUBLESHOOTING.md)**:
-  Reference table for the fourteen most common faults and how to avoid them (Dummy
+  Reference table for the fifteen most common faults and how to avoid them (Dummy
   Output, Intel ME enablement requirements, S0ix power tuning, etc.).
 * 🔄 **[UNINSTALL.md (System Recovery & Uninstall)](docs/UNINSTALL.md)**: Backup/restore mechanism and native package restoration.
 
@@ -134,6 +135,17 @@ Comet Lake SOF DSP audio is fully enabled through the ALSA UCM2 topology:
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf)) supporting the Search
   key "short-press CapsLock, long-press Super", and holding Super converts the
   top row into standard F1-F10.
+
+### 🔋 ChromeOS EC Control & Battery Protection (`ec/`)
+
+Direct hardware interface with the ChromeOS Embedded Controller via `/dev/cros_ec`:
+
+* **90% Battery Protection Daemon**: Continuous fail-safe protection using hardware AC bypass
+  (`idle` mode, 0 mA draw).
+* **Zero-Window Sleep Protection**: Dedicated `systemd-sleep` resume hook guarantees zero-window
+  protection across S3 deep sleep.
+* **EC Dashboard & Thermal Control**: Real-time monitoring of battery health, fan RPM, 3 motherboard
+  thermistors, and zero-RPM fan silent mode.
 
 ---
 
