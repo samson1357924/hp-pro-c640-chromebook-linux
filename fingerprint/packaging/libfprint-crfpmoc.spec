@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 Name:           libfprint-crfpmoc
 Version:        1.94.10
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Toolkit for fingerprint readers with ChromeOS Match-on-Chip support
 
 License:        LGPL-2.1-or-later
@@ -48,7 +48,9 @@ developing applications that use %{name}.
 %autosetup -n libfprint-56442591a5c302a906289f30988fb50fc3d82ed6 -a 2
 # The driver overlay ships crfpmoc-proto.c but upstream libfprint/meson.build
 # only lists crfpmoc.c + crfpmoc-ec-transfer.c — add it idempotently.
-sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
+if ! grep -q "drivers/crfpmoc/crfpmoc-proto.c" libfprint/meson.build; then
+    sed -i "s|'drivers/crfpmoc/crfpmoc-ec-transfer.c',|'drivers/crfpmoc/crfpmoc-ec-transfer.c',\n        'drivers/crfpmoc/crfpmoc-proto.c',|" libfprint/meson.build
+fi
 
 %build
 %meson -Dinstalled-tests=false -Ddrivers=default -Dintrospection=true -Dgtk-examples=false -Ddoc=false
@@ -75,5 +77,10 @@ rm -rf %{buildroot}%{_datadir}/installed-tests
 %{_datadir}/gir-1.0/FPrint-2.0.gir
 
 %changelog
+* Mon Aug 24 2026 HP Pro c640 Linux Team <samson1357924@users.noreply.github.com> - 1.94.10-2
+- Packaging iteration 2: rebuild against same upstream (5644259) with
+  container/DNF fixes (openssl-devel, gcc-c++, curl) and installed-tests
+  cleanup; no driver source change.
+
 * Sat Aug 15 2026 HP Pro c640 Linux Team <samson1357924@users.noreply.github.com> - 1.94.10-1
 - Initial packaging for ChromeOS MoC (FPC1025 / Dratini)

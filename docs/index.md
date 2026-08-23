@@ -35,7 +35,7 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 
 ## 📊 Hardware Status At-a-Glance
 
-> **Honest by design** — 🟢 = verified on real HP Pro c640 (Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-19), ⚠️ = driver bound but functional test not captured, ❌ = not measured. See [Verification Matrix](verification.md) for evidence bundle and reproducibility steps.
+> **Honest by design** — 🟢 = verified on real HP Pro c640 (Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-23), ⚠️ = driver bound but functional test not captured, ❌ = not measured. See [Verification Matrix](verification.md) for evidence bundle and reproducibility steps.
 
 | Hardware Component | Status | Driver / Solution | Notes & Support Level |
 | :--- | :---: | :--- | :--- |
@@ -50,7 +50,7 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging present; **external display via Type-C not verified** (see [verification.md](verification.md)). |
 
 !!! note "Last verified"
-    **2026-08-19** on Ubuntu 26.04 LTS (kernel `7.0.0-29-generic`, PipeWire `1.6.2`, fprintd `1.94.5`, MrChromebox `2606.1`). Evidence bundle `c640-diagnostic-20260815_152233.tar.gz` — see [verification.md](verification.md) for how to reproduce.
+    **2026-08-23** on Ubuntu 26.04 LTS (kernel `7.0.0-29-generic`, PipeWire `1.6.2`, fprintd `1.94.5`, MrChromebox `2606.1`). Evidence bundle `c640-diagnostic-20260815_152233.tar.gz` (EC 90% daemon + `c640-ec-sleep.sh` + `ectool` verified; packaging `1.94.10-2` metadata, driver unchanged) — see [verification.md](verification.md) for how to reproduce.
 
 ---
 

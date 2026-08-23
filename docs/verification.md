@@ -157,7 +157,9 @@ cat /sys/power/mem_sleep
   fingerprint claim-race fix), 2026-08-19 (system-sleep hook + i915 PSR
   quirk installed & rebooted; lid-cycle fingerprint re-test passed — first
   unlock works, zero resume delay, no retry lines; dark-panel issue
-  unresolved, user accepted)
+  unresolved, user accepted), 2026-08-23 (EC 90% battery daemon + `c640-ec-sleep.sh`
+  zero-window resume hook + standalone `ectool` LPC handshake verified; packaging
+  iteration 2 `1.94.10-2` metadata prepared, driver source unchanged)
 * **OS / kernel**: Ubuntu 26.04 LTS, `7.0.0-29-generic`
 * **Firmware**: MrChromebox `2606.1`
 * **Hardware**: HP Pro c640 Chromebook (`dratini`/`hatch`)

@@ -5,7 +5,7 @@
 
 pkgname=libfprint-crfpmoc
 pkgver=1.94.10
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers with ChromeOS Match-on-Chip (MoC) driver support"
 arch=('x86_64')
 url="https://gitlab.freedesktop.org/3v1n0/libfprint"

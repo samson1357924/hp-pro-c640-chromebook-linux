@@ -23,6 +23,24 @@ RELEASE_REPO="${RELEASE_REPO:-samson1357924/hp-pro-c640-chromebook-linux}"
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 INSTALL_MODE="auto" # "auto" (Hybrid), "source" (Plan A), "prebuilt" (Plan C)
 
+# Validate PKG_VERSION format (e.g. 1.94.10 or 1.94.10-2) to prevent path traversal
+if ! [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+    echo "Invalid PKG_VERSION: $PKG_VERSION (expected X.Y.Z or X.Y.Z-N)" >&2
+    exit 1
+fi
+# Derive base version without release suffix for candidate construction (avoid double -2)
+PKG_BASE="${PKG_VERSION%%-*}"
+
+# Validate RELEASE_REPO and RELEASE_TAG to prevent URL injection
+if ! [[ "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "Invalid RELEASE_REPO: $RELEASE_REPO (expected owner/repo)" >&2
+    exit 1
+fi
+if ! [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$RELEASE_TAG" != "latest" ]; then
+    echo "Invalid RELEASE_TAG: $RELEASE_TAG" >&2
+    exit 1
+fi
+
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -249,6 +267,15 @@ try_install_prebuilt_package() {
 
     # 2. If no local package found, try downloading from GitHub Releases
     if [ -z "$pkg_file" ]; then
+        # Re-validate RELEASE_* (may have been overridden via CLI args)
+        if ! [[ "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            log_error "Invalid RELEASE_REPO: $RELEASE_REPO"
+            return 1
+        fi
+        if ! [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$RELEASE_TAG" != "latest" ]; then
+            log_error "Invalid RELEASE_TAG: $RELEASE_TAG"
+            return 1
+        fi
         local release_base_url
         if [ "$RELEASE_TAG" = "latest" ]; then
             release_base_url="https://github.com/${RELEASE_REPO}/releases/latest/download"
@@ -257,17 +284,29 @@ try_install_prebuilt_package() {
         fi
 
         local remote_filename=""
+        local -a remote_candidates=()
         case "$DISTRO_FAMILY" in
             debian)
-                remote_filename="libfprint-crfpmoc_${PKG_VERSION}-1_amd64.deb"
+                remote_candidates=(
+                    "libfprint-crfpmoc_${PKG_BASE}-2_amd64.deb"
+                    "libfprint-crfpmoc_${PKG_BASE}-1_amd64.deb"
+                )
                 pkg_type="deb"
                 ;;
             fedora | suse)
-                remote_filename="libfprint-crfpmoc-${PKG_VERSION}-1.x86_64.rpm"
+                remote_candidates=(
+                    "libfprint-crfpmoc-${PKG_BASE}-2.fc42.x86_64.rpm"
+                    "libfprint-crfpmoc-${PKG_BASE}-2.x86_64.rpm"
+                    "libfprint-crfpmoc-${PKG_BASE}-1.fc42.x86_64.rpm"
+                    "libfprint-crfpmoc-${PKG_BASE}-1.x86_64.rpm"
+                )
                 pkg_type="rpm"
                 ;;
             arch)
-                remote_filename="libfprint-crfpmoc-${PKG_VERSION}-1-x86_64.pkg.tar.zst"
+                remote_candidates=(
+                    "libfprint-crfpmoc-${PKG_BASE}-2-x86_64.pkg.tar.zst"
+                    "libfprint-crfpmoc-${PKG_BASE}-1-x86_64.pkg.tar.zst"
+                )
                 pkg_type="arch"
                 ;;
             *)
@@ -276,26 +315,41 @@ try_install_prebuilt_package() {
                 ;;
         esac
 
-        local download_url="${release_base_url}/${remote_filename}"
         local tmp_download_dir
         tmp_download_dir="$(mktemp -d -t crfpmoc-pkg-XXXXXX)"
-        local tmp_target="${tmp_download_dir}/${remote_filename}"
+        # Ensure temp dir is cleaned on function return and on interrupt/exit
+        trap 'rm -rf "${tmp_download_dir:-}"; trap - RETURN; trap - EXIT; trap - INT; trap - TERM' RETURN
+        trap 'rm -rf "${tmp_download_dir:-}"; trap - RETURN; trap - EXIT; trap - INT; trap - TERM' EXIT INT TERM
+        local tmp_target=""
+        local download_url=""
+        remote_filename=""
 
         if [ "${DRY_RUN:-0}" = "1" ]; then
-            log_dryrun "Would attempt download from $download_url -> $tmp_target"
+            remote_filename="${remote_candidates[0]}"
+            tmp_target="${tmp_download_dir}/${remote_filename}"
+            log_dryrun "Would attempt download from ${release_base_url}/${remote_filename} -> $tmp_target (candidates: ${remote_candidates[*]})"
             pkg_file="$tmp_target"
+            # DRY_RUN: keep trap for cleanup on return, but do not return early
         else
-            log_info "Downloading prebuilt package: $remote_filename ..."
             local download_ok=0
-            if command -v curl > /dev/null 2>&1; then
-                if curl -sSL -f -o "$tmp_target" "$download_url" 2> /dev/null; then
-                    download_ok=1
+            for candidate in "${remote_candidates[@]}"; do
+                remote_filename="$candidate"
+                tmp_target="${tmp_download_dir}/${remote_filename}"
+                download_url="${release_base_url}/${remote_filename}"
+                log_info "Downloading prebuilt package: $remote_filename ..."
+                if command -v curl > /dev/null 2>&1; then
+                    if curl -sSL -f -o "$tmp_target" "$download_url" 2> /dev/null && [ -s "$tmp_target" ]; then
+                        download_ok=1
+                        break
+                    fi
+                elif command -v wget > /dev/null 2>&1; then
+                    if wget -q -O "$tmp_target" "$download_url" 2> /dev/null && [ -s "$tmp_target" ]; then
+                        download_ok=1
+                        break
+                    fi
                 fi
-            elif command -v wget > /dev/null 2>&1; then
-                if wget -q -O "$tmp_target" "$download_url" 2> /dev/null; then
-                    download_ok=1
-                fi
-            fi
+                rm -f "$tmp_target"
+            done
 
             if [ "$download_ok" = "1" ] && [ -s "$tmp_target" ]; then
                 log_success "Downloaded prebuilt package: $remote_filename"
@@ -320,23 +374,45 @@ try_install_prebuilt_package() {
     else
         case "$pkg_type" in
             deb)
-                sudo dpkg -i "$pkg_file" || {
+                local deb_ok=0
+                if sudo dpkg -i "$pkg_file"; then
+                    deb_ok=1
+                else
                     log_info "Resolving deb dependencies with apt-get..."
-                    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -f -y
-                }
-                manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                    if sudo env DEBIAN_FRONTEND=noninteractive apt-get install -f -y; then
+                        deb_ok=1
+                    fi
+                fi
+                if [ "$deb_ok" = "1" ]; then
+                    manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                else
+                    log_error "Failed to install deb package: $pkg_file"
+                    return 1
+                fi
                 ;;
             rpm)
+                local rpm_ok=0
                 if [ "$DISTRO_FAMILY" = "fedora" ]; then
-                    sudo dnf install -y "$pkg_file"
+                    if sudo dnf install -y "$pkg_file"; then rpm_ok=1; fi
                 else
-                    sudo zypper --non-interactive install --allow-unsigned-rpm "$pkg_file"
+                    if sudo zypper --non-interactive install --allow-unsigned-rpm "$pkg_file"; then rpm_ok=1; fi
                 fi
-                manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                if [ "$rpm_ok" = "1" ]; then
+                    manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                else
+                    log_error "Failed to install rpm package: $pkg_file"
+                    return 1
+                fi
                 ;;
             arch)
-                sudo pacman -U --noconfirm --overwrite='*' "$pkg_file"
-                manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                local arch_ok=0
+                if sudo pacman -U --noconfirm --overwrite='*' "$pkg_file"; then arch_ok=1; fi
+                if [ "$arch_ok" = "1" ]; then
+                    manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0"
+                else
+                    log_error "Failed to install arch package: $pkg_file"
+                    return 1
+                fi
                 ;;
         esac
 
@@ -525,11 +601,29 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --release-tag)
+            if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == --* ]]; then
+                log_error "--release-tag requires a non-empty argument"
+                show_help
+                exit 1
+            fi
             RELEASE_TAG="$2"
+            if ! [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$RELEASE_TAG" != "latest" ]; then
+                log_error "Invalid RELEASE_TAG: $RELEASE_TAG"
+                exit 1
+            fi
             shift 2
             ;;
         --release-repo)
+            if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == --* ]]; then
+                log_error "--release-repo requires a non-empty argument"
+                show_help
+                exit 1
+            fi
             RELEASE_REPO="$2"
+            if ! [[ "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+                log_error "Invalid RELEASE_REPO: $RELEASE_REPO (expected owner/repo)"
+                exit 1
+            fi
             shift 2
             ;;
         --check | -c)
