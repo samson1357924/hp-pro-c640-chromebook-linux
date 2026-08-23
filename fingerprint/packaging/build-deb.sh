@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PKG_VERSION="${PKG_VERSION:-1.94.10-1}"
+PKG_VERSION="${PKG_VERSION:-1.94.10-2}"
 PKG_NAME="libfprint-crfpmoc"
 PINNED_COMMIT="56442591a5c302a906289f30988fb50fc3d82ed6"
 OUTPUT_DIR="${1:-$SCRIPT_DIR/output}"
