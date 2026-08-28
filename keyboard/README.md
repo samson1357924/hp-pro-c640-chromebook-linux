@@ -89,9 +89,12 @@ Installed automatically via `./keyboard/install-keyboard.sh`:
 **What it installs:**
 
 * `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/` (`TAG+="uaccess"`)
-* `c640-kbd-backlight-sync` → `/usr/local/bin/` (bash daemon, `gdbus`/`dbus-monitor` event-driven, no polling by default)
-* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (enabled globally, `WantedBy=graphical-session.target`)
-* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (S3 resume restore, 0.6s debounce for `LED_CORE_SUSPENDRESUME`)
+* `c640-kbd-backlight-sync` → `/usr/local/bin/` (bash daemon,
+  `gdbus`/`dbus-monitor` event-driven, no polling by default)
+* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (enabled globally,
+  `WantedBy=graphical-session.target`)
+* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (S3 resume restore,
+  0.6s debounce for `LED_CORE_SUSPENDRESUME`)
 
 **Manual test without blanking the screen:**
 

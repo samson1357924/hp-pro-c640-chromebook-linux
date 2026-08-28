@@ -45,7 +45,7 @@ jobs:
 
       - name: Run shfmt Check (Formatting Consistency)
         run: |
-          shfmt -d -i 4 -ci -bn -sr $(shfmt -f .)
+          shfmt -d -i 4 -ci -bn -sr .
 
   hardware-configs:
     name: Validate hwdb, udev & keyd

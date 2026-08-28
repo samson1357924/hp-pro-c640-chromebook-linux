@@ -69,7 +69,9 @@ chmod +x keyboard/install-keyboard.sh
 
 ### 選項 3：鍵盤背光與螢幕熄滅/鎖定同步（新增）
 
-螢幕熄滅/鎖定時自動關閉鍵盤背光，螢幕點亮時自動恢復。支援 GNOME Wayland 閒置（`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` 對應 S3 盒蓋）與 ChromeOS EC `cros_kbd_led_backlight`（`/sys/class/leds/chromeos::kbd_backlight`）。
+螢幕熄滅/鎖定時自動關閉鍵盤背光，螢幕點亮時自動恢復。支援 GNOME Wayland
+閒置（`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` 對應 S3 盒蓋）與 ChromeOS EC
+`cros_kbd_led_backlight`（`/sys/class/leds/chromeos::kbd_backlight`）。
 
 透過 `./keyboard/install-keyboard.sh` 自動安裝：
 
@@ -84,7 +86,8 @@ chmod +x keyboard/install-keyboard.sh
 * `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`）
 * `c640-kbd-backlight-sync` → `/usr/local/bin/`（bash daemon，`gdbus`/`dbus-monitor` 事件驅動，預設無輪詢）
 * `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`）
-* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（S3 喚醒後恢復，0.6 秒 debounce 避免 `LED_CORE_SUSPENDRESUME` 競態）
+* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（S3 喚醒後恢復，
+  0.6 秒 debounce 避免 `LED_CORE_SUSPENDRESUME` 競態）
 
 **免熄屏手動測試：**
 
@@ -108,7 +111,8 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 # 停用：sudo rm /etc/systemd/user/c640-kbd-backlight-sync.service.d/override.conf && daemon-reload
 ```
 
-**Wayland/X11 相容性：** 主要路徑為 `org.gnome.ScreenSaver`（GNOME Wayland 原生，事件驅動，無輪詢）。`IdleMonitor` 為選用。非 GNOME 工作階段由 `system-sleep` hook 覆蓋 S3 盒蓋情境。
+**Wayland/X11 相容性：** 主要路徑為 `org.gnome.ScreenSaver`（GNOME Wayland
+原生，事件驅動，無輪詢）。`IdleMonitor` 為選用。非 GNOME 工作階段由 `system-sleep` hook 覆蓋 S3 盒蓋情境。
 
 **日誌：**
 
