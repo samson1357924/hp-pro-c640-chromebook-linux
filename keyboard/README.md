@@ -69,6 +69,63 @@ on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 
 ---
 
+### Option 3: Keyboard Backlight Sync with Screen Blank (New)
+
+Automatically turns off the keyboard backlight when the screen blanks/locks
+and restores it when the screen lights up. Handles both GNOME Wayland idle
+(`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` for S3 lid)
+and the ChromeOS EC `cros_kbd_led_backlight` (`/sys/class/leds/chromeos::kbd_backlight`).
+
+Installed automatically via `./keyboard/install-keyboard.sh`:
+
+```bash
+./keyboard/install-keyboard.sh          # install hwdb + backlight sync
+./keyboard/install-keyboard.sh --check  # verify daemon/service/udev state
+./keyboard/install-keyboard.sh --uninstall  # remove all keyboard components
+```
+
+**What it installs:**
+
+* `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/` (`TAG+="uaccess"`)
+* `c640-kbd-backlight-sync` → `/usr/local/bin/` (bash daemon, `gdbus`/`dbus-monitor` event-driven, no polling by default)
+* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (enabled globally, `WantedBy=graphical-session.target`)
+* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (S3 resume restore, 0.6s debounce for `LED_CORE_SUSPENDRESUME`)
+
+**Manual test without blanking the screen:**
+
+```bash
+c640-kbd-backlight-sync --check          # show current brightness & state
+c640-kbd-backlight-sync --test-blank     # simulate screen blank -> save + set 0
+cat /sys/class/leds/chromeos::kbd_backlight/brightness  # should be 0
+c640-kbd-backlight-sync --test-unblank   # simulate unblank -> restore
+```
+
+**Optional IdleMonitor polling** (off by default, for "dim before blank"):
+
+```bash
+# Enable Mutter IdleMonitor polling (idle-delay + 5s threshold) via drop-in:
+sudo mkdir -p /etc/systemd/user/c640-kbd-backlight-sync.service.d
+echo -e "[Service]\nEnvironment=C640_KBD_ENABLE_IDLEMONITOR=1" | sudo tee /etc/systemd/user/c640-kbd-backlight-sync.service.d/override.conf > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl --global daemon-reload 2> /dev/null || true
+systemctl --user daemon-reload 2> /dev/null || true
+systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
+# To disable: sudo rm /etc/systemd/user/c640-kbd-backlight-sync.service.d/override.conf && daemon-reload
+```
+
+**Wayland/X11 compatibility:** primary path is `org.gnome.ScreenSaver` (GNOME Wayland
+native, event-driven, no polling). `IdleMonitor` is optional. Non-GNOME sessions
+fall back to the `system-sleep` hook for lid-close S3.
+
+**Logs:**
+
+```bash
+journalctl --user -u c640-kbd-backlight-sync.service -f
+journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
+```
+
+---
+
 ## 🧪 Verification & Testing
 
 Verify that key events are properly recognized:

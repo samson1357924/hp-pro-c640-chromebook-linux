@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# c640-kbd-backlight-sync - Keyboard backlight sync with screen blank
+# Monitors org.gnome.ScreenSaver / org.freedesktop.ScreenSaver ActiveChanged
+# (Wayland/X11) and org.freedesktop.login1 PrepareForSleep (S3) to turn off
+# keyboard backlight when screen goes dark and restore it when screen lights up.
+#
+# State is stored atomically in $XDG_RUNTIME_DIR/c640-kbd-backlight.state
+# with first-wins semantics; 0 is never saved/restored to preserve user intent.
+# Handles LED_CORE_SUSPENDRESUME race with 0.5s debounce and re-checks
+# ScreenSaver Active before restoring (covers TROUBLESHOOTING.md #14).
+set -euo pipefail
+
+SYSFS_BRIGHTNESS="/sys/class/leds/chromeos::kbd_backlight/brightness"
+SYSFS_MAX="/sys/class/leds/chromeos::kbd_backlight/max_brightness"
+
+# Secure per-user state directory
+# Prefer XDG_RUNTIME_DIR, fallback to /run/user/<uid>, then secure tmp
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
+    STATE_DIR="$XDG_RUNTIME_DIR"
+elif [ -d "/run/user/$(id -u 2> /dev/null || echo 1000)" ] && [ -w "/run/user/$(id -u 2> /dev/null || echo 1000)" ]; then
+    STATE_DIR="/run/user/$(id -u 2> /dev/null || echo 1000)"
+else
+    STATE_DIR="${TMPDIR:-/tmp}/c640-kbd-$(id -u 2> /dev/null || echo 1000)"
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
+fi
+STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
+STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
+LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
+
+# Optional: enable IdleMonitor polling via env (0=off default, 1=on)
+C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
+
+log() {
+    echo "[c640-kbd-backlight-sync] $*" >&2
+}
+
+get_brightness() {
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+get_max() {
+    if [ -f "$SYSFS_MAX" ]; then
+        cat "$SYSFS_MAX" 2> /dev/null || echo 100
+    else
+        echo 100
+    fi
+}
+
+set_brightness() {
+    local val="$1"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+    local max
+    max="$(get_max)"
+    if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
+        max=100
+    fi
+    if [ "$val" -lt 0 ]; then
+        val=0
+    fi
+    if [ "$val" -gt "$max" ]; then
+        val="$max"
+    fi
+    if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
+        local pct
+        pct=$(( val * 100 / max ))
+        if command -v ectool > /dev/null 2>&1; then
+            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+        elif [ -x /usr/local/bin/ectool ]; then
+            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    if [ -w "$SYSFS_BRIGHTNESS" ]; then
+        echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null || true
+    else
+        echo "$val" | sudo tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1 || true
+    fi
+    # Verify write and fallback to ectool if needed (covers both branches)
+    local cur
+    cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
+    if [ "$cur" != "$val" ]; then
+        local pct
+        pct=$(( val * 100 / max ))
+        if command -v ectool > /dev/null 2>&1; then
+            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+        elif [ -x /usr/local/bin/ectool ]; then
+            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+        fi
+    fi
+}
+
+save_state() {
+    # Atomic first-wins with flock on STATE_LOCK
+    (
+        flock -n 200 || return 0
+        if [ -f "$STATE_FILE" ]; then
+            return 0
+        fi
+        if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
+            return 0
+        fi
+        local curr
+        curr="$(get_brightness)"
+        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
+            return 0
+        fi
+        if [ "$curr" -eq 0 ]; then
+            return 0
+        fi
+        mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
+        local tmp
+        tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
+        echo "$curr" > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$STATE_FILE" 2> /dev/null || cp "$tmp" "$STATE_FILE" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+        log "saved brightness $curr"
+    ) 200>"$STATE_LOCK" 2> /dev/null || true
+}
+
+restore_state() {
+    (
+        flock -n 200 || return 0
+        if [ ! -f "$STATE_FILE" ]; then
+            return 0
+        fi
+        local saved
+        saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+        rm -f "$STATE_FILE" 2> /dev/null || true
+        if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+            return 0
+        fi
+        if [ "$saved" -eq 0 ]; then
+            return 0
+        fi
+        if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
+            return 0
+        fi
+        local curr
+        curr="$(get_brightness)"
+        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
+            curr=0
+        fi
+        if [ "$curr" -ne 0 ]; then
+            log "skip restore: current brightness $curr != 0 (user changed manually)"
+            return 0
+        fi
+        # Re-check ScreenSaver still active -> defer restore (covers #14 re-blank)
+        local active=""
+        if command -v gdbus > /dev/null 2>&1; then
+            active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
+            if echo "$active" | grep -q "true"; then
+                active="true"
+            else
+                # Try freedesktop fallback
+                active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                if echo "$active2" | grep -q "true"; then
+                    active="true"
+                else
+                    active="false"
+                fi
+            fi
+        elif command -v busctl > /dev/null 2>&1; then
+            active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
+            if echo "$active" | grep -q "true"; then
+                active="true"
+            else
+                active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+                if echo "$active2" | grep -q "true"; then
+                    active="true"
+                else
+                    active="false"
+                fi
+            fi
+        fi
+        if [ "$active" = "true" ]; then
+            log "skip restore: ScreenSaver still active, re-saving"
+            local tmp2
+            tmp2="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
+            echo "$saved" > "$tmp2" 2> /dev/null || true
+            chmod 600 "$tmp2" 2> /dev/null || true
+            mv -f "$tmp2" "$STATE_FILE" 2> /dev/null || true
+            rm -f "$tmp2" 2> /dev/null || true
+            return 0
+        fi
+        log "restoring brightness $saved"
+        set_brightness "$saved"
+    ) 200>"$STATE_LOCK" 2> /dev/null || true
+}
+
+is_screensaver_available() {
+    if command -v gdbus > /dev/null 2>&1; then
+        gdbus introspect --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+        gdbus introspect --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+    fi
+    if command -v busctl > /dev/null 2>&1; then
+        busctl --user status org.gnome.ScreenSaver 2> /dev/null | grep -q "org.gnome.ScreenSaver" && return 0
+        busctl --user status org.freedesktop.ScreenSaver 2> /dev/null | grep -q "org.freedesktop.ScreenSaver" && return 0
+        busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null | grep -q "b " && return 0
+    fi
+    return 1
+}
+
+monitor_screensaver_dbus_monitor() {
+    # Monitor both GNOME and freedesktop ScreenSaver (covers GNOME Wayland + KDE/Sway fallback)
+    # shellcheck disable=SC2094
+    dbus-monitor --session "type='signal',member='ActiveChanged'" 2> /dev/null | while IFS= read -r line; do
+        # Filter to ScreenSaver interfaces only
+        if echo "$line" | grep -q "ActiveChanged"; then
+            # Need to read next lines for boolean value; we handle per-line boolean
+            continue
+        fi
+        case "$line" in
+            *boolean\ true*)
+                # Check if preceding signal was ScreenSaver (approx: last 5 lines contained ScreenSaver)
+                # For simplicity, treat any ActiveChanged true as blank (both interfaces mean screen dark)
+                log "ScreenSaver active -> saving and turning off kbd backlight"
+                save_state
+                set_brightness 0
+                ;;
+            *boolean\ false*)
+                log "ScreenSaver inactive -> restoring kbd backlight"
+                sleep 0.5
+                restore_state
+                ;;
+        esac
+    done
+}
+
+monitor_screensaver_gdbus() {
+    # Fallback via gdbus monitor: watch both destinations without --dest filter
+    gdbus monitor --session 2> /dev/null | while IFS= read -r line; do
+        if echo "$line" | grep -q "ActiveChanged"; then
+            if echo "$line" | grep -q "org.gnome.ScreenSaver\|org.freedesktop.ScreenSaver"; then
+                if echo "$line" | grep -q "true"; then
+                    log "ScreenSaver active (gdbus) -> off"
+                    save_state
+                    set_brightness 0
+                elif echo "$line" | grep -q "false"; then
+                    log "ScreenSaver inactive (gdbus) -> restore"
+                    sleep 0.5
+                    restore_state
+                fi
+            fi
+        fi
+    done
+}
+
+monitor_login1() {
+    dbus-monitor --system "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" 2> /dev/null | while IFS= read -r line; do
+        case "$line" in
+            *boolean\ true*)
+                log "PrepareForSleep true -> saving"
+                save_state
+                ;;
+            *boolean\ false*)
+                log "PrepareForSleep false -> restore after delay"
+                sleep 0.6
+                restore_state
+                ;;
+        esac
+    done
+}
+
+idle_poll_loop() {
+    if ! command -v gsettings > /dev/null 2>&1; then
+        return 0
+    fi
+    if ! command -v gdbus > /dev/null 2>&1; then
+        return 0
+    fi
+    if ! gdbus introspect --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core 2> /dev/null | grep -q "GetIdletime"; then
+        log "Mutter IdleMonitor not available, idle polling disabled"
+        return 0
+    fi
+    local idle_delay
+    idle_delay="$(gsettings get org.gnome.desktop.session idle-delay 2> /dev/null | grep -o '[0-9]*' || echo 300)"
+    if ! [[ "$idle_delay" =~ ^[0-9]+$ ]] || [ "$idle_delay" -eq 0 ]; then
+        log "idle-delay 0, idle polling disabled"
+        return 0
+    fi
+    local threshold
+    threshold=$(( (idle_delay + 5) * 1000 ))
+    log "idle polling enabled: idle-delay=${idle_delay}s threshold=${threshold}ms"
+    local was_idle=0
+    while true; do
+        local idletime
+        idletime="$(gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime 2> /dev/null | grep -o '[0-9]*' | head -n1 || echo 0)"
+        if ! [[ "$idletime" =~ ^[0-9]+$ ]]; then
+            idletime=0
+        fi
+        if [ "$idletime" -ge "$threshold" ]; then
+            if [ "$was_idle" -eq 0 ]; then
+                log "idle threshold reached (${idletime}ms) -> off"
+                save_state
+                set_brightness 0
+                was_idle=1
+            fi
+        else
+            if [ "$was_idle" -eq 1 ]; then
+                log "user active (idletime ${idletime}ms) -> restore"
+                sleep 0.5
+                restore_state
+                was_idle=0
+            fi
+        fi
+        sleep 5
+    done
+}
+
+print_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "  --help, -h           Show help"
+    echo "  --test-blank         Simulate screen blank (save + set 0)"
+    echo "  --test-unblank       Simulate screen unblank (restore)"
+    echo "  --check              Check status"
+    echo "  --daemon             Run daemon (default)"
+    echo ""
+    echo "Env:"
+    echo "  C640_KBD_ENABLE_IDLEMONITOR=1  Enable Mutter IdleMonitor polling"
+}
+
+check_status() {
+    echo "=== c640-kbd-backlight-sync status ==="
+    echo "SYSFS: $SYSFS_BRIGHTNESS"
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        echo "  brightness: $(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "?") / $(cat "$SYSFS_MAX" 2> /dev/null || echo "?")"
+    else
+        echo "  NOT FOUND"
+    fi
+    echo "STATE_FILE: $STATE_FILE"
+    if [ -f "$STATE_FILE" ]; then
+        echo "  saved: $(cat "$STATE_FILE")"
+    else
+        echo "  (no saved state)"
+    fi
+    echo "Daemon running: $(pgrep -f c640-kbd-backlight-sync > /dev/null && echo yes || echo no)"
+    echo "ScreenSaver available: $(is_screensaver_available && echo yes || echo no)"
+    echo "IdleMonitor enabled: $C640_KBD_ENABLE_IDLEMONITOR"
+    if command -v gdbus > /dev/null 2>&1; then
+        echo "gdbus: available"
+    else
+        echo "gdbus: not found"
+    fi
+    if command -v dbus-monitor > /dev/null 2>&1; then
+        echo "dbus-monitor: available"
+    else
+        echo "dbus-monitor: not found"
+    fi
+}
+
+# Handle CLI
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    print_help
+    exit 0
+fi
+if [ "${1:-}" = "--test-blank" ]; then
+    save_state
+    set_brightness 0
+    echo "simulated blank: saved and set 0"
+    exit 0
+fi
+if [ "${1:-}" = "--test-unblank" ]; then
+    restore_state
+    echo "simulated unblank: restored"
+    exit 0
+fi
+if [ "${1:-}" = "--check" ]; then
+    check_status
+    exit 0
+fi
+
+# Main daemon
+if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+    log "no backlight interface found, exiting"
+    exit 0
+fi
+
+# Single instance per user via flock (secure per-user lock)
+mkdir -p "$STATE_DIR" 2> /dev/null || true
+chmod 700 "$STATE_DIR" 2> /dev/null || true
+# Open lock file securely (do not fallback to world-writable /tmp)
+if ! exec 9>"$LOCK_FILE" 2> /dev/null; then
+    log "cannot open lock file $LOCK_FILE, exiting"
+    exit 1
+fi
+if ! flock -n 9 2> /dev/null; then
+    log "another instance is running, exiting"
+    exit 0
+fi
+
+cleanup() {
+    log "cleanup: restoring if needed"
+    restore_state || true
+    # kill background jobs
+    jobs -p | xargs -r kill 2> /dev/null || true
+    exit 0
+}
+trap cleanup TERM INT
+
+log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR"
+
+# Start optional idle polling in background
+if [ "$C640_KBD_ENABLE_IDLEMONITOR" = "1" ]; then
+    idle_poll_loop &
+fi
+
+# Start login1 monitor in background if dbus-monitor available
+if command -v dbus-monitor > /dev/null 2>&1; then
+    monitor_login1 &
+fi
+
+# Main screensaver monitor (foreground) with retry to avoid Restart storm
+# dbus-monitor may exit if session bus disappears (e.g. gnome-shell restart)
+if command -v dbus-monitor > /dev/null 2>&1; then
+    while true; do
+        monitor_screensaver_dbus_monitor || log "dbus-monitor exited $?, retry in 2s"
+        sleep 2
+    done &
+    wait || true
+else
+    if command -v gdbus > /dev/null 2>&1; then
+        log "dbus-monitor not found, falling back to gdbus"
+        while true; do
+            monitor_screensaver_gdbus || log "gdbus monitor exited $?, retry in 2s"
+            sleep 2
+        done &
+        wait || true
+    else
+        log "no dbus monitor tool found, entering poll loop"
+        prev=""
+        while true; do
+            active=""
+            if command -v gdbus > /dev/null 2>&1; then
+                active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                if echo "$active" | grep -q "true"; then
+                    active="true"
+                else
+                    # try freedesktop fallback
+                    active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                    if echo "$active2" | grep -q "true"; then
+                        active="true"
+                    else
+                        active="false"
+                    fi
+                fi
+            elif command -v busctl > /dev/null 2>&1; then
+                active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
+                if echo "$active" | grep -q "true"; then
+                    active="true"
+                else
+                    active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+                    if echo "$active2" | grep -q "true"; then
+                        active="true"
+                    else
+                        active="false"
+                    fi
+                fi
+            else
+                sleep 5
+                continue
+            fi
+            if [ "$active" != "$prev" ]; then
+                if [ "$active" = "true" ]; then
+                    save_state
+                    set_brightness 0
+                else
+                    sleep 0.5
+                    restore_state
+                fi
+                prev="$active"
+            fi
+            sleep 2
+        done
+    fi
+fi
