@@ -21,7 +21,7 @@ save_state() {
     fi
     curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
     case "$curr" in
-        ''|*[!0-9]*)
+        '' | *[!0-9]*)
             return 0
             ;;
     esac
@@ -43,7 +43,7 @@ restore_state() {
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
     rm -f "$STATE_FILE" 2> /dev/null || true
     case "$saved" in
-        ''|*[!0-9]*)
+        '' | *[!0-9]*)
             return 0
             ;;
     esac
@@ -55,7 +55,7 @@ restore_state() {
     fi
     curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
     case "$curr" in
-        ''|*[!0-9]*)
+        '' | *[!0-9]*)
             curr=0
             ;;
     esac
@@ -65,7 +65,7 @@ restore_state() {
     fi
     max="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
     case "$max" in
-        ''|*[!0-9]*)
+        '' | *[!0-9]*)
             max=100
             ;;
     esac
@@ -82,10 +82,10 @@ restore_state() {
         echo "$saved" > "$SYSFS" 2> /dev/null || true
         if [ "$(cat "$SYSFS" 2> /dev/null || echo -1)" != "$saved" ]; then
             if command -v ectool > /dev/null 2>&1; then
-                pct=$(( saved * 100 / max ))
+                pct=$((saved * 100 / max))
                 ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
             elif [ -x /usr/local/bin/ectool ]; then
-                pct=$(( saved * 100 / max ))
+                pct=$((saved * 100 / max))
                 /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
             fi
         fi
@@ -104,8 +104,7 @@ case "${1:-}" in
         sleep 0.6
         restore_state
         ;;
-    *)
-        ;;
+    *) ;;
 esac
 
 exit 0

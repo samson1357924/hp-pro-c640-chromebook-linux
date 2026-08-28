@@ -1,3 +1,5 @@
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
 # Keyboard Top-Row Mapping (HP Pro c640 Chromebook)
 
 ChromeOS devices feature dedicated top-row action keys instead of traditional

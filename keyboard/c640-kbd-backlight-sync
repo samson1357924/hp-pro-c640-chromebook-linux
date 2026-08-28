@@ -71,7 +71,7 @@ set_brightness() {
     fi
     if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
         local pct
-        pct=$(( val * 100 / max ))
+        pct=$((val * 100 / max))
         if command -v ectool > /dev/null 2>&1; then
             ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         elif [ -x /usr/local/bin/ectool ]; then
@@ -89,7 +89,7 @@ set_brightness() {
     cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
     if [ "$cur" != "$val" ]; then
         local pct
-        pct=$(( val * 100 / max ))
+        pct=$((val * 100 / max))
         if command -v ectool > /dev/null 2>&1; then
             ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         elif [ -x /usr/local/bin/ectool ]; then
@@ -124,7 +124,7 @@ save_state() {
         mv -f "$tmp" "$STATE_FILE" 2> /dev/null || cp "$tmp" "$STATE_FILE" 2> /dev/null || true
         rm -f "$tmp" 2> /dev/null || true
         log "saved brightness $curr"
-    ) 200>"$STATE_LOCK" 2> /dev/null || true
+    ) 200> "$STATE_LOCK" 2> /dev/null || true
 }
 
 restore_state() {
@@ -194,7 +194,7 @@ restore_state() {
         fi
         log "restoring brightness $saved"
         set_brightness "$saved"
-    ) 200>"$STATE_LOCK" 2> /dev/null || true
+    ) 200> "$STATE_LOCK" 2> /dev/null || true
 }
 
 is_screensaver_available() {
@@ -289,7 +289,7 @@ idle_poll_loop() {
         return 0
     fi
     local threshold
-    threshold=$(( (idle_delay + 5) * 1000 ))
+    threshold=$(((idle_delay + 5) * 1000))
     log "idle polling enabled: idle-delay=${idle_delay}s threshold=${threshold}ms"
     local was_idle=0
     while true; do
@@ -389,7 +389,7 @@ fi
 mkdir -p "$STATE_DIR" 2> /dev/null || true
 chmod 700 "$STATE_DIR" 2> /dev/null || true
 # Open lock file securely (do not fallback to world-writable /tmp)
-if ! exec 9>"$LOCK_FILE" 2> /dev/null; then
+if ! exec 9> "$LOCK_FILE" 2> /dev/null; then
     log "cannot open lock file $LOCK_FILE, exiting"
     exit 1
 fi

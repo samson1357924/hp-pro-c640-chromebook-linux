@@ -41,11 +41,11 @@ jobs:
 
       - name: Run ShellCheck (Modular with External Sources)
         run: |
-          find . -type f -name "*.sh" -not -path "*/.*/*" -print0 | xargs -0 shellcheck -S warning -x -P lib:scripts:audio:keyboard:fingerprint:power:ec -s bash
+          shfmt -f . | xargs shellcheck -S warning -x -P lib:scripts:audio:keyboard:fingerprint:power:ec -s bash
 
       - name: Run shfmt Check (Formatting Consistency)
         run: |
-          find . -type f -name "*.sh" -not -path "*/.*/*" -print0 | xargs -0 shfmt -d -i 4 -ci -bn -sr
+          shfmt -d -i 4 -ci -bn -sr $(shfmt -f .)
 
   hardware-configs:
     name: Validate hwdb, udev & keyd

@@ -150,7 +150,7 @@ uninstall_keyboard() {
                 if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
                     max=100
                 fi
-                val=$(( max / 2 ))
+                val=$((max / 2))
                 if [ -w "/sys/class/leds/chromeos::kbd_backlight/brightness" ]; then
                     echo "$val" > /sys/class/leds/chromeos::kbd_backlight/brightness 2> /dev/null || true
                 else
