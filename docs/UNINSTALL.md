@@ -18,7 +18,13 @@ Run this inside the project directory:
 This command automatically:
 
 1. Removes the custom `sof-rt5682` UCM configuration files from `/usr/share/alsa/ucm2/`.
-2. Removes keyboard hwdb & backlight sync (5 artifacts): `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` (+ `systemd-hwdb update`), `/etc/udev/rules.d/61-chromeos-kbd-backlight.rules` (+ `udevadm trigger --subsystem-match=leds`), `/usr/local/bin/c640-kbd-backlight-sync`, `/etc/systemd/user/c640-kbd-backlight-sync.service` (`--global disable` + per-user `disable --now` + `daemon-reload`), `/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh`, and cleans `/run/c640-kbd-backlight/state`.
+2. Removes keyboard hwdb & backlight sync (5 artifacts):
+   `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` (+ `systemd-hwdb update`),
+   `/etc/udev/rules.d/61-chromeos-kbd-backlight.rules` (+ `udevadm trigger`),
+   `/usr/local/bin/c640-kbd-backlight-sync`,
+   `/etc/systemd/user/c640-kbd-backlight-sync.service` (`--global disable` + per-user),
+   `/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh`, and cleans
+   `/run/c640-kbd-backlight/state`.
 3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
 4. Removes the power management tweaks (logind config and suspend helpers).
 5. Removes the EC tools, the 90% battery protection service, and the sleep hook.
@@ -26,10 +32,11 @@ This command automatically:
    touched it** (re-installs keep the original backup, so rollback always
    restores the pre-project state).
 7. Restores the enabled/active state of systemd services the installer
-   modified (`thermald`, `tlp`, `c640-battery-limit.service`, `c640-kbd-backlight-sync.service` with `scope: user` via `--global` + per-user `daemon-reload`, …) and removes
-   **plugdev group memberships that the installer added** (memberships that
-   existed before installation, or still required by other udev rules, are
-   kept).
+   modified (`thermald`, `tlp`, `c640-battery-limit.service`,
+   `c640-kbd-backlight-sync.service` with `scope: user` via `--global` + per-user
+   `daemon-reload`, …) and removes **plugdev group memberships that the installer
+   added** (memberships that existed before installation, or still required by
+   other udev rules, are kept).
 8. Removes the fingerprint encryption seed `/var/lib/fprint/crfpmoc.key` and
    shows the commands to reinstall the distro's native `libfprint` package.
 

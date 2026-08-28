@@ -19,14 +19,21 @@
 該指令會全自動執行：
 
 1. 移除 `/usr/share/alsa/ucm2/` 中的 `sof-rt5682` 自訂 UCM 設定檔。
-2. 移除鍵盤 hwdb 與背光同步（5 項）：`/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb`（+ `systemd-hwdb update`）、`/etc/udev/rules.d/61-chromeos-kbd-backlight.rules`（+ `udevadm trigger --subsystem-match=leds`）、`/usr/local/bin/c640-kbd-backlight-sync`、`/etc/systemd/user/c640-kbd-backlight-sync.service`（`--global disable` + per-user `disable --now` + `daemon-reload`）、`/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh`，並清除 `/run/c640-kbd-backlight/state`。
+2. 移除鍵盤 hwdb 與背光同步（5 項）：
+   `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb`（+ `systemd-hwdb update`）、
+   `/etc/udev/rules.d/61-chromeos-kbd-backlight.rules`（+ `udevadm trigger`）、
+   `/usr/local/bin/c640-kbd-backlight-sync`、
+   `/etc/systemd/user/c640-kbd-backlight-sync.service`（`--global disable` + per-user）、
+   `/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh`，並清除
+   `/run/c640-kbd-backlight/state`。
 3. 移除 `/etc/udev/rules.d/60-cros-fp.rules`。
 4. 移除電源管理調校（logind 設定與休眠輔助）。
 5. 移除 EC 工具、90% 電池保護服務與休眠喚醒鉤子。
 6. 從**本專案首次安裝前的最早備份**還原每個檔案（重裝會保留第一次備份，
    因此 rollback 永遠還原到專案介入前的狀態）。
 7. 還原安裝器曾修改的 systemd 服務啟用/運作狀態（`thermald`、`tlp`、
-   `c640-battery-limit.service`、`c640-kbd-backlight-sync.service` 的 `scope: user` 經 `--global` + per-user `daemon-reload` 等），並移除**安裝器新增的 plugdev 群組成員**
+   `c640-battery-limit.service`、`c640-kbd-backlight-sync.service` 的 `scope: user`
+   經 `--global` + per-user `daemon-reload` 等），並移除**安裝器新增的 plugdev 群組成員**
    （安裝前已存在、或仍被其他 udev 規則引用的成員資格會被保留）。
 8. 移除指紋加密種子 `/var/lib/fprint/crfpmoc.key`，並提示發行版重裝原生
    `libfprint` 套件的指令。
@@ -59,7 +66,10 @@
   ./keyboard/install-keyboard.sh --uninstall
   ```
 
-  > 此操作會移除全部 5 項鍵盤相關檔案、全域停用 user service、若背光停留在 0 則恢復為 50%、清除 `/run/c640-kbd-backlight/state` 與 `/run/user/$UID/c640-kbd-backlight.state`，並移除安裝器新增的 `plugdev` 成員（保留原本已存在的成員）。
+  > 此操作會移除全部 5 項鍵盤相關檔案、全域停用 user service、
+  > 若背光停留在 0 則恢復為 50%、清除 `/run/c640-kbd-backlight/state` 與
+  > `/run/user/$UID/c640-kbd-backlight.state`，並移除安裝器新增的 `plugdev`
+  > 成員（保留原本已存在的成員）。
 
 * **僅移除電源管理調校**（logind 設定、休眠輔助、TLP 設定、thermald 服務啟用）：
 

@@ -21,7 +21,7 @@ Lake-U platform):
 | **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | ⚠️ **Driver bound** | Display works out of the box; **VA-API 4K 60fps decode not measured**. |
 | **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | ⚠️ **Driver bound** | Standard USB UVC camera; **capture not tested**. |
 | **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **Charging works** | PD charging nodes present; **DP 1.2 display output not verified**. |
-| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 Top-row **hwdb verified**; backlight auto-off/restore on screen blank/S3 (event-driven, `ectool` fallback, 0.6s debounce). Test: `c640-kbd-backlight-sync --test-blank`/`--test-unblank` (config-only until lid-cycle verified). |
+| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Working** | Top-row hwdb verified; backlight auto-off/restore on screen blank/S3 (event-driven, ectool fallback, 0.6s debounce). Test: `c640-kbd-backlight-sync --test-blank`/`--test-unblank` (config-only until lid-cycle verified). |
 | **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 lid cycle verified** | S3 `deep` default; real lid-close cycle tested 2026-08-18. **Key/fingerprint wake untested**; panel stays dark on lid open until a keypress (see [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)). |
 
 ---

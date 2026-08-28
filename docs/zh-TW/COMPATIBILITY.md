@@ -21,7 +21,7 @@ HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hat
 | **GPU / 內顯** | Intel UHD Graphics 620 | `i915` | ⚠️ **驅動已綁定** | 顯示開箱即用；**VA-API 4K 60fps 解碼未量測**。 |
 | **視訊鏡頭** | 720p HD Camera (附隱私蓋) | `uvcvideo` | ⚠️ **驅動已綁定** | 標準 USB UVC 鏡頭；**擷取未測試**。 |
 | **雙 Type-C 輸出** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **充電正常** | PD 充電節點存在；**DP 1.2 螢幕輸出未驗證**。 |
-| **鍵盤頂排按鍵與背光同步** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync`（user service + system-sleep）+ `61-chromeos-kbd-backlight.rules` | 🟢 頂排 **hwdb 已驗證**；背光於螢幕熄滅/S3 自動關閉/恢復（事件驅動，`ectool` 回退，0.6s debounce）。測試：`c640-kbd-backlight-sync --test-blank`/`--test-unblank`（待盒蓋實測驗證）。 |
+| **鍵盤頂排按鍵與背光同步** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync`（user service + system-sleep）+ `61-chromeos-kbd-backlight.rules` | 🟢 **正常** | 頂排 hwdb 已驗證；背光於螢幕熄滅/S3 自動關閉/恢復（事件驅動，ectool 回退，0.6s debounce）。測試：`c640-kbd-backlight-sync --test-blank`/`--test-unblank`（待盒蓋實測驗證）。 |
 | **待機休眠** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 盒蓋週期已驗證** | 預設 S3 `deep`；2026-08-18 實測真實盒蓋週期。**按鍵/指紋喚醒未測試**；開蓋後螢幕需按鍵才亮（見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)）。 |
 
 ---
