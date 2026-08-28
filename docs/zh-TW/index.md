@@ -44,7 +44,7 @@
 | **Wi-Fi 6 & 藍牙 5.0** | ⚠️ **驅動已綁定** | Intel AX201 (`iwlwifi` / `btusb`) | 驅動開箱即綁定；**WPA3/吞吐量尚未量測**（見 [verification.md](verification.md)）。 |
 | **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸未納入證據**（見 [verification.md](verification.md)）。 |
 | **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 未量測**（見 [verification.md](verification.md)）。 |
-| **鍵盤背光 & 頂排功能鍵** | ⚠️ **頂排已驗證** | `cros_ec` + `udev hwdb` / `keyd` | 頂排 F1–F10 已映射（hwdb 已驗證）。**背光未測試** — 見 [verification.md](verification.md)。 |
+| **鍵盤背光 & 頂排功能鍵** | ⚠️ **頂排已驗證，背光同步就緒（僅設定，待實機驗證）** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon（user service + system-sleep） | 頂排 F1–F10 hwdb 已驗證。背光同步 daemon 經 `./setup.sh --keyboard` 安裝（事件驅動 `org.gnome.ScreenSaver`/`login1 PrepareForSleep`，`TAG+="uaccess"`）；以 `c640-kbd-backlight-sync --check/--test-blank` 驗證。見 [verification.md](verification.md)。 |
 | **EC 電池保護與風扇控制** | 🟢 **正常運作** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% 上限守護服務、0 mA AC 旁路、S3 休眠喚醒鉤子、風扇靜音模式。 |
 | **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測盒蓋 S3 休眠/喚醒（零錯誤）。**按鍵/指紋喚醒未測試**；開蓋後需按鍵才亮（見 [verification.md](verification.md)）。 |
 | **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電正常；**Type-C 外接螢幕未驗證**（見 [verification.md](verification.md)）。 |
@@ -152,6 +152,7 @@ Comet Lake SOF DSP 經 ALSA UCM2：
 
 - **方案 A（預設）**：`systemd-hwdb` 零開銷，TTY/X11/Wayland 通用
 - **方案 B**：`keyd` 雙模 `Search` → CapsLock / Super，Super+頂排 → F1–F10 — 見 [keyboard/keyd/cros.conf](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/keyd/cros.conf)
+- **方案 C（新增）**：鍵盤背光與螢幕熄滅/鎖定同步 — 事件驅動 `c640-kbd-backlight-sync`（GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` 對應 S3 盒蓋）+ `cros_kbd_led_backlight` sysfs。見 [keyboard/README.zh-TW.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.zh-TW.md#選項-3鍵盤背光與螢幕熄滅鎖定同步新增)
 
 ---
 

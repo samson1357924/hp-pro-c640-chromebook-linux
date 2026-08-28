@@ -18,7 +18,7 @@ Run this inside the project directory:
 This command automatically:
 
 1. Removes the custom `sof-rt5682` UCM configuration files from `/usr/share/alsa/ucm2/`.
-2. Removes `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` and rebuilds the hardware database.
+2. Removes keyboard hwdb & backlight sync (5 artifacts): `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` (+ `systemd-hwdb update`), `/etc/udev/rules.d/61-chromeos-kbd-backlight.rules` (+ `udevadm trigger --subsystem-match=leds`), `/usr/local/bin/c640-kbd-backlight-sync`, `/etc/systemd/user/c640-kbd-backlight-sync.service` (`--global disable` + per-user `disable --now` + `daemon-reload`), `/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh`, and cleans `/run/c640-kbd-backlight/state`.
 3. Removes `/etc/udev/rules.d/60-cros-fp.rules`.
 4. Removes the power management tweaks (logind config and suspend helpers).
 5. Removes the EC tools, the 90% battery protection service, and the sleep hook.
@@ -26,7 +26,7 @@ This command automatically:
    touched it** (re-installs keep the original backup, so rollback always
    restores the pre-project state).
 7. Restores the enabled/active state of systemd services the installer
-   modified (`thermald`, `tlp`, `c640-battery-limit.service`, …) and removes
+   modified (`thermald`, `tlp`, `c640-battery-limit.service`, `c640-kbd-backlight-sync.service` with `scope: user` via `--global` + per-user `daemon-reload`, …) and removes
    **plugdev group memberships that the installer added** (memberships that
    existed before installation, or still required by other udev rules, are
    kept).
@@ -56,11 +56,16 @@ This command automatically:
   hook, removes `/var/lib/fprint/crfpmoc.key` and the plugdev membership the
   installer added, and rolls the service states back.)*
 
-* **Remove only the keyboard top-row mapping**:
+* **Remove only the keyboard top-row mapping & backlight sync** (5 artifacts above):
 
   ```bash
   ./keyboard/install-keyboard.sh --uninstall
   ```
+
+  > This removes all 5 keyboard artifacts, disables the user service globally,
+  > restores brightness to 50% if left at 0, cleans `/run/c640-kbd-backlight/state`
+  > and `/run/user/$UID/c640-kbd-backlight.state`, and drops installer-added
+  > `plugdev` membership (keeps pre-existing memberships).
 
 * **Remove only the power management tweaks** (logind config, suspend
   helpers, TLP config, thermald service enablement):

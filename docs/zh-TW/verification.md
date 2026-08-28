@@ -55,13 +55,17 @@
 | 核心警告 | 🟢 | 📄 `system/dmesg_warnings.txt` — **空檔**（0 行） |
 | 實際播放 | 🟢 | 📄 `audio/wpctl.txt`：Chromium 串流路由至 `Speaker:playback_FL/FR [active]` |
 
-### 3. 鍵盤頂排 (systemd-hwdb)
+### 3. 鍵盤頂排 (systemd-hwdb) 與背光同步
 
 | 檢查項目 | 結果 | 證據 |
 | :--- | :---: | :--- |
 | hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在 |
 | hwdb 與 repo 一致 | 🟢 | `diff` → 僅 SPDX header 註解不同（功能完全相同） |
 | keyd 選項 B | ⚠️ | **本機未安裝**（使用 hwdb 選項 A）；僅提供設定檔 |
+| 鍵盤背光 udev rule | ⚠️ | `61-chromeos-kbd-backlight.rules`（`TAG+="uaccess", GROUP="plugdev" MODE="0660"`）— 僅設定，未在 2026-08-15 證據包；以 `udevadm test /sys/class/leds/chromeos::kbd_backlight` 驗證 |
+| 鍵盤背光 daemon | ⚠️ | `c640-kbd-backlight-sync` → `/usr/local/bin/`（gdbus/dbus-monitor 事件驅動，`C640_KBD_ENABLE_IDLEMONITOR=0` 預設）— 安裝 smoke 通過，尚無 S3 盒蓋實測；以 `c640-kbd-backlight-sync --check --test-blank --test-unblank` 測試 |
+| 鍵盤背光 user service | ⚠️ | `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（`WantedBy=graphical-session.target`，`StartLimitIntervalSec=60/Burst=5`）— `systemctl --global is-enabled` |
+| 鍵盤背光 sleep hook | ⚠️ | `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（0.6 秒喚醒後恢復）— 僅設定 |
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
 
@@ -108,7 +112,8 @@
 | **指紋 udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 2026-08-18 已安裝，重開機後以 `getfacl` 驗證 |
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | ❌ 使用 hwdb 選項 A |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
-| **觸控螢幕 / 觸控板 / 背光** | 內建核心驅動（`elan_i2c`、`cros_kbd_led_backlight`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢/背光功能測試證據** |
+| **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | ⚠️ 2026-08-29 已安裝（事件驅動 `gdbus`/`ScreenSaver`+`PrepareForSleep`，CI smoke 通過；**證據包尚無亮度軌跡**）— 以 `--test-blank` 驗證 |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §14） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -151,7 +156,8 @@ cat /sys/power/mem_sleep
   （system-sleep hook + i915 PSR 調校安裝並重開機；盒蓋指紋重測通過——第一次
   解鎖即成功、喚醒零延遲、日誌無 retry 行；黑屏問題未解決，使用者已接受）、2026-08-23
   （EC 90% 電池守護服務 + `c640-ec-sleep.sh` 零空窗喚醒鉤子 + standalone `ectool` LPC
-  通訊已實機驗證；打包迭代 2 `1.94.10-2` 中繼資料已備妥，驅動原始碼未異動）
+  通訊已實機驗證；打包迭代 2 `1.94.10-2` 中繼資料已備妥，驅動原始碼未異動）、
+  2026-08-29（鍵盤背光同步已安裝——僅設定，CI smoke 通過，尚無新證據包；見 keyboard/README.zh-TW.md 選項 3）
 * **OS / 核心**：Ubuntu 26.04 LTS，`7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）

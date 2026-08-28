@@ -57,13 +57,17 @@ diagnostic bundle.
 | Kernel warnings | 🟢 | 📄 `system/dmesg_warnings.txt` — **empty** (0 lines) |
 | Actual playback | 🟢 | 📄 `audio/wpctl.txt`: Chromium stream routed `Speaker:playback_FL/FR [active]` |
 
-### 3. Keyboard Top-Row (systemd-hwdb)
+### 3. Keyboard Top-Row (systemd-hwdb) & Backlight Sync
 
 | Check | Result | Evidence |
 | :--- | :---: | :--- |
 | hwdb installed | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` present |
 | hwdb identical to repo | 🟢 | `diff` → only SPDX header comments differ (functionally identical) |
 | keyd option B | ⚠️ | **Not installed on this machine** (hwdb option A used); config file provided only |
+| kbd backlight udev rule | ⚠️ | `61-chromeos-kbd-backlight.rules` (`TAG+="uaccess", GROUP="plugdev" MODE="0660"`) — config-only, not in 2026-08-15 bundle; verify with `udevadm test /sys/class/leds/chromeos::kbd_backlight` |
+| kbd backlight daemon | ⚠️ | `c640-kbd-backlight-sync` → `/usr/local/bin/` (gdbus/dbus-monitor event-driven, `C640_KBD_ENABLE_IDLEMONITOR=0` default) — install-smoke passed, no S3 lid-cycle evidence yet; test `c640-kbd-backlight-sync --check --test-blank --test-unblank` |
+| kbd backlight user service | ⚠️ | `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (`WantedBy=graphical-session.target`, `StartLimitIntervalSec=60/Burst=5`) — `systemctl --global is-enabled` |
+| kbd backlight sleep hook | ⚠️ | `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (0.6s post-resume restore) — config-only |
 
 ### 4. Wi-Fi / Bluetooth / Webcam / Storage
 
@@ -111,7 +115,8 @@ should be considered "provided for your distro, verify on your own hardware":
 | **Fingerprint udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 installed 2026-08-18, verified via `getfacl` after reboot |
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | ❌ option A (hwdb) used instead |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
-| **Touchscreen / touchpad / backlight** | stock kernel drivers (`elan_i2c`, `cros_kbd_led_backlight`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture/backlight test in evidence** |
+| **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | ⚠️ installed 2026-08-29 (event-driven `gdbus`/`ScreenSaver`+`PrepareForSleep`, CI smoke-test passed; **no hardware brightness trace in bundle yet**) — verify with `--test-blank` |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §14) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -159,7 +164,9 @@ cat /sys/power/mem_sleep
   unlock works, zero resume delay, no retry lines; dark-panel issue
   unresolved, user accepted), 2026-08-23 (EC 90% battery daemon + `c640-ec-sleep.sh`
   zero-window resume hook + standalone `ectool` LPC handshake verified; packaging
-  iteration 2 `1.94.10-2` metadata prepared, driver source unchanged)
+  iteration 2 `1.94.10-2` metadata prepared, driver source unchanged),
+  2026-08-29 (keyboard backlight sync installed — config-only, smoke-tested in CI,
+  no new evidence bundle yet; see keyboard/README.md Option 3)
 * **OS / kernel**: Ubuntu 26.04 LTS, `7.0.0-29-generic`
 * **Firmware**: MrChromebox `2606.1`
 * **Hardware**: HP Pro c640 Chromebook (`dratini`/`hatch`)

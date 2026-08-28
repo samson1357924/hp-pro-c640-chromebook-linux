@@ -44,7 +44,7 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 | **Wi-Fi 6 & Bluetooth 5.0** | ⚠️ **Driver bound** | Intel AX201 (`iwlwifi` / `btusb`) | Drivers bind out of the box; **WPA3/throughput not measured** (see [verification.md](verification.md)). |
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection not captured** (see [verification.md](verification.md)). |
 | **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works; **VA-API 4K60 not measured** (see [verification.md](verification.md)). |
-| **Keyboard Backlight & Top-Row Keys** | ⚠️ **Top-row verified** | `cros_ec` + `udev hwdb` / `keyd` | Top-row F1–F10 mapped (hwdb verified). **Backlight not tested** — see [verification.md](verification.md). |
+| **Keyboard Backlight & Top-Row Keys** | ⚠️ **Top-row verified, Backlight sync ready (config-only)** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon (user service + system-sleep) | Top-row F1–F10 hwdb verified. Backlight sync daemon installed via `./setup.sh --keyboard` (event-driven `org.gnome.ScreenSaver`/`login1 PrepareForSleep`, `TAG+="uaccess"`); verify with `c640-kbd-backlight-sync --check/--test-blank`. See [verification.md](verification.md). |
 | **EC Battery Protection & Fan Control** | 🟢 **Working** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% limit daemon with 0 mA AC bypass, S3 sleep resume hook, fan silent mode. |
 | **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 cycle verified 2026-08-18. **Key/fingerprint wake untested**; panel stays dark until keypress (see [verification.md](verification.md)). |
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging present; **external display via Type-C not verified** (see [verification.md](verification.md)). |
@@ -152,6 +152,7 @@ Comet Lake SOF DSP via ALSA UCM2:
 
 - **Option A (default)**: `systemd-hwdb` zero-overhead, TTY/X11/Wayland
 - **Option B**: `keyd` dual-mode `Search` → CapsLock / Super, Super+TopRow → F1–F10 — see [keyboard/keyd/cros.conf](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/keyd/cros.conf)
+- **Option C (new)**: Backlight sync with screen blank — event-driven `c640-kbd-backlight-sync` (GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` for S3 lid) + `cros_kbd_led_backlight` sysfs (`/sys/class/leds/chromeos::kbd_backlight`). See [keyboard/README.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.md#option-3-keyboard-backlight-sync-with-screen-blank-new)
 
 ---
 

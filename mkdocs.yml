@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 
 site_name: HP Pro c640 Chromebook Linux
-site_description: Complete Linux hardware enablement for HP Pro c640 (Google Dratini / Hatch, Comet Lake) — fingerprint crfpmoc, SOF audio UCM2, keyboard hwdb, power & EC tuning.
+site_description: Complete Linux hardware enablement for HP Pro c640 (Google Dratini / Hatch, Comet Lake) — fingerprint crfpmoc, SOF audio UCM2, keyboard hwdb + backlight sync, power & EC tuning.
 site_author: Samson
 site_url: https://samson1357924.github.io/hp-pro-c640-chromebook-linux/
 repo_url: https://github.com/samson1357924/hp-pro-c640-chromebook-linux
