@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+# ChromeOS keyboard backlight LED - allow logged-in user to control brightness
+# via sysfs without sudo. Complements the daemon that syncs kbd backlight with
+# screen blank. Falls back to GROUP="plugdev" if uaccess is unavailable.
+SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"

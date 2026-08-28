@@ -81,23 +81,66 @@ for dest in plan.values():
 ' "$plan" "$skip_prefixes")
 }
 
+_get_real_user_backup() {
+    # Helper to get real user without sourcing distro.sh (used for user services)
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "$SUDO_USER"
+    elif [ -n "${USER:-}" ] && [ "$USER" != "root" ]; then
+        echo "$USER"
+    else
+        echo ""
+    fi
+}
+
 manifest_add_service() {
     # $1=unit $2=component — record the enable/active state of a systemd
     # unit at install time so rollback can restore it on uninstall.
     # First record wins: a reinstall must not overwrite the state captured
     # at the original install, or rollback would undo installer-created state.
+    # Supports both system services and user services (--global scope).
     [ "${DRY_RUN:-0}" = "1" ] && {
         log_dryrun "Would record service state: $1"
         return 0
     }
-    systemctl cat "$1" > /dev/null 2>&1 || return 0
+    local is_user=0
+    local scope="system"
+    # Detect user service by path or --global cat success
+    if [ -f "/etc/systemd/user/$1" ] || [ -f "/usr/lib/systemd/user/$1" ]; then
+        is_user=1
+        scope="user"
+    elif systemctl --global cat "$1" > /dev/null 2>&1; then
+        is_user=1
+        scope="user"
+    elif systemctl cat "$1" > /dev/null 2>&1; then
+        is_user=0
+        scope="system"
+    else
+        return 0
+    fi
     local enabled active
-    systemctl is-enabled "$1" > /dev/null 2>&1 && enabled=1 || enabled=0
-    systemctl is-active "$1" > /dev/null 2>&1 && active=1 || active=0
+    if [ "$is_user" = "1" ]; then
+        systemctl --global is-enabled "$1" > /dev/null 2>&1 && enabled=1 || enabled=0
+        local real_user
+        real_user="$(_get_real_user_backup)"
+        if [ -n "$real_user" ] && [ "$real_user" != "root" ] && id -u "$real_user" > /dev/null 2>&1; then
+            local uid
+            uid="$(id -u "$real_user" 2> /dev/null || echo "")"
+            if [ -n "$uid" ] && [ -d "/run/user/$uid" ]; then
+                sudo -u "$real_user" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active "$1" > /dev/null 2>&1 && active=1 || active=0
+            else
+                active=0
+            fi
+        else
+            active=0
+        fi
+    else
+        systemctl is-enabled "$1" > /dev/null 2>&1 && enabled=1 || enabled=0
+        systemctl is-active "$1" > /dev/null 2>&1 && active=1 || active=0
+    fi
     sudo mkdir -p "$MANIFEST_DIR"
     sudo python3 -c '
 import json, sys, os
-mp, name, comp, enabled, active = sys.argv[1:6]
+mp, name, comp, enabled, active, scope = sys.argv[1:7]
 data = {"version":"2.0","records":[],"services":[],"groups":[]}
 if os.path.exists(mp):
     try:
@@ -112,13 +155,14 @@ data.setdefault("groups", [])
 if not any(s.get("name") == name and s.get("component") == comp for s in data["services"]):
     data["services"].append({
         "name": name, "component": comp,
-        "was_enabled": enabled == "1", "was_active": active == "1"
+        "was_enabled": enabled == "1", "was_active": active == "1",
+        "scope": scope
     })
 tmp = mp + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp, mp)
-' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active"
+' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active" "$scope"
 }
 
 manifest_add_group() {
@@ -336,6 +380,7 @@ except Exception as e:
 
 # Restore systemd service states BEFORE touching files, so units are still
 # present when systemctl disable/start is called.
+# Supports both system and user scopes (scope field added for kbd backlight user service).
 data.setdefault("services", [])
 services = data["services"]
 restored_services = []
@@ -345,16 +390,41 @@ for svc in services:
     name = svc.get("name")
     if not name:
         continue
-    print(f"Restoring service state: {name}")
+    scope = svc.get("scope", "system")
+    print(f"Restoring service state: {name} (scope={scope})")
     import subprocess
-    if svc.get("was_enabled"):
-        subprocess.run(["systemctl", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if scope == "user":
+        if svc.get("was_enabled"):
+            subprocess.run(["systemctl", "--global", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["systemctl", "--global", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # --global only supports enable/disable; start/stop must be per-user
+        # Attempt per-user stop/start for the real user if XDG_RUNTIME_DIR exists
+        try:
+            import pwd, os
+            # attempt to find real user from SUDO_USER or fallback
+            real_user = os.environ.get("SUDO_USER", "")
+            if real_user and real_user != "root":
+                uid = pwd.getpwnam(real_user).pw_uid
+                xdg = f"/run/user/{uid}"
+                if os.path.isdir(xdg):
+                    env = os.environ.copy()
+                    env["XDG_RUNTIME_DIR"] = xdg
+                    if svc.get("was_active"):
+                        subprocess.run(["sudo", "-u", real_user, "env", f"XDG_RUNTIME_DIR={xdg}", "systemctl", "--user", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(["sudo", "-u", real_user, "env", f"XDG_RUNTIME_DIR={xdg}", "systemctl", "--user", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
     else:
-        subprocess.run(["systemctl", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if svc.get("was_active"):
-        subprocess.run(["systemctl", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        subprocess.run(["systemctl", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if svc.get("was_enabled"):
+            subprocess.run(["systemctl", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["systemctl", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if svc.get("was_active"):
+            subprocess.run(["systemctl", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["systemctl", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     restored_services.append(svc)
 data["services"] = [s for s in services if s not in restored_services]
 

@@ -346,7 +346,7 @@ test_service_reinstall_first_wins() {
     rm -rf "$sandbox"
     mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
 
-    printf '#!/usr/bin/env bash\ncase "$1" in\n  cat) exit 0 ;;\n  is-enabled|is-active) [ -e "${STUB_UNIT_STATE_FILE:-}" ] && exit 0 || exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
+    printf '#!/usr/bin/env bash\ncase "$*" in\n  *"--global cat"*) exit 1 ;;\n  *" cat "*) exit 0 ;;\n  *"is-enabled"*|*"is-active"*) [ -e "${STUB_UNIT_STATE_FILE:-}" ] && exit 0 || exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
     chmod +x "$sandbox/stub/systemctl"
 
     run_sandboxed "$sandbox" '
@@ -390,6 +390,119 @@ test_group_remove_keeps_record_on_failure() {
 }
 
 # ---------------------------------------------------------------------------
+# 13. keyboard backlight sync: install and rollback of daemon + udev + user service + sleep hook
+# ---------------------------------------------------------------------------
+test_kbd_backlight_sync_install() {
+    local sandbox="/tmp/rollback-test-kbd-sync"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+    mkdir -p "$sandbox/etc/udev/rules.d" "$sandbox/etc/systemd/user" "$sandbox/usr/local/bin" "$sandbox/usr/lib/systemd/system-sleep"
+
+    # Stub systemctl to handle --global and --user queries (user service: --global cat succeeds)
+    printf '#!/usr/bin/env bash\ncase "$*" in\n  *"--global cat"*) exit 0 ;;\n  *" cat "*) exit 1 ;;\n  *"--global is-enabled"*|*"--global is-active"*) exit 1 ;;\n  *"is-enabled"*|*"is-active"*) exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/systemctl"
+    # Also stub udevadm and systemd-hwdb for completeness
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/udevadm"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/systemd-hwdb"
+    chmod +x "$sandbox/stub/udevadm" "$sandbox/stub/systemd-hwdb"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        # Simulate keyboard/install-keyboard.sh steps with sandbox paths
+        # For new files, backup must be called BEFORE creating file (was_existing=0)
+        backup_file_manifest_aware "$2/usr/local/bin/c640-kbd-backlight-sync" "keyboard"
+        mkdir -p "$(dirname "$2/usr/local/bin/c640-kbd-backlight-sync")"
+        echo "#!/bin/bash" > "$2/usr/local/bin/c640-kbd-backlight-sync"
+        backup_file_manifest_aware "$2/etc/udev/rules.d/61-chromeos-kbd-backlight.rules" "keyboard"
+        mkdir -p "$(dirname "$2/etc/udev/rules.d/61-chromeos-kbd-backlight.rules")"
+        echo "SUBSYSTEM==\"leds\"" > "$2/etc/udev/rules.d/61-chromeos-kbd-backlight.rules"
+        backup_file_manifest_aware "$2/etc/systemd/user/c640-kbd-backlight-sync.service" "keyboard"
+        mkdir -p "$(dirname "$2/etc/systemd/user/c640-kbd-backlight-sync.service")"
+        echo "[Unit]" > "$2/etc/systemd/user/c640-kbd-backlight-sync.service"
+        manifest_add_service "c640-kbd-backlight-sync.service" "keyboard"
+        backup_file_manifest_aware "$2/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh" "keyboard"
+        mkdir -p "$(dirname "$2/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh")"
+        echo "#!/bin/sh" > "$2/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh"
+    '
+
+    # Verify manifest has 4 records
+    local rec_count
+    rec_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "4" "$rec_count" "kbd sync install records 4 files"
+    local svc_count
+    svc_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "1" "$svc_count" "kbd sync install records user service"
+
+    # Verify service scope is user
+    local scope
+    scope="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("services", [])[0].get("scope",""))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "user" "$scope" "kbd sync service scope is user"
+
+    # Now rollback and ensure files removed
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rollback_component "keyboard"
+    '
+
+    if [ ! -e "$sandbox/usr/local/bin/c640-kbd-backlight-sync" ] && [ ! -e "$sandbox/etc/udev/rules.d/61-chromeos-kbd-backlight.rules" ] && [ ! -e "$sandbox/etc/systemd/user/c640-kbd-backlight-sync.service" ] && [ ! -e "$sandbox/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh" ]; then
+        ok
+    else
+        fail "kbd sync rollback should remove all 4 files"
+    fi
+
+    local remaining
+    remaining="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "0" "$remaining" "kbd sync records removed after rollback"
+    local svc_remaining
+    svc_remaining="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "0" "$svc_remaining" "kbd sync service record removed after rollback"
+}
+
+# ---------------------------------------------------------------------------
+# 14. keyboard backlight sync: user service first-wins and double install keeps single backup
+# ---------------------------------------------------------------------------
+test_kbd_backlight_double_install() {
+    local sandbox="/tmp/rollback-test-kbd-double"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+    mkdir -p "$sandbox/etc/systemd/user"
+    printf '#!/usr/bin/env bash\ncase "$*" in\n  *"--global cat"*) exit 0 ;;\n  *" cat "*) exit 1 ;;\n  *"is-enabled"*|*"is-active"*) [ -e "${STUB_UNIT_STATE_FILE:-}" ] && exit 0 || exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/systemctl"
+    # first install with file not existing
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        echo "ORIGINAL" > "$2/etc/systemd/user/c640-kbd-backlight-sync.service"
+        backup_file_manifest_aware "$2/etc/systemd/user/c640-kbd-backlight-sync.service" "keyboard"
+        manifest_add_service "c640-kbd-backlight-sync.service" "keyboard"
+    '
+    # modify file and reinstall (should keep original backup, first service record wins)
+    echo "CUSTOM" > "$sandbox/etc/systemd/user/c640-kbd-backlight-sync.service"
+    touch "$sandbox/unit-enabled"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_UNIT_STATE_FILE="$2/unit-enabled"
+        source "$1/lib/backup.sh"
+        backup_file_manifest_aware "$2/etc/systemd/user/c640-kbd-backlight-sync.service" "keyboard"
+        manifest_add_service "c640-kbd-backlight-sync.service" "keyboard"
+    '
+    local svc_state
+    svc_state="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])).get("services", [])[0]; print(s["was_enabled"], s.get("scope",""))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "False user" "$svc_state" "kbd sync double install keeps first service record with user scope"
+    local backup_count
+    backup_count="$(find "$sandbox/backups" -name "c640-kbd-backlight-sync.service" 2> /dev/null | wc -l)"
+    assert_eq "1" "$backup_count" "kbd sync double install keeps single backup"
+    # rollback should restore original
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rollback_component "keyboard"
+    '
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/systemd/user/c640-kbd-backlight-sync.service" 2> /dev/null || echo "MISSING")" "kbd double install rollback restores original"
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -404,6 +517,8 @@ test_legacy_manifest
 test_group_reinstall_first_wins
 test_service_reinstall_first_wins
 test_group_remove_keeps_record_on_failure
+test_kbd_backlight_sync_install
+test_kbd_backlight_double_install
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+[Unit]
+Description=HP Pro c640 Keyboard Backlight Sync with Screen Blank
+Documentation=https://github.com/samson1357924/hp-pro-c640-chromebook-linux
+After=graphical-session.target
+PartOf=graphical-session.target
+Wants=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/c640-kbd-backlight-sync
+Restart=on-failure
+RestartSec=2
+RestartSteps=3
+RestartMaxDelaySec=30
+# Optional IdleMonitor polling: override via drop-in or user env.
+# To enable: mkdir -p ~/.config/systemd/user/c640-kbd-backlight-sync.service.d
+# and create override.conf with [Service] Environment=C640_KBD_ENABLE_IDLEMONITOR=1
+# Do NOT use `systemctl --global set-environment` (not supported for user manager).
+# Environment=C640_KBD_ENABLE_IDLEMONITOR=0
+
+[Install]
+WantedBy=graphical-session.target
