@@ -90,7 +90,7 @@ class MediaOcrProcessor:
         self.llm_client = llm_client
         self.config = config.get("mediaOcr", {})
         self.enabled = bool(self.config.get("enabled", True))
-        self.model_id = self.config.get("model", "mimo-v2.5-free")
+        self.model_id = self.config.get("model", "gemini-3.7-flash-high")
         self.max_items = int(self.config.get("maxItems", 4))
         self.max_bytes = int(self.config.get("maxBytesPerItem", MAX_MEDIA_BYTES))
 
@@ -131,7 +131,7 @@ class MediaOcrProcessor:
             return ""
 
         extracted_summaries: list[str] = []
-        fallbacks = self.config.get("fallbackModels", ["mimo-v2.5-free", "grok-4.6"])
+        fallbacks = self.config.get("fallbackModels", ["opencode/mimo-v2.5-free", "grok-4.6"])
         for idx, url in enumerate(urls, 1):
             try:
                 data_uri = self._fetch_as_data_uri(url)

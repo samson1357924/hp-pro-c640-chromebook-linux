@@ -19,6 +19,19 @@ DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MIN_RESPONSE_CHARS = 100
 DEFAULT_REJECT_FINISH_REASONS = {"length", "max_tokens", "content_filter"}
 
+# opencode2api proxy migration:
+# - "opencode" is the canonical provider key (kept for backward compat).
+#   "opencode2api" is accepted as an alias and routed to the same logic.
+# - OPENCODE2API_BASE_URL1 is primary (even though slower), then
+#   OPENCODE2API_BASE_URL, then OPENCODE2API_BASE_URL2 (currently NXDOMAIN,
+#   kept last with fast-fail).
+OPENCODE_PROVIDER_NAMES = {"opencode", "opencode2api"}
+OPENCODE_BASE_URL_ENV_PRIORITY = (
+    "OPENCODE2API_BASE_URL1",
+    "OPENCODE2API_BASE_URL",
+    "OPENCODE2API_BASE_URL2",
+)
+
 
 class LLMClientError(RuntimeError):
     """Raised when an LLM call fails or returns an unusable completion."""
@@ -87,11 +100,38 @@ def fetch_models_dev_free_ids(timeout_seconds: int = 8) -> set[str]:
 
 
 def sanitize_model_name_for_display(model_id: str) -> str:
-    """Remove internal model tier suffixes like -high, -free, -extra-low, -low for clean display."""
+    """Remove provider namespace and internal tier suffixes for clean display."""
     if not model_id:
         return ""
-    cleaned = re.sub(r"-(high|free|extra-low|low)$", "", model_id, flags=re.IGNORECASE)
+    # Strip provider namespace like "opencode/" first so UI never leaks it.
+    without_ns = model_id.split("/", 1)[1] if "/" in model_id else model_id
+    cleaned = re.sub(r"-(high|free|extra-low|low)$", "", without_ns, flags=re.IGNORECASE)
     return cleaned
+
+
+def _redact_secret_detail(text: str) -> str:
+    """Redact key-like material from provider error bodies before surfacing."""
+    if not text:
+        return text
+    redacted = re.sub(r"sk-[A-Za-z0-9_\-]{4,}", "sk-***", text)
+    redacted = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.~+/=]{4,}", r"\1***", redacted)
+    redacted = re.sub(r"(?i)(api[_-]?key['\"\s:=]+)[^,\s}\"]{4,}", r"\1***", redacted)
+    return redacted
+
+
+def _is_validation_rejection(exc: BaseException) -> bool:
+    """True when the error is content validation, not transport.
+
+    Validation means the base responded but the completion was unusable
+    (empty / too short / truncated / missing marker). Those must not trigger
+    cross-base failover; they belong to call_model's length-retry / fallback.
+    """
+    msg = str(exc).lower()
+    return (
+        "unusable completion" in msg
+        or "missing required marker" in msg
+        or "llm returned empty content" in msg
+    )
 
 
 def _redact_url(url: str) -> str:
@@ -144,34 +184,87 @@ class LLMClient:
 
         self.providers = {}
         self.models = {}
+        # Config changed -> stale discovery must not survive.
+        self._discovery_cache = None
+        self._discovery_cache_time = 0.0
 
         for provider_name, pdata in data.items():
             if not isinstance(pdata, dict):
                 continue
             base_url = pdata.get("baseUrl") or ""
+            base_urls: list[str] = []
+            # Explicit multi-base list takes precedence when present.
+            raw_base_urls = pdata.get("baseUrls")
+            if isinstance(raw_base_urls, list):
+                for u in raw_base_urls:
+                    if isinstance(u, str):
+                        u = interpolate_env_vars(u).strip()
+                        if u:
+                            if not u.endswith("/"):
+                                u += "/"
+                            if u not in base_urls:
+                                base_urls.append(u)
             # CPA has no built-in fallback: CPA_BASE_URL must be explicitly configured
             if not base_url and provider_name == "cpa":
                 base_url = os.environ.get("CPA_BASE_URL", "")
+            # opencode2api proxy: BASE_URL1 (primary, slower) > BASE_URL > BASE_URL2.
+            # JSON baseUrl is kept as a fallback entry so old configs still work.
+            if provider_name in OPENCODE_PROVIDER_NAMES:
+                for env_key in OPENCODE_BASE_URL_ENV_PRIORITY:
+                    env_url = (os.environ.get(env_key, "") or "").strip()
+                    if env_url:
+                        if not env_url.endswith("/"):
+                            env_url += "/"
+                        if env_url not in base_urls:
+                            base_urls.append(env_url)
             if base_url and not base_url.endswith("/"):
                 base_url += "/"
+            if base_url and base_url not in base_urls:
+                # JSON single baseUrl goes last so env priority wins for opencode;
+                # for other providers it is the only entry.
+                if provider_name in OPENCODE_PROVIDER_NAMES:
+                    base_urls.append(base_url)
+                else:
+                    base_urls.insert(0, base_url)
+            # Enforce HTTPS for remote LLM endpoints (localhost exempt for tests).
+            for u in base_urls:
+                host = (urllib.parse.urlparse(u).hostname or "").lower()
+                if u and not u.lower().startswith("https://") and host not in {"localhost", "127.0.0.1", "::1"}:
+                    raise LLMClientError(
+                        f"Insecure base URL for provider '{provider_name}': {_redact_url(u)} (must be https://)"
+                    )
+            canonical_base_url = base_urls[0] if base_urls else base_url
 
             api_key = pdata.get("apikey") or ""
             if not api_key:
                 if provider_name == "cpa":
                     api_key = os.environ.get("CPA_API_KEY", "")
-                elif provider_name == "opencode":
-                    api_key = os.environ.get("OPENCODE_API_KEY", "")
+                elif provider_name in OPENCODE_PROVIDER_NAMES:
+                    # New proxy key first, legacy Zen key kept as deprecated fallback.
+                    api_key = os.environ.get("OPENCODE2API_API_KEY", "") or os.environ.get("OPENCODE_API_KEY", "")
 
             api_type = pdata.get("api", "openai-completions")
             timeout_seconds = int(pdata.get("timeoutSeconds", DEFAULT_TIMEOUT_SECONDS))
+            # opencode2api proxy: SSE streaming is unverified (non-streaming is
+            # proven). Default to non-streaming unless JSON opts in explicitly.
+            if "enableStreaming" in pdata:
+                raw_stream = pdata.get("enableStreaming")
+                if isinstance(raw_stream, str):
+                    provider_streaming = raw_stream.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    provider_streaming = bool(raw_stream)
+            else:
+                provider_streaming = False if provider_name in OPENCODE_PROVIDER_NAMES else True
 
             self.providers[provider_name] = {
                 "name": provider_name,
-                "baseUrl": base_url,
+                "baseUrl": canonical_base_url,
+                "baseUrls": base_urls or ([canonical_base_url] if canonical_base_url else []),
                 "apikey": api_key,
                 "api": api_type,
                 "timeoutSeconds": timeout_seconds,
                 "models": pdata.get("models", []),
+                "enableStreaming": provider_streaming,
             }
 
             for m in pdata.get("models", []):
@@ -180,69 +273,93 @@ class LLMClient:
                     self.models[mid] = {**m, "_provider": provider_name}
 
     def discover_models(self, timeout_seconds: int = 8, *, force_refresh: bool = False) -> dict[str, list[str]]:
-        """Dynamically query providers' /models endpoints, cross-filter with models.dev, and register active models."""
+        """Dynamically query providers' /models endpoints and register active models.
+
+        opencode2api proxy returns a curated list (currently 7 ``opencode/`` IDs)
+        so it is trusted as-is; models.dev is only a best-effort hint for legacy
+        Zen IDs and never filters proxy results.
+        """
+        import sys
         import time
 
         now = time.monotonic()
         if not force_refresh and self._discovery_cache is not None and now - self._discovery_cache_time < self._discovery_ttl_seconds:
-            return dict(self._discovery_cache)
+            return {k: list(v) for k, v in self._discovery_cache.items()}
 
         discovered: dict[str, list[str]] = {}
         models_dev_free = fetch_models_dev_free_ids(timeout_seconds=timeout_seconds)
+        if not models_dev_free:
+            print("[LLM] models.dev free list empty/unreachable; proxy results trusted as-is", file=sys.stderr)
 
         for pname, pdata in self.providers.items():
-            base_url = pdata.get("baseUrl") or ""
             api_key = pdata.get("apikey") or ""
-            if not base_url or not api_key:
+            base_urls = list(pdata.get("baseUrls") or [])
+            if pdata.get("baseUrl") and pdata.get("baseUrl") not in base_urls:
+                base_urls.insert(0, pdata.get("baseUrl"))
+            if not base_urls or not api_key:
                 continue
 
-            models_url = f"{base_url.rstrip('/')}/models"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "hp-pro-c640-linux-ai-bot/1.0",
-            }
-            try:
-                req = urllib.request.Request(models_url, headers=headers, method="GET")
-                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    model_list: list[str] = []
-                    items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        mid = item.get("id")
-                        if not mid:
-                            continue
-
-                        # If provider is opencode, only keep active free models (input == 0 or name contains 'free')
-                        if pname == "opencode":
-                            is_free = (mid in models_dev_free) or ("free" in mid.lower())
-                            if not is_free:
+            model_list: list[str] = []
+            seen: set[str] = set()
+            for base_url in base_urls:
+                models_url = f"{base_url.rstrip('/')}/models"
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "hp-pro-c640-linux-ai-bot/1.0",
+                }
+                try:
+                    req = urllib.request.Request(models_url, headers=headers, method="GET")
+                    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            mid = item.get("id")
+                            if not mid or mid in seen:
                                 continue
 
-                        model_list.append(mid)
-                        if mid not in self.models:
-                            self.models[mid] = {
-                                "id": mid,
-                                "name": item.get("name", mid),
-                                "description": f"Dynamically discovered model from {pname}",
-                                "_provider": pname,
-                                "input": ["text"],
-                                "output": ["text"],
-                            }
-                    discovered[pname] = model_list
-            except Exception:
-                # Silently proceed if endpoint is unavailable or unsupported
-                pass
-        self._discovery_cache = discovered
-        self._discovery_cache_time = time.monotonic()
-        return dict(self._discovery_cache)
+                            # Proxy namespace is curated: accept everything.
+                            # Legacy Zen provider (no prefix) keeps the old free filter.
+                            if pname in OPENCODE_PROVIDER_NAMES and "/" in str(mid):
+                                pass
+                            elif pname in OPENCODE_PROVIDER_NAMES:
+                                is_free = (mid in models_dev_free) or ("free" in mid.lower())
+                                if not is_free:
+                                    continue
+
+                            seen.add(mid)
+                            model_list.append(mid)
+                            if mid not in self.models:
+                                self.models[mid] = {
+                                    "id": mid,
+                                    "name": item.get("name", mid),
+                                    "description": f"Dynamically discovered model from {pname}",
+                                    "_provider": pname,
+                                    "input": ["text"],
+                                    "output": ["text"],
+                                }
+                    # First healthy base wins for discovery; chat path still
+                    # failovers across all bases per request.
+                    if model_list:
+                        break
+                except Exception as exc:
+                    print(f"[LLM] discover {pname} via {_redact_url(base_url)} failed: {type(exc).__name__}", file=sys.stderr)
+                    continue
+            if model_list:
+                discovered[pname] = model_list
+        # Don't cache total failure (empty dict): a transient outage would
+        # otherwise black-hole discovery for the full TTL.
+        if discovered:
+            self._discovery_cache = discovered
+            self._discovery_cache_time = time.monotonic()
+        return {k: list(v) for k, v in discovered.items()}
 
     def get_dynamic_fallback_chain(self, configured_fallbacks: list[str] | None = None) -> list[str]:
-        """Build prioritized fallback chain: CPA priority -> Configured -> Dynamic OpenCode Free -> Dynamic CPA."""
+        """Build prioritized fallback chain: Configured -> Dynamic opencode2api -> Dynamic CPA."""
         chain: list[str] = []
 
-        # 1. Configured fallbacks in prioritized order
+        # 1. Configured fallbacks in prioritized order (muse-spark first per policy)
         for m in (configured_fallbacks or []):
             if m and m not in chain:
                 chain.append(m)
@@ -250,12 +367,27 @@ class LLMClient:
         # 2. Discover live active models from providers
         try:
             discovered = self.discover_models()
-        except Exception:
+        except Exception as exc:
+            import sys
+
+            print(f"[LLM] dynamic fallback discovery failed: {type(exc).__name__}", file=sys.stderr)
             discovered = {}
 
-        # 3. Append verified active OpenCode free models
-        opencode_free = discovered.get("opencode", [])
-        for m in opencode_free:
+        # 3. Append verified active opencode2api proxy models (muse-spark priority)
+        def _muse_spark_rank(mid: str) -> tuple[int, str]:
+            low = mid.lower()
+            if "muse-spark-1.3" in low:
+                return (0, mid)
+            if "muse-spark-1.2" in low:
+                return (1, mid)
+            if "muse-spark" in low:
+                return (2, mid)
+            return (3, mid)
+
+        opencode_free: list[str] = []
+        for key in ("opencode", "opencode2api"):
+            opencode_free.extend(discovered.get(key, []))
+        for m in sorted(dict.fromkeys(opencode_free), key=_muse_spark_rank):
             if m not in chain:
                 chain.append(m)
 
@@ -271,6 +403,12 @@ class LLMClient:
         if model_id in self.models:
             pname = self.models[model_id].get("_provider", self.default_provider)
             return self.providers.get(pname, {})
+        # opencode*/ namespaced IDs always route to the proxy provider even
+        # before discovery has registered them.
+        if isinstance(model_id, str) and model_id.startswith(("opencode/", "opencode2api/")):
+            for pname in ("opencode", "opencode2api"):
+                if pname in self.providers:
+                    return self.providers[pname]
         # Fallback to default provider
         return self.providers.get(self.default_provider, {})
 
@@ -333,16 +471,71 @@ class LLMClient:
         required_markers: list[str] | None,
     ) -> str:
         provider = self.get_provider_for_model(model_id)
-        base_url = provider.get("baseUrl") or ""
+        pname = provider.get("name", self.default_provider)
+        base_urls = list(provider.get("baseUrls") or [])
+        if provider.get("baseUrl") and provider.get("baseUrl") not in base_urls:
+            base_urls.insert(0, provider.get("baseUrl"))
         api_key = provider.get("apikey") or ""
         api_type = provider.get("api", "openai-completions")
         timeout = timeout_seconds or provider.get("timeoutSeconds", DEFAULT_TIMEOUT_SECONDS)
 
-        if not base_url:
-            raise LLMClientError(f"Base URL is not configured for provider '{provider.get('name')}'")
+        if not base_urls:
+            raise LLMClientError(f"Base URL is not configured for provider '{pname}' (set OPENCODE2API_BASE_URL1 or CPA_BASE_URL)")
         if not api_key:
-            raise LLMClientError(f"API key is missing for provider '{provider.get('name')}' (set OPENCODE_API_KEY or CPA_API_KEY)")
+            if pname in OPENCODE_PROVIDER_NAMES:
+                hint = "set OPENCODE2API_API_KEY (legacy OPENCODE_API_KEY as fallback)"
+            elif pname == "cpa":
+                hint = "set CPA_API_KEY"
+            else:
+                hint = "set OPENCODE2API_API_KEY or CPA_API_KEY"
+            raise LLMClientError(f"API key is missing for provider '{pname}' ({hint})")
 
+        last_error: LLMClientError | None = None
+        for base_url in base_urls:
+            try:
+                return self._do_single_base_call(
+                    pname,
+                    base_url,
+                    api_key,
+                    api_type,
+                    model_id,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    min_chars=min_chars,
+                    required_markers=required_markers,
+                )
+            except LLMClientError as exc:
+                last_error = exc
+                # Validation rejections (empty/too short/missing marker) mean the
+                # base responded but content was unusable: don't burn the other
+                # bases, let call_model handle length-retry / fallback models.
+                if _is_validation_rejection(exc):
+                    raise
+                # Transport / HTTP errors fail over to the next base (DNS,
+                # timeout, 4xx model_not_found during migration, 5xx, CF 403).
+                continue
+        assert last_error is not None
+        raise last_error
+
+    def _do_single_base_call(
+        self,
+        pname: str,
+        base_url: str,
+        api_key: str,
+        api_type: str,
+        model_id: str,
+        messages: list[ChatMessage],
+        *,
+        temperature: float,
+        max_tokens: int,
+        timeout: int,
+        min_chars: int,
+        required_markers: list[str] | None,
+    ) -> str:
+        provider = self.providers.get(pname, {})
+        use_streaming = bool(self.enable_streaming and provider.get("enableStreaming", True))
         model_info = self.models.get(model_id, {})
         prepared_messages = _prepare_messages_for_model(messages, model_info)
         reasoning_effort = model_info.get("reasoningEffort")
@@ -377,7 +570,7 @@ class LLMClient:
             "Authorization": f"Bearer {api_key}",
             "User-Agent": "hp-pro-c640-linux-ai-bot/1.0",
         }
-        if self.enable_streaming:
+        if use_streaming:
             body["stream"] = True
             headers["Accept"] = "text/event-stream"
 
@@ -390,13 +583,13 @@ class LLMClient:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
-                    content, finish_reason = _parse_sse_stream(resp, api_type, print_progress=True)
+                    content, finish_reason = _parse_sse_stream(resp, api_type, print_progress=False)
                 else:
                     resp_bytes = resp.read()
                     payload = json.loads(resp_bytes.decode("utf-8"))
                     content, finish_reason = _extract_response_content_and_reason(payload, api_type)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            detail = _redact_secret_detail(exc.read().decode("utf-8", errors="replace"))
             # If responses endpoint failed with 404, attempt fallback to chat/completions
             if exc.code == 404 and "responses" in endpoint:
                 return self._fallback_openai_call(
@@ -404,7 +597,8 @@ class LLMClient:
                 )
             raise LLMClientError(f"HTTP {exc.code} from {_redact_url(endpoint)}: {detail[:500]}") from exc
         except Exception as exc:
-            raise LLMClientError(f"LLM request to {_redact_url(endpoint)} failed: {exc}") from exc
+            safe_exc = _redact_secret_detail(str(exc))
+            raise LLMClientError(f"LLM request to {_redact_url(endpoint)} failed: {type(exc).__name__}: {safe_exc}") from exc
 
         rejection = unusable_completion_reason(
             content,
@@ -429,32 +623,38 @@ class LLMClient:
         min_chars: int,
         required_markers: list[str] | None,
     ) -> str:
-        endpoint = f"{base_url}chat/completions"
+        endpoint = f"{base_url.rstrip('/')}/chat/completions"
         body = {
             "model": model_id,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": self.enable_streaming,
+            "stream": False,
         }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
             "User-Agent": "hp-pro-c640-linux-ai-bot/1.0",
+            "Accept": "application/json",
         }
-        if self.enable_streaming:
-            headers["Accept"] = "text/event-stream"
 
-        req = urllib.request.Request(endpoint, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
-        content = ""
-        finish_reason = None
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type:
-                content, finish_reason = _parse_sse_stream(resp, "openai-completions", print_progress=True)
-            else:
-                payload = json.loads(resp.read().decode("utf-8"))
-                content, finish_reason = _extract_response_content_and_reason(payload, "openai-completions")
+        try:
+            req = urllib.request.Request(endpoint, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+            content = ""
+            finish_reason = None
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    content, finish_reason = _parse_sse_stream(resp, "openai-completions", print_progress=False)
+                else:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    content, finish_reason = _extract_response_content_and_reason(payload, "openai-completions")
+        except urllib.error.HTTPError as exc:
+            detail = _redact_secret_detail(exc.read().decode("utf-8", errors="replace"))
+            raise LLMClientError(f"HTTP {exc.code} from {_redact_url(endpoint)}: {detail[:500]}") from exc
+        except Exception as exc:
+            safe_exc = _redact_secret_detail(str(exc))
+            raise LLMClientError(f"LLM fallback request to {_redact_url(endpoint)} failed: {type(exc).__name__}: {safe_exc}") from exc
 
         rejection = unusable_completion_reason(
             content, finish_reason, min_chars=min_chars, required_markers=required_markers, reject_finish_reasons=self.reject_finish_reasons

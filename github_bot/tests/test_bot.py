@@ -58,10 +58,12 @@ class TestLLMClientConfig(unittest.TestCase):
     def test_sanitize_model_name_for_display(self) -> None:
         from llm_client import sanitize_model_name_for_display
         self.assertEqual(sanitize_model_name_for_display("gemini-3.7-flash-high"), "gemini-3.7-flash")
-        self.assertEqual(sanitize_model_name_for_display("deepseek-v4-flash-free"), "deepseek-v4-flash")
-        self.assertEqual(sanitize_model_name_for_display("nemotron-3-ultra-free"), "nemotron-3-ultra")
-        self.assertEqual(sanitize_model_name_for_display("gemini-3.5-flash-extra-low"), "gemini-3.5-flash")
-        self.assertEqual(sanitize_model_name_for_display("mimo-v2.5-free"), "mimo-v2.5")
+        self.assertEqual(sanitize_model_name_for_display("opencode/muse-spark-1.3-contributor-free"), "muse-spark-1.3-contributor")
+        self.assertEqual(sanitize_model_name_for_display("opencode/muse-spark-1.2-contributor-free"), "muse-spark-1.2-contributor")
+        self.assertEqual(sanitize_model_name_for_display("opencode/nemotron-3-ultra-free"), "nemotron-3-ultra")
+        self.assertEqual(sanitize_model_name_for_display("opencode/ling-3.0-flash-fin-free"), "ling-3.0-flash-fin")
+        self.assertEqual(sanitize_model_name_for_display("opencode/mimo-v2.5-free"), "mimo-v2.5")
+        self.assertEqual(sanitize_model_name_for_display("opencode/big-pickle"), "big-pickle")
         self.assertEqual(sanitize_model_name_for_display("grok-4.6"), "grok-4.6")
         self.assertEqual(sanitize_model_name_for_display("claude-opus-4-6-thinking"), "claude-opus-4-6-thinking")
 
@@ -199,8 +201,8 @@ class TestStreamAndMessagePrep(unittest.TestCase):
                 ],
             }
         ]
-        # Text-only model
-        text_model_info = {"id": "deepseek-v4-flash-free", "input": ["text"]}
+        # Text-only model (muse-spark proxy model is text-only with string compat)
+        text_model_info = {"id": "opencode/muse-spark-1.3-contributor-free", "input": ["text"]}
         prepared_text = _prepare_messages_for_model(messages, text_model_info)
         self.assertIsInstance(prepared_text[0]["content"], str)
         self.assertIn("[Image attached:", prepared_text[0]["content"])

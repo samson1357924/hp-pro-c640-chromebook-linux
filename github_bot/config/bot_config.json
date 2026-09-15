@@ -14,18 +14,18 @@
   "maxDiffChars": 180000,
   "maxIssueBodyChars": 40000,
   "codingModels": [
+    "opencode/muse-spark-1.3-contributor-free",
     "gemini-3.7-flash-high",
-    "grok-4.6",
-    "deepseek-v4-flash-free"
+    "grok-4.6"
   ],
   "fallbackModels": [
+    "opencode/muse-spark-1.3-contributor-free",
+    "opencode/muse-spark-1.2-contributor-free",
     "gemini-3.7-flash-high",
     "grok-4.6",
-    "deepseek-v4-flash-free",
     "claude-opus-4-6-thinking",
-    "mimo-v2.5-free",
     "gemini-3.6-flash-high",
-    "nemotron-3-ultra-free"
+    "opencode/mimo-v2.5-free"
   ],
   "fallbackModel": "gemini-3.7-flash-high",
   "dynamicModelDiscovery": true,
@@ -33,7 +33,7 @@
     "enabled": true,
     "model": "gemini-3.7-flash-high",
     "fallbackModels": [
-      "mimo-v2.5-free",
+      "opencode/mimo-v2.5-free",
       "grok-4.6"
     ],
     "maxItems": 4,
@@ -80,7 +80,7 @@
       "reasoningEffort": "high"
     },
     "triage_agent": {
-      "model": "deepseek-v4-flash-free",
+      "model": "opencode/muse-spark-1.3-contributor-free",
       "description": "Issue investigator: decision-first classification, quality scoring, missing-info checklist, and root-cause hypotheses",
       "promptFile": "./prompts/roles/triage_agent.md",
       "temperature": 0.2,
