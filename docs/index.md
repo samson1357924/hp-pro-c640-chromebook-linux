@@ -73,7 +73,7 @@ chmod +x setup.sh
 | **Install audio UCM only** | `./setup.sh --audio` (or `./audio/install-audio.sh`) |
 | **Install fingerprint driver + PAM (Hybrid A+C)** | `./setup.sh --fingerprint` |
 | **Force compile fingerprint from source (Plan A)** | `./setup.sh --source` |
-| **Install top-row keyboard mapping only** | `./setup.sh --keyboard` |
+| **Install top-row keyboard mapping + backlight sync** | `./setup.sh --keyboard` (add `--with-keyd` for Search dual-role) |
 | **Run hardware diagnostics** | `./setup.sh --check` |
 | **Preview mode (no system changes)** | `./setup.sh --all --dry-run` |
 | **One-click uninstall & restore** | `./setup.sh --uninstall` |
@@ -101,7 +101,7 @@ chmod +x setup.sh
     Honest tested-vs-untested matrix, troubleshooting and recovery.
 
     [:octicons-arrow-right-24: Verification Matrix](verification.md) — **read this first**
-    [:octicons-arrow-right-24: Troubleshooting (15 pitfalls)](TROUBLESHOOTING.md)
+    [:octicons-arrow-right-24: Troubleshooting (16 pitfalls)](TROUBLESHOOTING.md)
     [:octicons-arrow-right-24: Uninstall & Restore](UNINSTALL.md)
 
 - :material-microscope: **Deep Dive**

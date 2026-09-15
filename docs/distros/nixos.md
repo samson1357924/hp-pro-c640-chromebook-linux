@@ -57,11 +57,12 @@ in
     package = pkgs.fprintd.override { libfprint = libfprint-crfpmoc; };
   };
 
-  # 4. ChromeOS /dev/cros_fp udev permissions
+  # 4. ChromeOS /dev/cros_fp + keyboard backlight udev permissions
   #    (add your user to `plugdev`: `users.users.<you>.extraGroups = [ "plugdev" ];`)
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"
   '';
 
   # 5. Fingerprint for sudo only (NOT for GDM login: the GDM unlock claim
@@ -74,6 +75,7 @@ in
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
+    evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
      KEYBOARD_KEY_ea=back
      KEYBOARD_KEY_e9=forward
      KEYBOARD_KEY_e7=refresh
@@ -82,9 +84,23 @@ in
      KEYBOARD_KEY_a0=mute
      KEYBOARD_KEY_ae=volumedown
      KEYBOARD_KEY_b0=volumeup
+     KEYBOARD_KEY_db=leftmeta
      KEYBOARD_KEY_ee=brightnessdown
      KEYBOARD_KEY_ef=brightnessup
   '';
+  # Keyboard backlight sync daemon (user service + system-sleep)
+  # Option A: use the repo installer as imperative step: sudo /path/to/keyboard/install-keyboard.sh
+  # Option B: declarative (example, adjust paths):
+  # systemd.user.services.c640-kbd-backlight-sync = {
+  #   Unit.Description = "HP Pro c640 Keyboard Backlight Sync";
+  #   Unit.After = [ "graphical-session.target" ];
+  #   Unit.PartOf = [ "graphical-session.target" ];
+  #   Install.WantedBy = [ "graphical-session.target" ];
+  #   Service.ExecStart = "/usr/local/bin/c640-kbd-backlight-sync";
+  #   Service.Restart = "on-failure";
+  # };
+  # environment.systemPackages = [ (pkgs.writeShellScriptBin "c640-kbd-backlight-sync" (builtins.readFile ./keyboard/c640-kbd-backlight-sync)) ];
+  # See keyboard/README.md Option 3 for full manual steps.
 
   # 7. S0ix sleep and power management
   boot.kernelParams = [ "pcie_aspm=force" ];

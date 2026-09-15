@@ -6,7 +6,7 @@ on:
     paths:
       - 'ec/**'
       - 'keyboard/**'
-      - 'scripts/c640-ec-control.sh'
+      - 'scripts/**'
       - 'lib/**'
       - 'setup.sh'
       - 'tests/**'
@@ -16,7 +16,7 @@ on:
     paths:
       - 'ec/**'
       - 'keyboard/**'
-      - 'scripts/c640-ec-control.sh'
+      - 'scripts/**'
       - 'lib/**'
       - 'setup.sh'
       - 'tests/**'
@@ -171,6 +171,20 @@ jobs:
         run: |
           set -euo pipefail
           ./keyboard/install-keyboard.sh --dry-run
+          # assert no side effects
+          test ! -e /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb
+          test ! -e /etc/udev/rules.d/61-chromeos-kbd-backlight.rules
+          test ! -e /usr/local/bin/c640-kbd-backlight-sync
+          test ! -e /etc/systemd/user/c640-kbd-backlight-sync.service
+          test ! -e /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh
+          if [ -f /var/lib/cros-enablement/install-manifest.json ]; then
+            python3 -c 'import json,sys; d=json.load(open("/var/lib/cros-enablement/install-manifest.json")); assert not d.get("records") and not d.get("services") and not d.get("groups"), f"manifest not empty after dry-run: {d}"'
+          fi
+          # dry-run with keyd
+          ./keyboard/install-keyboard.sh --with-keyd --dry-run
+          test ! -e /etc/keyd/cros.conf
+          test ! -e /etc/keyd/default.conf
+          test ! -L /etc/keyd/default.conf
 
       - name: Install Keyboard (real root, simulates target system)
         run: |
@@ -182,8 +196,42 @@ jobs:
           test -x /usr/local/bin/c640-kbd-backlight-sync
           test -f /etc/systemd/user/c640-kbd-backlight-sync.service
           test -f /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh
+          # permissions
+          test "$(stat -c %a /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb)" = "644"
+          test "$(stat -c %a /etc/udev/rules.d/61-chromeos-kbd-backlight.rules)" = "644"
+          test "$(stat -c %a /usr/local/bin/c640-kbd-backlight-sync)" = "755"
+          test "$(stat -c %a /etc/systemd/user/c640-kbd-backlight-sync.service)" = "644"
+          test "$(stat -c %a /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh)" = "755"
           /usr/local/bin/c640-kbd-backlight-sync --check > /dev/null 2>&1 || true
           /usr/local/bin/c640-kbd-backlight-sync --help > /dev/null
+
+      - name: Install Keyboard Double-Install Idempotency
+        run: |
+          set -euo pipefail
+          USER=smoketest ./keyboard/install-keyboard.sh --install
+          USER=smoketest ./keyboard/install-keyboard.sh --install
+          test -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb
+          test -f /etc/udev/rules.d/61-chromeos-kbd-backlight.rules
+          python3 -c '
+          import json, glob
+          d=json.load(open("/var/lib/cros-enablement/install-manifest.json"))
+          # first-wins: only single backup for hwdb
+          hwdb_backups=glob.glob("/var/lib/cros-enablement/backups/keyboard/*90-chromebook*")
+          assert len(hwdb_backups) <= 1, f"double-install created extra backups: {hwdb_backups}"
+          # 5 records expected for keyboard (hwdb+udev+daemon+service+sleep)
+          assert len(d.get("records",[])) == 5, f"records={d.get(\"records\")}"
+          '
+
+      - name: Install keyd Dual-Role (optional)
+        run: |
+          set -euo pipefail
+          # install with keyd flag (keyd binary not present in container, but config should be deployed)
+          USER=smoketest ./keyboard/install-keyboard.sh --with-keyd
+          test -f /etc/keyd/cros.conf
+          test -L /etc/keyd/default.conf
+          test "$(readlink /etc/keyd/default.conf)" = "cros.conf"
+          # keyd check already validated in lint job, but verify file exists
+          cat /etc/keyd/cros.conf | grep -q "leftmeta = overload"
 
       - name: Uninstall Round-Trip (manifest rollback)
         run: |
@@ -195,6 +243,9 @@ jobs:
           test ! -e /etc/udev/rules.d/61-chromeos-kbd-backlight.rules
           # hwdb also removed
           test ! -e /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb
+          test ! -e /etc/keyd/cros.conf
+          test ! -e /etc/keyd/default.conf
+          test ! -L /etc/keyd/default.conf
           if id -nG smoketest 2> /dev/null | tr ' ' '\n' | grep -qx plugdev; then
             echo "::error::plugdev membership created by keyboard installer was not removed"
             exit 1

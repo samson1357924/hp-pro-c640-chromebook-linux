@@ -27,7 +27,7 @@ chmod +x setup.sh
 | **Full one-click installation** | `./setup.sh --all` |
 | **Install only the audio UCM configuration** | `./setup.sh --audio` or `./audio/install-audio.sh` |
 | **Install only the fingerprint driver and PAM** | `./setup.sh --fingerprint` or `./fingerprint/install-fingerprint.sh` |
-| **Install only the keyboard top-row mapping** | `./setup.sh --keyboard` or `./keyboard/install-keyboard.sh` |
+| **Install only the keyboard top-row mapping + backlight sync** | `./setup.sh --keyboard` or `./keyboard/install-keyboard.sh` (add `--with-keyd` for Search tap=CapsLock hold=Super) |
 | **Install only the power management tweaks** | `./power/install-power.sh` |
 | **Enable the 90% battery protection service** | `./ec/install-ec.sh --enable-battery-limit` |
 | **Comprehensive hardware diagnostics** | `./setup.sh --check` or `./scripts/detect-hardware.sh` |

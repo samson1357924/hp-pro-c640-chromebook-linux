@@ -38,7 +38,7 @@
 | 驅動原始碼與本 repo 一致 | 🟢 | `diff -r fingerprint/driver <build-tree>/drivers/crfpmoc` → 無差異 |
 | udev rules（已安裝版） | 🟢 | 2026-08-18 已安裝 repo 版（`GROUP="plugdev", MODE="0660", TAG+="uaccess"`），重開機後以 `getfacl` 驗證；舊 `0666` 版已備份 |
 | 單元測試 | 🟢 | `test-crfpmoc-unit`（`/usr/libexec/installed-tests/libfprint-2/`）4/4 全過：`fp_info_v3`、`fp_info_v1`、`enc_status_bitmask`、`payload_bounds` |
-| 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §13](TROUBLESHOOTING.md) |
+| 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md) |
 | `sudo` PAM 授權 | 🟢 | `fprintd` 僅存在於 `/etc/pam.d/sudo`（2026-08-18 Claim 競賽修復——不在 `common-auth`）；`sudo -k` 後執行 `sudo whoami` 會跳出指紋提示並接受驗證（測試方法見 [fingerprint README](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/fingerprint/README.md#test)）。PAM 堆疊與上述鎖定畫面修復同一 session 驗證 |
 
 ### 2. 音訊 (Intel SOF DSP + ALSA UCM2 + PipeWire)
@@ -104,7 +104,7 @@
 
 | 模組 | 檔案 | 狀態 |
 | :--- | :--- | :---: |
-| **電源調校 — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 2026-08-19 已安裝並重開機（已過濾 d0i3、重建 initramfs）；**開蓋黑屏問題仍在**（仍須按鍵才亮——使用者已接受，見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)） |
+| **電源調校 — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 2026-08-19 已安裝並重開機（已過濾 d0i3、重建 initramfs）；**開蓋黑屏問題仍在**（仍須按鍵才亮——使用者已接受，見 [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)） |
 | **電源調校 — wireplumber / logind** | `power/wireplumber/50-disable-suspend.conf`、`power/systemd/logind.conf.d/99-hp-c640-lid.conf` | 🟢 2026-08-18 已安裝（logind 盒蓋規則經真實 S3 週期驗證） |
 | **電源調校 — TLP** | `power/tlp/99-hp-c640.conf` | ❌ 未安裝 — **與運作中的 `power-profiles-daemon` 衝突**（見下方） |
 | **EC 控制與電池保護** | `ec/install-ec.sh`、`scripts/c640-ec-control.sh`、`ec/systemd/c640-battery-limit.service`、`ec/systemd/c640-ec-sleep.sh` | 🟢 2026-08-23 已安裝並實機驗證（standalone `ectool` LPC 通訊、健康度儀表板、90% 電池守護服務、0 mA 旁路斷充與 S3 喚醒鉤子皆通過實測） |
@@ -115,7 +115,7 @@
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
 | **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | ⚠️ 2026-08-29 已安裝（事件驅動 `gdbus`/`ScreenSaver`+`PrepareForSleep`，CI smoke 通過；**證據包尚無亮度軌跡**）— 以 `--test-blank` 驗證 |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
-| **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §14） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
+| **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
 
 > [!NOTE]

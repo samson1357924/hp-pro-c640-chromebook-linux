@@ -96,12 +96,31 @@ configure_pam_fingerprint() {
             fi
             ;;
         suse)
+            # Do NOT use `pam-config -a --fprintd` — it injects pam_fprintd into
+            # common-auth/system-auth which gdm-password includes, causing the
+            # GDM unlock claim race (GNOME/gdm#1071). Enable ONLY for sudo.
             if command -v pam-config > /dev/null 2>&1; then
-                log_info "Enabling fprintd via pam-config..."
-                sudo pam-config -a --fprintd
-                log_success "PAM configuration updated via pam-config."
+                log_info "Removing fprintd from common-auth/system-auth to avoid GDM claim race..."
+                sudo pam-config -d --fprintd 2> /dev/null || true
+            fi
+            local sudo_pam="/etc/pam.d/sudo"
+            if [ -f "$sudo_pam" ]; then
+                local fp_line="auth sufficient pam_fprintd.so max-tries=1 timeout=10"
+                if grep -q "^${fp_line}$" "$sudo_pam"; then
+                    log_info "pam_fprintd already configured in $sudo_pam."
+                else
+                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
+                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
+                    sudo sed -i '/^auth[[:space:]].*\(pam_fprintd\.so\|rust_fp\|fp_pam\)/d' "$sudo_pam"
+                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
+                    if grep -q "^${fp_line}$" "$sudo_pam"; then
+                        log_success "sudo fingerprint PAM configured."
+                    else
+                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
+                    fi
+                fi
             else
-                log_warn "pam-config not found. Please enable fprintd in PAM manually."
+                log_warn "$sudo_pam not found; sudo fingerprint not configured."
             fi
             ;;
         arch)
@@ -175,9 +194,15 @@ disable_pam_fingerprint() {
             fi
             ;;
         suse)
+            local sudo_pam="/etc/pam.d/sudo"
+            if [ -f "$sudo_pam" ]; then
+                log_info "Removing pam_fprintd from $sudo_pam..."
+                sudo sed -i '/^auth sufficient pam_fprintd.so/d' "$sudo_pam"
+                log_success "sudo PAM fingerprint line removed."
+            fi
             if command -v pam-config > /dev/null 2>&1; then
-                log_info "Disabling fprintd via pam-config..."
-                sudo pam-config -d --fprintd
+                log_info "Ensuring fprintd not in common-auth via pam-config..."
+                sudo pam-config -d --fprintd 2> /dev/null || true
                 log_success "PAM fingerprint configuration removed."
             fi
             ;;

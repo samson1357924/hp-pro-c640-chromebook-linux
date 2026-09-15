@@ -51,27 +51,73 @@ chmod +x keyboard/install-keyboard.sh
 If you want the **Search key** to act as **CapsLock on tap** and **Super/Meta
 on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 
-1. Install `keyd`:
+> **Prerequisite:** Option 1 `systemd-hwdb` must be installed first. `keyd` relies on
+> hwdb having translated `0xEA/0xE9/0xE7/0x91/0x92/0xEE/0xEF/0xA0/0xAE/0xB0/0xDB` to
+> `KEY_BACK`/`KEY_LEFTMETA` etc; `cros.conf` uses those names (`back`, `leftmeta`).
+> Recommended: `sudo ./keyboard/install-keyboard.sh --with-keyd` (installs hwdb+backlight+keyd atomically).
+
+1. Install `keyd` (pinned to v2.6.0, hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3` in CI):
 
    ```bash
-   # Ubuntu / Debian
-   sudo apt install -y keyd  # or build from https://github.com/rvaiya/keyd
-   # Fedora
+   # Ubuntu 25.04+ / Debian 13+ (native)
+   sudo apt update && sudo apt install -y keyd
+
+   # Ubuntu 22.04/24.04 or Debian 12 (PPA)
+   sudo add-apt-repository ppa:keyd-team/ppa -y
+   sudo apt update && sudo apt install -y keyd
+   # or build from source pinned:
+   git clone --depth 1 --branch v2.6.0 https://github.com/rvaiya/keyd /tmp/keyd
+   test "$(git -C /tmp/keyd rev-parse HEAD)" = "7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3"
+   make -C /tmp/keyd && sudo make -C /tmp/keyd install
+
+   # Fedora (COPR)
+   sudo dnf copr enable alternateved/keyd -y
    sudo dnf install -y keyd
-   # Arch Linux
+
+   # Arch Linux (extra)
    sudo pacman -S keyd
+
+   # NixOS
+   # services.keyd.enable = true;  # plus environment.etc."keyd/cros.conf".source = ./keyboard/keyd/cros.conf
    ```
 
-2. Copy configuration:
+2. Install configuration (via installer, recommended):
 
    ```bash
-   sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-   sudo systemctl enable --now keyd
+   sudo ./keyboard/install-keyboard.sh --with-keyd
+   # equivalent manual:
+   # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
+   # sudo ln -sf cros.conf /etc/keyd/default.conf
+   # keyd check /etc/keyd/cros.conf
+   # sudo systemctl enable --now keyd
    ```
+
+3. Verify & tune:
+
+   ```bash
+   keyd --version
+   sudo keyd monitor  # short press Search -> capslock, long hold -> leftmeta ; Search+TopRow -> F1
+   sudo systemctl status keyd
+   journalctl -eu keyd -f
+   # If tap vs hold is too sensitive, add to /etc/keyd/cros.conf [global]:
+   # overload_tap_timeout = 200  # ms, see man keyd
+   # sudo keyd reload
+   ```
+
+   **GNOME Wayland trackpad quirk** (optional, fixes `disable-while-typing` stall):
+
+   ```bash
+   sudo mkdir -p /etc/libinput
+   printf '[Keyd]\nMatchName=keyd virtual keyboard\nAttrKeyboardIntegration=internal\n' | sudo tee /etc/libinput/local-overrides.quirks > /dev/null
+   ```
+
+    **Notes:**
+    * `X11` users: `setxkbmap` is reset on `keyd restart`; reapply after.
+    * `TTy` works via `uinput`; panic: `backspace+escape+enter` if config locks you out.
 
 ---
 
-### Option 3: Keyboard Backlight Sync with Screen Blank (New)
+### Option 3: Keyboard Backlight Sync with Screen Blank
 
 Automatically turns off the keyboard backlight when the screen blanks/locks
 and restores it when the screen lights up. Handles both GNOME Wayland idle
@@ -81,9 +127,11 @@ and the ChromeOS EC `cros_kbd_led_backlight` (`/sys/class/leds/chromeos::kbd_bac
 Installed automatically via `./keyboard/install-keyboard.sh`:
 
 ```bash
-./keyboard/install-keyboard.sh          # install hwdb + backlight sync
-./keyboard/install-keyboard.sh --check  # verify daemon/service/udev state
-./keyboard/install-keyboard.sh --uninstall  # remove all keyboard components
+./keyboard/install-keyboard.sh                          # install hwdb + backlight sync
+./keyboard/install-keyboard.sh --with-keyd              # hwdb + backlight + keyd dual-role (Option 2)
+./keyboard/install-keyboard.sh --check                  # verify daemon/service/udev/keyd state
+./keyboard/install-keyboard.sh --uninstall              # remove all keyboard components (incl. keyd)
+./keyboard/install-keyboard.sh --with-keyd --dry-run    # preview all
 ```
 
 **What it installs:**

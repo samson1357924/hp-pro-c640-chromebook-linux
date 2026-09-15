@@ -58,11 +58,12 @@ in
     package = pkgs.fprintd.override { libfprint = libfprint-crfpmoc; };
   };
 
-  # 4. ChromeOS /dev/cros_fp udev 權限
+  # 4. ChromeOS /dev/cros_fp + 鍵盤背光 udev 權限
   #    （把使用者加入 `plugdev`：`users.users.<you>.extraGroups = [ "plugdev" ];`）
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"
   '';
 
   # 5. 只為 sudo 啟用指紋（不要加入 GDM：解鎖時 GDM 的 claim race
@@ -75,6 +76,7 @@ in
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
+    evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
      KEYBOARD_KEY_ea=back
      KEYBOARD_KEY_e9=forward
      KEYBOARD_KEY_e7=refresh
@@ -83,9 +85,23 @@ in
      KEYBOARD_KEY_a0=mute
      KEYBOARD_KEY_ae=volumedown
      KEYBOARD_KEY_b0=volumeup
+     KEYBOARD_KEY_db=leftmeta
      KEYBOARD_KEY_ee=brightnessdown
      KEYBOARD_KEY_ef=brightnessup
   '';
+  # 鍵盤背光同步 daemon（user service + system-sleep）
+  # 選項 A：以 repo 安裝器作為 imperative 步驟：sudo /path/to/keyboard/install-keyboard.sh
+  # 選項 B：宣告式範例（自行調整路徑）：
+  # systemd.user.services.c640-kbd-backlight-sync = {
+  #   Unit.Description = "HP Pro c640 Keyboard Backlight Sync";
+  #   Unit.After = [ "graphical-session.target" ];
+  #   Unit.PartOf = [ "graphical-session.target" ];
+  #   Install.WantedBy = [ "graphical-session.target" ];
+  #   Service.ExecStart = "/usr/local/bin/c640-kbd-backlight-sync";
+  #   Service.Restart = "on-failure";
+  # };
+  # environment.systemPackages = [ (pkgs.writeShellScriptBin "c640-kbd-backlight-sync" (builtins.readFile ./keyboard/c640-kbd-backlight-sync)) ];
+  # 完整手動步驟見 keyboard/README.zh-TW.md 選項 3。
 
   # 7. S0ix 睡眠與電源管理
   boot.kernelParams = [ "pcie_aspm=force" ];

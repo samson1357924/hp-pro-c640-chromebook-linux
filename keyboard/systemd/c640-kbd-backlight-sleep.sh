@@ -13,13 +13,29 @@ STATE_DIR="/run/c640-kbd-backlight"
 STATE_FILE="$STATE_DIR/state"
 
 save_state() {
-    if [ ! -f "$SYSFS" ]; then
+    if [ ! -f "$SYSFS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
         return 0
     fi
     if [ -f "$STATE_FILE" ]; then
         return 0
     fi
-    curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
+    if [ -f "$SYSFS" ]; then
+        curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
+    elif command -v ectool > /dev/null 2>&1; then
+        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        case "$pct" in
+            '' | *[!0-9]*) curr="" ;;
+            *) max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp" in '' | *[!0-9]* ) max_tmp=100;; esac; [ "$max_tmp" -eq 0 ] && max_tmp=100; curr=$((pct * max_tmp / 100)) ;;
+        esac
+    elif [ -x /usr/local/bin/ectool ]; then
+        pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        case "$pct" in
+            '' | *[!0-9]*) curr="" ;;
+            *) max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp" in '' | *[!0-9]* ) max_tmp=100;; esac; [ "$max_tmp" -eq 0 ] && max_tmp=100; curr=$((pct * max_tmp / 100)) ;;
+        esac
+    else
+        curr=""
+    fi
     case "$curr" in
         '' | *[!0-9]*)
             return 0
@@ -29,6 +45,7 @@ save_state() {
         return 0
     fi
     mkdir -p "$STATE_DIR" 2> /dev/null || true
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
     tmp="$(mktemp "$STATE_DIR/.state.XXXXXX" 2> /dev/null || mktemp /tmp/.c640-kbd-sleep-XXXXXX)"
     echo "$curr" > "$tmp" 2> /dev/null || true
     chmod 600 "$tmp" 2> /dev/null || true
@@ -41,19 +58,37 @@ restore_state() {
         return 0
     fi
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-    rm -f "$STATE_FILE" 2> /dev/null || true
     case "$saved" in
         '' | *[!0-9]*)
+            rm -f "$STATE_FILE" 2> /dev/null || true
             return 0
             ;;
     esac
     if [ "$saved" -eq 0 ]; then
+        rm -f "$STATE_FILE" 2> /dev/null || true
         return 0
     fi
-    if [ ! -f "$SYSFS" ]; then
+    if [ ! -f "$SYSFS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+        rm -f "$STATE_FILE" 2> /dev/null || true
         return 0
     fi
-    curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
+    if [ -f "$SYSFS" ]; then
+        curr="$(cat "$SYSFS" 2> /dev/null || echo "")"
+    elif command -v ectool > /dev/null 2>&1; then
+        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        case "$pct" in
+            '' | *[!0-9]*) curr="0" ;;
+            *) max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp2" in '' | *[!0-9]* ) max_tmp2=100;; esac; [ "$max_tmp2" -eq 0 ] && max_tmp2=100; curr=$((pct * max_tmp2 / 100)) ;;
+        esac
+    elif [ -x /usr/local/bin/ectool ]; then
+        pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        case "$pct" in
+            '' | *[!0-9]*) curr="0" ;;
+            *) max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp2" in '' | *[!0-9]* ) max_tmp2=100;; esac; [ "$max_tmp2" -eq 0 ] && max_tmp2=100; curr=$((pct * max_tmp2 / 100)) ;;
+        esac
+    else
+        curr="0"
+    fi
     case "$curr" in
         '' | *[!0-9]*)
             curr=0
@@ -63,6 +98,7 @@ restore_state() {
     if [ "$curr" -ne 0 ]; then
         return 0
     fi
+    rm -f "$STATE_FILE" 2> /dev/null || true
     max="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
     case "$max" in
         '' | *[!0-9]*)
