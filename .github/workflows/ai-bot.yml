@@ -2,7 +2,8 @@ name: HP Pro c640 Multi-Agent GitHub AI Bot
 
 on:
   # NOTE: pull_request_target runs in the base-branch context with secrets access
-  # (CPA_BASE_URL / CPA_API_KEY / OPENCODE_API_KEY / GITHUB_TOKEN).
+  # (CPA_BASE_URL / CPA_API_KEY / OPENCODE2API_BASE_URL1 / OPENCODE2API_BASE_URL /
+  #  OPENCODE2API_BASE_URL2 / OPENCODE2API_API_KEY / GITHUB_TOKEN).
   # Untrusted PR code is never checked out or executed; the bot only analyzes diffs.
   pull_request_target:
     types: [opened, reopened, synchronize]
@@ -149,7 +150,10 @@ jobs:
         env:
           CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
           CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE2API_BASE_URL1: ${{ secrets.OPENCODE2API_BASE_URL1 }}
+          OPENCODE2API_BASE_URL: ${{ secrets.OPENCODE2API_BASE_URL }}
+          OPENCODE2API_BASE_URL2: ${{ secrets.OPENCODE2API_BASE_URL2 }}
+          OPENCODE2API_API_KEY: ${{ secrets.OPENCODE2API_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYTHONPATH: github_bot/src
         run: |

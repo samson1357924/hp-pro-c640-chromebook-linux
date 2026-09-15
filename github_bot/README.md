@@ -17,8 +17,13 @@ Production multi-agent GitHub review and issue triage bot for
      GitHub API and only reviewed when opened by a trusted author (OWNER / MEMBER / COLLABORATOR).
 
 2. **⚡ Multi-Provider LLM Engine**:
-   - Native integration with **OpenCode Zen** (`https://opencode.ai/zen/v1/`) and **CPA** (`responses` API).
-   - Reads `CPA_BASE_URL`, `CPA_API_KEY`, and `OPENCODE_API_KEY` from repository secrets.
+   - Native integration with **opencode2api proxy**
+     (OpenAI-compatible, `OPENCODE2API_BASE_URL1` primary) and
+     **CPA** (`responses` API).
+   - Reads `CPA_BASE_URL`, `CPA_API_KEY`, `OPENCODE2API_BASE_URL1`,
+     `OPENCODE2API_BASE_URL`, `OPENCODE2API_BASE_URL2`, and
+     `OPENCODE2API_API_KEY` from repository secrets
+     (`OPENCODE_API_KEY` is deprecated).
    - Automatic retry on token truncation with doubled token budgets.
 
 3. **🔍 Deterministic Rule Pre-Scanner**:
@@ -89,7 +94,7 @@ secrets or target selectors):
 | `PR_NUMBER` / `ISSUE_NUMBER` | Target selector for slash-command dispatches | in CI |
 | `REVIEW_BASE_REF` / `REVIEW_HEAD_REF` | Local git diff range when no API token is available | local only |
 | `CPA_BASE_URL`, `CPA_API_KEY` | CPA LLM provider (secrets) | for CPA |
-| `OPENCODE_API_KEY` | OpenCode Zen LLM provider (secret) | for OpenCode |
+| `OPENCODE2API_BASE_URL1`, `OPENCODE2API_BASE_URL`, `OPENCODE2API_BASE_URL2`, `OPENCODE2API_API_KEY` | opencode2api proxy LLM provider (secrets, BASE_URL1 primary) | for opencode |
 | `.env` | Any of the above; auto-loaded from the repo root or `github_bot/` | optional |
 
 Provider/model definitions live in `github_bot/config/LLM_config.example.json`

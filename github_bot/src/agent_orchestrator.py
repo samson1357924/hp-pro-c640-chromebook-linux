@@ -100,7 +100,7 @@ class AgentOrchestrator:
                 continue
 
             role_prompt = self.load_role_prompt(role_def["promptFile"])
-            model_id = role_def.get("model", "ling-3.0-flash-free")
+            model_id = role_def.get("model", "opencode/muse-spark-1.3-contributor-free")
             temperature = float(role_def.get("temperature", 0.1))
             max_tokens = int(role_def.get("maxTokens", 4096))
 
@@ -164,7 +164,7 @@ class AgentOrchestrator:
         """Execute the Issue Triage Agent with 0-100 quality scoring and root cause hypotheses."""
         role_def = self.config.get("roles", {}).get("triage_agent", {})
         role_prompt = self.load_role_prompt(role_def.get("promptFile", "./prompts/roles/triage_agent.md"))
-        model_id = role_def.get("model", "deepseek-v4-flash-free")
+        model_id = role_def.get("model", "opencode/muse-spark-1.3-contributor-free")
         temperature = float(role_def.get("temperature", 0.2))
         max_tokens = int(role_def.get("maxTokens", 6144))
 
@@ -255,7 +255,7 @@ class AgentOrchestrator:
         """Generate a maintainer-friendly plain language summary."""
         role_def = self.config.get("roles", {}).get("explainer_agent", {})
         role_prompt = self.load_role_prompt(role_def.get("promptFile", "./prompts/roles/explainer_agent.md"))
-        model_id = role_def.get("model", "deepseek-v4-flash-free")
+        model_id = role_def.get("model", "opencode/muse-spark-1.3-contributor-free")
 
         system_instruction = f"{self.soul_prompt}\n\n---\n\n{role_prompt}"
         user_payload = (
