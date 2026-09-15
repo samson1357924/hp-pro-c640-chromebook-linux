@@ -32,6 +32,79 @@ OPENCODE_BASE_URL_ENV_PRIORITY = (
     "OPENCODE2API_BASE_URL2",
 )
 
+RE_GEMINI_FLASH_HIGH = re.compile(
+    r"^(?:(?P<namespace>[a-zA-Z0-9_\-\.]+)/)?gemini-(?P<version>\d+(?:\.\d+)*)-flash-high(?:-(?P<variant>[a-zA-Z0-9_\-]+))?$",
+    re.IGNORECASE,
+)
+
+RE_MUSE_SPARK = re.compile(
+    r"^(?:(?P<namespace>[a-zA-Z0-9_\-\.]+)/)?muse-spark-(?P<version>\d+(?:\.\d+)*)(?:-(?P<variant>[a-zA-Z0-9_\-]+))?$",
+    re.IGNORECASE,
+)
+
+
+def parse_version_tuple(version_str: str | None) -> tuple[int, ...]:
+    """Parse '3.8' -> (3, 8), '1.3.1' -> (1, 3, 1). Returns (0,) on failure."""
+    if not isinstance(version_str, str):
+        return (0,)
+    try:
+        parts = [int(p) for p in version_str.split(".") if p.isdigit()]
+        return tuple(parts) if parts else (0,)
+    except (ValueError, TypeError):
+        return (0,)
+
+
+def _variant_priority(family_name: str, variant: str | None) -> int:
+    """Return priority score for variants of the same version (higher is better)."""
+    v = (variant or "").lower()
+    if family_name == "muse-spark":
+        if "contributor" in v:
+            return 3
+        if "free" in v:
+            return 2
+        return 1
+    elif family_name == "gemini-flash-high":
+        if not v:
+            return 3
+        if "preview" in v or "exp" in v:
+            return 1
+        return 2
+    return 0
+
+
+VIRTUAL_MODEL_ALIASES: dict[str, dict[str, Any]] = {
+    "gemini-latest-flash-high": {
+        "family": "gemini-flash-high",
+        "pattern": RE_GEMINI_FLASH_HIGH,
+        "provider": "cpa",
+        "offline_default": "gemini-3.8-flash-high",
+    },
+    "cpa/gemini-latest-flash-high": {
+        "family": "gemini-flash-high",
+        "pattern": RE_GEMINI_FLASH_HIGH,
+        "provider": "cpa",
+        "offline_default": "gemini-3.8-flash-high",
+    },
+    "opencode/muse-spark-latest": {
+        "family": "muse-spark",
+        "pattern": RE_MUSE_SPARK,
+        "provider": "opencode",
+        "offline_default": "opencode/muse-spark-1.3-contributor-free",
+    },
+    "opencode2api/muse-spark-latest": {
+        "family": "muse-spark",
+        "pattern": RE_MUSE_SPARK,
+        "provider": "opencode",
+        "offline_default": "opencode/muse-spark-1.3-contributor-free",
+    },
+    "muse-spark-latest": {
+        "family": "muse-spark",
+        "pattern": RE_MUSE_SPARK,
+        "provider": "opencode",
+        "offline_default": "opencode/muse-spark-1.3-contributor-free",
+    },
+}
+
 
 class LLMClientError(RuntimeError):
     """Raised when an LLM call fails or returns an unusable completion."""
@@ -331,12 +404,20 @@ class LLMClient:
                             seen.add(mid)
                             model_list.append(mid)
                             if mid not in self.models:
+                                low_mid = mid.lower()
+                                is_multimodal = (
+                                    "gemini" in low_mid
+                                    or "mimo" in low_mid
+                                    or "vision" in low_mid
+                                    or "claude" in low_mid
+                                )
+                                inputs = ["text", "image"] if is_multimodal else ["text"]
                                 self.models[mid] = {
                                     "id": mid,
                                     "name": item.get("name", mid),
                                     "description": f"Dynamically discovered model from {pname}",
                                     "_provider": pname,
-                                    "input": ["text"],
+                                    "input": inputs,
                                     "output": ["text"],
                                 }
                     # First healthy base wins for discovery; chat path still
@@ -355,16 +436,76 @@ class LLMClient:
             self._discovery_cache_time = time.monotonic()
         return {k: list(v) for k, v in discovered.items()}
 
+    def get_family_versions(self, family_or_alias: str) -> list[str]:
+        """Return all known/discovered versions of a family sorted newest first."""
+        if self._discovery_cache is None:
+            try:
+                self.discover_models()
+            except Exception:
+                pass
+
+        spec = VIRTUAL_MODEL_ALIASES.get(family_or_alias)
+        family_name = spec["family"] if spec else family_or_alias
+        pattern = spec["pattern"] if spec else (
+            RE_MUSE_SPARK if family_name == "muse-spark" else RE_GEMINI_FLASH_HIGH
+        )
+        offline_default = spec["offline_default"] if spec else (
+            "opencode/muse-spark-1.3-contributor-free" if family_name == "muse-spark" else "gemini-3.8-flash-high"
+        )
+        expected_provider = spec.get("provider") if spec else (
+            "opencode" if family_name == "muse-spark" else "cpa"
+        )
+
+        candidates: set[str] = set()
+        if self._discovery_cache:
+            if expected_provider == "opencode":
+                for k in ("opencode", "opencode2api"):
+                    candidates.update(self._discovery_cache.get(k, []))
+            elif expected_provider in self._discovery_cache:
+                candidates.update(self._discovery_cache.get(expected_provider, []))
+            else:
+                for p_models in self._discovery_cache.values():
+                    candidates.update(p_models)
+
+        for mid, minfo in self.models.items():
+            mp = minfo.get("_provider")
+            if not expected_provider or mp == expected_provider or (expected_provider == "opencode" and mp in OPENCODE_PROVIDER_NAMES):
+                candidates.add(mid)
+
+        matched: list[tuple[tuple[int, ...], int, str]] = []
+        for mid in sorted(candidates):
+            m = pattern.match(mid)
+            if m:
+                ver = parse_version_tuple(m.group("version"))
+                var_score = _variant_priority(family_name, m.group("variant"))
+                matched.append((ver, var_score, mid))
+
+        if matched:
+            matched.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            res: list[str] = []
+            for item in matched:
+                if item[2] not in res:
+                    res.append(item[2])
+            return res
+
+        return [offline_default]
+
+    def resolve_model_id(self, model_id: str) -> str:
+        """Resolve a virtual alias to the highest active physical model ID."""
+        if model_id in VIRTUAL_MODEL_ALIASES:
+            versions = self.get_family_versions(model_id)
+            return versions[0]
+        return model_id
+
     def get_dynamic_fallback_chain(self, configured_fallbacks: list[str] | None = None) -> list[str]:
         """Build prioritized fallback chain: Configured -> Dynamic opencode2api -> Dynamic CPA."""
         chain: list[str] = []
 
-        # 1. Configured fallbacks in prioritized order (muse-spark first per policy)
-        for m in (configured_fallbacks or []):
-            if m and m not in chain:
-                chain.append(m)
+        def _append(mid: str) -> None:
+            if mid and mid not in chain:
+                chain.append(mid)
 
-        # 2. Discover live active models from providers
+        # 1. Discover live active models from providers first so cache is warm for alias expansion
         try:
             discovered = self.discover_models()
         except Exception as exc:
@@ -373,42 +514,59 @@ class LLMClient:
             print(f"[LLM] dynamic fallback discovery failed: {type(exc).__name__}", file=sys.stderr)
             discovered = {}
 
-        # 3. Append verified active opencode2api proxy models (muse-spark priority)
-        def _muse_spark_rank(mid: str) -> tuple[int, str]:
-            low = mid.lower()
-            if "muse-spark-1.3" in low:
-                return (0, mid)
-            if "muse-spark-1.2" in low:
-                return (1, mid)
-            if "muse-spark" in low:
-                return (2, mid)
-            return (3, mid)
+        # 2. Configured fallbacks in prioritized order (aliases expanded into versions newest first)
+        for m in (configured_fallbacks or []):
+            if not m:
+                continue
+            if m in VIRTUAL_MODEL_ALIASES:
+                for ver in self.get_family_versions(m):
+                    _append(ver)
+            else:
+                _append(self.resolve_model_id(m))
+
+        # 3. Append verified active opencode2api proxy models (muse-spark sorted newest first)
+        for ver in self.get_family_versions("muse-spark"):
+            _append(ver)
 
         opencode_free: list[str] = []
         for key in ("opencode", "opencode2api"):
             opencode_free.extend(discovered.get(key, []))
-        for m in sorted(dict.fromkeys(opencode_free), key=_muse_spark_rank):
-            if m not in chain:
-                chain.append(m)
+        for m in opencode_free:
+            _append(m)
 
-        # 4. Append remaining live CPA models (excluding image generation)
+        # 4. Append live CPA models (gemini-flash-high sorted newest first, excluding image generation)
+        for ver in self.get_family_versions("gemini-flash-high"):
+            _append(ver)
+
         for m in discovered.get("cpa", []):
-            if m not in chain and not m.startswith("vertex/imagen") and not m.startswith("imagen-"):
-                chain.append(m)
+            if not m.startswith("vertex/imagen") and not m.startswith("imagen-"):
+                _append(m)
 
         return chain
 
     def get_provider_for_model(self, model_id: str) -> dict[str, Any]:
         """Resolve the provider definition for a specific model ID."""
+        if model_id in VIRTUAL_MODEL_ALIASES:
+            spec_provider = VIRTUAL_MODEL_ALIASES[model_id].get("provider")
+            if spec_provider and spec_provider in self.providers:
+                return self.providers[spec_provider]
+
+        resolved = self.resolve_model_id(model_id)
+        if resolved in self.models:
+            pname = self.models[resolved].get("_provider", self.default_provider)
+            return self.providers.get(pname, {})
         if model_id in self.models:
             pname = self.models[model_id].get("_provider", self.default_provider)
             return self.providers.get(pname, {})
-        # opencode*/ namespaced IDs always route to the proxy provider even
-        # before discovery has registered them.
-        if isinstance(model_id, str) and model_id.startswith(("opencode/", "opencode2api/")):
+        # opencode*/ namespaced IDs or muse-spark family always route to opencode proxy
+        low = resolved.lower()
+        if low.startswith(("opencode/", "opencode2api/")) or "muse-spark" in low:
             for pname in ("opencode", "opencode2api"):
                 if pname in self.providers:
                     return self.providers[pname]
+        if low.startswith("cpa/") or "gemini" in low or "grok" in low or "claude" in low:
+            if "cpa" in self.providers:
+                return self.providers["cpa"]
         # Fallback to default provider
         return self.providers.get(self.default_provider, {})
 
@@ -425,11 +583,28 @@ class LLMClient:
         fallback_models: list[str] | None = None,
     ) -> str:
         """Call an LLM model with automatic retry on truncation and fallback model support."""
-        models_to_try = [model_id]
+        models_to_try: list[str] = []
+        if model_id in VIRTUAL_MODEL_ALIASES:
+            for m in self.get_family_versions(model_id):
+                if m and m not in models_to_try:
+                    models_to_try.append(m)
+        else:
+            resolved_primary = self.resolve_model_id(model_id)
+            if resolved_primary not in models_to_try:
+                models_to_try.append(resolved_primary)
+
         if fallback_models:
             for f in fallback_models:
-                if f and f not in models_to_try:
-                    models_to_try.append(f)
+                if not f:
+                    continue
+                if f in VIRTUAL_MODEL_ALIASES:
+                    for m in self.get_family_versions(f):
+                        if m and m not in models_to_try:
+                            models_to_try.append(m)
+                else:
+                    resolved_f = self.resolve_model_id(f)
+                    if resolved_f not in models_to_try:
+                        models_to_try.append(resolved_f)
 
         last_error: LLMClientError | None = None
         for current_model in models_to_try:
@@ -773,7 +948,10 @@ def _normalize_content(content: Any) -> str:
 
 
 def _prepare_messages_for_model(messages: list[ChatMessage], model_info: dict[str, Any]) -> list[ChatMessage]:
-    supports_multimodal = any(t in (model_info.get("input") or ["text"]) for t in ["image", "video", "audio"])
+    mid_low = (model_info.get("id") or "").lower()
+    supports_multimodal = any(
+        t in (model_info.get("input") or ["text"]) for t in ["image", "video", "audio"]
+    ) or ("gemini" in mid_low or "mimo" in mid_low)
     requires_string = bool((model_info.get("compat") or {}).get("requiresStringContent"))
 
     prepared: list[ChatMessage] = []

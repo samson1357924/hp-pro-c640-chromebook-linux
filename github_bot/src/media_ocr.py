@@ -90,7 +90,7 @@ class MediaOcrProcessor:
         self.llm_client = llm_client
         self.config = config.get("mediaOcr", {})
         self.enabled = bool(self.config.get("enabled", True))
-        self.model_id = self.config.get("model", "gemini-3.7-flash-high")
+        self.model_id = self.config.get("model", "gemini-latest-flash-high")
         self.max_items = int(self.config.get("maxItems", 4))
         self.max_bytes = int(self.config.get("maxBytesPerItem", MAX_MEDIA_BYTES))
 

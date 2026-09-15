@@ -55,9 +55,131 @@ class TestLLMClientConfig(unittest.TestCase):
         chain = client.get_dynamic_fallback_chain(["model-a", "model-b", "model-a"])
         self.assertEqual(chain[:2], ["model-a", "model-b"])
 
+    def test_version_parsing_and_sorting(self) -> None:
+        from llm_client import parse_version_tuple
+        self.assertEqual(parse_version_tuple("3.8"), (3, 8))
+        self.assertEqual(parse_version_tuple("3.10"), (3, 10))
+        self.assertGreater(parse_version_tuple("3.10"), parse_version_tuple("3.9"))
+        self.assertGreater(parse_version_tuple("3.8"), parse_version_tuple("3.7"))
+        self.assertGreater(parse_version_tuple("1.3"), parse_version_tuple("1.2"))
+        self.assertEqual(parse_version_tuple("invalid"), (0,))
+        # Type safety: non-string arguments must return (0,)
+        self.assertEqual(parse_version_tuple(None), (0,))
+        self.assertEqual(parse_version_tuple(123), (0,))
+        self.assertEqual(parse_version_tuple([]), (0,))
+
+    def test_resolve_model_alias_with_discovery_cache(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        client._discovery_cache = {
+            "cpa": ["gemini-3.6-flash-high", "gemini-3.8-flash-high", "gemini-3.7-flash-high"],
+            "opencode": [
+                "opencode/muse-spark-1.2-contributor-free",
+                "opencode/muse-spark-1.3-contributor-free",
+            ],
+        }
+        import time
+        client._discovery_cache_time = time.monotonic()
+
+        self.assertEqual(client.resolve_model_id("gemini-latest-flash-high"), "gemini-3.8-flash-high")
+        self.assertEqual(client.resolve_model_id("cpa/gemini-latest-flash-high"), "gemini-3.8-flash-high")
+        self.assertEqual(
+            client.resolve_model_id("opencode/muse-spark-latest"),
+            "opencode/muse-spark-1.3-contributor-free",
+        )
+        self.assertEqual(
+            client.resolve_model_id("muse-spark-latest"),
+            "opencode/muse-spark-1.3-contributor-free",
+        )
+        self.assertEqual(client.resolve_model_id("grok-4.6"), "grok-4.6")
+
+    def test_resolve_model_alias_dynamic_upgrade(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        client._discovery_cache = {
+            "cpa": ["gemini-3.6-flash-high", "gemini-3.9-flash-high", "gemini-3.8-flash-high"],
+            "opencode": [
+                "opencode/muse-spark-1.4-contributor-free",
+                "opencode/muse-spark-1.3-contributor-free",
+            ],
+        }
+        import time
+        client._discovery_cache_time = time.monotonic()
+
+        self.assertEqual(client.resolve_model_id("gemini-latest-flash-high"), "gemini-3.9-flash-high")
+        self.assertEqual(
+            client.resolve_model_id("opencode/muse-spark-latest"),
+            "opencode/muse-spark-1.4-contributor-free",
+        )
+
+    def test_resolve_model_alias_offline_default(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        client._discovery_cache = {}
+        import time
+        client._discovery_cache_time = time.monotonic()
+
+        self.assertEqual(client.resolve_model_id("gemini-latest-flash-high"), "gemini-3.8-flash-high")
+        self.assertEqual(
+            client.resolve_model_id("opencode/muse-spark-latest"),
+            "opencode/muse-spark-1.3-contributor-free",
+        )
+
+    def test_cold_start_discovery_and_fallback_chain_ordering(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        # Mock discover_models to simulate discovering 3.9 on cold start
+        def fake_discover(*args, **kwargs):
+            client._discovery_cache = {
+                "cpa": ["gemini-3.6-flash-high", "gemini-3.9-flash-high", "gemini-3.8-flash-high"],
+                "opencode": ["opencode/muse-spark-1.4-contributor-free"],
+            }
+            import time
+            client._discovery_cache_time = time.monotonic()
+            return client._discovery_cache
+
+        client.discover_models = fake_discover
+        # On cold start (_discovery_cache is None), get_dynamic_fallback_chain must discover first
+        # and expand gemini-latest-flash-high with 3.9 ahead of 3.8
+        chain = client.get_dynamic_fallback_chain(["gemini-latest-flash-high"])
+        self.assertEqual(chain[0], "gemini-3.9-flash-high")
+        self.assertEqual(chain[1], "gemini-3.8-flash-high")
+
+    def test_provider_isolation_in_family_versions(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        # Inject an opencode model with gemini in name
+        client._discovery_cache = {
+            "opencode": ["opencode/gemini-9.9-flash-high", "opencode/muse-spark-1.3-contributor-free"],
+            "cpa": ["gemini-3.8-flash-high"],
+        }
+        import time
+        client._discovery_cache_time = time.monotonic()
+        # gemini-latest-flash-high is CPA only and must NOT be hijacked by opencode
+        versions = client.get_family_versions("gemini-latest-flash-high")
+        self.assertEqual(versions[0], "gemini-3.8-flash-high")
+        self.assertNotIn("opencode/gemini-9.9-flash-high", versions)
+
+    def test_get_provider_for_model_routing(self) -> None:
+        from llm_client import LLMClient
+        client = LLMClient()
+        client.providers = {
+            "opencode": {"name": "opencode"},
+            "cpa": {"name": "cpa"},
+        }
+        # Direct virtual aliases
+        self.assertEqual(client.get_provider_for_model("gemini-latest-flash-high")["name"], "cpa")
+        self.assertEqual(client.get_provider_for_model("opencode/muse-spark-latest")["name"], "opencode")
+        # Prefix routing
+        self.assertEqual(client.get_provider_for_model("cpa/custom-model")["name"], "cpa")
+        self.assertEqual(client.get_provider_for_model("opencode/custom-model")["name"], "opencode")
+
     def test_sanitize_model_name_for_display(self) -> None:
         from llm_client import sanitize_model_name_for_display
+        self.assertEqual(sanitize_model_name_for_display("gemini-3.8-flash-high"), "gemini-3.8-flash")
         self.assertEqual(sanitize_model_name_for_display("gemini-3.7-flash-high"), "gemini-3.7-flash")
+        self.assertEqual(sanitize_model_name_for_display("gemini-latest-flash-high"), "gemini-latest-flash")
+        self.assertEqual(sanitize_model_name_for_display("opencode/muse-spark-latest"), "muse-spark-latest")
         self.assertEqual(sanitize_model_name_for_display("opencode/muse-spark-1.3-contributor-free"), "muse-spark-1.3-contributor")
         self.assertEqual(sanitize_model_name_for_display("opencode/muse-spark-1.2-contributor-free"), "muse-spark-1.2-contributor")
         self.assertEqual(sanitize_model_name_for_display("opencode/nemotron-3-ultra-free"), "nemotron-3-ultra")
@@ -382,6 +504,25 @@ class TestGithubRunnerFlows(unittest.TestCase):
         )
         findings = scanner.scan_diff_file("scripts/test.sh", patch)
         self.assertTrue(any(f.rule_id == "C640-SH-001" and f.line_number == 12 for f in findings))
+
+    def test_orchestrator_resolves_role_fallbacks(self) -> None:
+        from agent_orchestrator import AgentOrchestrator
+        from llm_client import LLMClient
+        client = LLMClient()
+        client._discovery_cache = {}
+        import time
+        client._discovery_cache_time = time.monotonic()
+
+        orch = AgentOrchestrator(Path(__file__).resolve().parents[1], client)
+        # Role with custom fallbackModels
+        role_custom = {"model": "opencode/muse-spark-latest", "fallbackModels": ["gemini-latest-flash-high"]}
+        chain = orch._resolve_role_fallbacks(role_custom)
+        self.assertIn("gemini-3.8-flash-high", chain)
+
+        # Role defaulting to global fallbackModels
+        role_default = {"model": "custom"}
+        chain_default = orch._resolve_role_fallbacks(role_default)
+        self.assertTrue(len(chain_default) > 0)
 
 
 if __name__ == "__main__":

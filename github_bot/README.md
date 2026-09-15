@@ -24,6 +24,11 @@ Production multi-agent GitHub review and issue triage bot for
      `OPENCODE2API_BASE_URL`, `OPENCODE2API_BASE_URL2`, and
      `OPENCODE2API_API_KEY` from repository secrets
      (`OPENCODE_API_KEY` is deprecated).
+   - Automatic live model discovery from `/models` endpoints with
+     semantic version sorting (e.g. Gemini 3.8 > 3.7 > 3.6).
+   - Virtual aliases (`gemini-latest-flash-high`,
+     `opencode/muse-spark-latest`) automatically resolve to the
+     highest verified active model release.
    - Automatic retry on token truncation with doubled token budgets.
 
 3. **🔍 Deterministic Rule Pre-Scanner**:
@@ -78,6 +83,23 @@ ISSUE_TITLE="[Bug]: No sound after installing Ubuntu 24.04" \
 ISSUE_BODY="Sound card shows Dummy Output in settings. aplay -l shows card 0 sofrt5682." \
 python3 github_bot/src/github_runner.py --mode=triage --dry-run
 ```
+
+---
+
+## 🤖 Dynamic Model Discovery & Virtual Aliases
+
+The bot automatically discovers active models via provider `/models` endpoints.
+Virtual aliases resolve dynamically to the newest available release:
+
+| Virtual Alias | Target Provider | Pattern / Family | Static Fallback |
+|---|---|---|---|
+| `gemini-latest-flash-high` | CPA | `gemini-*-flash-high` | `gemini-3.8-flash-high` |
+| `opencode/muse-spark-latest` | opencode2api proxy | `opencode/muse-spark-*` | `opencode/muse-spark-1.3-contributor-free` |
+
+- **Version Precedence**: Higher semantic versions always precede older
+  releases (e.g. 3.8 before 3.7 before 3.6, and 1.3 before 1.2).
+- **Per-Role Fallback Chains**: Roles can define specialized fallback
+  sequences, ensuring immediate cross-provider redundancy.
 
 ---
 

@@ -89,6 +89,19 @@
     "timeoutSeconds": 420,
     "models": [
       {
+        "id": "gemini-3.8-flash-high",
+        "name": "Gemini 3.8 Flash High",
+        "description": "Google Gemini 3.8 Flash High reasoning model via CPA",
+        "input": ["text", "image", "audio", "video"],
+        "output": ["text"],
+        "reasoning": true,
+        "reasoningEffort": "high",
+        "maxContextTokens": 1048576,
+        "maxOutputTokens": 65536,
+        "contextWindow": 1048576,
+        "maxTokens": 65536
+      },
+      {
         "id": "gemini-3.7-flash-high",
         "name": "Gemini 3.7 Flash High",
         "description": "Google Gemini 3.7 Flash High reasoning model via CPA",

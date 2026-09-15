@@ -14,24 +14,24 @@
   "maxDiffChars": 180000,
   "maxIssueBodyChars": 40000,
   "codingModels": [
-    "opencode/muse-spark-1.3-contributor-free",
-    "gemini-3.7-flash-high",
+    "opencode/muse-spark-latest",
+    "gemini-latest-flash-high",
     "grok-4.6"
   ],
   "fallbackModels": [
-    "opencode/muse-spark-1.3-contributor-free",
+    "opencode/muse-spark-latest",
+    "gemini-latest-flash-high",
     "opencode/muse-spark-1.2-contributor-free",
-    "gemini-3.7-flash-high",
     "grok-4.6",
     "claude-opus-4-6-thinking",
     "gemini-3.6-flash-high",
     "opencode/mimo-v2.5-free"
   ],
-  "fallbackModel": "gemini-3.7-flash-high",
+  "fallbackModel": "gemini-latest-flash-high",
   "dynamicModelDiscovery": true,
   "mediaOcr": {
     "enabled": true,
-    "model": "gemini-3.7-flash-high",
+    "model": "gemini-latest-flash-high",
     "fallbackModels": [
       "opencode/mimo-v2.5-free",
       "grok-4.6"
@@ -56,7 +56,10 @@
   },
   "roles": {
     "hardware_driver": {
-      "model": "gemini-3.7-flash-high",
+      "model": "opencode/muse-spark-latest",
+      "fallbackModels": [
+        "gemini-latest-flash-high"
+      ],
       "description": "Hardware, ALSA UCM2, libfprint C driver, udev, hwdb, and EC safety reviewer",
       "promptFile": "./prompts/roles/reviewer_hardware_driver.md",
       "temperature": 0.1,
@@ -64,7 +67,10 @@
       "reasoningEffort": "high"
     },
     "script_safety": {
-      "model": "gemini-3.7-flash-high",
+      "model": "gemini-latest-flash-high",
+      "fallbackModels": [
+        "opencode/muse-spark-latest"
+      ],
       "description": "Shell script safety, root privilege isolation, backup/manifest, and ShellCheck reviewer",
       "promptFile": "./prompts/roles/reviewer_script_safety.md",
       "temperature": 0.1,
@@ -72,7 +78,10 @@
       "reasoningEffort": "high"
     },
     "docs_public": {
-      "model": "gemini-3.7-flash-high",
+      "model": "gemini-latest-flash-high",
+      "fallbackModels": [
+        "opencode/muse-spark-latest"
+      ],
       "description": "Bilingual documentation (EN/ZH), REUSE/SPDX licensing, and MarkdownLint reviewer",
       "promptFile": "./prompts/roles/reviewer_docs_public.md",
       "temperature": 0.2,
@@ -80,7 +89,10 @@
       "reasoningEffort": "high"
     },
     "triage_agent": {
-      "model": "opencode/muse-spark-1.3-contributor-free",
+      "model": "opencode/muse-spark-latest",
+      "fallbackModels": [
+        "gemini-latest-flash-high"
+      ],
       "description": "Issue investigator: decision-first classification, quality scoring, missing-info checklist, and root-cause hypotheses",
       "promptFile": "./prompts/roles/triage_agent.md",
       "temperature": 0.2,
@@ -89,6 +101,10 @@
     },
     "explainer_agent": {
       "model": "grok-4.6",
+      "fallbackModels": [
+        "gemini-latest-flash-high",
+        "opencode/muse-spark-latest"
+      ],
       "description": "Plain-language PR and Issue explainer for maintainers",
       "promptFile": "./prompts/roles/explainer_agent.md",
       "temperature": 0.3,
