@@ -25,13 +25,23 @@ save_state() {
         pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
         case "$pct" in
             '' | *[!0-9]*) curr="" ;;
-            *) max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp" in '' | *[!0-9]* ) max_tmp=100;; esac; [ "$max_tmp" -eq 0 ] && max_tmp=100; curr=$((pct * max_tmp / 100)) ;;
+            *)
+                max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
+                case "$max_tmp" in '' | *[!0-9]*) max_tmp=100 ;; esac
+                [ "$max_tmp" -eq 0 ] && max_tmp=100
+                curr=$((pct * max_tmp / 100))
+                ;;
         esac
     elif [ -x /usr/local/bin/ectool ]; then
         pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
         case "$pct" in
             '' | *[!0-9]*) curr="" ;;
-            *) max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp" in '' | *[!0-9]* ) max_tmp=100;; esac; [ "$max_tmp" -eq 0 ] && max_tmp=100; curr=$((pct * max_tmp / 100)) ;;
+            *)
+                max_tmp="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
+                case "$max_tmp" in '' | *[!0-9]*) max_tmp=100 ;; esac
+                [ "$max_tmp" -eq 0 ] && max_tmp=100
+                curr=$((pct * max_tmp / 100))
+                ;;
         esac
     else
         curr=""
@@ -78,13 +88,23 @@ restore_state() {
         pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
         case "$pct" in
             '' | *[!0-9]*) curr="0" ;;
-            *) max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp2" in '' | *[!0-9]* ) max_tmp2=100;; esac; [ "$max_tmp2" -eq 0 ] && max_tmp2=100; curr=$((pct * max_tmp2 / 100)) ;;
+            *)
+                max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
+                case "$max_tmp2" in '' | *[!0-9]*) max_tmp2=100 ;; esac
+                [ "$max_tmp2" -eq 0 ] && max_tmp2=100
+                curr=$((pct * max_tmp2 / 100))
+                ;;
         esac
     elif [ -x /usr/local/bin/ectool ]; then
         pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
         case "$pct" in
             '' | *[!0-9]*) curr="0" ;;
-            *) max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"; case "$max_tmp2" in '' | *[!0-9]* ) max_tmp2=100;; esac; [ "$max_tmp2" -eq 0 ] && max_tmp2=100; curr=$((pct * max_tmp2 / 100)) ;;
+            *)
+                max_tmp2="$(cat "$SYSFS_MAX" 2> /dev/null || echo 100)"
+                case "$max_tmp2" in '' | *[!0-9]*) max_tmp2=100 ;; esac
+                [ "$max_tmp2" -eq 0 ] && max_tmp2=100
+                curr=$((pct * max_tmp2 / 100))
+                ;;
         esac
     else
         curr="0"

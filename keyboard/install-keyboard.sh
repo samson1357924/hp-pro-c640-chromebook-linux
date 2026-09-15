@@ -234,12 +234,20 @@ uninstall_keyboard() {
                 sudo rm -f "/run/user/$ruid/c640-kbd-backlight.state" 2> /dev/null || true
                 sudo rm -f "/run/user/$ruid/c640-kbd-backlight.lock" 2> /dev/null || true
                 sudo rm -f "/run/user/$ruid/c640-kbd-backlight.state.lock" 2> /dev/null || true
-                sudo rm -rf "${TMPDIR:-/tmp}/c640-kbd-$ruid" 2> /dev/null || true
+                local kbd_tmpdir
+                kbd_tmpdir="${TMPDIR:-/tmp}/c640-kbd-$ruid"
+                if [ -n "$kbd_tmpdir" ] && [ "$kbd_tmpdir" != "/" ] && [ "$kbd_tmpdir" != "/tmp" ]; then
+                    sudo rm -rf -- "$kbd_tmpdir" 2> /dev/null || true
+                fi
             fi
         fi
         # Also clean fallback tmp for root
         sudo rm -rf /tmp/c640-kbd-0 2> /dev/null || true
-        sudo rm -rf "${TMPDIR:-/tmp}/c640-kbd-$(id -u 2> /dev/null || echo 0)" 2> /dev/null || true
+        local root_tmpdir
+        root_tmpdir="${TMPDIR:-/tmp}/c640-kbd-$(id -u 2> /dev/null || echo 0)"
+        if [ -n "$root_tmpdir" ] && [ "$root_tmpdir" != "/" ] && [ "$root_tmpdir" != "/tmp" ]; then
+            sudo rm -rf -- "$root_tmpdir" 2> /dev/null || true
+        fi
     else
         log_dryrun "Would run: systemd-hwdb update, udevadm trigger, daemon-reload, restore brightness, clean state"
         log_dryrun "Would clean: /run/c640-kbd-backlight/state, /run/user/\$UID/c640-kbd-backlight.state*, TMPDIR fallback"

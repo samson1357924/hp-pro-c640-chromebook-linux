@@ -212,15 +212,16 @@ jobs:
           USER=smoketest ./keyboard/install-keyboard.sh --install
           test -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb
           test -f /etc/udev/rules.d/61-chromeos-kbd-backlight.rules
-          python3 -c '
+          python3 <<'PYEOF'
           import json, glob
           d=json.load(open("/var/lib/cros-enablement/install-manifest.json"))
           # first-wins: only single backup for hwdb
           hwdb_backups=glob.glob("/var/lib/cros-enablement/backups/keyboard/*90-chromebook*")
           assert len(hwdb_backups) <= 1, f"double-install created extra backups: {hwdb_backups}"
           # 5 records expected for keyboard (hwdb+udev+daemon+service+sleep)
-          assert len(d.get("records",[])) == 5, f"records={d.get(\"records\")}"
-          '
+          recs=d.get("records",[])
+          assert len(recs) == 5, f"records={recs}"
+          PYEOF
 
       - name: Install keyd Dual-Role (optional)
         run: |
@@ -231,7 +232,7 @@ jobs:
           test -L /etc/keyd/default.conf
           test "$(readlink /etc/keyd/default.conf)" = "cros.conf"
           # keyd check already validated in lint job, but verify file exists
-          cat /etc/keyd/cros.conf | grep -q "leftmeta = overload"
+          grep -q "leftmeta = overload" /etc/keyd/cros.conf
 
       - name: Uninstall Round-Trip (manifest rollback)
         run: |

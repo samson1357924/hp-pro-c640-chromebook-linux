@@ -445,10 +445,10 @@ fi
 
 # Start login1 monitor in background if dbus-monitor available (with retry)
 if command -v dbus-monitor > /dev/null 2>&1; then
-    ( while true; do
+    (while true; do
         monitor_login1 || log "login1 monitor exited $?, retry in 2s"
         sleep 2
-    done ) &
+    done) &
 fi
 
 # Main screensaver monitor (foreground) with retry to avoid Restart storm
