@@ -17,8 +17,13 @@ Production multi-agent GitHub review and issue triage bot for
      GitHub API and only reviewed when opened by a trusted author (OWNER / MEMBER / COLLABORATOR).
 
 2. **⚡ Multi-Provider LLM Engine**:
-   - Native integration with **opencode2api proxy** (OpenAI-compatible, `OPENCODE2API_BASE_URL1` primary) and **CPA** (`responses` API).
-   - Reads `CPA_BASE_URL`, `CPA_API_KEY`, `OPENCODE2API_BASE_URL1`, `OPENCODE2API_BASE_URL`, `OPENCODE2API_BASE_URL2`, and `OPENCODE2API_API_KEY` from repository secrets (`OPENCODE_API_KEY` is deprecated).
+   - Native integration with **opencode2api proxy**
+     (OpenAI-compatible, `OPENCODE2API_BASE_URL1` primary) and
+     **CPA** (`responses` API).
+   - Reads `CPA_BASE_URL`, `CPA_API_KEY`, `OPENCODE2API_BASE_URL1`,
+     `OPENCODE2API_BASE_URL`, `OPENCODE2API_BASE_URL2`, and
+     `OPENCODE2API_API_KEY` from repository secrets
+     (`OPENCODE_API_KEY` is deprecated).
    - Automatic retry on token truncation with doubled token budgets.
 
 3. **🔍 Deterministic Rule Pre-Scanner**:
