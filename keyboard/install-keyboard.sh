@@ -242,7 +242,11 @@ uninstall_keyboard() {
             fi
         fi
         # Also clean fallback tmp for root
-        sudo rm -rf /tmp/c640-kbd-0 2> /dev/null || true
+        local root_fallback
+        root_fallback="/tmp/c640-kbd-0"
+        if [ -n "$root_fallback" ] && [ "$root_fallback" != "/" ] && [ "$root_fallback" != "/tmp" ]; then
+            sudo rm -rf -- "$root_fallback" 2> /dev/null || true
+        fi
         local root_tmpdir
         root_tmpdir="${TMPDIR:-/tmp}/c640-kbd-$(id -u 2> /dev/null || echo 0)"
         if [ -n "$root_tmpdir" ] && [ "$root_tmpdir" != "/" ] && [ "$root_tmpdir" != "/tmp" ]; then
