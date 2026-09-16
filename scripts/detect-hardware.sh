@@ -94,16 +94,94 @@ run_diagnostic() {
         fprintd-list "$local_user" 2> /dev/null || log_warn "  fprintd returned non-zero. Device may not be registered yet."
     fi
 
-    # 4. Keyboard & Function Keys
-    log_step 4 6 "Keyboard Top-Row Action Mapping"
+    # 4. Keyboard & Function Keys (+ Backlight Sync)
+    log_step 4 6 "Keyboard Top-Row Action Mapping & Backlight Sync"
     if [ -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb ]; then
         log_success "  90-chromebook-keyboard.hwdb installed in /etc/udev/hwdb.d/"
+        if command -v systemd-hwdb > /dev/null 2>&1; then
+            if systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
+                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_db=leftmeta present)"
+            elif systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_ea=back"; then
+                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_ea present, but db missing - update hwdb)"
+            else
+                log_warn "  hwdb query for Dratini missing KEYBOARD_KEY_ea (run systemd-hwdb update)"
+            fi
+            for q in "evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"; do
+                if ! systemd-hwdb query "$q" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
+                    log_warn "  hwdb query missing db for $q"
+                fi
+            done
+        fi
     else
         log_warn "  Custom keyboard hwdb not deployed. Run './setup.sh --keyboard' to install."
     fi
 
+    if [ -f /etc/udev/rules.d/61-chromeos-kbd-backlight.rules ]; then
+        log_success "  61-chromeos-kbd-backlight.rules installed"
+    else
+        log_info "  Backlight udev rule not installed (optional, run './setup.sh --keyboard')"
+    fi
+
+    if [ -f /usr/local/bin/c640-kbd-backlight-sync ]; then
+        log_success "  c640-kbd-backlight-sync daemon installed at /usr/local/bin/c640-kbd-backlight-sync"
+        if [ -x /usr/local/bin/c640-kbd-backlight-sync ]; then
+            /usr/local/bin/c640-kbd-backlight-sync --check 2> /dev/null | sed 's/^/    /' || true
+        fi
+        if systemctl --global is-enabled c640-kbd-backlight-sync.service > /dev/null 2>&1; then
+            log_success "  Backlight user service enabled (global)"
+        else
+            log_warn "  Backlight user service not enabled (global)"
+        fi
+        if [ -f /etc/systemd/user/c640-kbd-backlight-sync.service ]; then
+            log_success "  Backlight user service file present"
+        fi
+    else
+        log_info "  Backlight daemon not installed (run './setup.sh --keyboard')"
+    fi
+
+    if [ -f /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh ]; then
+        log_success "  Backlight sleep hook present at /usr/lib/systemd/system-sleep/"
+    else
+        log_info "  Backlight sleep hook not installed"
+    fi
+
+    if [ -f /sys/class/leds/chromeos::kbd_backlight/brightness ]; then
+        local curr max
+        curr="$(cat /sys/class/leds/chromeos::kbd_backlight/brightness 2> /dev/null || echo "?")"
+        max="$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "?")"
+        log_info "  Current kbd backlight: $curr / $max"
+    else
+        log_warn "  No kbd backlight sysfs (/sys/class/leds/chromeos::kbd_backlight) - is this a hatch device?"
+    fi
+
     if systemctl is-active --quiet keyd 2> /dev/null; then
-        log_success "  keyd daemon is running for advanced dual-role key mapping."
+        log_success "  keyd daemon is running for advanced dual-role (Search tap=CapsLock hold=Super)"
+    elif systemctl is-enabled --quiet keyd 2> /dev/null; then
+        log_warn "  keyd is enabled but not active"
+    else
+        if [ -f /etc/keyd/cros.conf ] || [ -f /etc/keyd/default.conf ] || [ -L /etc/keyd/default.conf ]; then
+            log_info "  keyd config present but keyd not active (sudo systemctl enable --now keyd)"
+        else
+            log_info "  keyd not installed (optional, use --with-keyd)"
+        fi
+    fi
+    if [ -f /etc/keyd/cros.conf ]; then
+        log_success "  keyd config at /etc/keyd/cros.conf"
+        if command -v keyd > /dev/null 2>&1; then
+            if keyd check /etc/keyd/cros.conf > /dev/null 2>&1; then
+                log_success "  keyd config syntax valid"
+            else
+                log_warn "  keyd config syntax check failed for /etc/keyd/cros.conf"
+            fi
+        fi
+    fi
+    if [ -L /etc/keyd/default.conf ]; then
+        local kd_target
+        kd_target="$(readlink /etc/keyd/default.conf 2> /dev/null || echo "?")"
+        log_info "  keyd default.conf -> $kd_target"
+        if [ ! -e /etc/keyd/default.conf ]; then
+            log_warn "  keyd default.conf is dangling symlink"
+        fi
     fi
 
     # 5. Power & Battery Management

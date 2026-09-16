@@ -40,6 +40,7 @@ chmod +x keyboard/install-keyboard.sh
 * `./keyboard/install-keyboard.sh --check`：檢查 hwdb 是否已部署。
 * `./keyboard/install-keyboard.sh --dry-run`：預覽操作。
 * `./keyboard/install-keyboard.sh --uninstall`：還原 hwdb 變更。
+* `./keyboard/install-keyboard.sh --with-keyd`：連 keyd 一起安裝（進階雙重角色）。
 
 ---
 
@@ -47,27 +48,73 @@ chmod +x keyboard/install-keyboard.sh
 
 若希望 **Search 鍵** 呈現 **輕點為 CapsLock、長按為 Super/Meta**，或希望 `Search + 頂排` 輸出傳統 `F1-F10`：
 
-1. 安裝 `keyd`：
+> **前置條件：** 需先安裝選項 1 `systemd-hwdb`。`keyd` 依賴 hwdb 已將
+> `0xEA/0xE9/0xE7/0x91/0x92/0xEE/0xEF/0xA0/0xAE/0xB0/0xDB` 轉為
+> `KEY_BACK`/`KEY_LEFTMETA` 等，`cros.conf` 使用這些名稱（`back`、`leftmeta`）。
+> 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。
+
+1. 安裝 `keyd`（CI 固定 `v2.6.0` `7c0aecb8...`）：
 
    ```bash
-   # Ubuntu / Debian
-   sudo apt install -y keyd  # 或從 https://github.com/rvaiya/keyd 自行編譯
-   # Fedora
+   # Ubuntu 25.04+ / Debian 13+（原生）
+   sudo apt update && sudo apt install -y keyd
+
+   # Ubuntu 22.04/24.04 或 Debian 12（PPA）
+   sudo add-apt-repository ppa:keyd-team/ppa -y
+   sudo apt update && sudo apt install -y keyd
+   # 或從源碼固定編譯：
+   git clone --depth 1 --branch v2.6.0 https://github.com/rvaiya/keyd /tmp/keyd
+   test "$(git -C /tmp/keyd rev-parse HEAD)" = "7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3"
+   make -C /tmp/keyd && sudo make -C /tmp/keyd install
+
+   # Fedora（COPR）
+   sudo dnf copr enable alternateved/keyd -y
    sudo dnf install -y keyd
-   # Arch Linux
+
+   # Arch Linux（extra）
    sudo pacman -S keyd
+
+   # NixOS
+   # services.keyd.enable = true;
    ```
 
-2. 複製設定檔：
+2. 安裝設定檔（建議走安裝器）：
 
    ```bash
-   sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-   sudo systemctl enable --now keyd
+   sudo ./keyboard/install-keyboard.sh --with-keyd
+   # 等價手動：
+   # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
+   # sudo ln -sf cros.conf /etc/keyd/default.conf
+   # keyd check /etc/keyd/cros.conf
+   # sudo systemctl enable --now keyd
    ```
+
+3. 驗證與調校：
+
+   ```bash
+   keyd --version
+   sudo keyd monitor  # 短按 Search -> capslock，長按 -> leftmeta；Search+頂排 -> F1
+   sudo systemctl status keyd
+   journalctl -eu keyd -f
+   # 若輕點/長按太靈敏，於 /etc/keyd/cros.conf [global] 加入：
+   # overload_tap_timeout = 200  # ms，見 man keyd
+   # sudo keyd reload
+   ```
+
+   **GNOME Wayland 觸控板 quirk**（選用，修 `disable-while-typing` 卡頓）：
+
+   ```bash
+   sudo mkdir -p /etc/libinput
+   printf '[Keyd]\nMatchName=keyd virtual keyboard\nAttrKeyboardIntegration=internal\n' | sudo tee /etc/libinput/local-overrides.quirks > /dev/null
+   ```
+
+    **備註：**
+    * `X11` 使用者：`setxkbmap` 會在 `keyd restart` 後重置，需重套。
+    * `TTY` 由 `uinput` 支援；若設定鎖死，急救：`backspace+escape+enter`。
 
 ---
 
-### 選項 3：鍵盤背光與螢幕熄滅/鎖定同步（新增）
+### 選項 3：鍵盤背光與螢幕熄滅/鎖定同步
 
 螢幕熄滅/鎖定時自動關閉鍵盤背光，螢幕點亮時自動恢復。支援 GNOME Wayland
 閒置（`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` 對應 S3 盒蓋）與 ChromeOS EC
@@ -76,9 +123,11 @@ chmod +x keyboard/install-keyboard.sh
 透過 `./keyboard/install-keyboard.sh` 自動安裝：
 
 ```bash
-./keyboard/install-keyboard.sh          # 安裝 hwdb + 背光同步
-./keyboard/install-keyboard.sh --check  # 驗證 daemon/service/udev 狀態
-./keyboard/install-keyboard.sh --uninstall  # 移除所有鍵盤相關元件
+./keyboard/install-keyboard.sh                          # 安裝 hwdb + 背光同步
+./keyboard/install-keyboard.sh --with-keyd              # 加裝 keyd 雙重角色（選項 2）
+./keyboard/install-keyboard.sh --check                  # 驗證 daemon/service/udev/keyd 狀態
+./keyboard/install-keyboard.sh --uninstall              # 移除所有鍵盤相關元件（含 keyd）
+./keyboard/install-keyboard.sh --with-keyd --dry-run    # 預覽全部
 ```
 
 **安裝內容：**

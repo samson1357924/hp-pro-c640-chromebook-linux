@@ -26,16 +26,26 @@ SERVICE_SRC="$SCRIPT_DIR/systemd/c640-kbd-backlight-sync.service"
 SERVICE_DST="/etc/systemd/user/c640-kbd-backlight-sync.service"
 SLEEP_SRC="$SCRIPT_DIR/systemd/c640-kbd-backlight-sleep.sh"
 SLEEP_DST="/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh"
+KEYD_SRC="$SCRIPT_DIR/keyd/cros.conf"
+KEYD_DST="/etc/keyd/cros.conf"
+KEYD_LINK="/etc/keyd/default.conf"
 
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
     echo "  --install, -i      Install Chromebook top-row udev hwdb mapping + kbd backlight sync (default)"
+    echo "  --with-keyd        Also install keyd advanced dual-role config (Search tap= CapsLock, hold=Super, Search+TopRow=F1-F10)"
+    echo "  --keyd             Alias for --with-keyd"
     echo "  --check, -c        Check current keyboard hwdb and backlight sync status"
-    echo "  --uninstall, -u    Uninstall top-row hwdb mapping and backlight sync"
+    echo "  --uninstall, -u    Uninstall top-row hwdb mapping and backlight sync (and keyd config if present)"
     echo "  --dry-run, -n      Preview changes without modifying files"
     echo "  --help, -h         Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                              # hwdb + backlight"
+    echo "  $0 --with-keyd                  # hwdb + backlight + keyd dual-role"
+    echo "  $0 --with-keyd --dry-run        # preview all"
 }
 
 check_keyboard_status() {
@@ -98,6 +108,51 @@ check_keyboard_status() {
     else
         log_warn "No kbd backlight sysfs found (/sys/class/leds/chromeos::kbd_backlight)"
     fi
+
+    log_info "=== keyd Advanced Dual-Role Status ==="
+    if [ -f "$KEYD_DST" ] || [ -f "$KEYD_LINK" ] || [ -L "$KEYD_LINK" ]; then
+        if [ -f "$KEYD_DST" ]; then
+            log_success "keyd config installed at $KEYD_DST"
+        fi
+        if [ -L "$KEYD_LINK" ]; then
+            local link_target
+            link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
+            log_info "  default.conf -> $link_target"
+            if [ ! -e "$KEYD_LINK" ]; then
+                log_warn "  default.conf is dangling symlink (target missing)"
+            fi
+        elif [ -f "$KEYD_LINK" ]; then
+            log_success "keyd default.conf exists at $KEYD_LINK"
+        fi
+        if command -v keyd > /dev/null 2>&1; then
+            log_info "  keyd version: $(keyd --version 2> /dev/null | head -n1 || echo "unknown")"
+        else
+            log_warn "  keyd binary not found (install with: sudo apt install keyd or see keyboard/README.md)"
+        fi
+        if systemctl is-active --quiet keyd 2> /dev/null; then
+            log_success "  keyd service is active"
+        elif systemctl is-enabled --quiet keyd 2> /dev/null; then
+            log_warn "  keyd service is enabled but not active"
+        else
+            log_info "  keyd service not active (run: sudo systemctl enable --now keyd)"
+        fi
+        if command -v keyd > /dev/null 2>&1 && [ -f "$KEYD_DST" ]; then
+            if keyd check "$KEYD_DST" > /dev/null 2>&1; then
+                log_success "  keyd config syntax valid (keyd check $KEYD_DST)"
+            else
+                log_warn "  keyd config syntax check failed for $KEYD_DST"
+            fi
+        elif command -v keyd > /dev/null 2>&1 && [ -f "$KEYD_SRC" ]; then
+            # Fallback check source when DST not yet deployed
+            if keyd check "$KEYD_SRC" > /dev/null 2>&1; then
+                log_success "  keyd source syntax valid (keyd check $KEYD_SRC)"
+            else
+                log_warn "  keyd source syntax check failed"
+            fi
+        fi
+    else
+        log_info "keyd config not installed (optional, use --with-keyd to enable Search tap=CapsLock hold=Super)"
+    fi
 }
 
 uninstall_keyboard() {
@@ -117,8 +172,16 @@ uninstall_keyboard() {
         sudo systemctl --global disable c640-kbd-backlight-sync.service 2> /dev/null || true
         # Also try system scope disable for backwards compat
         sudo systemctl disable c640-kbd-backlight-sync.service 2> /dev/null || true
+        # Disable keyd if we installed it (system service) - handle dangling symlink too
+        if systemctl is-active --quiet keyd 2> /dev/null || systemctl is-enabled --quiet keyd 2> /dev/null; then
+            if [ -f "$KEYD_DST" ] || [ -f "$KEYD_LINK" ] || [ -L "$KEYD_LINK" ]; then
+                sudo systemctl disable --now keyd 2> /dev/null || true
+                log_info "Disabled keyd service (was managing Search dual-role)"
+            fi
+        fi
     else
         log_dryrun "Would disable user service: c640-kbd-backlight-sync.service (global + user)"
+        log_dryrun "Would disable keyd if active and config present"
     fi
 
     rollback_component "keyboard"
@@ -170,10 +233,28 @@ uninstall_keyboard() {
             if [ -n "$ruid" ]; then
                 sudo rm -f "/run/user/$ruid/c640-kbd-backlight.state" 2> /dev/null || true
                 sudo rm -f "/run/user/$ruid/c640-kbd-backlight.lock" 2> /dev/null || true
+                sudo rm -f "/run/user/$ruid/c640-kbd-backlight.state.lock" 2> /dev/null || true
+                local kbd_tmpdir
+                kbd_tmpdir="${TMPDIR:-/tmp}/c640-kbd-$ruid"
+                if [ -n "$kbd_tmpdir" ] && [ "$kbd_tmpdir" != "/" ] && [ "$kbd_tmpdir" != "/tmp" ]; then
+                    sudo rm -rf -- "$kbd_tmpdir" 2> /dev/null || true
+                fi
             fi
+        fi
+        # Also clean fallback tmp for root
+        local root_fallback
+        root_fallback="/tmp/c640-kbd-0"
+        if [ -n "$root_fallback" ] && [ "$root_fallback" != "/" ] && [ "$root_fallback" != "/tmp" ]; then
+            sudo rm -rf -- "$root_fallback" 2> /dev/null || true
+        fi
+        local root_tmpdir
+        root_tmpdir="${TMPDIR:-/tmp}/c640-kbd-$(id -u 2> /dev/null || echo 0)"
+        if [ -n "$root_tmpdir" ] && [ "$root_tmpdir" != "/" ] && [ "$root_tmpdir" != "/tmp" ]; then
+            sudo rm -rf -- "$root_tmpdir" 2> /dev/null || true
         fi
     else
         log_dryrun "Would run: systemd-hwdb update, udevadm trigger, daemon-reload, restore brightness, clean state"
+        log_dryrun "Would clean: /run/c640-kbd-backlight/state, /run/user/\$UID/c640-kbd-backlight.state*, TMPDIR fallback"
     fi
     log_success "Keyboard mapping uninstallation completed."
 }
@@ -182,7 +263,12 @@ install_keyboard() {
     log_section "Installing Chromebook Top-Row Function Keys Mapping & Backlight Sync"
     check_dmi_board || true
 
-    log_step 1 5 "Installing hwdb mapping to $HWDB_DST..."
+    local total_steps=5
+    if [ "${WITH_KEYD:-0}" = "1" ]; then
+        total_steps=6
+    fi
+
+    log_step 1 $total_steps "Installing hwdb mapping to $HWDB_DST..."
     backup_file_manifest_aware "$HWDB_DST" "keyboard"
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -191,7 +277,7 @@ install_keyboard() {
         sudo install -D -m 0644 "$HWDB_SRC" "$HWDB_DST"
     fi
 
-    log_step 2 5 "Installing kbd backlight udev rule to $UDEV_DST..."
+    log_step 2 $total_steps "Installing kbd backlight udev rule to $UDEV_DST..."
     backup_file_manifest_aware "$UDEV_DST" "keyboard"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0644 $UDEV_SRC -> $UDEV_DST"
@@ -219,7 +305,7 @@ install_keyboard() {
         fi
     fi
 
-    log_step 3 5 "Installing kbd backlight sync daemon to $DAEMON_DST..."
+    log_step 3 $total_steps "Installing kbd backlight sync daemon to $DAEMON_DST..."
     backup_file_manifest_aware "$DAEMON_DST" "keyboard"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0755 $DAEMON_SRC -> $DAEMON_DST"
@@ -227,7 +313,7 @@ install_keyboard() {
         sudo install -D -m 0755 "$DAEMON_SRC" "$DAEMON_DST"
     fi
 
-    log_step 4 5 "Installing kbd backlight user service to $SERVICE_DST..."
+    log_step 4 $total_steps "Installing kbd backlight user service to $SERVICE_DST..."
     backup_file_manifest_aware "$SERVICE_DST" "keyboard"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0644 $SERVICE_SRC -> $SERVICE_DST"
@@ -260,7 +346,7 @@ install_keyboard() {
         log_success "User service enabled (global) and started where possible"
     fi
 
-    log_step 5 5 "Installing kbd backlight sleep hook to $SLEEP_DST..."
+    log_step 5 $total_steps "Installing kbd backlight sleep hook to $SLEEP_DST..."
     backup_file_manifest_aware "$SLEEP_DST" "keyboard"
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Install -D -m 0755 $SLEEP_SRC -> $SLEEP_DST"
@@ -288,21 +374,74 @@ install_keyboard() {
         fi
     fi
 
+    # Optional keyd dual-role step
+    if [ "${WITH_KEYD:-0}" = "1" ]; then
+        log_step 6 $total_steps "Installing keyd dual-role config to $KEYD_DST..."
+        backup_file_manifest_aware "$KEYD_DST" "keyboard"
+        backup_file_manifest_aware "$KEYD_LINK" "keyboard"
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+            log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
+            log_dryrun "Create symlink $KEYD_LINK -> cros.conf"
+            log_dryrun "Would record service state: keyd (keyboard)"
+            log_dryrun "keyd check $KEYD_DST && systemctl enable --now keyd (if keyd installed)"
+        else
+            if [ ! -f "$KEYD_SRC" ]; then
+                log_warn "keyd source not found at $KEYD_SRC, skipping"
+            else
+                sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"
+                # Ensure default.conf symlink points to cros.conf (idempotent) - already backed up LINK above
+                if [ -L "$KEYD_LINK" ] || [ -f "$KEYD_LINK" ]; then
+                    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
+                fi
+                sudo ln -sf "$(basename "$KEYD_DST")" "$KEYD_LINK" 2> /dev/null || true
+                # Record service state before enabling (first-wins) - even if binary not yet installed, stub handles is-enabled=1 case
+                manifest_add_service "keyd" "keyboard"
+                # Validate syntax if keyd is available
+                if command -v keyd > /dev/null 2>&1; then
+                    if keyd check "$KEYD_DST" > /dev/null 2>&1; then
+                        log_success "keyd config syntax valid"
+                    else
+                        log_warn "keyd config syntax check failed for $KEYD_DST"
+                    fi
+                    sudo systemctl enable --now keyd 2> /dev/null || log_warn "Failed to enable keyd (try: sudo systemctl enable --now keyd)"
+                    # Recommend libinput quirk for GNOME Wayland
+                    if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
+                        log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
+                    fi
+                else
+                    log_warn "keyd not installed — config deployed but daemon not started. Install: sudo apt install keyd (Ubuntu>=25.04) or see keyboard/README.md for PPA/COPR/source"
+                fi
+            fi
+        fi
+    fi
+
     log_success "Chromebook top-row keyboard mapping and backlight sync installed! ⌨️"
+    if [ "${WITH_KEYD:-0}" = "1" ]; then
+        log_success "keyd dual-role included (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
+    fi
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_info "Dry-run: no system files were changed. Run without --dry-run to apply."
     else
         log_info "Tip: re-login or run 'systemctl --user start c640-kbd-backlight-sync.service' to start the daemon immediately."
         log_info "Test blank: c640-kbd-backlight-sync --test-blank  && c640-kbd-backlight-sync --test-unblank"
+        if [ "${WITH_KEYD:-0}" = "1" ]; then
+            log_info "Test keyd: sudo keyd monitor  # short press Search -> capslock, long -> meta"
+        fi
     fi
 }
 
 # CLI Argument Parsing
 ACTION="install"
+WITH_KEYD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --install | -i)
             ACTION="install"
+            shift
+            ;;
+        --with-keyd | --keyd | --enable-keyd)
+            WITH_KEYD=1
+            export WITH_KEYD
             shift
             ;;
         --check | -c)

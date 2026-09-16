@@ -59,7 +59,7 @@ chmod +x setup.sh
 | **僅安裝音訊 UCM 設定檔** | `./setup.sh --audio` (或 `./audio/install-audio.sh`) |
 | **僅安裝指紋驅動與 PAM（混合 A+C 模式）** | `./setup.sh --fingerprint` (或 `./fingerprint/install-fingerprint.sh`) |
 | **強制從源碼編譯安裝指紋驅動（Plan A）** | `./setup.sh --source` (或 `./fingerprint/install-fingerprint.sh --source`) |
-| **僅安裝頂排鍵盤映射** | `./setup.sh --keyboard` (或 `./keyboard/install-keyboard.sh`) |
+| **僅安裝頂排鍵盤映射＋背光同步** | `./setup.sh --keyboard` (或 `./keyboard/install-keyboard.sh`，加 `--with-keyd` 啟用雙重角色) |
 | **執行系統硬體綜合診斷** | `./setup.sh --check` (或 `./scripts/detect-hardware.sh`) |
 | **預覽模式（不改動系統檔案）** | `./setup.sh --all --dry-run` |
 | **一鍵解除安裝與復原系統** | `./setup.sh --uninstall` |
@@ -76,7 +76,7 @@ chmod +x setup.sh
 * 🔧 **[韌體刷機與還原指南 (FIRMWARE.md)](docs/zh-TW/FIRMWARE.md)**：
   MrChromebox UEFI 刷機、**拔除電池排線解除 Cr50 防寫** 與還原 ChromeOS 步驟。
 * 🛠️ **[疑難排解與避坑 FAQ (TROUBLESHOOTING.md)](docs/zh-TW/TROUBLESHOOTING.md)**：
-  十五大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校等）。
+  十六大常見故障與避坑對照表（Dummy Output、Intel ME 開啟需求、S0ix 耗電調校、鍵盤背光同步等）。
 * 🔄 **[系統復原與解除安裝 (UNINSTALL.md)](docs/zh-TW/UNINSTALL.md)**：
   備份還原機制與原生套件復原。
 

@@ -60,7 +60,7 @@ chmod +x setup.sh
 | **Install audio UCM configuration only** | `./setup.sh --audio` (or `./audio/install-audio.sh`) |
 | **Install fingerprint driver and PAM (Hybrid A+C)** | `./setup.sh --fingerprint` (or `./fingerprint/install-fingerprint.sh`) |
 | **Force compile fingerprint driver from source (Plan A)** | `./setup.sh --source` (or `./fingerprint/install-fingerprint.sh --source`) |
-| **Install top-row keyboard mapping only** | `./setup.sh --keyboard` (or `./keyboard/install-keyboard.sh`) |
+| **Install top-row keyboard mapping + backlight sync** | `./setup.sh --keyboard` (or `./keyboard/install-keyboard.sh`, add `--with-keyd` for Search dual-role) |
 | **Run system hardware comprehensive diagnostics** | `./setup.sh --check` (or `./scripts/detect-hardware.sh`) |
 | **Preview mode (no system files modified)** | `./setup.sh --all --dry-run` |
 | **One-click uninstall and system restore** | `./setup.sh --uninstall` |
@@ -78,8 +78,8 @@ chmod +x setup.sh
   MrChromebox UEFI flashing, **disconnecting the battery cable to remove the
   Cr50 hardware write-protect (HW WP)**, and steps to restore ChromeOS.
 * 🛠️ **[TROUBLESHOOTING.md (Troubleshooting & Pitfall FAQ)](docs/TROUBLESHOOTING.md)**:
-  Reference table for the fifteen most common faults and how to avoid them (Dummy
-  Output, Intel ME enablement requirements, S0ix power tuning, etc.).
+  Reference table for the sixteen most common faults and how to avoid them (Dummy
+  Output, Intel ME enablement requirements, S0ix power tuning, keyboard backlight sync, etc.).
 * 🔄 **[UNINSTALL.md (System Recovery & Uninstall)](docs/UNINSTALL.md)**: Backup/restore mechanism and native package restoration.
 
 ### 🔬 Deep Dive

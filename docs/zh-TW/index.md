@@ -73,7 +73,7 @@ chmod +x setup.sh
 | **僅安裝音訊 UCM 設定** | `./setup.sh --audio` (或 `./audio/install-audio.sh`) |
 | **僅安裝指紋驅動與 PAM（混合 A+C）** | `./setup.sh --fingerprint` |
 | **強制從源碼編譯指紋驅動（Plan A）** | `./setup.sh --source` |
-| **僅安裝頂排鍵盤映射** | `./setup.sh --keyboard` |
+| **僅安裝頂排鍵盤映射＋背光同步** | `./setup.sh --keyboard`（加 `--with-keyd` 啟用雙重角色） |
 | **執行系統硬體綜合診斷** | `./setup.sh --check` |
 | **預覽模式（不改動系統檔案）** | `./setup.sh --all --dry-run` |
 | **一鍵解除安裝與復原** | `./setup.sh --uninstall` |
@@ -101,7 +101,7 @@ chmod +x setup.sh
     誠實的已測/未測矩陣、疑難排解與復原。
 
     [:octicons-arrow-right-24: 實測驗證矩陣](verification.md) — **請優先閱讀**
-    [:octicons-arrow-right-24: 疑難排解（15 坑）](TROUBLESHOOTING.md)
+    [:octicons-arrow-right-24: 疑難排解（16 坑）](TROUBLESHOOTING.md)
     [:octicons-arrow-right-24: 解除安裝與還原](UNINSTALL.md)
 
 - :material-microscope: **深度解析**

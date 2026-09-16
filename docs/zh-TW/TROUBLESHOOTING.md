@@ -3,7 +3,7 @@
 # 🛠️ 疑難排解與避坑 FAQ (Troubleshooting & Pitfall Guide)
 
 本文整理了在 **HP Pro c640 Chromebook (Google `dratini`)** 安裝與使用 Linux 時
-最常遇到的十五大問題與根本解決之道。
+最常遇到的十六大問題與根本解決之道。
 
 ---
 
@@ -147,11 +147,37 @@
   sudo systemctl enable --now keyd
   ```
 
+### 11. 鍵盤背光不會隨螢幕熄滅/點亮而開關
+
+* **症狀**：`c640-kbd-backlight-sync --check` 顯示 `brightness: 5/100` 但 `--test-blank`
+  不會到 `0` 或不會恢復；`journalctl --user -u c640-kbd-backlight-sync` 空白或 `Daemon running: no`。
+* **排解**：
+
+  ```bash
+  c640-kbd-backlight-sync --check          # brightness、STATE_FILE、Daemon running、ScreenSaver available
+  systemctl --global is-enabled c640-kbd-backlight-sync.service
+  systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
+  journalctl --user -u c640-kbd-backlight-sync.service -f
+  loginctl show-user "$USER" -p State
+  udevadm test /sys/class/leds/chromeos::kbd_backlight
+  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness
+  # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
+  # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin
+  # ectool 回退：ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+* **常見修復**：
+  * 安裝後**重新登入**（`plugdev`/`uaccess` ACL），或 `systemctl --user start c640-kbd-backlight-sync.service`。
+  * 若未 enable：`sudo systemctl --global enable c640-kbd-backlight-sync.service && systemctl --user daemon-reload`。
+  * KDE/Sway 上 `ScreenSaver available: no` 時，仍由 `system-sleep` 處理盒蓋 `suspend`，
+    閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
+  * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
+
 ---
 
 ## 🔋 電源管理與待機問題 (Power & Suspend)
 
-### 11. 蓋螢幕休眠一整夜耗電過多 (超過 5~8%)
+### 12. 蓋螢幕休眠一整夜耗電過多 (超過 5~8%)
 
 * **根本原因**：Intel AX201 Wi-Fi 背景喚醒 (WoWLAN) 或 PCIe ASPM 節能未完全
   啟用，導致 SoC 無法進入低功耗 Package C10 (SLP_S0#) 狀態。
@@ -165,7 +191,7 @@
   2. 在 `/etc/default/grub` 中的 `GRUB_CMDLINE_LINUX_DEFAULT` 加上 `pcie_aspm=force`，並執行 `sudo update-grub`。
   3. 安裝 `tlp` 或 `power-profiles-daemon` 管理省電狀態。
 
-### 12. 蓋上螢幕筆電不會休眠
+### 13. 蓋上螢幕筆電不會休眠
 
 * **解決方法**：確認 `/etc/systemd/logind.conf.d/99-hp-c640-lid.conf`
   （由 `./power/install-power.sh` 安裝）或 `/etc/systemd/logind.conf` 中設定：
@@ -195,7 +221,7 @@
   *（2026-08-18 實測：重啟 systemd-logind 在 HP Pro c640 上引發完整登出風暴，
   外觀上如同系統當機。）*
 
-### 13. 休眠喚醒後（或鎖定後立刻）鎖定畫面沒有指紋提示
+### 14. 休眠喚醒後（或鎖定後立刻）鎖定畫面沒有指紋提示
 
 * **症狀**：盒蓋休眠後打開（或鎖定後馬上操作），解鎖畫面**沒有指紋提示、
   碰觸感應器無效**。按 `Esc` 重新進入登入畫面後指紋恢復正常。
@@ -256,7 +282,7 @@
   *（若仍失敗：在 fprintd.service drop-in 暫時加
   `Environment=G_MESSAGES_DEBUG=fprintd`，再重複盒蓋測試以捕捉驅動錯誤。）*
 
-### 14. 開蓋喚醒後螢幕全黑（需按鍵/點擊才亮）
+### 15. 開蓋喚醒後螢幕全黑（需按鍵/點擊才亮）
 
 * **症狀**：盒蓋休眠（S3 `deep`）後打開，系統已喚醒（`PM: suspend exit`）
   但面板**全黑**，直到按鍵或點擊才亮。不是當機——輸入一到鎖定畫面即正常。
@@ -291,7 +317,7 @@
   `org.gnome.SettingsDaemon.Power` 是否有 resume 後再度關閉螢幕的事件
   （可證實使用者層再黑屏假說）。回報至 GNOME/mutter#4111。
 
-### 15. 電池充過 90% 或出現 `ERROR: Old EC doesn't support sustainer`
+### 16. 電池充過 90% 或出現 `ERROR: Old EC doesn't support sustainer`
 
 * **症狀**：下達 `ectool chargecontrol normal 80 90` 出現 `ERROR: Old EC doesn't support sustainer`，
   或是系統在重開機、S3 休眠喚醒後充超過 90%。

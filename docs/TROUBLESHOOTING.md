@@ -1,6 +1,6 @@
 # 🛠️ Troubleshooting & Pitfall Guide
 
-This article covers the fifteen most common problems and their root-cause solutions
+This article covers the sixteen most common problems and their root-cause solutions
 when installing and using Linux on the **HP Pro c640 Chromebook (Google
 `dratini`)**.
 
@@ -170,11 +170,40 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   sudo systemctl enable --now keyd
   ```
 
+### 11. Keyboard backlight doesn't turn off / restore with screen blank
+
+* **Symptoms**: `c640-kbd-backlight-sync --check` shows `brightness: 5/100` but `--test-blank`
+  stays `0` or doesn't restore; `journalctl --user -u c640-kbd-backlight-sync` is empty
+  or `Daemon running: no`.
+* **Triage**:
+
+  ```bash
+  c640-kbd-backlight-sync --check          # brightness, STATE_FILE, Daemon running, ScreenSaver available
+  systemctl --global is-enabled c640-kbd-backlight-sync.service
+  systemctl --user is-active c640-kbd-backlight-sync.service  # needs graphical-session
+  journalctl --user -u c640-kbd-backlight-sync.service -f
+  loginctl show-user "$USER" -p State       # active?
+  udevadm test /sys/class/leds/chromeos::kbd_backlight  # check TAG+="uaccess" rule
+  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
+  cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # non-GNOME (Sway/KDE): org.gnome.ScreenSaver not available -> daemon falls back to org.freedesktop.ScreenSaver + system-sleep hook only
+  # minimal image missing gdbus/dbus-monitor: sudo apt install dbus-x11 libglib2.0-bin
+  # ectool fallback: ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+* **Common fixes**:
+  * After install, **re-login** (for `plugdev` / `uaccess` ACL), or `systemctl --user start c640-kbd-backlight-sync.service`.
+  * If service not enabled: `sudo systemctl --global enable c640-kbd-backlight-sync.service && systemctl --user daemon-reload`.
+  * If `ScreenSaver available: no` on KDE/Sway, backlight still works via `system-sleep` hook
+    for lid close (`suspend`), but not for idle blank - enable IdleMonitor:
+    see `keyboard/README.md` `C640_KBD_ENABLE_IDLEMONITOR=1`.
+  * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
+
 ---
 
 ## 🔋 Power & Suspend
 
-### 11. Closing the lid overnight drains too much battery (over 5-8%)
+### 12. Closing the lid overnight drains too much battery (over 5-8%)
 
 * **Root cause**: Intel AX201 Wi-Fi background wake (WoWLAN) or PCIe ASPM power
   saving is not fully enabled, so the SoC can't reach the low-power Package C10
@@ -189,7 +218,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   2. Add `pcie_aspm=force` to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then run `sudo update-grub`.
   3. Install `tlp` or `power-profiles-daemon` to manage power saving states.
 
-### 12. Laptop doesn't suspend when the lid is closed
+### 13. Laptop doesn't suspend when the lid is closed
 
 * **Solution**: make sure `/etc/systemd/logind.conf.d/99-hp-c640-lid.conf`
   (installed by `./power/install-power.sh`) or `/etc/systemd/logind.conf`
@@ -221,7 +250,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   *(Verified 2026-08-18: restarting systemd-logind caused a full session
   logout storm that appeared as a system crash on an HP Pro c640.)*
 
-### 13. No fingerprint prompt on the lock screen after suspend/resume (or instantly after locking)
+### 14. No fingerprint prompt on the lock screen after suspend/resume (or instantly after locking)
 
 * **Symptoms**: after lid-close suspend and reopen (or locking and interacting
   immediately), the unlock dialog shows **no fingerprint hint and touching the
@@ -292,7 +321,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   `Environment=G_MESSAGES_DEBUG=fprintd` in a fprintd.service drop-in and
   repeat the lid cycle to capture the driver error.)*
 
-### 14. Screen stays dark after lid-open resume (until a key/click)
+### 15. Screen stays dark after lid-open resume (until a key/click)
 
 * **Symptoms**: after lid close (S3 `deep`) and reopen, the system resumes
   (`PM: suspend exit`) but the panel stays **dark** until a key press or
@@ -332,7 +361,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   turn-off-after-resume event (confirms the userspace re-blank hypothesis).
   Report findings against GNOME/mutter#4111.
 
-### 15. Battery charges past 90% or `ERROR: Old EC doesn't support sustainer`
+### 16. Battery charges past 90% or `ERROR: Old EC doesn't support sustainer`
 
 * **Symptoms**: attempting to configure `ectool chargecontrol normal 80 90` outputs
   `ERROR: Old EC doesn't support sustainer`, or the battery charges past the target limit

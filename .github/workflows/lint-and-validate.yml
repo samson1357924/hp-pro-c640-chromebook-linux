@@ -71,6 +71,8 @@ jobs:
           echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_ea=back"
           echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_e7=refresh"
           echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_a0=mute"
+          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_ef=brightnessup"
 
           # Query assertion 2: HP OEM DMI (HP Pro c640 Chromebook)
           QUERY_DMI2="evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"
@@ -78,9 +80,34 @@ jobs:
           echo "Query Output for HP Pro c640 (OEM):"
           echo "${HWDB_OUT2}"
           echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_db=leftmeta"
           echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_a0=mute"
 
-          echo "All hwdb key mappings verified across Coreboot & OEM DMI strings!"
+          # Query assertion 3: Hatch baseboard fallback
+          QUERY_DMI3="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0"
+          HWDB_OUT3=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI3}")
+          echo "Query Output for Hatch (baseboard):"
+          echo "${HWDB_OUT3}"
+          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+
+          # Query assertion 4: HP c640 generic wildcard (lower case, matches svnHP*:pn*c640*)
+          QUERY_DMI4="evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0"
+          HWDB_OUT4=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI4}")
+          echo "Query Output for HP c640 generic:"
+          echo "${HWDB_OUT4}"
+          echo "${HWDB_OUT4}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT4}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+
+          # Query assertion 5: lower-case dratini (coreboot reports lower on some builds)
+          QUERY_DMI5="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pndratini:pvr1.0"
+          HWDB_OUT5=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI5}")
+          echo "Query Output for dratini lower:"
+          echo "${HWDB_OUT5}"
+          echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+
+          echo "All hwdb key mappings verified across Coreboot & OEM & Hatch/c640/dratini-lower strings!"
 
       - name: Validate udev Rules Syntax
         run: |

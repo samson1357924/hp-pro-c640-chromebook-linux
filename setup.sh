@@ -55,6 +55,7 @@ show_help() {
     echo "  --fingerprint, -f    Install crfpmoc libfprint driver (Hybrid: prebuilt package with source fallback)"
     echo "  --source, --build    Force building fingerprint driver from source (Plan A)"
     echo "  --keyboard, -k       Install Chromebook top-row mapping + kbd backlight sync (ScreenBlank)"
+    echo "  --with-keyd          With --keyboard/--all, also install keyd dual-role (Search tap=CapsLock hold=Super)"
     echo "  --power, -p          Install power management & S0ix modern standby tuning"
     echo "  --ec                 Install ChromeOS EC control utility (c640-ec-control)"
     echo "  --check, -c          Run full hardware diagnostic check"
@@ -75,7 +76,11 @@ make_executable() {
 
 run_keyboard() {
     make_executable "$SCRIPT_DIR/keyboard/install-keyboard.sh"
-    "$SCRIPT_DIR/keyboard/install-keyboard.sh" --install
+    if [ "${WITH_KEYD:-0}" = "1" ]; then
+        "$SCRIPT_DIR/keyboard/install-keyboard.sh" --install --with-keyd
+    else
+        "$SCRIPT_DIR/keyboard/install-keyboard.sh" --install
+    fi
 }
 
 run_fingerprint() {
@@ -136,6 +141,7 @@ run_uninstall() {
 
 # Parse CLI flags
 MODE=""
+WITH_KEYD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --all | -a | 1)
@@ -157,6 +163,11 @@ while [ $# -gt 0 ]; do
             ;;
         --keyboard | -k | --kbd | 4)
             MODE="keyboard"
+            shift
+            ;;
+        --with-keyd | --keyd | --enable-keyd)
+            WITH_KEYD=1
+            export WITH_KEYD
             shift
             ;;
         --power | -p | 5)
@@ -194,6 +205,12 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "${WITH_KEYD:-0}" = "1" ] && [ -n "$MODE" ] && [ "$MODE" != "keyboard" ] && [ "$MODE" != "all" ]; then
+    log_warn "--with-keyd only applies with --keyboard or --all; ignoring for mode '$MODE'"
+    WITH_KEYD=0
+    export WITH_KEYD
+fi
 
 if [ -z "$MODE" ]; then
     show_menu

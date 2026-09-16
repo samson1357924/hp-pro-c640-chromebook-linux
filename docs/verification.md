@@ -40,7 +40,7 @@ diagnostic bundle.
 | Driver source matches this repo | 🟢 | `diff -r fingerprint/driver <build-tree>/drivers/crfpmoc` → no differences |
 | udev rules (installed) | 🟢 | 2026-08-18: repo rule installed (`GROUP="plugdev", MODE="0660", TAG+="uaccess"`), verified via `getfacl` after reboot — old `0666` version backed up |
 | Unit tests | 🟢 | `test-crfpmoc-unit` binary (in `/usr/libexec/installed-tests/libfprint-2/`) passes 4/4: `fp_info_v3`, `fp_info_v1`, `enc_status_bitmask`, `payload_bounds` |
-| Lock-screen fingerprint after suspend/resume | 🟢 | **Fully verified 2026-08-19**: (1) PAM claim race fixed 2026-08-18 (fprintd out of `common-auth`, kept in `gdm-fingerprint` + `sudo` only — was "Device was already claimed", GNOME/gdm#1071); (2) FPMCU open failure right after wake fixed by driver-level open retry (`CRFPMOC_OPEN_MAX_RETRIES` × 500 ms in crfpmoc.c) + system-sleep hook (`fprintd-sleep.sh` stops fprintd pre-sleep). User lid-cycle test: **first unlock has fingerprint prompt, zero resume delay, no retry lines in logs**. See [TROUBLESHOOTING.md §13](TROUBLESHOOTING.md) |
+| Lock-screen fingerprint after suspend/resume | 🟢 | **Fully verified 2026-08-19**: (1) PAM claim race fixed 2026-08-18 (fprintd out of `common-auth`, kept in `gdm-fingerprint` + `sudo` only — was "Device was already claimed", GNOME/gdm#1071); (2) FPMCU open failure right after wake fixed by driver-level open retry (`CRFPMOC_OPEN_MAX_RETRIES` × 500 ms in crfpmoc.c) + system-sleep hook (`fprintd-sleep.sh` stops fprintd pre-sleep). User lid-cycle test: **first unlock has fingerprint prompt, zero resume delay, no retry lines in logs**. See [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md) |
 | `sudo` PAM authorization | 🟢 | `fprintd` lives in `/etc/pam.d/sudo` only (claim-race fix 2026-08-18 — not in `common-auth`); after `sudo -k`, `sudo whoami` prompts for and accepts the fingerprint (test method in [fingerprint README](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/fingerprint/README.md#test)). PAM stack verified in same session as lock-screen fix above |
 
 ### 2. Audio (Intel SOF DSP + ALSA UCM2 + PipeWire)
@@ -107,7 +107,7 @@ should be considered "provided for your distro, verify on your own hardware":
 
 | Module | Files | Status |
 | :--- | :--- | :---: |
-| **Power tuning — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 installed + rebooted 2026-08-19 (d0i3 stripped, initramfs rebuilt); **dark-panel-after-resume persists** (screen still dark until keypress — user accepted; see [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md)) |
+| **Power tuning — modprobe quirks** | `power/modprobe.d/99-hp-c640-power.conf` | 🟢 installed + rebooted 2026-08-19 (d0i3 stripped, initramfs rebuilt); **dark-panel-after-resume persists** (screen still dark until keypress — user accepted; see [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)) |
 | **Power tuning — wireplumber / logind** | `power/wireplumber/50-disable-suspend.conf`, `power/systemd/logind.conf.d/99-hp-c640-lid.conf` | 🟢 installed 2026-08-18 (logind lid rule verified via a real S3 lid cycle) |
 | **Power tuning — TLP** | `power/tlp/99-hp-c640.conf` | ❌ not installed — **conflicts with the active `power-profiles-daemon`** (see ⚠️ below) |
 | **EC control & battery protection** | `ec/install-ec.sh`, `scripts/c640-ec-control.sh`, `ec/systemd/c640-battery-limit.service`, `ec/systemd/c640-ec-sleep.sh` | 🟢 installed + hardware-verified 2026-08-23 (standalone `ectool` LPC handshake, status dashboard, 90% battery daemon, 0 mA idle bypass, and S3 resume hook verified) |
@@ -118,7 +118,7 @@ should be considered "provided for your distro, verify on your own hardware":
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
 | **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | ⚠️ installed 2026-08-29 (event-driven `gdbus`/`ScreenSaver`+`PrepareForSleep`, CI smoke-test passed; **no hardware brightness trace in bundle yet**) — verify with `--test-blank` |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
-| **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §14) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
+| **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
 
 > [!NOTE]

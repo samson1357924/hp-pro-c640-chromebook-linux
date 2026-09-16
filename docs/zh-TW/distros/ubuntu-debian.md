@@ -39,12 +39,32 @@ sudo alsactl init
 systemctl --user restart wireplumber
 ```
 
-### (3) 部署鍵盤頂排映射
+### (3) 部署鍵盤頂排映射＋背光同步
+
+推薦（涵蓋 hwdb + `61-chromeos-kbd-backlight.rules` + daemon + user service + system-sleep）：
+
+```bash
+sudo ./keyboard/install-keyboard.sh          # hwdb + 背光同步（5 檔）
+# 進階雙重角色：sudo ./keyboard/install-keyboard.sh --with-keyd
+```
+
+手動等價（5 檔，見 `keyboard/README.zh-TW.md`）：
 
 ```bash
 sudo cp keyboard/90-chromebook-keyboard.hwdb /etc/udev/hwdb.d/
+sudo cp keyboard/udev/61-chromeos-kbd-backlight.rules /etc/udev/rules.d/
+sudo install -D -m 0755 keyboard/c640-kbd-backlight-sync /usr/local/bin/c640-kbd-backlight-sync
+sudo install -D -m 0644 keyboard/systemd/c640-kbd-backlight-sync.service /etc/systemd/user/c640-kbd-backlight-sync.service
+sudo install -D -m 0755 keyboard/systemd/c640-kbd-backlight-sleep.sh /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh
 sudo systemd-hwdb update
+sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=input
+sudo udevadm trigger --subsystem-match=leds
+sudo systemctl daemon-reload
+sudo systemctl --global enable c640-kbd-backlight-sync.service
+# keyd 雙重角色（Search 輕點=CapsLock 長按=Super）：
+# sudo apt install keyd  # Ubuntu 25.04+ 原生，否則 PPA keyd-team/ppa
+# sudo ./keyboard/install-keyboard.sh --with-keyd
 ```
 
 ### (4) 編譯並安裝指紋驅動
