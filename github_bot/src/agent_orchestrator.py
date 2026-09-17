@@ -69,6 +69,13 @@ class AgentOrchestrator:
         """Flatten untrusted titles into a single line before interpolation."""
         return (title or "").replace("\r", " ").replace("\n", " ")[:max_chars]
 
+    def _resolve_role_fallbacks(self, role_def: dict[str, Any]) -> list[str]:
+        """Resolve role-specific fallback chain, falling back to global fallbackModels."""
+        role_fallbacks = role_def.get("fallbackModels")
+        if role_fallbacks is None:
+            role_fallbacks = self.config.get("fallbackModels", [])
+        return self.llm_client.get_dynamic_fallback_chain(role_fallbacks)
+
     # -------------------------------------------------------------------------
     # PR Review Pipeline
     # -------------------------------------------------------------------------
@@ -122,7 +129,7 @@ class AgentOrchestrator:
                 {"role": "user", "content": user_payload},
             ]
 
-            fallbacks = self.llm_client.get_dynamic_fallback_chain(self.config.get("fallbackModels", []))
+            fallbacks = self._resolve_role_fallbacks(role_def)
             try:
                 report = self.llm_client.call_model(
                     model_id,
@@ -195,7 +202,7 @@ class AgentOrchestrator:
         triage_config = self.config.get("triage", {})
         required_sections = triage_config.get("requiredSections", [])
 
-        fallbacks = self.llm_client.get_dynamic_fallback_chain(self.config.get("fallbackModels", []))
+        fallbacks = self._resolve_role_fallbacks(role_def)
         try:
             report = self.llm_client.call_model(
                 model_id,
@@ -242,7 +249,8 @@ class AgentOrchestrator:
 
         suggested_labels = extract_suggested_labels(report, self.config.get("triage", {}).get("labelAllowlist", []))
         marker = self.config.get("triageMarker", "<!-- C640_LINUX_AI_TRIAGE_REPORT -->")
-        display_model = sanitize_model_name_for_display(model_id)
+        actual_model = self.llm_client.resolve_model_id(model_id)
+        display_model = sanitize_model_name_for_display(actual_model)
 
         full_comment = f"{marker}\n# 🔍 HP Pro c640 Hardware Issue Investigation\n\n{report}\n\n---\n*HP Pro c640 Linux AI Triage Bot ({display_model})*"
         return full_comment, suggested_labels
@@ -255,7 +263,9 @@ class AgentOrchestrator:
         """Generate a maintainer-friendly plain language summary."""
         role_def = self.config.get("roles", {}).get("explainer_agent", {})
         role_prompt = self.load_role_prompt(role_def.get("promptFile", "./prompts/roles/explainer_agent.md"))
-        model_id = role_def.get("model", "opencode/muse-spark-1.3-contributor-free")
+        model_id = role_def.get("model", "grok-4.6")
+        temperature = float(role_def.get("temperature", 0.3))
+        max_tokens = int(role_def.get("maxTokens", 4096))
 
         system_instruction = f"{self.soul_prompt}\n\n---\n\n{role_prompt}"
         user_payload = (
@@ -269,18 +279,20 @@ class AgentOrchestrator:
             {"role": "user", "content": user_payload},
         ]
 
-        fallbacks = self.llm_client.get_dynamic_fallback_chain(self.config.get("fallbackModels", []))
+        fallbacks = self._resolve_role_fallbacks(role_def)
         try:
             report = self.llm_client.call_model(
                 model_id,
                 messages,
-                max_tokens=3072,
+                temperature=temperature,
+                max_tokens=max_tokens,
                 fallback_models=fallbacks,
             )
         except LLMClientError as exc:
             report = f"*[Explanation generation failed: {exc}]*"
         marker = self.config.get("commandMarker", "<!-- C640_LINUX_AI_COMMAND_REPORT -->")
-        display_model = sanitize_model_name_for_display(model_id)
+        actual_model = self.llm_client.resolve_model_id(model_id)
+        display_model = sanitize_model_name_for_display(actual_model)
         return f"{marker}\n{report}\n\n---\n*HP Pro c640 Linux AI Bot ({display_model})*"
 
     def _format_thread_comments(self, comments: list[dict[str, Any]]) -> str:
