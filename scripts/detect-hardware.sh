@@ -167,12 +167,16 @@ run_diagnostic() {
     fi
     if [ -f /etc/keyd/cros.conf ]; then
         log_success "  keyd config at /etc/keyd/cros.conf"
-        if command -v keyd > /dev/null 2>&1; then
-            if keyd check /etc/keyd/cros.conf > /dev/null 2>&1; then
-                log_success "  keyd config syntax valid"
-            else
-                log_warn "  keyd config syntax check failed for /etc/keyd/cros.conf"
-            fi
+        local kd_bin="" kd_rc=0
+        kd_bin="$(keyd_bin 2> /dev/null || true)"
+        if [ -n "$kd_bin" ]; then
+            log_info "  keyd binary: $kd_bin"
+            keyd_check_config /etc/keyd/cros.conf || kd_rc=$?
+            case "$kd_rc" in
+                0) log_success "  keyd config syntax valid" ;;
+                3) log_info "  keyd < 2.6 has no 'check' subcommand; validated on reload" ;;
+                *) log_warn "  keyd config syntax check failed for /etc/keyd/cros.conf" ;;
+            esac
         fi
     fi
     if [ -L /etc/keyd/default.conf ]; then

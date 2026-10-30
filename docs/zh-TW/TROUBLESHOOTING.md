@@ -143,9 +143,18 @@
 
   ```bash
   sudo apt install -y keyd   # (或 dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo ln -sf cros.conf /etc/keyd/default.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # 必要：keyd 2.5.x 只在啟動時讀取設定
   ```
+
+  > Ubuntu 26.04 套件安裝的是 `/usr/bin/keyd.rvaiya`（2.5.0），請用
+  > `sudo keyd.rvaiya monitor`，看到「keyd: command not found」可忽略。
+  > `keyd check` 僅存在於 ≥ 2.6。建議直接執行
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`，上述差異它都已處理。
+  > 若按鍵仍無反應，確認 keyd 有 grab 內建 AT 鍵盤：
+  > `journalctl -u keyd | grep 'DEVICE: match'` 應出現 `0001:0001`。
 
 ### 11. 鍵盤背光不會隨螢幕熄滅/點亮而開關
 
@@ -172,6 +181,15 @@
   * KDE/Sway 上 `ScreenSaver available: no` 時，仍由 `system-sleep` 處理盒蓋 `suspend`，
     閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
   * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
+  * Ubuntu 26.04 上，LED 屬性只有在 udev 規則的 `RUN+=chgrp plugdev` +
+    `RUN+=chmod 0660` 生效時才可寫（實測為 `-rw-rw---- root plugdev`）。
+    `MODE=`/`GROUP=`/`uaccess` 無法 chmod sysfs；若
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` 顯示 `root root 0644`，
+    請執行 `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`，
+    daemon 才不會退回 `sudo -n tee`。
+  * 根因判斷：使用者 service 無法互動輸入 sudo 密碼。若
+    `journalctl --user -u c640-kbd-backlight-sync` 出現 `sudo: a password is required`，
+    表示問題在上述權限路徑，而非 D-Bus 事件。
 
 ---
 

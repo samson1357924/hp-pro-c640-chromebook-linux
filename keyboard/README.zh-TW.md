@@ -78,6 +78,12 @@ chmod +x keyboard/install-keyboard.sh
    # services.keyd.enable = true;
    ```
 
+   > **各發行版執行檔名稱不同（Ubuntu 26.04 實測）：** Debian/Ubuntu 套件安裝的是
+   > **`/usr/bin/keyd.rvaiya`**（2.5.0-5），`$PATH` 中沒有 `keyd`；systemd 服務名稱
+   > 仍是 `keyd`。請用實際存在的名稱，例如 `keyd.rvaiya --version`；安裝器會透過
+   > `lib/syscheck.sh` 的 `keyd_bin()` 自動偵測。另外 **`keyd check` 僅存在於 keyd ≥ 2.6**，
+   > 2.5.x 會直接印出用法並回傳 0。
+
 2. 安裝設定檔（建議走安裝器）：
 
    ```bash
@@ -85,20 +91,22 @@ chmod +x keyboard/install-keyboard.sh
    # 等價手動：
    # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
    # sudo ln -sf cros.conf /etc/keyd/default.conf
-   # keyd check /etc/keyd/cros.conf
-   # sudo systemctl enable --now keyd
+   # keyd check /etc/keyd/cros.conf     # 僅 keyd ≥ 2.6；2.5.x 於啟動時驗證
+   # sudo systemctl enable keyd
+   # sudo systemctl restart keyd         # keyd 2.5.x 只在啟動時讀取設定
    ```
 
 3. 驗證與調校：
 
    ```bash
-   keyd --version
-   sudo keyd monitor  # 短按 Search -> capslock，長按 -> leftmeta；Search+頂排 -> F1
+   keyd --version || keyd.rvaiya --version   # Ubuntu 26.04 為 keyd.rvaiya
+   sudo keyd monitor || sudo keyd.rvaiya monitor
+   # 短按 Search -> capslock，長按 -> leftmeta；Search+頂排 -> F1
    sudo systemctl status keyd
    journalctl -eu keyd -f
    # 若輕點/長按太靈敏，於 /etc/keyd/cros.conf [global] 加入：
    # overload_tap_timeout = 200  # ms，見 man keyd
-   # sudo keyd reload
+   # sudo systemctl restart keyd
    ```
 
    **GNOME Wayland 觸控板 quirk**（選用，修 `disable-while-typing` 卡頓）：
@@ -109,6 +117,14 @@ chmod +x keyboard/install-keyboard.sh
    ```
 
     **備註：**
+    * `[ids] 0001:0001` 將 `cros.conf` 限定在內建 AT 鍵盤。若用萬用字元 `*`，會一併
+      grab ChromeOS 的 `Video Bus`（`0000:0006`）與外接 USB 鍵盤，造成亮度鍵重複處理、
+      外接鍵盤按鍵被吞掉。若要一併映射外接鍵盤，請從 `sudo keyd monitor` 取得 ID 後加入。
+    * keyd 2.5.x 輕點 Search 時會先送出一組短暫的 `leftmeta` + `leftctrl`，再送 `capslock`。
+      這是 keyd 的修飾鍵防護（`src/keyboard.c` 的 `clear_mod()`），避免 GNOME 把單獨的
+      Meta 解讀成「活動總覽」快捷鍵；屬預期行為，寫測試時請以 `KEY_CAPSLOCK` 判斷。
+    * keyd 2.5.x 沒有裝置熱插拔偵測：修改 `/etc/keyd/*.conf` 後必須
+      `sudo systemctl restart keyd`（`reload` 只會重新解析已被 grab 裝置的設定）。
     * `X11` 使用者：`setxkbmap` 會在 `keyd restart` 後重置，需重套。
     * `TTY` 由 `uinput` 支援；若設定鎖死，急救：`backspace+escape+enter`。
 
@@ -132,11 +148,25 @@ chmod +x keyboard/install-keyboard.sh
 
 **安裝內容：**
 
-* `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`）
+* `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`，並以
+  `RUN+=chgrp plugdev` / `RUN+=chmod 0660` 調整 brightness 屬性權限）
 * `c640-kbd-backlight-sync` → `/usr/local/bin/`（bash daemon，`gdbus`/`dbus-monitor` 事件驅動，預設無輪詢）
 * `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`）
 * `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（S3 喚醒後恢復，
   0.6 秒 debounce 避免 `LED_CORE_SUSPENDRESUME` 競態）
+
+> **為何需要 `RUN+=chmod`？** `MODE=`、`GROUP=`、`uaccess` 只作用於 `/dev` 裝置節點。
+> `/sys/class/leds/chromeos::kbd_backlight/brightness` 是沒有裝置節點的純 sysfs 屬性，
+> udev 無法用那些欄位改權限，預設會維持 `root:root 0644`；因此規則額外執行
+> `chgrp plugdev` + `chmod 0660`（Ubuntu 26.04 實測有效）。否則使用者服務會退回到
+> `echo | sudo -n tee`，而 session service 通常無法回應 sudo。驗證：
+>
+> ```bash
+> ls -l /sys/class/leds/chromeos::kbd_backlight/brightness   # 應為 root plugdev 0660
+> sudo udevadm control --reload-rules
+> sudo udevadm trigger --subsystem-match=leds                # 不重開機即可重套
+> id -nG | tr ' ' '\n' | grep -qx plugdev && echo "使用者屬於 plugdev"
+> ```
 
 **免熄屏手動測試：**
 
@@ -180,3 +210,52 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 sudo evtest
 # 選擇「AT Translated Set 2 keyboard」並按下頂排按鍵。
 ```
+
+### 自動化 keyd 雙重角色測試（不需人手按鍵）
+
+`keyboard/tests/keyd-dualrole-uinput.py` 會建立 AT ID `0001:0001` 的虛擬鍵盤、
+重啟 keyd 讓它被 grab，注入按鍵後讀取 keyd 虛擬鍵盤的輸出並斷言：
+
+```bash
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/keyd-dualrole-uinput.py
+# PASS: tap Search -> CAPSLOCK
+# PASS: hold Search + Back -> META + F1
+# PASS: hold Search + BrightnessDown -> F6
+# PASS: BrightnessDown alone -> brightnessdown
+# RESULT=PASS
+```
+
+### 實機驗證記錄（HP Pro c640 / Dratini，2026-10-31）
+
+環境：Ubuntu 26.04.1 LTS、kernel `7.0.0-30-generic`、`keyd 2.5.0-5`
+（執行檔 `/usr/bin/keyd.rvaiya`）、`python3-evdev 1.9.3`、GNOME Wayland。
+
+| 檢查項目 | 結果 | 證據 |
+| :--- | :---: | :--- |
+| hwdb 即時轉譯 | 🟢 | `udevadm info /dev/input/event2` → `KEYBOARD_KEY_db=leftmeta`、`ea=back`、`ef=brightnessup` |
+| keyd 只 grab 內建鍵盤 | 🟢 | journal：`match 0001:0001 ... (AT Translated Set 2 keyboard)`；`ignoring 0000:0006 (Video Bus)` |
+| 輕點 Search | 🟢 | uinput 測試：`LEFTMETA+LEFTCTRL` 防護組，接著 `CAPSLOCK` down/up |
+| 長按 Search + Back | 🟢 | `META` 持續按住 → `F1` down/up |
+| 長按 Search + BrightnessDown | 🟢 | `F6` down/up（Search+頂排 = F1-F10 層） |
+| 單按 BrightnessDown | 🟢 | `KEY_BRIGHTNESSDOWN` down/up（媒體層保留） |
+| LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
+| daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
+| daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
+| sleep hook | 🟢 | `pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（本次以直接呼叫驗證；自動化 session 無法做真實盒蓋 S3 循環） |
+| `--check` | 🟢 | 全綠，含「backlight node writable by group plugdev (mode 660)」 |
+
+**實機發現的坑（repo 已修）：**
+
+1. Ubuntu 26.04 的 `keyd` 套件執行檔是 `/usr/bin/keyd.rvaiya`，`$PATH` 沒有 `keyd`；
+   請用 `keyd_bin()` / `command -v keyd keyd.rvaiya`。
+2. keyd 2.5.x 沒有 `check` 子命令，也沒有裝置熱插拔偵測：安裝器部署
+   `/etc/keyd/cros.conf` 後必須 `systemctl restart keyd`，否則仍是舊映射（或完全沒映射）。
+3. `[ids] *` 會一併 grab ChromeOS `Video Bus`；應限定 `0001:0001`。
+4. udev 的 `MODE=`/`GROUP=`/`uaccess` **不會**改 sysfs LED 屬性；背光 daemon 需要
+   `61-chromeos-kbd-backlight.rules` 裡的 `RUN+=chgrp plugdev` + `RUN+=chmod 0660`，
+   否則會退回 `sudo -n tee`，而使用者服務無法回應 sudo。
+5. keyd 的修飾鍵防護會在單獨 Meta 放開時插入無害的 `LEFTCTRL` 點擊；測試請斷言
+   「含有 `CAPSLOCK`」，不要寫成「只有 `CAPSLOCK`」。
+6. 使用者端 `uinput` 裝置必須提供完整 `keyboard_mask`（`KEY_1..0`、`Q..Y`）或
+   `KEY_BRIGHTNESSUP`，keyd 才會視為鍵盤；只給 `KEY_LEFTMETA` 會被忽略。

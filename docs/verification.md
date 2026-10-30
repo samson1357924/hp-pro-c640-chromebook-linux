@@ -63,11 +63,11 @@ diagnostic bundle.
 | :--- | :---: | :--- |
 | hwdb installed | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` present |
 | hwdb identical to repo | 🟢 | `diff` → only SPDX header comments differ (functionally identical) |
-| keyd option B | ⚠️ | **Not installed on this machine** (hwdb option A used); config file provided only |
-| kbd backlight udev rule | ⚠️ | `61-chromeos-kbd-backlight.rules` (`TAG+="uaccess", GROUP="plugdev" MODE="0660"`) — config-only, not in 2026-08-15 bundle; verify with `udevadm test /sys/class/leds/chromeos::kbd_backlight` |
-| kbd backlight daemon | ⚠️ | `c640-kbd-backlight-sync` → `/usr/local/bin/` (gdbus/dbus-monitor event-driven, `C640_KBD_ENABLE_IDLEMONITOR=0` default) — install-smoke passed, no S3 lid-cycle evidence yet; test `c640-kbd-backlight-sync --check --test-blank --test-unblank` |
-| kbd backlight user service | ⚠️ | `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (`WantedBy=graphical-session.target`, `StartLimitIntervalSec=60/Burst=5`) — `systemctl --global is-enabled` |
-| kbd backlight sleep hook | ⚠️ | `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (0.6s post-resume restore) — config-only |
+| keyd option B | 🟢 | **Installed and hardware-tested 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`): uinput test PASS - tap Search→`CAPSLOCK`, hold Search+Back→`META`+`F1`, hold Search+BrightnessDown→`F6`, BrightnessDown alone→media key; journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
+| kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
+| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal |
+| kbd backlight user service | 🟢 | `/etc/systemd/user/`, globally enabled and **active for uid 1000** (`systemctl --global is-enabled`, `systemctl --user is-active` both OK) |
+| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; direct `pre suspend` → saved 6, simulated 0 → `post suspend` restored 6, state file removed. A real S3 lid cycle was not run in the automated session (no one to wake the machine) |
 
 ### 4. Wi-Fi / Bluetooth / Webcam / Storage
 
@@ -113,10 +113,10 @@ should be considered "provided for your distro, verify on your own hardware":
 | **EC control & battery protection** | `ec/install-ec.sh`, `scripts/c640-ec-control.sh`, `ec/systemd/c640-battery-limit.service`, `ec/systemd/c640-ec-sleep.sh` | 🟢 installed + hardware-verified 2026-08-23 (standalone `ectool` LPC handshake, status dashboard, 90% battery daemon, 0 mA idle bypass, and S3 resume hook verified) |
 | **Fingerprint system-sleep hook** | `fingerprint/systemd/fprintd-sleep.sh` | 🟢 installed + verified 2026-08-19 (lid-cycle test: first unlock has fingerprint prompt, zero resume delay, no retry lines) |
 | **Fingerprint udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 installed 2026-08-18, verified via `getfacl` after reboot |
-| **keyd keyboard config** | `keyboard/keyd/cros.conf` | ❌ option A (hwdb) used instead |
+| **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed + hardware-verified 2026-10-31 (dual-role Search, `[ids] 0001:0001`, uinput test PASS) |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | ⚠️ installed 2026-08-29 (event-driven `gdbus`/`ScreenSaver`+`PrepareForSleep`, CI smoke-test passed; **no hardware brightness trace in bundle yet**) — verify with `--test-blank` |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (enable-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6; a real S3 lid cycle is still pending) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |

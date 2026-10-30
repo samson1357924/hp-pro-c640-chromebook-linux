@@ -166,9 +166,18 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   sudo apt install -y keyd   # (or dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo ln -sf cros.conf /etc/keyd/default.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # required: keyd 2.5.x reads config only at start-up
   ```
+
+  > On Ubuntu 26.04 the package installs `/usr/bin/keyd.rvaiya` (2.5.0), so use
+  > `sudo keyd.rvaiya monitor` and ignore "keyd: command not found". `keyd check`
+  > only exists in >= 2.6. The recommended path is
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`, which handles both.
+  > If the keys still do nothing, check that keyd grabbed the internal AT
+  > keyboard: `journalctl -u keyd | grep 'DEVICE: match'` should show `0001:0001`.
 
 ### 11. Keyboard backlight doesn't turn off / restore with screen blank
 
@@ -198,6 +207,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     for lid close (`suspend`), but not for idle blank - enable IdleMonitor:
     see `keyboard/README.md` `C640_KBD_ENABLE_IDLEMONITOR=1`.
   * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
+  * On Ubuntu 26.04 the LED attribute is only writable if the udev rule applied its
+    `RUN+=chgrp plugdev` + `RUN+=chmod 0660` (verified: `-rw-rw---- root plugdev`).
+    `MODE=`/`GROUP=`/`uaccess` alone cannot chmod sysfs, so if
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` shows `root root 0644`,
+    run `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`;
+    the daemon then stops falling back to `sudo -n tee`.
+  * Root cause check: the user unit cannot prompt for sudo. `journalctl --user -u
+    c640-kbd-backlight-sync` showing `sudo: a password is required` confirms the
+    permission path above is the problem, not the D-Bus events.
 
 ---
 

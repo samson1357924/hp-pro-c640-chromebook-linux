@@ -65,6 +65,18 @@ sudo systemctl --global enable c640-kbd-backlight-sync.service
 # sudo ./keyboard/install-keyboard.sh --with-keyd
 ```
 
+> **Ubuntu 26.04 note (real-hardware verified 2026-10-31):** the `keyd` package
+> (2.5.0-5) installs **`/usr/bin/keyd.rvaiya`**, so plain `keyd ...` is "command
+> not found"; the service is still `keyd`. There is no `keyd check` subcommand
+> before 2.6 - the syntax is validated when the daemon starts. keyd 2.5.x also
+> has no hot-plug detection, so re-run `sudo systemctl restart keyd` after
+> changing `/etc/keyd/*.conf`. `install-keyboard.sh --with-keyd` handles all
+> three cases (binary lookup, optional `check`, restart).
+>
+> The udev rule sets `root:plugdev 0660` on the keyboard-backlight brightness
+> attribute via `RUN+=chgrp/chmod`; `MODE=`/`GROUP=` alone do not touch sysfs.
+> Confirm with `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness`.
+
 ### (4) Compile and Install the Fingerprint Driver
 
 ```bash

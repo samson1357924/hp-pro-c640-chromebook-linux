@@ -99,16 +99,16 @@ set_brightness() {
         local pct
         pct=$((val * 100 / max))
         if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         fi
         return 0
     fi
     if [ -w "$SYSFS_BRIGHTNESS" ]; then
         echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null || true
     else
-        echo "$val" | sudo tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1 || true
+        echo "$val" | sudo -n tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1 || true
     fi
     # Verify write and fallback to ectool if needed (covers both branches)
     local cur
@@ -117,9 +117,9 @@ set_brightness() {
         local pct
         pct=$((val * 100 / max))
         if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
         fi
     fi
 }
