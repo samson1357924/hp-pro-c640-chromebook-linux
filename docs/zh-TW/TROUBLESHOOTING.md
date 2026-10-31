@@ -130,12 +130,20 @@
 
 ### 9. 頂排功能鍵（上一頁/重新整理/亮度/音量）按了無反應
 
-* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射。
+* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射，**或**映射的是這台機器根本不會送的掃描碼（例如直接複製別台 Chromebook 的 hwdb）。第二種情況重裝 hwdb 不會修好。
 * **解決方法**：
 
   ```bash
+  # 先驗證真實掃描碼（唯讀，不會 grab 裝置）：
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # 若失敗，再安裝/重裝映射：
   ./setup.sh --keyboard
   ```
+
+  > 本檔映射的是 Dratini 實測的 AT 掃描碼 `0x3b`-`0x44`。其他 Chromebook
+  > （包含同樣被這條 hwdb 匹配的其他 `Hatch` 機型）可能送 ChromeOS action
+  > 掃描碼（`0xea`、`0xe9`…）。複製映射前請先用
+  > `check-top-row-hwdb.py --listen 60` 擷取自己的掃描碼（見 §10）。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
@@ -149,12 +157,18 @@
   sudo systemctl restart keyd   # 必要：keyd 2.5.x 只在啟動時讀取設定
   ```
 
-  > Ubuntu 26.04 套件安裝的是 `/usr/bin/keyd.rvaiya`（2.5.0），請用
-  > `sudo keyd.rvaiya monitor`，看到「keyd: command not found」可忽略。
+  > Ubuntu 26.04 套件安裝的是 `/usr/bin/keyd.rvaiya`（2.5.0）；
   > `keyd check` 僅存在於 ≥ 2.6。建議直接執行
   > `sudo ./keyboard/install-keyboard.sh --with-keyd`，上述差異它都已處理。
-  > 若按鍵仍無反應，確認 keyd 有 grab 內建 AT 鍵盤：
-  > `journalctl -u keyd | grep 'DEVICE: match'` 應出現 `0001:0001`。
+  > 若頂排仍無反應，先驗證**掃描碼**而不是只看 hwdb 文字：
+  > `sudo python3 keyboard/tests/check-top-row-hwdb.py` 必須印出
+  > `RESULT=PASS`。這台機器送的是 AT 掃描碼 `0x3b`-`0x44`，不是部分
+  > Chromebook 使用的 ChromeOS action 掃描碼。
+  > 若 Search 輕點/長按異常，請用 `overloadt2(meta, capslock, 200)`，
+  > 不要用 `overload`：後者放開時會插入 `LEFTCTRL` 防護，Mutter 就不會開總覽。
+  > 驗證請用 `sudo python3 keyboard/tests/capture-keyd-output.py`（唯讀；
+  > `keyd monitor` 無法開啟已被 keyd grab 的裝置），並確認 keyd 有 grab 內建
+  > AT 鍵盤：`journalctl -u keyd | grep 'DEVICE: match'` 應出現 `0001:0001`。
 
 ### 11. 鍵盤背光不會隨螢幕熄滅/點亮而開關
 

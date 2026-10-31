@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+#
+# Physical AT scancode -> hwdb key name for the HP Pro c640 top row.
+# Measured on real Dratini hardware on 2026-10-31 with EVIOCGKEYCODE and
+# EVIOCGKEY on /dev/input/event2: the top row emits the standard F1-F10
+# scancodes 0x3b-0x44 (keycodes 59-68), NOT the ChromeOS action scancodes.
+#
+# scancode	hwdb-key	name
+3b	back		Top 1 Back
+3c	forward		Top 2 Forward
+3d	refresh		Top 3 Refresh
+3e	f11		Top 4 Fullscreen
+3f	scale		Top 5 Overview
+40	brightnessdown	Top 6 Brightness down
+41	brightnessup	Top 7 Brightness up
+42	mute		Top 8 Mute
+43	volumedown	Top 9 Volume down
+44	volumeup	Top 10 Volume up
+db	leftmeta	Search / Launcher

@@ -29,10 +29,24 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   ```bash
   sudo systemd-hwdb update
   sudo udevadm trigger --subsystem-match=input
-  sudo evtest
+  # Read-only: compares EVIOCGKEYCODE with the measured scancode fixture.
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # Live presses, without grabbing the keyboard away from the desktop:
+  sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 30
   ```
 
+  Do not use `evtest` here: it grabs the device, and grabbing the keyd virtual
+  keyboard kills desktop input until it exits.
+
 * Ensure all HWDB properties start with a **single leading space** and match proper DMI strings (`cat /sys/class/dmi/id/product_name`).
+* **New Chromebook model?** Capture its own scancodes first — do not copy the
+  Dratini block. Press each top-row key with
+  `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` and confirm
+  what the hardware emits; some Chromebooks send the ChromeOS action scancodes
+  (`0xea`, `0xe9`, ...), others standard AT `0x3b`-`0x44`. Update
+  `keyboard/tests/hwdb-top-row-scancodes.tsv` with the measured rows and, if the
+  scancodes differ, add a model-specific DMI block instead of widening
+  `pn*Hatch*`.
 
 ### 3. Audio (ALSA UCM for sofrt5682)
 

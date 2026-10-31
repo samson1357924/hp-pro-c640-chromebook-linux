@@ -68,27 +68,41 @@ jobs:
           HWDB_OUT1=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI1}")
           echo "Query Output for Dratini (Coreboot):"
           echo "${HWDB_OUT1}"
-          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_ea=back"
-          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_e7=refresh"
-          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_a0=mute"
+          # Every scancode from the measured fixture must be present. The
+          # fixture records the real hardware scancodes (0x3b-0x44); asserting
+          # only that *some* mapping exists is what let a dead 0xea-0xb0 block
+          # ship unnoticed.
+          while IFS=$'\t' read -r sc key name; do
+            case "${sc}" in ''|'#'*) continue ;; esac
+            if ! echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_${sc}=${key}"; then
+              echo "FAIL: hwdb is missing KEYBOARD_KEY_${sc}=${key} (${name})"
+              exit 1
+            fi
+          done < keyboard/tests/hwdb-top-row-scancodes.tsv
+          # Search must stay leftmeta so keyd can overload it.
           echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_db=leftmeta"
-          echo "${HWDB_OUT1}" | grep -q "KEYBOARD_KEY_ef=brightnessup"
+          # Guard against re-adding the ChromeOS action scancodes; this hardware
+          # never emits them, so mapping them is dead code.
+          if grep -qE "KEYBOARD_KEY_(ea|e9|e7|91|92|ee|ef|a0|ae|b0)=" keyboard/90-chromebook-keyboard.hwdb; then
+            echo "FAIL: hwdb maps ChromeOS action scancodes this hardware never sends"
+            exit 1
+          fi
 
           # Query assertion 2: HP OEM DMI (HP Pro c640 Chromebook)
           QUERY_DMI2="evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"
           HWDB_OUT2=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI2}")
           echo "Query Output for HP Pro c640 (OEM):"
           echo "${HWDB_OUT2}"
-          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_3b=back"
           echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_db=leftmeta"
-          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_a0=mute"
+          echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_42=mute"
 
           # Query assertion 3: Hatch baseboard fallback
           QUERY_DMI3="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0"
           HWDB_OUT3=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI3}")
           echo "Query Output for Hatch (baseboard):"
           echo "${HWDB_OUT3}"
-          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_3b=back"
           echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_db=leftmeta"
 
           # Query assertion 4: HP c640 generic wildcard (lower case, matches svnHP*:pn*c640*)
@@ -96,7 +110,7 @@ jobs:
           HWDB_OUT4=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI4}")
           echo "Query Output for HP c640 generic:"
           echo "${HWDB_OUT4}"
-          echo "${HWDB_OUT4}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT4}" | grep -q "KEYBOARD_KEY_3b=back"
           echo "${HWDB_OUT4}" | grep -q "KEYBOARD_KEY_db=leftmeta"
 
           # Query assertion 5: lower-case dratini (coreboot reports lower on some builds)
@@ -104,7 +118,7 @@ jobs:
           HWDB_OUT5=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI5}")
           echo "Query Output for dratini lower:"
           echo "${HWDB_OUT5}"
-          echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_3b=back"
           echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_db=leftmeta"
 
           # Query assertion 6: real Dratini firmware modalias (extra br/efr fields)
@@ -116,8 +130,8 @@ jobs:
           echo "Query Output for real Dratini modalias:"
           echo "${HWDB_OUT6}"
           echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_db=leftmeta"
-          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_ea=back"
-          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_ee=brightnessdown"
+          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_3b=back"
+          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_40=brightnessdown"
 
           echo "All hwdb key mappings verified across Coreboot & OEM & Hatch/c640/dratini-lower strings!"
 

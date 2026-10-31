@@ -6,10 +6,20 @@
 This injects events through a virtual keyboard instead of requiring a human to
 press the real one, then reads what keyd's virtual keyboard emits. It verifies:
 
-  1. tap Search                       -> CAPSLOCK
-  2. hold Search + Back               -> META (held) ... F1
-  3. hold Search + BrightnessDown     -> F6  (Search+top-row = F1-F10 layer)
-  4. BrightnessDown alone             -> brightnessdown (media layer)
+  1. tap Search                       -> CAPSLOCK only (no META, no guard)
+  2. hold Search + each top-row key   -> F1 ... F10 (all ten)
+  3. each top-row key alone           -> its media key (pass-through)
+  4. hold Search, release alone       -> lone META down/up, NO LEFTCTRL guard
+                                         (this is what lets Mutter open the
+                                         GNOME overview)
+
+LIMITATION: this test feeds keycodes *after* the hwdb translation. It cannot
+tell whether the physical keyboard really emits KEY_BACK/KEY_BRIGHTNESSDOWN,
+because it injects those keycodes directly. Use
+`keyboard/tests/check-top-row-hwdb.py` on the real machine to verify the AT
+scancodes (0x3b-0x44 on Dratini). An earlier version of this test passed while
+the top row was still sending raw F1-F10, because the hwdb mapped scancodes the
+hardware never sends.
 
 Why a virtual device: keyd 2.5.x only grabs devices it classified as a keyboard
 at start-up (no hot-plug support), so the test creates the device first, then
@@ -50,17 +60,48 @@ KEYS = (
         e.KEY_SPACE,
         e.KEY_LEFTSHIFT,
         e.KEY_LEFTMETA,
+        # Post-hwdb top-row keycodes: Back..VolumeUp plus F11/F1.
         e.KEY_BACK,
-        e.KEY_F1,
-        e.KEY_BRIGHTNESSUP,
+        e.KEY_FORWARD,
+        e.KEY_REFRESH,
+        e.KEY_F11,
+        e.KEY_SCALE,
         e.KEY_BRIGHTNESSDOWN,
+        e.KEY_BRIGHTNESSUP,
+        e.KEY_MUTE,
+        e.KEY_VOLUMEDOWN,
+        e.KEY_VOLUMEUP,
     ]
 )
 
-# keyd's modifier guard (src/keyboard.c:clear_mod) wraps a lone LEFTCTRL/ALT
-# release with a short LEFTCTRL down/up pair so GNOME does not treat the tap as
-# an Activities shortcut. These are expected and not failures.
+# The top row after hwdb: injected keycode -> expected keycode on the meta layer.
+TOP_ROW = (
+    ("Back", e.KEY_BACK, "KEY_F1"),
+    ("Forward", e.KEY_FORWARD, "KEY_F2"),
+    ("Refresh", e.KEY_REFRESH, "KEY_F3"),
+    ("Fullscreen (F11)", e.KEY_F11, "KEY_F4"),
+    ("Overview (Scale)", e.KEY_SCALE, "KEY_F5"),
+    ("BrightnessDown", e.KEY_BRIGHTNESSDOWN, "KEY_F6"),
+    ("BrightnessUp", e.KEY_BRIGHTNESSUP, "KEY_F7"),
+    ("Mute", e.KEY_MUTE, "KEY_F8"),
+    ("VolumeDown", e.KEY_VOLUMEDOWN, "KEY_F9"),
+    ("VolumeUp", e.KEY_VOLUMEUP, "KEY_F10"),
+)
+
+# Modifier key names, filtered out where only the non-modifier result matters.
+# The tap assertion additionally requires that no META/CTRL pair appears at all:
+# keyd's old plain overload() emitted a LEFTCTRL guard around the tap, which
+# made Mutter treat it as Meta+Ctrl.
 MODIFIERS = ("KEY_LEFTMETA", "KEY_LEFTCTRL", "KEY_RIGHTMETA", "KEY_RIGHTCTRL")
+
+
+def key_name(code):
+    """Return one readable name for a keycode (resolve evdev aliases)."""
+    name = evdev.ecodes.KEY.get(code, str(code))
+    if isinstance(name, tuple):
+        # e.g. (KEY_MIN_INTERESTING, KEY_MUTE): prefer the descriptive alias.
+        return next((n for n in name if n != "KEY_MIN_INTERESTING"), name[0])
+    return name
 
 
 def find_keyd():
@@ -84,7 +125,7 @@ def collect(dev, seconds, label):
             break
         for ev in dev.read():
             if ev.type == e.EV_KEY:
-                out.append((evdev.ecodes.KEY.get(ev.code, str(ev.code)), ev.value))
+                out.append((key_name(ev.code), ev.value))
     print(f"[{label}] {out}")
     return out
 
@@ -133,52 +174,74 @@ def main():
             print("FAIL: keyd did not grab the test device (check [ids] in /etc/keyd/cros.conf)")
             failures.append("attach")
 
-        # 1. tap Search -> CAPSLOCK
+        # 1. tap Search -> CAPSLOCK only. A plain overload() would also emit
+        # META plus the LEFTCTRL guard here, so check the raw event names
+        # instead of filtering modifiers out.
         press(ui, e.KEY_LEFTMETA, hold=0.05)
         tap = names(collect(kd, 0.6, "tap Search"))
         non_mods = [n for n in tap if n not in MODIFIERS]
-        if tap.count("KEY_CAPSLOCK") == 2 and set(non_mods) == {"KEY_CAPSLOCK"}:
-            print("PASS: tap Search -> CAPSLOCK (modifier guard LEFTCTRL ignored)")
+        if (
+            tap.count("KEY_CAPSLOCK") == 2
+            and set(non_mods) == {"KEY_CAPSLOCK"}
+            and "KEY_LEFTMETA" not in tap
+            and "KEY_LEFTCTRL" not in tap
+        ):
+            print("PASS: tap Search -> CAPSLOCK only (no META, no guard)")
         else:
-            print("FAIL: tap Search expected CAPSLOCK only")
+            print("FAIL: tap Search expected CAPSLOCK only, got", tap)
             failures.append("tap")
 
-        # 2. hold Search + Back -> META + F1
-        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
-        ui.syn()
-        time.sleep(0.6)  # exceed the tap timeout and enter the meta layer
-        press(ui, e.KEY_BACK)
-        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
-        ui.syn()
-        held = names(collect(kd, 0.8, "hold Search + Back"))
-        if "KEY_LEFTMETA" in held and "KEY_F1" in held:
-            print("PASS: hold Search + Back -> META + F1")
-        else:
-            print("FAIL: hold Search + Back expected META and F1")
-            failures.append("hold-f1")
+        # 2. hold Search + each top-row key -> F1 ... F10.
+        for label, code, expected in TOP_ROW:
+            ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
+            ui.syn()
+            time.sleep(0.6)  # exceed the tap timeout and enter the meta layer
+            press(ui, code)
+            ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
+            ui.syn()
+            held = names(collect(kd, 0.7, f"hold Search + {label}"))
+            if expected in held:
+                print(f"PASS: hold Search + {label} -> {expected}")
+            else:
+                print(f"FAIL: hold Search + {label} expected {expected}, got", held)
+                failures.append(f"hold-{expected.lower()}")
 
-        # 3. hold Search + BrightnessDown -> F6
+        # 3. each top-row key alone -> its own media key (pass-through).
+        for label, code, _expected in TOP_ROW:
+            press(ui, code)
+            media = names(collect(kd, 0.6, f"{label} alone"))
+            own = key_name(code)
+            if own in media:
+                print(f"PASS: {label} alone -> {own}")
+            else:
+                print(f"FAIL: {label} alone expected {own}, got", media)
+                failures.append(f"media-{label.lower().split()[0]}")
+
+        # 4. hold Search and release it alone -> clean lone META, no LEFTCTRL.
+        # keyd's clear_mod() guard would otherwise turn this into Meta+Ctrl and
+        # Mutter would not treat it as the overlay key (no GNOME overview).
         ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
         ui.syn()
         time.sleep(0.6)
-        press(ui, e.KEY_BRIGHTNESSDOWN)
         ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
         ui.syn()
-        held2 = names(collect(kd, 0.8, "hold Search + BrightnessDown"))
-        if "KEY_F6" in held2:
-            print("PASS: hold Search + BrightnessDown -> F6")
+        lone = collect(kd, 0.8, "hold Search alone, release")
+        lone_names = names(lone)
+        # Autorepeat events (value 2) are normal while the key is held; the
+        # point is that the final release is a bare META (no LEFTCTRL guard).
+        if (
+            lone_names
+            and lone_names[0] == "KEY_LEFTMETA"
+            and lone_names[-1] == "KEY_LEFTMETA"
+            and lone[0][1] == 1
+            and lone[-1][1] == 0
+            and "KEY_LEFTCTRL" not in lone_names
+            and "KEY_RIGHTCTRL" not in lone_names
+        ):
+            print("PASS: hold Search alone -> bare META release (no guard)")
         else:
-            print("FAIL: hold Search + BrightnessDown expected F6 (F1-F10 layer)")
-            failures.append("hold-f6")
-
-        # 4. BrightnessDown alone -> brightnessdown media key
-        press(ui, e.KEY_BRIGHTNESSDOWN)
-        media = names(collect(kd, 0.6, "BrightnessDown alone"))
-        if "KEY_BRIGHTNESSDOWN" in media and "KEY_F6" not in media:
-            print("PASS: BrightnessDown alone -> brightnessdown")
-        else:
-            print("FAIL: BrightnessDown alone expected the media key")
-            failures.append("media")
+            print("FAIL: hold Search alone expected a META release without LEFTCTRL guard")
+            failures.append("hold-meta-clean")
 
         kd.close()
     finally:

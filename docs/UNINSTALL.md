@@ -73,6 +73,10 @@ This command automatically:
   > restores brightness to 50% if left at 0, cleans `/run/c640-kbd-backlight/state`
   > and `/run/user/$UID/c640-kbd-backlight.state`, and drops installer-added
   > `plugdev` membership (keeps pre-existing memberships).
+  >
+  > If you installed with `--with-keyd`, it also removes `/etc/keyd/cros.conf`
+  > and the `/etc/keyd/default.conf` symlink (restoring the pre-install backup
+  > when one exists) and disables the `keyd` service.
 
 * **Remove only the power management tweaks** (logind config, suspend
   helpers, TLP config, thermald service enablement):

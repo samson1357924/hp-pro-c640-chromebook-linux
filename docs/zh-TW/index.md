@@ -35,7 +35,7 @@
 
 ## 📊 硬體運作狀態一覽
 
-> **誠實為本** — 🟢 = 已在實機 HP Pro c640 驗證（Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-23），⚠️ = 驅動已綁定但功能測試未納入證據，❌ = 未量測。詳見 [實測驗證矩陣](verification.md)。
+> **誠實為本** — 🟢 = 已在實機 HP Pro c640 驗證（Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-23；鍵盤頂排、雙重角色與背光另於 2026-10-31 在 7.0.0-38 重新驗證），⚠️ = 驅動已綁定但功能測試未納入證據，❌ = 未量測。詳見 [實測驗證矩陣](verification.md)。
 
 | 硬體組件 | 運作狀態 | 驅動 / 解決方案 | 說明與支援度 |
 | :--- | :---: | :--- | :--- |
@@ -44,13 +44,13 @@
 | **Wi-Fi 6 & 藍牙 5.0** | ⚠️ **驅動已綁定** | Intel AX201 (`iwlwifi` / `btusb`) | 驅動開箱即綁定；**WPA3/吞吐量尚未量測**（見 [verification.md](verification.md)）。 |
 | **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸未納入證據**（見 [verification.md](verification.md)）。 |
 | **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 未量測**（見 [verification.md](verification.md)）。 |
-| **鍵盤背光 & 頂排功能鍵** | 🟢 **頂排＋雙重角色＋背光皆已驗證** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon（user service + system-sleep） | 頂排 F1–F10 hwdb 已驗證。2026-10-31 實機測試：keyd 雙重角色 Search（`keyboard/tests/keyd-dualrole-uinput.py`）與背光於 `ScreenSaver.ActiveChanged`/`--test-blank` 的 0↔恢復，sysfs `0660 root:plugdev`（無需 sudo），sleep hook 存還原通過。真實盒蓋 S3 循環仍待測。見 [verification.md](verification.md)。 |
+| **鍵盤背光 & 頂排功能鍵** | 🟢 **頂排＋雙重角色＋背光皆已驗證** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon（user service + system-sleep） | 頂排媒體鍵由 hwdb 提供（實測 AT 掃描碼 `0x3b`-`0x44`），Super+頂排 F1–F10 由 keyd 提供。2026-10-31：虛擬 uinput 測試 PASS，並以實體按鍵被動擷取確認（GNOME 總覽、亮度/音量/靜音）；背光於 `ScreenSaver.ActiveChanged`/`--test-blank` 的 0↔恢復，sysfs `0660 root:plugdev`（無需 sudo），sleep hook 存還原通過。真實盒蓋 S3 循環仍待測。見 [verification.md](verification.md)。 |
 | **EC 電池保護與風扇控制** | 🟢 **正常運作** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% 上限守護服務、0 mA AC 旁路、S3 休眠喚醒鉤子、風扇靜音模式。 |
 | **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測盒蓋 S3 休眠/喚醒（零錯誤）。**按鍵/指紋喚醒未測試**；開蓋後需按鍵才亮（見 [verification.md](verification.md)）。 |
 | **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電正常；**Type-C 外接螢幕未驗證**（見 [verification.md](verification.md)）。 |
 
 !!! note "最後驗證"
-    **2026-08-23** 於 Ubuntu 26.04 LTS（kernel `7.0.0-29-generic`、PipeWire `1.6.2`、fprintd `1.94.5`、MrChromebox `2606.1`）。證據包 `c640-diagnostic-20260815_152233.tar.gz`（EC 90% 守護服務 + `c640-ec-sleep.sh` + `ectool` 已實機驗證；打包 `1.94.10-2` 中繼資料，驅動未異動）— 見 [verification.md](verification.md) 的重現步驟。
+    **2026-08-23** 於 Ubuntu 26.04 LTS（kernel `7.0.0-29-generic`、PipeWire `1.6.2`、fprintd `1.94.5`、MrChromebox `2606.1`）；鍵盤頂排/雙重角色/背光另於 2026-10-31 在 `7.0.0-38-generic` 重新驗證。證據包 `c640-diagnostic-20260815_152233.tar.gz`（EC 90% 守護服務 + `c640-ec-sleep.sh` + `ectool` 已實機驗證；打包 `1.94.10-2` 中繼資料，驅動未異動）— 見 [verification.md](verification.md) 的重現步驟。
 
 ---
 
@@ -152,7 +152,7 @@ Comet Lake SOF DSP 經 ALSA UCM2：
 
 - **方案 A（預設）**：`systemd-hwdb` 零開銷，TTY/X11/Wayland 通用
 - **方案 B**：`keyd` 雙模 `Search` → CapsLock / Super，Super+頂排 → F1–F10 — 見 [keyboard/keyd/cros.conf](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/keyd/cros.conf)
-- **方案 C（新增）**：鍵盤背光與螢幕熄滅/鎖定同步 — 事件驅動 `c640-kbd-backlight-sync`（GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` 對應 S3 盒蓋）+ `cros_kbd_led_backlight` sysfs。見 [keyboard/README.zh-TW.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.zh-TW.md#選項-3鍵盤背光與螢幕熄滅鎖定同步新增)
+- **方案 C（新增）**：鍵盤背光與螢幕熄滅/鎖定同步 — 事件驅動 `c640-kbd-backlight-sync`（GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` 對應 S3 盒蓋）+ `cros_kbd_led_backlight` sysfs。見 [keyboard/README.zh-TW.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.zh-TW.md#選項-3鍵盤背光與螢幕熄滅鎖定同步)
 
 ---
 

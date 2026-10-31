@@ -33,7 +33,7 @@
 | **Wi-Fi 6 & 藍牙 5.0** | ⚠️ **驅動已綁定** | Intel AX201 (`iwlwifi` / `btusb`) | 驅動開箱即綁定；**WPA3/吞吐量尚未量測**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **觸控螢幕 & 觸控板** | ⚠️ **驅動已綁定** | `i2c_hid` / `elan_i2c` | 模組存在；**手勢/防掌觸功能測試未納入證據**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **Intel UHD 顯示與硬解** | ⚠️ **驅動已綁定** | `i915` (Wayland / X11) | 顯示開箱即用；**VA-API 4K 60fps 硬解尚未量測**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
-| **鍵盤背光 & 頂排功能鍵** | 🟢 **頂排＋雙重角色＋背光皆已驗證** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon（user service + system-sleep） | 頂排 F1–F10 hwdb 已驗證。2026-10-31 實機測試：keyd 雙重角色 Search（輕點=CapsLock、長按=Super、Super+頂排=F1–F10）以 `keyboard/tests/keyd-dualrole-uinput.py` 驗證；背光於 `ScreenSaver.ActiveChanged` 與 `--test-blank` 皆能 0↔恢復，sysfs 為 `0660 root:plugdev`（無需 sudo），sleep hook 存還原通過。真實盒蓋 S3 循環仍待測。見 [VERIFICATION.md](docs/zh-TW/verification.md)。 |
+| **鍵盤背光 & 頂排功能鍵** | 🟢 **頂排＋雙重角色＋背光皆已驗證** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon（user service + system-sleep） | 頂排媒體鍵由 hwdb 提供（實測 AT 掃描碼 `0x3b`-`0x44`），Super+頂排 F1–F10 由 keyd 提供。2026-10-31：虛擬 uinput 測試 PASS（輕點=CapsLock、長按=乾淨 Super、10 組 F1–F10、10 個媒體鍵），另外以實體按鍵被動擷取確認（GNOME 總覽會開、亮度/音量/靜音有反應）；背光於 `ScreenSaver.ActiveChanged` 與 `--test-blank` 皆能 0↔恢復，sysfs 為 `0660 root:plugdev`（無需 sudo），sleep hook 存還原通過。真實盒蓋 S3 循環仍待測。見 [VERIFICATION.md](docs/zh-TW/verification.md)。 |
 | **EC 電池保護與風扇控制** | 🟢 **正常** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% 上限守護服務、0 mA AC 旁路、S3 休眠喚醒鉤子、風扇靜音模式。 |
 | **待機休眠** | 🟢 **S3 盒蓋週期已驗證** | ACPI S3 `deep`（預設）+ `s2idle` | 2026-08-18 實測真實盒蓋 S3 休眠/喚醒週期（零錯誤）。**按鍵/指紋喚醒未測試**；已知問題：開蓋後螢幕需按鍵才亮（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
 | **雙 Type-C 輸出與快充** | ⚠️ **充電正常** | USB-PD + DP 1.2 Alt Mode | PD 充電節點存在；**Type-C 外接螢幕尚未驗證**（見 [VERIFICATION.md](docs/zh-TW/verification.md)）。 |
@@ -127,7 +127,8 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 * **方案 B（進階雙模）**：安裝並驗證 `keyd` 設定檔
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf))，支援 Search 鍵「短按
   CapsLock、長按 Super」，按住 Super 轉換頂排為標準 F1-F10。已於 2026-10-31
-  以 `keyboard/tests/keyd-dualrole-uinput.py` 實機驗證（無需人手按鍵）。
+  詳細驗證見 `keyboard/tests/keyd-dualrole-uinput.py`（虛擬鍵盤）與
+  `capture-keyd-output.py`（實體按鍵被動擷取）。
 
 ### 🔋 ChromeOS EC 控制與電池保護 (`ec/`)
 

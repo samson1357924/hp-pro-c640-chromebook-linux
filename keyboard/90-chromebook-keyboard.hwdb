@@ -1,22 +1,36 @@
 # SPDX-License-Identifier: CC0-1.0
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
-# Key mapping data derived from systemd 60-chromebook-keyboard.hwdb (CC0-1.0)
 # HP Pro c640 Chromebook (Google Dratini / Hatch) Keyboard Top-Row Mapping
 # Matches both standard Google Coreboot DMI strings and OEM HP DMI tables
+#
+# Scancodes measured on real Dratini hardware (2026-10-31):
+#   EVIOCGKEYCODE /dev/input/event2 -> 0x3b..0x44 = keycode 59..68 (KEY_F1..F10)
+#   EVIOCGKEY while pressing brightness/mute BEFORE the fix -> KEY_F6/F7/F8
+#   (the firmware really sends F6-F8, i.e. scancodes 0x40-0x42)
+# In other words this machine's top row emits the *standard AT* F1-F10
+# scancodes, not the ChromeOS action scancodes (0xea/0xe9/0xe7/0x91/0x92/...)
+# that 60-keyboard.hwdb-style snippets use for some other Chromebooks. Mapping
+# 0x3b-0x44 is therefore what actually changes the behaviour here; the old
+# 0xea-0xb0 block never matched a real key press and was dead code.
+#
+# NOTE: the pn*Hatch* line matches every Hatch-based Chromebook, not just this
+# Dratini. Other Hatch boards may emit different (action) scancodes; capture
+# yours with keyboard/tests/check-top-row-hwdb.py --listen before reusing this
+# block, and add a model-specific stanza if they differ.
 
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
- KEYBOARD_KEY_ea=back
- KEYBOARD_KEY_e9=forward
- KEYBOARD_KEY_e7=refresh
- KEYBOARD_KEY_91=f11
- KEYBOARD_KEY_92=scale
- KEYBOARD_KEY_a0=mute
- KEYBOARD_KEY_ae=volumedown
- KEYBOARD_KEY_b0=volumeup
+ KEYBOARD_KEY_3b=back
+ KEYBOARD_KEY_3c=forward
+ KEYBOARD_KEY_3d=refresh
+ KEYBOARD_KEY_3e=f11
+ KEYBOARD_KEY_3f=scale
+ KEYBOARD_KEY_40=brightnessdown
+ KEYBOARD_KEY_41=brightnessup
+ KEYBOARD_KEY_42=mute
+ KEYBOARD_KEY_43=volumedown
+ KEYBOARD_KEY_44=volumeup
  KEYBOARD_KEY_db=leftmeta
- KEYBOARD_KEY_ee=brightnessdown
- KEYBOARD_KEY_ef=brightnessup
