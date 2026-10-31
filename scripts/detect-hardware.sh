@@ -99,12 +99,25 @@ run_diagnostic() {
     if [ -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb ]; then
         log_success "  90-chromebook-keyboard.hwdb installed in /etc/udev/hwdb.d/"
         if command -v systemd-hwdb > /dev/null 2>&1; then
-            if systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
-                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_db=leftmeta present)"
-            elif systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_ea=back"; then
-                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_ea present, but db missing - update hwdb)"
+            # The top row emits AT scancodes 0x3b-0x44 on this hardware; the
+            # ChromeOS action scancodes (0xea/...) are never sent. Check every
+            # row of the shared fixture (keyboard/tests/hwdb-top-row-scancodes.tsv).
+            FIXTURE="$ROOT_DIR/keyboard/tests/hwdb-top-row-scancodes.tsv"
+            QUERY="evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*"
+            missing=0
+            if [ -f "$FIXTURE" ]; then
+                while IFS=$'\t' read -r sc key name; do
+                    case "$sc" in '' | '#'*) continue ;; esac
+                    if ! systemd-hwdb query "$QUERY" 2> /dev/null | grep -q "KEYBOARD_KEY_${sc}=${key}"; then
+                        log_warn "  hwdb query missing ${sc}=${key} (${name})"
+                        missing=1
+                    fi
+                done < "$FIXTURE"
+                if [ "$missing" -eq 0 ]; then
+                    log_success "  hwdb Dratini query OK (all fixture scancodes present)"
+                fi
             else
-                log_warn "  hwdb query for Dratini missing KEYBOARD_KEY_ea (run systemd-hwdb update)"
+                log_warn "  Fixture $FIXTURE not found; skipping per-scancode check"
             fi
             for q in "evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"; do
                 if ! systemd-hwdb query "$q" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then

@@ -446,7 +446,7 @@ install_keyboard() {
             local kd_hint=""
             kd_hint="$(keyd_bin 2> /dev/null || true)"
             [ -n "$kd_hint" ] || kd_hint="keyd"
-            log_info "Test keyd: sudo $kd_hint monitor  # short press Search -> capslock, long -> meta"
+            log_info "Test keyd: sudo python3 $SCRIPT_DIR/tests/capture-keyd-output.py  # tap Search -> capslock, hold -> meta"
             log_info "Automated check: sudo python3 $SCRIPT_DIR/tests/keyd-dualrole-uinput.py"
         fi
     fi

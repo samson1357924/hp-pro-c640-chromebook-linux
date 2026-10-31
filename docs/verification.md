@@ -17,7 +17,7 @@
 | **Device** | HP Pro c640 Chromebook (board: `dratini` / baseboard: `hatch`) |
 | **BIOS / Firmware** | MrChromebox UEFI Full ROM, version `2606.1` |
 | **OS** | Ubuntu 26.04 LTS (Resolute Raccoon), x86_64 |
-| **Kernel** | `7.0.0-29-generic` (Ubuntu 7.0.0-29.29, built 2026-07-17) |
+| **Kernel** | `7.0.0-38-generic` for the 2026-10-31 keyboard/backlight session; the 2026-08 evidence bundle was collected on `7.0.0-29-generic` |
 | **Desktop** | GNOME (gnome-shell + GDM), Wayland |
 | **Audio stack** | PipeWire `1.6.2`, WirePlumber `0.5.13`, alsa-ucm-conf `1.2.15.3` |
 | **Fingerprint stack** | fprintd `1.94.5`, libfprint-2 `1.95.1` (custom build with `crfpmoc`) |
@@ -61,9 +61,9 @@ diagnostic bundle.
 
 | Check | Result | Evidence |
 | :--- | :---: | :--- |
-| hwdb installed | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` present |
-| hwdb identical to repo | 🟢 | `diff` → only SPDX header comments differ (functionally identical) |
-| keyd option B | 🟢 | **Installed and hardware-tested 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`): uinput test PASS - tap Search→`CAPSLOCK`, hold Search+Back→`META`+`F1`, hold Search+BrightnessDown→`F6`, BrightnessDown alone→media key; passive capture of the real keyboard shows the same (`LEFTMETA` guard→`CAPSLOCK`, `KEY_F1`, `KEY_F6`×4); journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
+| hwdb installed | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` present; `diff` against the repo file is empty |
+| hwdb scancode map (real hardware) | 🟢 | `keyboard/tests/check-top-row-hwdb.py` (2026-10-31 19:22, `EVIOCGKEYCODE` on the real keyboard): all 11 entries `OK` - `0x3b`→`KEY_BACK`, `0x40`→`KEY_BRIGHTNESSDOWN`, `0x42`→`KEY_MUTE`, `0xdb`→`KEY_LEFTMETA`. This proves the kernel map, not what a key press emits; the physical emission was captured separately (`18:14:47-18:15:18`, see the keyd row). The top row emits standard AT scancodes `0x3b`-`0x44`, not ChromeOS action scancodes. |
+| keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:21, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10`, all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI match (real modalias) | 🟢 | `udevadm test /sys/class/input/event2` applies `KEYBOARD_KEY_*` via the `evdev:atkbd:` lookup even with the firmware's extra `br0.0:efr0.0` fields; non-`atkbd` lookups printing `No entry found from hwdb` is expected |
 | kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
 | kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal |
@@ -114,7 +114,7 @@ should be considered "provided for your distro, verify on your own hardware":
 | **EC control & battery protection** | `ec/install-ec.sh`, `scripts/c640-ec-control.sh`, `ec/systemd/c640-battery-limit.service`, `ec/systemd/c640-ec-sleep.sh` | 🟢 installed + hardware-verified 2026-08-23 (standalone `ectool` LPC handshake, status dashboard, 90% battery daemon, 0 mA idle bypass, and S3 resume hook verified) |
 | **Fingerprint system-sleep hook** | `fingerprint/systemd/fprintd-sleep.sh` | 🟢 installed + verified 2026-08-19 (lid-cycle test: first unlock has fingerprint prompt, zero resume delay, no retry lines) |
 | **Fingerprint udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 installed 2026-08-18, verified via `getfacl` after reboot |
-| **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed + hardware-verified 2026-10-31 (dual-role Search, `[ids] 0001:0001`, uinput test PASS) |
+| **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
 | **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (enable-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6; a real S3 lid cycle is still pending) |
@@ -166,8 +166,14 @@ cat /sys/power/mem_sleep
   unresolved, user accepted), 2026-08-23 (EC 90% battery daemon + `c640-ec-sleep.sh`
   zero-window resume hook + standalone `ectool` LPC handshake verified; packaging
   iteration 2 `1.94.10-2` metadata prepared, driver source unchanged),
-  2026-08-29 (keyboard backlight sync installed — config-only, smoke-tested in CI,
-  no new evidence bundle yet; see keyboard/README.md Option 3)
-* **OS / kernel**: Ubuntu 26.04 LTS, `7.0.0-29-generic`
+  2026-08-29 (keyboard backlight sync installed — config-only at the time;
+  superseded by the 2026-10-31 entry below),
+  2026-10-31 (keyboard top row re-measured: hwdb now maps the real AT scancodes
+  `0x3b`-`0x44`; keyd `overloadt2` dual-role Search verified with the uinput
+  test and with real-key passive capture; backlight sync installed and
+  exercised end-to-end with `--test-blank`, `ScreenSaver.ActiveChanged` and the
+  sleep hook)
+* **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
+  keyboard/backlight session, `7.0.0-29-generic` for the 2026-08 evidence bundle
 * **Firmware**: MrChromebox `2606.1`
 * **Hardware**: HP Pro c640 Chromebook (`dratini`/`hatch`)

@@ -21,7 +21,7 @@ Lake-U platform):
 | **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | ⚠️ **Driver bound** | Display works out of the box; **VA-API 4K 60fps decode not measured**. |
 | **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | ⚠️ **Driver bound** | Standard USB UVC camera; **capture not tested**. |
 | **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **Charging works** | PD charging nodes present; **DP 1.2 display output not verified**. |
-| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Top-row + dual-role + backlight verified (2026-10-31)** | Top-row hwdb verified (incl. Search `db=leftmeta`); keyd dual-role Search (tap CapsLock / hold Super / Super+TopRow F1-F10) verified via `keyboard/tests/keyd-dualrole-uinput.py`; backlight auto-off/restore on screen blank verified (`ScreenSaver.ActiveChanged` 2→0→2, no sudo) and sleep hook save/restore verified; sysfs `0660 root:plugdev`. Real S3 lid cycle still pending. |
+| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Top-row + dual-role + backlight verified (2026-10-31)** | Top-row hwdb maps the measured AT scancodes `0x3b`-`0x44` (not the ChromeOS action scancodes); `check-top-row-hwdb.py` confirmed all 11 `EVIOCGKEYCODE` entries on the real keyboard, and a real-key passive capture confirmed the presses reach the desktop. keyd dual-role Search: virtual uinput test PASS for tap CapsLock (no Meta/guard), hold Super with no `LEFTCTRL` guard, Super+TopRow F1–F10 (all ten) and each top-row key alone; real-key passive capture confirmed lone hold → GNOME overview and single presses → brightness/volume/mute. Backlight auto-off/restore on screen blank verified (`ScreenSaver.ActiveChanged` 2→0→2, no sudo) and sleep hook save/restore verified; sysfs `0660 root:plugdev`. Real S3 lid cycle still pending. |
 | **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 lid cycle verified** | S3 `deep` default; real lid-close cycle tested 2026-08-18. **Key/fingerprint wake untested**; panel stays dark on lid open until a keypress (see [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)). |
 
 ---
@@ -32,8 +32,9 @@ Lake-U platform):
 * **Audio server**: PipeWire `>= 0.3.65` (recommend PipeWire 1.0+ / WirePlumber 0.4.14+).
 * **Distro testing status** (see [VERIFICATION.md](verification.md) for what was actually
   hardware-tested):
-  * 🟢 **Hardware-tested on real device**: **Ubuntu 26.04 LTS** (kernel `7.0.0-29-generic`,
-    PipeWire `1.6.2`, WirePlumber `0.5.13`, fprintd `1.94.5`)
+  * 🟢 **Hardware-tested on real device**: **Ubuntu 26.04 LTS** (kernel `7.0.0-38-generic` for the
+    2026-10-31 keyboard session, `7.0.0-29-generic` for the 2026-08 evidence
+    bundle; PipeWire `1.6.2`, WirePlumber `0.5.13`, fprintd `1.94.5`)
   * ⚠️ **Build-tested in CI only (no hardware test)**: Ubuntu 24.04, Fedora 42,
     Arch Linux (distro-matrix dry-run + dependency resolution), plus packaging
     lint (Arch `namcap`, Fedora `rpmlint`)
