@@ -229,8 +229,8 @@ jobs:
           # install with keyd flag (keyd binary not present in container, but config should be deployed)
           USER=smoketest ./keyboard/install-keyboard.sh --with-keyd
           test -f /etc/keyd/cros.conf
-          test -L /etc/keyd/default.conf
-          test "$(readlink /etc/keyd/default.conf)" = "cros.conf"
+          test ! -e /etc/keyd/default.conf
+          test ! -L /etc/keyd/default.conf
           # keyd check already validated in lint job, but verify file exists
           grep -q "leftmeta = overload" /etc/keyd/cros.conf
 

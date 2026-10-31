@@ -75,7 +75,7 @@ This command automatically:
   > `plugdev` membership (keeps pre-existing memberships).
   >
   > If you installed with `--with-keyd`, it also removes `/etc/keyd/cros.conf`
-  > and the `/etc/keyd/default.conf` symlink (restoring the pre-install backup
+  > and any legacy `/etc/keyd/default.conf` symlink (restoring the pre-install backup
   > when one exists) and disables the `keyd` service.
 
 * **Remove only the power management tweaks** (logind config, suspend

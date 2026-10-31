@@ -23,12 +23,15 @@ if [ -z "${LOG_FILE:-}" ]; then
         fi
     fi
 fi
-if [ -n "$LOG_FILE" ] && ! { : >> "$LOG_FILE"; } 2> /dev/null; then
-    LOG_FILE=""
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2> /dev/null || true
+    if ! { : >> "$LOG_FILE"; } 2> /dev/null; then
+        LOG_FILE=""
+    fi
 fi
 
 _log_file_append() {
-    echo "$1" >> "$LOG_FILE"
+    printf '%s\n' "$1" >> "$LOG_FILE"
 }
 
 # Color codes
@@ -86,7 +89,8 @@ log_step() {
     shift 2
     echo -e "\n${CLR_CYAN}${CLR_BOLD}===> [${step_num}/${total_steps}] ${*}${CLR_RESET}" >&2
     if [ -n "$LOG_FILE" ]; then
-        _log_file_append "\n=== [${step_num}/${total_steps}] ${*} ===" 2> /dev/null || true
+        _log_file_append "" 2> /dev/null || true
+        _log_file_append "=== [${step_num}/${total_steps}] ${*} ===" 2> /dev/null || true
     fi
 }
 

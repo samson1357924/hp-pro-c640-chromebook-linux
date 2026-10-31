@@ -152,7 +152,6 @@
   ```bash
   sudo apt install -y keyd   # (或 dnf/pacman)
   sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
-  sudo ln -sf cros.conf /etc/keyd/default.conf
   sudo systemctl enable keyd
   sudo systemctl restart keyd   # 必要：keyd 2.5.x 只在啟動時讀取設定
   ```
