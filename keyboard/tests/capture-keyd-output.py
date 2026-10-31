@@ -26,6 +26,7 @@ press a top-row key) and read the output.
 Exit status: 0 when the capture window ends, 1 if no keyd device is found.
 """
 import argparse
+import glob
 import os
 import select
 import sys
@@ -34,7 +35,6 @@ import time
 try:
     import evdev
     from evdev import ecodes as e
-    from evdev import list_devices
 except ImportError:
     print("FAIL: python3-evdev is missing; install it with: sudo apt install python3-evdev")
     sys.exit(1)
@@ -43,14 +43,20 @@ KEYD_NAME = "keyd virtual keyboard"
 
 
 def find_keyd_device():
-    for path in sorted(list_devices()):
+    permission_denied = False
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
             dev = evdev.InputDevice(path)
+        except PermissionError:
+            permission_denied = True
+            continue
         except OSError:
             continue
         if dev.name == KEYD_NAME:
             return dev
         dev.close()
+    if permission_denied:
+        raise PermissionError("Insufficient permissions to read /dev/input/event* (run with sudo)")
     return None
 
 
@@ -86,13 +92,20 @@ def main():
     if args.device:
         try:
             dev = evdev.InputDevice(args.device)
+        except PermissionError:
+            print("FAIL: Insufficient permissions to read /dev/input/event* (run with sudo)")
+            return 1
         except OSError as exc:
             print(f"FAIL: cannot open {args.device}: {exc}")
             return 1
         if dev.name != KEYD_NAME:
             print(f"WARN: {dev.path} is {dev.name!r}, not {KEYD_NAME!r}")
     else:
-        dev = find_keyd_device()
+        try:
+            dev = find_keyd_device()
+        except PermissionError as exc:
+            print(f"FAIL: {exc}")
+            return 1
         if dev is None:
             print(f"FAIL: {KEYD_NAME!r} not found; is keyd running? (systemctl status keyd)")
             return 1

@@ -38,6 +38,7 @@ Run:
 Exit code 0 = all checks passed. NOTE: restarting keyd briefly drops the real
 keyboard remapping, so run this from a TTY/SSH or accept a ~1s interruption.
 """
+import os
 import select
 import subprocess
 import sys
@@ -143,6 +144,10 @@ def press(ui, code, hold=0.05):
 
 
 def main():
+    if os.geteuid() != 0:
+        print("FAIL: keyd-dualrole-uinput.py requires root permissions (run with sudo)")
+        return 1
+
     ui = UInput(
         {e.EV_KEY: KEYS},
         name=TEST_DEVICE_NAME,
@@ -164,11 +169,18 @@ def main():
             return 1
         print(f"keyd output device: {kd.path}")
 
-        log = subprocess.run(
-            ["journalctl", "-u", "keyd", "-n", "40", "--no-pager"],
+        res = subprocess.run(
+            ["journalctl", "-u", "keyd", "--since", "20 seconds ago", "--no-pager"],
             capture_output=True,
             text=True,
-        ).stdout
+        )
+        log = res.stdout
+        if res.returncode != 0 or TEST_DEVICE_NAME not in log:
+            log = subprocess.run(
+                ["journalctl", "-u", "keyd", "-n", "100", "--no-pager"],
+                capture_output=True,
+                text=True,
+            ).stdout
         attached = TEST_DEVICE_NAME in log
         print("keyd attached to test device:", attached)
         if not attached:

@@ -20,6 +20,7 @@ Exit status: 0 all expected mappings present, 1 otherwise.
 """
 import argparse
 import fcntl
+import glob
 import os
 import struct
 import sys
@@ -27,7 +28,7 @@ import time
 
 try:
     import evdev
-    from evdev import InputDevice, ecodes as e, list_devices
+    from evdev import InputDevice, ecodes as e
 except ImportError:
     print("FAIL: python3-evdev is missing; install it with: sudo apt install python3-evdev")
     sys.exit(1)
@@ -38,14 +39,20 @@ EVIOCGKEYCODE = 0x80084504
 
 
 def find_at_keyboard():
-    for path in sorted(list_devices()):
+    permission_denied = False
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
             dev = InputDevice(path)
+        except PermissionError:
+            permission_denied = True
+            continue
         except OSError:
             continue
         if dev.name == AT_KEYBOARD_NAME:
             return dev
         dev.close()
+    if permission_denied:
+        raise PermissionError("Insufficient permissions to read /dev/input/event* (run with sudo)")
     return None
 
 
@@ -112,7 +119,11 @@ def main():
                         help="after checking, log key presses for this many seconds")
     args = parser.parse_args()
 
-    dev = find_at_keyboard()
+    try:
+        dev = find_at_keyboard()
+    except PermissionError as exc:
+        print(f"FAIL: {exc}")
+        return 1
     if dev is None:
         print(f"FAIL: {AT_KEYBOARD_NAME!r} not found")
         return 1
@@ -143,7 +154,7 @@ def main():
     if failures:
         print(f"RESULT=FAIL ({failures} scancode(s) not mapped as expected)")
         print("Reinstall with: sudo ./keyboard/install-keyboard.sh --with-keyd")
-        print("then check:     udevadm info /dev/input/event2 | grep KEYBOARD_KEY")
+        print(f"then check:     udevadm info {dev.path} | grep KEYBOARD_KEY")
         return 1
     print("RESULT=PASS")
     return 0
