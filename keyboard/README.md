@@ -32,6 +32,11 @@ kernel/hardware level using `systemd-hwdb` or at the input daemon level using
 > Chromebooks use. hwdb must therefore map `0x3b`-`0x44`; mapping the action
 > scancodes has no effect on this machine. The measured table lives in
 > `keyboard/tests/hwdb-top-row-scancodes.tsv` and is asserted in CI.
+>
+> **Other Chromebooks:** hwdb also matches `pn*Hatch*`, so this mapping applies
+> to other Hatch boards that might emit different scancodes. Run
+> `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` and press the
+> top row to verify before relying on this table.
 
 ---
 
@@ -51,6 +56,7 @@ chmod +x keyboard/install-keyboard.sh
 * `./keyboard/install-keyboard.sh --check` : Check if hwdb is deployed.
 * `./keyboard/install-keyboard.sh --dry-run` : Preview operations.
 * `./keyboard/install-keyboard.sh --uninstall` : Remove the top-row hwdb, backlight sync and (if installed) the keyd config.
+* `./keyboard/install-keyboard.sh --with-keyd` : Install with keyd (advanced dual-role).
 
 ---
 

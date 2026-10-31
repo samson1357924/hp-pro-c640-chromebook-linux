@@ -89,7 +89,7 @@ chmod +x keyboard/install-keyboard.sh
    sudo pacman -S keyd
 
    # NixOS
-   # services.keyd.enable = true;
+   # services.keyd.enable = true;  # 另需 environment.etc."keyd/cros.conf".source = ./keyboard/keyd/cros.conf
    ```
 
    > **各發行版執行檔名稱不同（Ubuntu 26.04 實測）：** Debian/Ubuntu 套件安裝的是
