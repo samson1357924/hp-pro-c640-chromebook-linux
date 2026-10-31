@@ -305,12 +305,12 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 
 | 檢查項目 | 結果 | 證據 |
 | :--- | :---: | :--- |
-| hwdb 即時轉譯 | 🟢 | `check-top-row-hwdb.py`（2026-10-31 19:22，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 OK — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA` |
+| hwdb 即時轉譯 | 🟢 | `check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 OK — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA` |
 | keyd 只 grab 內建鍵盤 | 🟢 | journal：`match 0001:0001 ... (AT Translated Set 2 keyboard)`；`ignoring 0000:0006 (Video Bus)` |
-| 輕點 Search（uinput） | 🟢 | uinput 測試（2026-10-31 19:21）：只有 `CAPSLOCK` down/up，沒有 `META`、沒有防護組 |
-| 純長按 Search（uinput） | 🟢 | uinput 測試（19:21）：`LEFTMETA` down、autorepeat、乾淨的 `LEFTMETA` up，沒有 `LEFTCTRL` 防護，Mutter 可開總覽 |
-| 長按 Search + 頂排（uinput） | 🟢 | uinput 測試（19:21）：10 組全部通過 — `Back`→`F1`、`Forward`→`F2`、`Refresh`→`F3`、`F11`→`F4`、`Scale`→`F5`、`BrightnessDown`→`F6`、`BrightnessUp`→`F7`、`Mute`→`F8`、`VolumeDown`→`F9`、`VolumeUp`→`F10` |
-| 單按頂排（uinput） | 🟢 | uinput 測試（19:21）：10 個鍵全部原樣送出媒體鍵碼（`KEY_BACK` … `KEY_VOLUMEUP`） |
+| 輕點 Search（uinput） | 🟢 | uinput 測試（2026-10-31 19:45:37）：只有 `CAPSLOCK` down/up，沒有 `META`、沒有防護組 |
+| 純長按 Search（uinput） | 🟢 | uinput 測試（19:45:37）：`LEFTMETA` down、autorepeat、乾淨的 `LEFTMETA` up，沒有 `LEFTCTRL` 防護，Mutter 可開總覽 |
+| 長按 Search + 頂排（uinput） | 🟢 | uinput 測試（19:45:37）：10 組全部通過 — `Back`→`F1`、`Forward`→`F2`、`Refresh`→`F3`、`F11`→`F4`、`Scale`→`F5`、`BrightnessDown`→`F6`、`BrightnessUp`→`F7`、`Mute`→`F8`、`VolumeDown`→`F9`、`VolumeUp`→`F10` |
+| 單按頂排（uinput） | 🟢 | uinput 測試（19:45:37）：10 個鍵全部原樣送出媒體鍵碼（`KEY_BACK` … `KEY_VOLUMEUP`） |
 | 實體長按 Search 後放開（被動擷取） | 🟢 | `18:14:47-18:14:50`：`LEFTMETA` down + autorepeat、乾淨的 `LEFTMETA` up（**沒有 `LEFTCTRL`**）；GNOME 活動總覽確實開啟（畫面確認） |
 | 實體輕點 Search（被動擷取） | 🟢 | `18:14:52`：只有 `CAPSLOCK` down/up |
 | 實體單按亮度/靜音/音量（被動擷取） | 🟢 | `18:14:59-18:15:07`：`KEY_BRIGHTNESSDOWN`/`KEY_BRIGHTNESSUP`/`KEY_MUTE`/`KEY_VOLUMEDOWN`/`KEY_VOLUMEUP`；螢幕亮度與音量確實改變（畫面確認） |

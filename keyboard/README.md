@@ -325,12 +325,12 @@ Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 
 | Check | Result | Evidence |
 | :--- | :---: | :--- |
-| hwdb live translation | 🟢 | `check-top-row-hwdb.py` (2026-10-31 19:22, `EVIOCGKEYCODE` on the real keyboard): all 11 entries OK - `0x3b`→`KEY_BACK`, `0x40`→`KEY_BRIGHTNESSDOWN`, `0x42`→`KEY_MUTE`, `0xdb`→`KEY_LEFTMETA` |
+| hwdb live translation | 🟢 | `check-top-row-hwdb.py` (2026-10-31 19:45:29, `EVIOCGKEYCODE` on the real keyboard): all 11 entries OK - `0x3b`→`KEY_BACK`, `0x40`→`KEY_BRIGHTNESSDOWN`, `0x42`→`KEY_MUTE`, `0xdb`→`KEY_LEFTMETA` |
 | keyd grabs only the internal keyboard | 🟢 | journal: `match 0001:0001 ... (AT Translated Set 2 keyboard)`; `ignoring 0000:0006 (Video Bus)` |
-| Tap Search (uinput) | 🟢 | uinput test (2026-10-31 19:21): `CAPSLOCK` down/up only - no `META`, no guard pair |
-| Hold Search alone (uinput) | 🟢 | uinput test (19:21): `LEFTMETA` down, repeats, bare `LEFTMETA` up - no `LEFTCTRL` guard, so Mutter opens the overview |
-| Hold Search + top row (uinput) | 🟢 | uinput test (19:21): all ten chords `Back`→`F1`, `Forward`→`F2`, `Refresh`→`F3`, `F11`→`F4`, `Scale`→`F5`, `BrightnessDown`→`F6`, `BrightnessUp`→`F7`, `Mute`→`F8`, `VolumeDown`→`F9`, `VolumeUp`→`F10` |
-| Top row alone (uinput) | 🟢 | uinput test (19:21): all ten keys pass through as their media keycode (`KEY_BACK` ... `KEY_VOLUMEUP`) |
+| Tap Search (uinput) | 🟢 | uinput test (2026-10-31 19:45:37): `CAPSLOCK` down/up only - no `META`, no guard pair |
+| Hold Search alone (uinput) | 🟢 | uinput test (19:45:37): `LEFTMETA` down, repeats, bare `LEFTMETA` up - no `LEFTCTRL` guard, so Mutter opens the overview |
+| Hold Search + top row (uinput) | 🟢 | uinput test (19:45:37): all ten chords `Back`→`F1`, `Forward`→`F2`, `Refresh`→`F3`, `F11`→`F4`, `Scale`→`F5`, `BrightnessDown`→`F6`, `BrightnessUp`→`F7`, `Mute`→`F8`, `VolumeDown`→`F9`, `VolumeUp`→`F10` |
+| Top row alone (uinput) | 🟢 | uinput test (19:45:37): all ten keys pass through as their media keycode (`KEY_BACK` ... `KEY_VOLUMEUP`) |
 | Physical hold Search, release (passive capture) | 🟢 | `18:14:47-18:14:50`: `LEFTMETA` down + repeats, bare `LEFTMETA` up (**no `LEFTCTRL`**); GNOME Activities opened (confirmed on screen) |
 | Physical tap Search (passive capture) | 🟢 | `18:14:52`: `CAPSLOCK` down/up only |
 | Physical single press of brightness/mute/volume (passive capture) | 🟢 | `18:14:59-18:15:07`: `KEY_BRIGHTNESSDOWN`/`KEY_BRIGHTNESSUP`/`KEY_MUTE`/`KEY_VOLUMEDOWN`/`KEY_VOLUMEUP`; screen brightness and audio volume changed (confirmed on screen) |

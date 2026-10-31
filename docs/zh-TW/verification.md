@@ -60,8 +60,8 @@
 | 檢查項目 | 結果 | 證據 |
 | :--- | :---: | :--- |
 | hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在；與 repo 檔 `diff` 為空 |
-| hwdb 掃描碼映射（實機） | 🟢 | `keyboard/tests/check-top-row-hwdb.py`（2026-10-31 19:22，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 `OK` — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA`。這證明的是核心映射，不是按鍵實際送出的掃描碼；實體送出的部分另以 `18:14:47-18:15:18` 的被動擷取驗證。頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`，不是 ChromeOS action 掃描碼。 |
-| keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:21，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
+| hwdb 掃描碼映射（實機） | 🟢 | `keyboard/tests/check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 `OK` — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA`。這證明的是核心映射，不是按鍵實際送出的掃描碼；實體送出的部分另以 `18:14:47-18:15:18` 的被動擷取驗證。頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`，不是 ChromeOS action 掃描碼。 |
+| keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
 | 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫** |
@@ -98,10 +98,11 @@
 
 ---
 
-## ⚠️ 僅提供設定檔／尚未實測
+## ⚠️ 其他元件（逐列狀態）
 
-下列檔案在上述裝置上皆屬「僅設定」——狀態欄標明已安裝或存在但未啟用。
-未實測項目請視為「提供給你的發行版參考，請自行驗證」：
+下列檔案在上述裝置上分別是已安裝、存在但未啟用，或刻意不安裝——以狀態欄為準。
+標 🟢 的列有列內註明的實測證據；標 ⚠️/❌ 的列**尚未**驗證，請視為
+「提供給你的發行版參考，請自行驗證」：
 
 | 模組 | 檔案 | 狀態 |
 | :--- | :--- | :---: |
