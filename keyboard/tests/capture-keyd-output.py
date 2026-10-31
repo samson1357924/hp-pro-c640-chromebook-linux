@@ -71,6 +71,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def key_name(code):
+    """Return one readable name per keycode (evdev aliases are tuples)."""
+    name = evdev.ecodes.KEY.get(code, f"KEY_{code}")
+    if isinstance(name, tuple):
+        # e.g. (KEY_MIN_INTERESTING, KEY_MUTE): prefer the descriptive alias.
+        return next((n for n in name if n != "KEY_MIN_INTERESTING"), name[0])
+    return name
+
+
 def main():
     args = parse_args()
 
@@ -88,7 +97,7 @@ def main():
             print(f"FAIL: {KEYD_NAME!r} not found; is keyd running? (systemctl status keyd)")
             return 1
 
-    print(f"passive capture {dev.path} {dev.name} (no EVIOCGRAB)", flush=True)
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} passive capture {dev.path} {dev.name} (no EVIOCGRAB)", flush=True)
     if args.seconds:
         print(f"listening for {args.seconds:g}s, press keys now", flush=True)
 
@@ -107,8 +116,7 @@ def main():
             for ev in dev.read():
                 stamp = time.strftime("%H:%M:%S")
                 if ev.type == e.EV_KEY:
-                    name = evdev.ecodes.KEY.get(ev.code, f"KEY_{ev.code}")
-                    print(f"{stamp} {name} {ev.value}", flush=True)
+                    print(f"{stamp} {key_name(ev.code)} {ev.value}", flush=True)
                 elif ev.type == e.EV_SYN and ev.code == e.SYN_DROPPED:
                     print(f"{stamp} !!! SYN_DROPPED (events were lost)", flush=True)
     except KeyboardInterrupt:

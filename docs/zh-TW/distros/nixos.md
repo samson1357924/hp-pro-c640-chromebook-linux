@@ -66,7 +66,7 @@ in
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
   '';
 
   # 5. 只為 sudo 啟用指紋（不要加入 GDM：解鎖時 GDM 的 claim race

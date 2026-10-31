@@ -106,6 +106,7 @@ def listen(dev, seconds):
 
 
 def main():
+    print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--listen", type=float, metavar="SECONDS",
                         help="after checking, log key presses for this many seconds")

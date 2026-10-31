@@ -62,8 +62,8 @@ diagnostic bundle.
 | Check | Result | Evidence |
 | :--- | :---: | :--- |
 | hwdb installed | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` present; `diff` against the repo file is empty |
-| hwdb scancode map (real hardware) | 🟢 | `keyboard/tests/check-top-row-hwdb.py` (2026-10-31 19:22, `EVIOCGKEYCODE` on the real keyboard): all 11 entries `OK` - `0x3b`→`KEY_BACK`, `0x40`→`KEY_BRIGHTNESSDOWN`, `0x42`→`KEY_MUTE`, `0xdb`→`KEY_LEFTMETA`. This proves the kernel map, not what a key press emits; the physical emission was captured separately (`18:14:47-18:15:18`, see the keyd row). The top row emits standard AT scancodes `0x3b`-`0x44`, not ChromeOS action scancodes. |
-| keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:21, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10`, all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
+| hwdb scancode map (real hardware) | 🟢 | `keyboard/tests/check-top-row-hwdb.py` (2026-10-31 19:45:29, `EVIOCGKEYCODE` on the real keyboard): all 11 entries `OK` - `0x3b`→`KEY_BACK`, `0x40`→`KEY_BRIGHTNESSDOWN`, `0x42`→`KEY_MUTE`, `0xdb`→`KEY_LEFTMETA`. This proves the kernel map, not what a key press emits; the physical emission was captured separately (`18:14:47-18:15:18`, see the keyd row). The top row emits standard AT scancodes `0x3b`-`0x44`, not ChromeOS action scancodes. |
+| keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:45:37, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10`, all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI match (real modalias) | 🟢 | `udevadm test /sys/class/input/event2` applies `KEYBOARD_KEY_*` via the `evdev:atkbd:` lookup even with the firmware's extra `br0.0:efr0.0` fields; non-`atkbd` lookups printing `No entry found from hwdb` is expected |
 | kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
 | kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal |
@@ -100,11 +100,12 @@ diagnostic bundle.
 
 ---
 
-## ⚠️ Config-Only / NOT Yet Verified
+## ⚠️ Other Components (Status Per Row)
 
-These files are **config-only on the device above** — installed or
-available-but-not-enabled as the status column says. Anything not measured
-should be considered "provided for your distro, verify on your own hardware":
+These files are installed, available-but-not-enabled, or deliberately not
+installed on the device above, exactly as the status column says. 🟢 rows have
+the evidence noted inline; ⚠️/❌ rows are **not** verified and should be treated
+as "provided for your distro, verify on your own hardware":
 
 | Module | Files | Status |
 | :--- | :--- | :---: |

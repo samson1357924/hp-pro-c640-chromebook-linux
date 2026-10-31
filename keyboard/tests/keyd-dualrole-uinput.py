@@ -60,7 +60,7 @@ KEYS = (
         e.KEY_SPACE,
         e.KEY_LEFTSHIFT,
         e.KEY_LEFTMETA,
-        # Post-hwdb top-row keycodes: Back..VolumeUp plus F11/F1.
+        # Post-hwdb top-row keycodes: Back..VolumeUp plus F11.
         e.KEY_BACK,
         e.KEY_FORWARD,
         e.KEY_REFRESH,
@@ -157,6 +157,7 @@ def main():
         subprocess.run(["systemctl", "restart", "keyd"], check=True)
         time.sleep(1.5)
 
+        print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
         kd = find_keyd()
         if kd is None:
             print("FAIL: keyd virtual keyboard not found (is keyd running?)")

@@ -43,10 +43,11 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   Dratini block. Press each top-row key with
   `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` and confirm
   what the hardware emits; some Chromebooks send the ChromeOS action scancodes
-  (`0xea`, `0xe9`, ...), others standard AT `0x3b`-`0x44`. Update
-  `keyboard/tests/hwdb-top-row-scancodes.tsv` with the measured rows and, if the
-  scancodes differ, add a model-specific DMI block instead of widening
-  `pn*Hatch*`.
+  (`0xea`, `0xe9`, ...), others standard AT `0x3b`-`0x44`. If the scancodes
+  differ, add a model-specific DMI block **and** a model-specific fixture (plus
+  a CI assertion for that DMI); do not append different scancodes to the shared
+  `keyboard/tests/hwdb-top-row-scancodes.tsv`, because CI asserts that whole
+  file against the Dratini DMI.
 
 ### 3. Audio (ALSA UCM for sofrt5682)
 
