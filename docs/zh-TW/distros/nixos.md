@@ -60,10 +60,13 @@ in
 
   # 4. ChromeOS /dev/cros_fp + 鍵盤背光 udev 權限
   #    （把使用者加入 `plugdev`：`users.users.<you>.extraGroups = [ "plugdev" ];`）
+  #    注意：MODE=/GROUP=/uaccess 只作用於 /dev 節點；LED 亮度是純 sysfs
+  #    檔案，必須用 RUN+= 明確 chgrp/chmod（與 repo 的
+  #    61-chromeos-kbd-backlight.rules 相同）。
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
   '';
 
   # 5. 只為 sudo 啟用指紋（不要加入 GDM：解鎖時 GDM 的 claim race
@@ -71,24 +74,33 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. 鍵盤頂排映射 (udev hwdb)
+  #    以下是 Dratini（HP Pro c640）實測的掃描碼。pn*Hatch* 那行也會匹配
+  #    其他 Hatch 系列 Chromebook，它們可能送不同掃描碼——直接複製前請先
+  #    自行擷取驗證。
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
-     KEYBOARD_KEY_ea=back
-     KEYBOARD_KEY_e9=forward
-     KEYBOARD_KEY_e7=refresh
-     KEYBOARD_KEY_91=f11
-     KEYBOARD_KEY_92=scale
-     KEYBOARD_KEY_a0=mute
-     KEYBOARD_KEY_ae=volumedown
-     KEYBOARD_KEY_b0=volumeup
+     KEYBOARD_KEY_3b=back
+     KEYBOARD_KEY_3c=forward
+     KEYBOARD_KEY_3d=refresh
+     KEYBOARD_KEY_3e=f11
+     KEYBOARD_KEY_3f=scale
+     KEYBOARD_KEY_40=brightnessdown
+     KEYBOARD_KEY_41=brightnessup
+     KEYBOARD_KEY_42=mute
+     KEYBOARD_KEY_43=volumedown
+     KEYBOARD_KEY_44=volumeup
      KEYBOARD_KEY_db=leftmeta
-     KEYBOARD_KEY_ee=brightnessdown
-     KEYBOARD_KEY_ef=brightnessup
   '';
+  # 6b. keyd 雙重角色 Search（選用；設定檔在 keyboard/keyd/cros.conf）
+  #     NixOS 各版本的 keyd module schema 不同，本指南不自動產生設定。請把
+  #     keyboard/keyd/cros.conf 部署到 /etc/keyd/cros.conf（含
+  #     [ids] 0001:0001 與 leftmeta = overloadt2(meta, capslock, 200)）並啟用
+  #     keyd 服務。沒有 keyd 時，頂排仍可透過上面的 hwdb 當媒體鍵使用。
+
   # 鍵盤背光同步 daemon（user service + system-sleep）
   # 選項 A：以 repo 安裝器作為 imperative 步驟：sudo /path/to/keyboard/install-keyboard.sh
   # 選項 B：宣告式範例（自行調整路徑）：

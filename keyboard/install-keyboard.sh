@@ -105,6 +105,14 @@ check_keyboard_status() {
         curr="$(cat /sys/class/leds/chromeos::kbd_backlight/brightness 2> /dev/null || echo "?")"
         max="$(cat /sys/class/leds/chromeos::kbd_backlight/max_brightness 2> /dev/null || echo "?")"
         log_info "Current kbd backlight: $curr / $max"
+        local led="/sys/class/leds/chromeos::kbd_backlight/brightness"
+        local led_mode led_group
+        led_mode="$(stat -c '%a' "$led" 2> /dev/null || echo "?")"
+        led_group="$(stat -c '%G' "$led" 2> /dev/null || echo "?")"
+        case "$led_mode" in
+            66[04] | 66[26]) log_success "  backlight node writable by group $led_group (mode $led_mode)" ;;
+            *) log_warn "  backlight node is $led_mode $led_group - udev chmod not applied yet (run: sudo udevadm trigger --subsystem-match=leds)" ;;
+        esac
     else
         log_warn "No kbd backlight sysfs found (/sys/class/leds/chromeos::kbd_backlight)"
     fi
@@ -124,8 +132,11 @@ check_keyboard_status() {
         elif [ -f "$KEYD_LINK" ]; then
             log_success "keyd default.conf exists at $KEYD_LINK"
         fi
-        if command -v keyd > /dev/null 2>&1; then
-            log_info "  keyd version: $(keyd --version 2> /dev/null | head -n1 || echo "unknown")"
+        local keyd_cmd=""
+        keyd_cmd="$(keyd_bin 2> /dev/null || true)"
+        if [ -n "$keyd_cmd" ]; then
+            log_info "  keyd binary: $keyd_cmd"
+            log_info "  keyd version: $("$keyd_cmd" --version 2> /dev/null | head -n1 || echo "unknown")"
         else
             log_warn "  keyd binary not found (install with: sudo apt install keyd or see keyboard/README.md)"
         fi
@@ -136,18 +147,18 @@ check_keyboard_status() {
         else
             log_info "  keyd service not active (run: sudo systemctl enable --now keyd)"
         fi
-        if command -v keyd > /dev/null 2>&1 && [ -f "$KEYD_DST" ]; then
-            if keyd check "$KEYD_DST" > /dev/null 2>&1; then
-                log_success "  keyd config syntax valid (keyd check $KEYD_DST)"
-            else
-                log_warn "  keyd config syntax check failed for $KEYD_DST"
-            fi
-        elif command -v keyd > /dev/null 2>&1 && [ -f "$KEYD_SRC" ]; then
-            # Fallback check source when DST not yet deployed
-            if keyd check "$KEYD_SRC" > /dev/null 2>&1; then
-                log_success "  keyd source syntax valid (keyd check $KEYD_SRC)"
-            else
-                log_warn "  keyd source syntax check failed"
+        if [ -n "$keyd_cmd" ]; then
+            local check_target="$KEYD_DST"
+            [ -f "$check_target" ] || check_target="$KEYD_SRC"
+            [ -f "$check_target" ] || check_target=""
+            if [ -n "$check_target" ]; then
+                local rc=0
+                keyd_check_config "$check_target" || rc=$?
+                case "$rc" in
+                    0) log_success "  keyd config syntax valid ($check_target)" ;;
+                    3) log_info "  keyd < 2.6 has no 'check' subcommand; syntax validated on daemon reload" ;;
+                    *) log_warn "  keyd config syntax check failed for $check_target" ;;
+                esac
             fi
         fi
     else
@@ -383,7 +394,7 @@ install_keyboard() {
             log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
             log_dryrun "Create symlink $KEYD_LINK -> cros.conf"
             log_dryrun "Would record service state: keyd (keyboard)"
-            log_dryrun "keyd check $KEYD_DST && systemctl enable --now keyd (if keyd installed)"
+            log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
         else
             if [ ! -f "$KEYD_SRC" ]; then
                 log_warn "keyd source not found at $KEYD_SRC, skipping"
@@ -397,13 +408,20 @@ install_keyboard() {
                 # Record service state before enabling (first-wins) - even if binary not yet installed, stub handles is-enabled=1 case
                 manifest_add_service "keyd" "keyboard"
                 # Validate syntax if keyd is available
-                if command -v keyd > /dev/null 2>&1; then
-                    if keyd check "$KEYD_DST" > /dev/null 2>&1; then
-                        log_success "keyd config syntax valid"
-                    else
-                        log_warn "keyd config syntax check failed for $KEYD_DST"
-                    fi
-                    sudo systemctl enable --now keyd 2> /dev/null || log_warn "Failed to enable keyd (try: sudo systemctl enable --now keyd)"
+                local keyd_cmd=""
+                keyd_cmd="$(keyd_bin 2> /dev/null || true)"
+                if [ -n "$keyd_cmd" ]; then
+                    local rc=0
+                    keyd_check_config "$KEYD_DST" || rc=$?
+                    case "$rc" in
+                        0) log_success "keyd config syntax valid" ;;
+                        3) log_info "keyd < 2.6 has no 'check' subcommand; relying on daemon reload" ;;
+                        *) log_warn "keyd config syntax check failed for $KEYD_DST" ;;
+                    esac
+                    sudo systemctl enable keyd 2> /dev/null || log_warn "Failed to enable keyd (try: sudo systemctl enable keyd)"
+                    # The config is deployed after keyd's initial device scan; restart
+                    # so the daemon grabs the keyboard and applies the mapping now.
+                    sudo systemctl restart keyd 2> /dev/null || log_warn "Failed to restart keyd (try: sudo systemctl restart keyd)"
                     # Recommend libinput quirk for GNOME Wayland
                     if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
                         log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
@@ -425,7 +443,11 @@ install_keyboard() {
         log_info "Tip: re-login or run 'systemctl --user start c640-kbd-backlight-sync.service' to start the daemon immediately."
         log_info "Test blank: c640-kbd-backlight-sync --test-blank  && c640-kbd-backlight-sync --test-unblank"
         if [ "${WITH_KEYD:-0}" = "1" ]; then
-            log_info "Test keyd: sudo keyd monitor  # short press Search -> capslock, long -> meta"
+            local kd_hint=""
+            kd_hint="$(keyd_bin 2> /dev/null || true)"
+            [ -n "$kd_hint" ] || kd_hint="keyd"
+            log_info "Test keyd: sudo python3 $SCRIPT_DIR/tests/capture-keyd-output.py  # tap Search -> capslock, hold -> meta"
+            log_info "Automated check: sudo python3 $SCRIPT_DIR/tests/keyd-dualrole-uinput.py"
         fi
     fi
 }

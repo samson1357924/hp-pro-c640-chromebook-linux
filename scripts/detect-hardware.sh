@@ -99,12 +99,25 @@ run_diagnostic() {
     if [ -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb ]; then
         log_success "  90-chromebook-keyboard.hwdb installed in /etc/udev/hwdb.d/"
         if command -v systemd-hwdb > /dev/null 2>&1; then
-            if systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
-                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_db=leftmeta present)"
-            elif systemd-hwdb query "evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*" 2> /dev/null | grep -q "KEYBOARD_KEY_ea=back"; then
-                log_success "  hwdb query for Dratini OK (KEYBOARD_KEY_ea present, but db missing - update hwdb)"
+            # The top row emits AT scancodes 0x3b-0x44 on this hardware; the
+            # ChromeOS action scancodes (0xea/...) are never sent. Check every
+            # row of the shared fixture (keyboard/tests/hwdb-top-row-scancodes.tsv).
+            FIXTURE="$ROOT_DIR/keyboard/tests/hwdb-top-row-scancodes.tsv"
+            QUERY="evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*"
+            missing=0
+            if [ -f "$FIXTURE" ]; then
+                while IFS=$'\t' read -r sc key name; do
+                    case "$sc" in '' | '#'*) continue ;; esac
+                    if ! systemd-hwdb query "$QUERY" 2> /dev/null | grep -q "KEYBOARD_KEY_${sc}=${key}"; then
+                        log_warn "  hwdb query missing ${sc}=${key} (${name})"
+                        missing=1
+                    fi
+                done < "$FIXTURE"
+                if [ "$missing" -eq 0 ]; then
+                    log_success "  hwdb Dratini query OK (all fixture scancodes present)"
+                fi
             else
-                log_warn "  hwdb query for Dratini missing KEYBOARD_KEY_ea (run systemd-hwdb update)"
+                log_warn "  Fixture $FIXTURE not found; skipping per-scancode check"
             fi
             for q in "evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"; do
                 if ! systemd-hwdb query "$q" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
@@ -167,12 +180,16 @@ run_diagnostic() {
     fi
     if [ -f /etc/keyd/cros.conf ]; then
         log_success "  keyd config at /etc/keyd/cros.conf"
-        if command -v keyd > /dev/null 2>&1; then
-            if keyd check /etc/keyd/cros.conf > /dev/null 2>&1; then
-                log_success "  keyd config syntax valid"
-            else
-                log_warn "  keyd config syntax check failed for /etc/keyd/cros.conf"
-            fi
+        local kd_bin="" kd_rc=0
+        kd_bin="$(keyd_bin 2> /dev/null || true)"
+        if [ -n "$kd_bin" ]; then
+            log_info "  keyd binary: $kd_bin"
+            keyd_check_config /etc/keyd/cros.conf || kd_rc=$?
+            case "$kd_rc" in
+                0) log_success "  keyd config syntax valid" ;;
+                3) log_info "  keyd < 2.6 has no 'check' subcommand; validated on reload" ;;
+                *) log_warn "  keyd config syntax check failed for /etc/keyd/cros.conf" ;;
+            esac
         fi
     fi
     if [ -L /etc/keyd/default.conf ]; then

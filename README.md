@@ -34,7 +34,7 @@ automated installation scripts, and a comprehensive guide to avoiding pitfalls.
 | **Wi-Fi 6 & Bluetooth 5.0** | ⚠️ **Driver bound** | Intel AX201 (`iwlwifi` / `btusb`) | Drivers bind out of the box; **WPA3/throughput not yet measured** on this device (see [VERIFICATION.md](docs/verification.md)). |
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection functional test not captured** (see [VERIFICATION.md](docs/verification.md)). |
 | **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works out of the box; **VA-API 4K 60fps hardware decode not yet measured** (see [VERIFICATION.md](docs/verification.md)). |
-| **Keyboard Backlight & Top-Row Function Keys** | ⚠️ **Top-row verified, Backlight sync ready (config-only)** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon (user service + system-sleep) | Top-row F1-F10 hwdb verified. Backlight sync daemon via `./setup.sh --keyboard` (event-driven `org.gnome.ScreenSaver`/`login1`, `TAG+="uaccess"`); verify with `c640-kbd-backlight-sync --check/--test-blank`. See [VERIFICATION.md](docs/verification.md). |
+| **Keyboard Backlight & Top-Row Function Keys** | 🟢 **Top-row + dual-role + backlight verified** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon (user service + system-sleep) | Top-row media keys via hwdb (measured AT scancodes `0x3b`-`0x44`) and Super+TopRow F1-F10 via keyd. 2026-10-31: virtual uinput test PASS (tap=CapsLock, hold=bare Super, all ten F1-F10, all ten media keys) plus passive capture of real key presses (GNOME overview opened; brightness/volume/mute changed); backlight 0↔restore on `ScreenSaver.ActiveChanged` and `--test-blank`, sysfs `0660 root:plugdev` (no sudo), sleep hook save/restore. A real S3 lid cycle is still pending. See [VERIFICATION.md](docs/verification.md). |
 | **EC Battery Protection & Fan Control** | 🟢 **Working** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% limit daemon with 0 mA AC bypass, S3 sleep resume hook, fan silent mode. |
 | **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 suspend/resume cycle verified 2026-08-18 (zero errors). **Key/fingerprint wake untested**; known issue: panel stays dark on lid open until a keypress (see [VERIFICATION.md](docs/verification.md)). |
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging nodes present; **external display via Type-C not yet verified** (see [VERIFICATION.md](docs/verification.md)). |
@@ -131,10 +131,12 @@ Comet Lake SOF DSP audio is fully enabled through the ALSA UCM2 topology:
 
 * **Option A (recommended by default)**: `systemd-hwdb` kernel-level mapping,
   zero resource consumption, supports TTY, X11 and Wayland.
-* **Option B (advanced dual-mode)**: Provides a `keyd` configuration file
+* **Option B (advanced dual-mode)**: Installs and verifies a `keyd` configuration
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf)) supporting the Search
   key "short-press CapsLock, long-press Super", and holding Super converts the
-  top row into standard F1-F10.
+  top row into standard F1-F10. Installed and verified 2026-10-31: the virtual
+  uinput test passes, and a passive capture of real key presses confirmed the
+  GNOME overview opens on a lone hold and that brightness/volume/mute respond.
 
 ### 🔋 ChromeOS EC Control & Battery Protection (`ec/`)
 

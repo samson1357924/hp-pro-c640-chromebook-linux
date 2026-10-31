@@ -153,12 +153,24 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
 ### 9. Top-row function keys (Back/Reload/Brightness/Volume) don't respond
 
-* **Root cause**: the system is missing the `90-chromebook-keyboard.hwdb` scancode mapping.
+* **Root cause**: the system is missing the `90-chromebook-keyboard.hwdb`
+  scancode mapping, **or** it has a mapping for scancodes this machine never
+  emits (for example a hwdb file copied from another Chromebook). Installing
+  the hwdb again will not fix the second case.
 * **Solution**:
 
   ```bash
+  # Check the real scancodes first (read-only, never grabs the device):
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # If it fails, install/refresh the mapping:
   ./setup.sh --keyboard
   ```
+
+  > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`.
+  > Other Chromebooks, including other `Hatch` boards matched by the same hwdb
+  > entry, may emit the ChromeOS action scancodes (`0xea`, `0xe9`, ...) instead.
+  > Capture your own with `check-top-row-hwdb.py --listen 60` before copying
+  > the mapping (see §10).
 
 ### 10. Want the Search key to act as "CapsLock on tap, Super on hold"
 
@@ -166,9 +178,26 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   sudo apt install -y keyd   # (or dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo ln -sf cros.conf /etc/keyd/default.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # required: keyd 2.5.x reads config only at start-up
   ```
+
+  > On Ubuntu 26.04 the package installs `/usr/bin/keyd.rvaiya` (2.5.0); `keyd check`
+  > only exists in >= 2.6. The recommended path is
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`, which handles both.
+  > If the top row does nothing, first check the **scancodes**, not just the hwdb
+  > text: `sudo python3 keyboard/tests/check-top-row-hwdb.py` must print
+  > `RESULT=PASS`. This hardware emits AT scancodes `0x3b`-`0x44`, not the
+  > ChromeOS action scancodes some other Chromebooks use.
+  > If Search tap/hold misbehaves, use `overloadt2(meta, capslock, 200)`, not
+  > `overload`: plain overload injects a `LEFTCTRL` guard on release and Mutter
+  > then never opens Activities.
+  > Verify with `sudo python3 keyboard/tests/capture-keyd-output.py` (read-only;
+  > `keyd monitor` cannot open a device keyd already grabbed). Also check that
+  > keyd grabbed the internal AT keyboard:
+  > `journalctl -u keyd | grep 'DEVICE: match'` should show `0001:0001`.
 
 ### 11. Keyboard backlight doesn't turn off / restore with screen blank
 
@@ -198,6 +227,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     for lid close (`suspend`), but not for idle blank - enable IdleMonitor:
     see `keyboard/README.md` `C640_KBD_ENABLE_IDLEMONITOR=1`.
   * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
+  * On Ubuntu 26.04 the LED attribute is only writable if the udev rule applied its
+    `RUN+=chgrp plugdev` + `RUN+=chmod 0660` (verified: `-rw-rw---- root plugdev`).
+    `MODE=`/`GROUP=`/`uaccess` alone cannot chmod sysfs, so if
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` shows `root root 0644`,
+    run `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`;
+    the daemon then stops falling back to `sudo -n tee`.
+  * Root cause check: the user unit cannot prompt for sudo. `journalctl --user -u
+    c640-kbd-backlight-sync` showing `sudo: a password is required` confirms the
+    permission path above is the problem, not the D-Bus events.
 
 ---
 
