@@ -240,9 +240,38 @@ sudo python3 keyboard/tests/keyd-dualrole-uinput.py
 # RESULT=PASS
 ```
 
+### Passive capture of real key presses (safe)
+
+`keyboard/tests/capture-keyd-output.py` reads keyd's virtual keyboard read-only,
+so the desktop keeps receiving input while it runs:
+
+```bash
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
+# 12:49:15 KEY_LEFTMETA 1     <- tap Search
+# 12:49:16 KEY_CAPSLOCK 1
+# 12:49:18 KEY_LEFTMETA 1     <- hold Search (Super)
+# 12:49:26 KEY_F6 1           <- hold Search + BrightnessDown
+```
+
+**Never grab the keyd virtual keyboard** (`evtest`, `evemu-record`, raw
+`EVIOCGRAB`). A grab takes the device away from the compositor and the whole
+keyboard stops working until the tool exits. `keyd monitor` is not a substitute
+either: keyd 2.5.x cannot open a device it has already grabbed, so the internal
+keyboard never appears there.
+
+### Reading `udevadm test` output
+
+`udevadm test /sys/class/input/event2` prints `No entry found from hwdb` for the
+generic lookups (`evdev:`, `evdev:name:`, `evdev:name:...:phys:...`). Only the
+`evdev:atkbd:$attr{[dmi/id]modalias}` line matters; when it applies
+`KEYBOARD_KEY_*`, the mapping is live. Real Dratini firmware reports extra
+`br0.0:efr0.0` fields between `bd*` and `svn*`, which `bd*:svnGoogle*` still
+matches (verified 2026-10-31).
+
 ### Real-hardware validation log (HP Pro c640 / Dratini, 2026-10-31)
 
-Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-30-generic`, `keyd 2.5.0-5`
+Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 (binary `/usr/bin/keyd.rvaiya`), `python3-evdev 1.9.3`, GNOME Wayland session.
 
 | Check | Result | Evidence |
@@ -253,6 +282,9 @@ Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-30-generic`, `keyd 2.5.0-5`
 | Hold Search + Back | 🟢 | `META` held → `F1` down/up |
 | Hold Search + BrightnessDown | 🟢 | `F6` down/up (Search+top-row = F1-F10 layer) |
 | BrightnessDown alone | 🟢 | `KEY_BRIGHTNESSDOWN` down/up (media layer preserved) |
+| Physical tap Search (passive capture) | 🟢 | `13:26:02` passive capture (no grab): `LEFTMETA` + `LEFTCTRL` guard pair, then `CAPSLOCK` down/up |
+| Physical hold Search + BrightnessDown | 🟢 | `12:49:26` passive capture: `KEY_F6` ×4 (Search+top-row layer) |
+| Physical hold Search + Back | 🟢 | `13:25:56` passive capture (no grab): `LEFTMETA` held → `KEY_F1` down/up |
 | LED node permissions | 🟢 | `-rw-rw---- root plugdev` on `chromeos::kbd_backlight/brightness` after `udevadm trigger --subsystem-match=leds`; user write succeeds without sudo |
 | Daemon blank/unblank | 🟢 | `--test-blank` 2 → 0, `--test-unblank` 0 → 2, state file `0600` and removed |
 | Daemon event path | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → brightness 2 → 0 → 2 with **no `sudo` calls** in the user journal |
@@ -276,3 +308,9 @@ Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-30-generic`, `keyd 2.5.0-5`
 6. A user `uinput` device is only grabbed by keyd if it exposes the full
    `keyboard_mask` (`KEY_1..0`, `Q..Y`) or `KEY_BRIGHTNESSUP`; adding a single
    `KEY_LEFTMETA` is not enough.
+7. Grabbing the keyd virtual keyboard (`EVIOCGRAB`, `evtest`) removes it from
+   the compositor and kills all keyboard input for the desktop. Verify with the
+   passive `capture-keyd-output.py` instead.
+8. `udevadm test` reports `No entry found from hwdb` for the generic `evdev:`
+   lookups even when the mapping works; only the `evdev:atkbd:` lookup applies
+   `KEYBOARD_KEY_*`.

@@ -61,7 +61,8 @@
 | :--- | :---: | :--- |
 | hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在 |
 | hwdb 與 repo 一致 | 🟢 | `diff` → 僅 SPDX header 註解不同（功能完全相同） |
-| keyd 選項 B | 🟢 | **2026-10-31 已安裝並實機測試**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`）：uinput 測試 PASS — 輕點 Search→`CAPSLOCK`、長按 Search+Back→`META`+`F1`、長按 Search+BrightnessDown→`F6`、單按 BrightnessDown→媒體鍵；journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
+| keyd 選項 B | 🟢 | **2026-10-31 已安裝並實機測試**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`）：uinput 測試 PASS — 輕點 Search→`CAPSLOCK`、長按 Search+Back→`META`+`F1`、長按 Search+BrightnessDown→`F6`、單按 BrightnessDown→媒體鍵；被動擷取實體鍵盤得到相同結果（`LEFTMETA` 防護→`CAPSLOCK`、`KEY_F1`、`KEY_F6`×4）；journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
+| hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
 | 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫** |
 | 鍵盤背光 user service | 🟢 | `/etc/systemd/user/`，全域啟用且 **uid 1000 的服務為 active**（`systemctl --global is-enabled`、`systemctl --user is-active` 皆正常） |

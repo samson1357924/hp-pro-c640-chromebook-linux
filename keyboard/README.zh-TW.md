@@ -226,9 +226,34 @@ sudo python3 keyboard/tests/keyd-dualrole-uinput.py
 # RESULT=PASS
 ```
 
+### 被動擷取實體按鍵（安全，不會搶走鍵盤）
+
+`keyboard/tests/capture-keyd-output.py` 以唯讀方式讀取 keyd 虛擬鍵盤，執行時桌面仍可正常輸入：
+
+```bash
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
+# 12:49:15 KEY_LEFTMETA 1     <- 輕點 Search
+# 12:49:16 KEY_CAPSLOCK 1
+# 12:49:18 KEY_LEFTMETA 1     <- 長按 Search（Super）
+# 12:49:26 KEY_F6 1           <- 按住 Search + 降低亮度
+```
+
+**絕對不要對 keyd 虛擬鍵盤下 `EVIOCGRAB`**（`evtest`、`evemu-record` 等）：
+一旦獨占，compositor 就收不到鍵盤，整個桌面會失去輸入，直到程式結束為止。
+`keyd monitor` 也不能取代：keyd 2.5.x 無法開啟已被自己 grab 的裝置，所以內建鍵盤不會出現在那裡。
+
+### 怎麼看 `udevadm test` 的輸出
+
+`udevadm test /sys/class/input/event2` 對泛用查詢（`evdev:`、`evdev:name:`、
+`evdev:name:...:phys:...`）都會印 `No entry found from hwdb`，這是正常的。
+只有 `evdev:atkbd:$attr{[dmi/id]modalias}` 那一行才是重點；只要它套用了
+`KEYBOARD_KEY_*`，映射就是生效的。實機 Dratini 的 modalias 在 `bd*` 與 `svn*`
+之間多了 `br0.0:efr0.0` 欄位，`bd*:svnGoogle*` 仍可命中（2026-10-31 驗證）。
+
 ### 實機驗證記錄（HP Pro c640 / Dratini，2026-10-31）
 
-環境：Ubuntu 26.04.1 LTS、kernel `7.0.0-30-generic`、`keyd 2.5.0-5`
+環境：Ubuntu 26.04.1 LTS、kernel `7.0.0-38-generic`、`keyd 2.5.0-5`
 （執行檔 `/usr/bin/keyd.rvaiya`）、`python3-evdev 1.9.3`、GNOME Wayland。
 
 | 檢查項目 | 結果 | 證據 |
@@ -239,6 +264,9 @@ sudo python3 keyboard/tests/keyd-dualrole-uinput.py
 | 長按 Search + Back | 🟢 | `META` 持續按住 → `F1` down/up |
 | 長按 Search + BrightnessDown | 🟢 | `F6` down/up（Search+頂排 = F1-F10 層） |
 | 單按 BrightnessDown | 🟢 | `KEY_BRIGHTNESSDOWN` down/up（媒體層保留） |
+| 實體輕點 Search（被動擷取） | 🟢 | `13:26:02` 被動擷取（無 grab）：`LEFTMETA` + `LEFTCTRL` 防護組，接著 `CAPSLOCK` down/up |
+| 實體長按 Search + 降低亮度 | 🟢 | `12:49:26` 被動擷取：`KEY_F6` ×4（Search+頂排層） |
+| 實體長按 Search + Back | 🟢 | `13:25:56` 被動擷取（無 grab）：`LEFTMETA` 按住 → `KEY_F1` down/up |
 | LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
 | daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
 | daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
@@ -259,3 +287,7 @@ sudo python3 keyboard/tests/keyd-dualrole-uinput.py
    「含有 `CAPSLOCK`」，不要寫成「只有 `CAPSLOCK`」。
 6. 使用者端 `uinput` 裝置必須提供完整 `keyboard_mask`（`KEY_1..0`、`Q..Y`）或
    `KEY_BRIGHTNESSUP`，keyd 才會視為鍵盤；只給 `KEY_LEFTMETA` 會被忽略。
+7. 對 keyd 虛擬鍵盤下 `EVIOCGRAB`（或跑 `evtest`）會把它從 compositor 手上搶走，
+   整個桌面鍵盤會失效到程式結束為止。請改用被動的 `capture-keyd-output.py`。
+8. `udevadm test` 對泛用 `evdev:` 查詢印 `No entry found from hwdb` 是正常現象；
+   只有 `evdev:atkbd:` 那條會套用 `KEYBOARD_KEY_*`。
