@@ -138,9 +138,9 @@ jobs:
       - name: Validate udev Rules Syntax
         run: |
           if udevadm --help | grep -q "verify"; then
-            udevadm verify fingerprint/60-cros-fp.rules
+            udevadm verify fingerprint/60-cros-fp.rules keyboard/udev/61-chromeos-kbd-backlight.rules
           else
-            while IFS= read -r rule_file; do
+            while IFS= read -r -d '' rule_file; do
               echo "Checking $rule_file"
               grep -E 'KERNEL=[^=]' "$rule_file" && { echo "Error: KERNEL must use == for match"; exit 1; }
               grep -E 'SUBSYSTEM=[^=]' "$rule_file" && { echo "Error: SUBSYSTEM must use == for match"; exit 1; }
