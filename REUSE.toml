@@ -15,7 +15,9 @@ path = [
     "scripts/**",
     "lib/**",
     "keyboard/install-keyboard.sh",
+    "keyboard/c640-kbd-backlight-sync",
     "keyboard/keyd/**",
+    "keyboard/tests/**.py",
     "power/**",
     "ec/**",
     "fingerprint/install-fingerprint.sh",
@@ -30,7 +32,11 @@ SPDX-License-Identifier = "MIT"
 
 # Keyboard hwdb mapping data (derived from systemd 60-chromebook-keyboard.hwdb)
 [[annotations]]
-path = "keyboard/90-chromebook-keyboard.hwdb"
+path = [
+    "keyboard/90-chromebook-keyboard.hwdb",
+    "keyboard/tests/hwdb-top-row-scancodes.tsv",
+    "keyboard/udev/**"
+]
 SPDX-FileCopyrightText = "2026 Samson <https://github.com/samson1357924>"
 SPDX-License-Identifier = "CC0-1.0"
 
