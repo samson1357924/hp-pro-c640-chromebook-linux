@@ -72,7 +72,7 @@
   > 成員（保留原本已存在的成員）。
   >
   > 若當初使用 `--with-keyd` 安裝，也會移除 `/etc/keyd/cros.conf` 與
-  > `/etc/keyd/default.conf` symlink（有安裝前備份時會還原），並停用
+  > 舊版殘留的 `/etc/keyd/default.conf` symlink（有安裝前備份時會還原），並停用
   > `keyd` 服務。
 
 * **僅移除電源管理調校**（logind 設定、休眠輔助、TLP 設定、thermald 服務啟用）：

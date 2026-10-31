@@ -179,7 +179,6 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   ```bash
   sudo apt install -y keyd   # (or dnf/pacman)
   sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
-  sudo ln -sf cros.conf /etc/keyd/default.conf
   sudo systemctl enable keyd
   sudo systemctl restart keyd   # required: keyd 2.5.x reads config only at start-up
   ```

@@ -125,12 +125,16 @@ check_keyboard_status() {
         if [ -L "$KEYD_LINK" ]; then
             local link_target
             link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
-            log_info "  default.conf -> $link_target"
+            if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
+                log_warn "  default.conf -> $link_target (redundant symlink; keyd loads all *.conf automatically)"
+            else
+                log_info "  default.conf -> $link_target"
+            fi
             if [ ! -e "$KEYD_LINK" ]; then
                 log_warn "  default.conf is dangling symlink (target missing)"
             fi
         elif [ -f "$KEYD_LINK" ]; then
-            log_success "keyd default.conf exists at $KEYD_LINK"
+            log_info "keyd default.conf exists at $KEYD_LINK"
         fi
         local keyd_cmd=""
         keyd_cmd="$(keyd_bin 2> /dev/null || true)"
@@ -183,9 +187,19 @@ uninstall_keyboard() {
         sudo systemctl --global disable c640-kbd-backlight-sync.service 2> /dev/null || true
         # Also try system scope disable for backwards compat
         sudo systemctl disable c640-kbd-backlight-sync.service 2> /dev/null || true
-        # Disable keyd if we installed it (system service) - handle dangling symlink too
+        # Disable keyd if we installed it (system service) - handle legacy symlink too
         if systemctl is-active --quiet keyd 2> /dev/null || systemctl is-enabled --quiet keyd 2> /dev/null; then
-            if [ -f "$KEYD_DST" ] || [ -f "$KEYD_LINK" ] || [ -L "$KEYD_LINK" ]; then
+            local keyd_ours=0
+            if [ -f "$KEYD_DST" ]; then
+                keyd_ours=1
+            elif [ -L "$KEYD_LINK" ]; then
+                local link_target
+                link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
+                if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
+                    keyd_ours=1
+                fi
+            fi
+            if [ "$keyd_ours" = "1" ]; then
                 sudo systemctl disable --now keyd 2> /dev/null || true
                 log_info "Disabled keyd service (was managing Search dual-role)"
             fi
@@ -197,6 +211,20 @@ uninstall_keyboard() {
 
     rollback_component "keyboard"
     remove_group_membership "plugdev" "$(get_real_user)" "keyboard"
+
+    # Clean up legacy default.conf symlink pointing to cros.conf if present
+    if [ -L "$KEYD_LINK" ]; then
+        local link_target
+        link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
+        if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
+            if [ "${DRY_RUN:-0}" = "1" ]; then
+                log_dryrun "Would remove legacy symlink: $KEYD_LINK -> $link_target"
+            else
+                sudo rm -f "$KEYD_LINK" 2> /dev/null || true
+                log_info "Removed legacy symlink: $KEYD_LINK -> $link_target"
+            fi
+        fi
+    fi
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemd-hwdb update 2> /dev/null || true
@@ -389,10 +417,22 @@ install_keyboard() {
     if [ "${WITH_KEYD:-0}" = "1" ]; then
         log_step 6 $total_steps "Installing keyd dual-role config to $KEYD_DST..."
         backup_file_manifest_aware "$KEYD_DST" "keyboard"
-        backup_file_manifest_aware "$KEYD_LINK" "keyboard"
+        # Remove redundant default.conf symlink pointing to cros.conf if present,
+        # preventing keyd from loading duplicate configurations (keyd loads all *.conf)
+        if [ -L "$KEYD_LINK" ]; then
+            local link_target
+            link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
+            if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
+                if [ "${DRY_RUN:-0}" = "1" ]; then
+                    log_dryrun "Would remove redundant symlink $KEYD_LINK -> $link_target"
+                else
+                    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
+                    log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
+                fi
+            fi
+        fi
         if [ "${DRY_RUN:-0}" = "1" ]; then
             log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
-            log_dryrun "Create symlink $KEYD_LINK -> cros.conf"
             log_dryrun "Would record service state: keyd (keyboard)"
             log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
         else
@@ -400,11 +440,6 @@ install_keyboard() {
                 log_warn "keyd source not found at $KEYD_SRC, skipping"
             else
                 sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"
-                # Ensure default.conf symlink points to cros.conf (idempotent) - already backed up LINK above
-                if [ -L "$KEYD_LINK" ] || [ -f "$KEYD_LINK" ]; then
-                    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
-                fi
-                sudo ln -sf "$(basename "$KEYD_DST")" "$KEYD_LINK" 2> /dev/null || true
                 # Record service state before enabling (first-wins) - even if binary not yet installed, stub handles is-enabled=1 case
                 manifest_add_service "keyd" "keyboard"
                 # Validate syntax if keyd is available

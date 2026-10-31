@@ -104,7 +104,6 @@ chmod +x keyboard/install-keyboard.sh
    sudo ./keyboard/install-keyboard.sh --with-keyd
    # 等價手動：
    # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
-   # sudo ln -sf cros.conf /etc/keyd/default.conf
    # keyd check /etc/keyd/cros.conf     # 僅 keyd ≥ 2.6；2.5.x 於啟動時驗證
    # sudo systemctl enable keyd
    # sudo systemctl restart keyd         # keyd 2.5.x 只在啟動時讀取設定

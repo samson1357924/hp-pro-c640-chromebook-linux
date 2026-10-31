@@ -104,7 +104,6 @@ on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
    sudo ./keyboard/install-keyboard.sh --with-keyd
    # equivalent manual:
    # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
-   # sudo ln -sf cros.conf /etc/keyd/default.conf
    # keyd check /etc/keyd/cros.conf     # only keyd >= 2.6; 2.5.x validates on start
    # sudo systemctl enable keyd
    # sudo systemctl restart keyd         # keyd 2.5.x reads config only at start-up
