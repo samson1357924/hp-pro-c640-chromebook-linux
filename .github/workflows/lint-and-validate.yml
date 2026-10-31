@@ -107,6 +107,18 @@ jobs:
           echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_ea=back"
           echo "${HWDB_OUT5}" | grep -q "KEYBOARD_KEY_db=leftmeta"
 
+          # Query assertion 6: real Dratini firmware modalias (extra br/efr fields)
+          # Captured from /sys/class/dmi/id/modalias on 2026-10-31. systemd-hwdb
+          # matches by DMI key/value, so `bd*:svnGoogle*` must still hit even
+          # though br0.0/efr0.0 sit between bd* and svn*.
+          QUERY_DMI6="evdev:atkbd:dmi:bvncoreboot:bvrMrChromebox-2606.1:bd07/14/2026:br0.0:efr0.0:svnGoogle:pnDratini:pvrrev4:rvnHP:rnDratini:rvrrev4:cvnGoogle:ct9:cvr:skusku8:pfaGoogle_Hatch:"
+          HWDB_OUT6=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI6}")
+          echo "Query Output for real Dratini modalias:"
+          echo "${HWDB_OUT6}"
+          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_ea=back"
+          echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_ee=brightnessdown"
+
           echo "All hwdb key mappings verified across Coreboot & OEM & Hatch/c640/dratini-lower strings!"
 
       - name: Validate udev Rules Syntax
