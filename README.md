@@ -135,7 +135,8 @@ Comet Lake SOF DSP audio is fully enabled through the ALSA UCM2 topology:
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf)) supporting the Search
   key "short-press CapsLock, long-press Super", and holding Super converts the
   top row into standard F1-F10. Installed and verified 2026-10-31: the virtual
-  uinput test passes, and a passive capture of real key presses confirmed the
+  uinput test passes (`keyboard/tests/keyd-dualrole-uinput.py`), and a passive
+  capture of real key presses (`capture-keyd-output.py`) confirmed the
   GNOME overview opens on a lone hold and that brightness/volume/mute respond.
 
 ### 🔋 ChromeOS EC Control & Battery Protection (`ec/`)

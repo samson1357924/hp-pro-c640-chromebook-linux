@@ -127,8 +127,9 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 * **方案 B（進階雙模）**：安裝並驗證 `keyd` 設定檔
   ([keyboard/keyd/cros.conf](keyboard/keyd/cros.conf))，支援 Search 鍵「短按
   CapsLock、長按 Super」，按住 Super 轉換頂排為標準 F1-F10。已於 2026-10-31
-  詳細驗證見 `keyboard/tests/keyd-dualrole-uinput.py`（虛擬鍵盤）與
-  `capture-keyd-output.py`（實體按鍵被動擷取）。
+  安裝並驗證：虛擬 uinput 測試通過（`keyboard/tests/keyd-dualrole-uinput.py`），
+  且實體按鍵被動擷取（`capture-keyd-output.py`）確認單獨長按可開啟 GNOME
+  總覽、亮度/音量/靜音正常反應。
 
 ### 🔋 ChromeOS EC 控制與電池保護 (`ec/`)
 
