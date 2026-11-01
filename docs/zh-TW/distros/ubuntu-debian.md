@@ -67,6 +67,17 @@ sudo systemctl --global enable c640-kbd-backlight-sync.service
 # sudo ./keyboard/install-keyboard.sh --with-keyd
 ```
 
+> **Ubuntu 26.04 實測備註（2026-10-31）：** `keyd` 套件（2.5.0-5）安裝的是
+> **`/usr/bin/keyd.rvaiya`**，直接輸入 `keyd ...` 會得到 command not found；
+> systemd 服務名稱仍是 `keyd`。keyd 2.6 之前沒有 `keyd check` 子命令，設定語法
+> 會在 daemon 啟動時驗證。keyd 2.5.x 也沒有熱插拔偵測，修改 `/etc/keyd/*.conf`
+> 後必須 `sudo systemctl restart keyd`。`install-keyboard.sh --with-keyd` 已處理
+> 這三種情況（執行檔偵測、可選 `check`、重新啟動）。
+>
+> udev 規則以 `RUN+=chgrp/chmod` 將鍵盤背光 brightness 屬性設為 `root:plugdev 0660`；
+> 只寫 `MODE=`/`GROUP=` 對 sysfs 無效。可用
+> `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` 確認。
+
 ### (4) 編譯並安裝指紋驅動
 
 ```bash

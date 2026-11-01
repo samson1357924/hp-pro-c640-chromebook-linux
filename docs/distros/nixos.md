@@ -59,10 +59,13 @@ in
 
   # 4. ChromeOS /dev/cros_fp + keyboard backlight udev permissions
   #    (add your user to `plugdev`: `users.users.<you>.extraGroups = [ "plugdev" ];`)
+  #    NOTE: MODE=/GROUP=/uaccess only apply to /dev nodes. The LED brightness
+  #    attribute is a plain sysfs file, so it needs explicit RUN+= chgrp/chmod
+  #    (same as 61-chromeos-kbd-backlight.rules in this repo).
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
   '';
 
   # 5. Fingerprint for sudo only (NOT for GDM login: the GDM unlock claim
@@ -70,24 +73,34 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. Keyboard top-row mapping (udev hwdb)
+  #    These are the scancodes measured on a Dratini (HP Pro c640). The
+  #    pn*Hatch* line also matches other Hatch-based Chromebooks, which may
+  #    emit different scancodes - capture yours before copying this block.
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
-     KEYBOARD_KEY_ea=back
-     KEYBOARD_KEY_e9=forward
-     KEYBOARD_KEY_e7=refresh
-     KEYBOARD_KEY_91=f11
-     KEYBOARD_KEY_92=scale
-     KEYBOARD_KEY_a0=mute
-     KEYBOARD_KEY_ae=volumedown
-     KEYBOARD_KEY_b0=volumeup
+     KEYBOARD_KEY_3b=back
+     KEYBOARD_KEY_3c=forward
+     KEYBOARD_KEY_3d=refresh
+     KEYBOARD_KEY_3e=f11
+     KEYBOARD_KEY_3f=scale
+     KEYBOARD_KEY_40=brightnessdown
+     KEYBOARD_KEY_41=brightnessup
+     KEYBOARD_KEY_42=mute
+     KEYBOARD_KEY_43=volumedown
+     KEYBOARD_KEY_44=volumeup
      KEYBOARD_KEY_db=leftmeta
-     KEYBOARD_KEY_ee=brightnessdown
-     KEYBOARD_KEY_ef=brightnessup
   '';
+  # 6b. keyd dual-role Search (optional; config lives in keyboard/keyd/cros.conf)
+  #     The NixOS keyd module schema differs between releases, so this guide
+  #     does not generate the config. Deploy /etc/keyd/cros.conf from
+  #     keyboard/keyd/cros.conf (with [ids] 0001:0001 and
+  #     leftmeta = overloadt2(meta, capslock, 200)) and enable the keyd service.
+  #     Without keyd the top row still works as media keys via hwdb above.
+
   # Keyboard backlight sync daemon (user service + system-sleep)
   # Option A: use the repo installer as imperative step: sudo /path/to/keyboard/install-keyboard.sh
   # Option B: declarative (example, adjust paths):

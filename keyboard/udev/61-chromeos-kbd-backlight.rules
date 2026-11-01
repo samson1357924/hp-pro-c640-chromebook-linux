@@ -2,5 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 # ChromeOS keyboard backlight LED - allow logged-in user to control brightness
 # via sysfs without sudo. Complements the daemon that syncs kbd backlight with
-# screen blank. Falls back to GROUP="plugdev" if uaccess is unavailable.
-SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# screen blank.
+#
+# NOTE: uaccess/MODE/GROUP only affect /dev device nodes. The LED brightness
+# attribute is a plain sysfs file with no device node, so udev cannot chmod it
+# through MODE=/GROUP= and an explicit RUN+= is required. Without this the
+# daemon falls back to `sudo tee`, which a user service cannot answer for.
+SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", GROUP="plugdev", MODE="0660", RUN+="/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"

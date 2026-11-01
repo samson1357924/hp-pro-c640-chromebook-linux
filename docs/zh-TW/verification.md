@@ -16,7 +16,7 @@
 | **裝置** | HP Pro c640 Chromebook (board: `dratini` / baseboard: `hatch`) |
 | **BIOS / 韌體** | MrChromebox UEFI Full ROM，版本 `2606.1` |
 | **作業系統** | Ubuntu 26.04 LTS (Resolute Raccoon)，x86_64 |
-| **核心** | `7.0.0-29-generic` (Ubuntu 7.0.0-29.29，2026-07-17 建置) |
+| **核心** | 2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`；2026-08 證據包是在 `7.0.0-29-generic` 收集 |
 | **桌面環境** | GNOME (gnome-shell + GDM)，Wayland |
 | **音訊堆疊** | PipeWire `1.6.2`、WirePlumber `0.5.13`、alsa-ucm-conf `1.2.15.3` |
 | **指紋堆疊** | fprintd `1.94.5`、libfprint-2 `1.95.1`（內建 `crfpmoc` 的自訂建置） |
@@ -59,13 +59,14 @@
 
 | 檢查項目 | 結果 | 證據 |
 | :--- | :---: | :--- |
-| hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在 |
-| hwdb 與 repo 一致 | 🟢 | `diff` → 僅 SPDX header 註解不同（功能完全相同） |
-| keyd 選項 B | ⚠️ | **本機未安裝**（使用 hwdb 選項 A）；僅提供設定檔 |
-| 鍵盤背光 udev rule | ⚠️ | `61-chromeos-kbd-backlight.rules`（`TAG+="uaccess", GROUP="plugdev" MODE="0660"`）— 僅設定，未在 2026-08-15 證據包；以 `udevadm test /sys/class/leds/chromeos::kbd_backlight` 驗證 |
-| 鍵盤背光 daemon | ⚠️ | `c640-kbd-backlight-sync` → `/usr/local/bin/`（gdbus/dbus-monitor 事件驅動，`C640_KBD_ENABLE_IDLEMONITOR=0` 預設）— 安裝 smoke 通過，尚無 S3 盒蓋實測；以 `c640-kbd-backlight-sync --check --test-blank --test-unblank` 測試 |
-| 鍵盤背光 user service | ⚠️ | `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（`WantedBy=graphical-session.target`，`StartLimitIntervalSec=60/Burst=5`）— `systemctl --global is-enabled` |
-| 鍵盤背光 sleep hook | ⚠️ | `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（0.6 秒喚醒後恢復）— 僅設定 |
+| hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在；與 repo 檔 `diff` 為空 |
+| hwdb 掃描碼映射（實機） | 🟢 | `keyboard/tests/check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 `OK` — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA`。這證明的是核心映射，不是按鍵實際送出的掃描碼；實體送出的部分另以 `18:14:47-18:15:18` 的被動擷取驗證。頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`，不是 ChromeOS action 掃描碼。 |
+| keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
+| hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
+| 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
+| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫** |
+| 鍵盤背光 user service | 🟢 | `/etc/systemd/user/`，全域啟用且 **uid 1000 的服務為 active**（`systemctl --global is-enabled`、`systemctl --user is-active` 皆正常） |
+| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；直接呼叫 `pre suspend` 存下 6、模擬 0，`post suspend` 還原 6、state 檔清除。自動化 session 無法做真實盒蓋 S3 循環（無人可喚醒機器） |
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
 
@@ -97,10 +98,11 @@
 
 ---
 
-## ⚠️ 僅提供設定檔／尚未實測
+## ⚠️ 其他元件（逐列狀態）
 
-下列檔案在上述裝置上皆屬「僅設定」——狀態欄標明已安裝或存在但未啟用。
-未實測項目請視為「提供給你的發行版參考，請自行驗證」：
+下列檔案在上述裝置上分別是已安裝、存在但未啟用，或刻意不安裝——以狀態欄為準。
+標 🟢 的列有列內註明的實測證據；標 ⚠️/❌ 的列**尚未**驗證，請視為
+「提供給你的發行版參考，請自行驗證」：
 
 | 模組 | 檔案 | 狀態 |
 | :--- | :--- | :---: |
@@ -110,10 +112,10 @@
 | **EC 控制與電池保護** | `ec/install-ec.sh`、`scripts/c640-ec-control.sh`、`ec/systemd/c640-battery-limit.service`、`ec/systemd/c640-ec-sleep.sh` | 🟢 2026-08-23 已安裝並實機驗證（standalone `ectool` LPC 通訊、健康度儀表板、90% 電池守護服務、0 mA 旁路斷充與 S3 喚醒鉤子皆通過實測） |
 | **指紋 system-sleep hook** | `fingerprint/systemd/fprintd-sleep.sh` | 🟢 2026-08-19 已安裝並驗證（盒蓋測試：第一次解鎖即有指紋、喚醒零延遲、日誌無 retry 行） |
 | **指紋 udev rule** | `fingerprint/60-cros-fp.rules` (plugdev/0660/uaccess) | 🟢 2026-08-18 已安裝，重開機後以 `getfacl` 驗證 |
-| **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | ❌ 使用 hwdb 選項 A |
+| **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | ⚠️ 2026-08-29 已安裝（事件驅動 `gdbus`/`ScreenSaver`+`PrepareForSleep`，CI smoke 通過；**證據包尚無亮度軌跡**）— 以 `--test-blank` 驗證 |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6；真實盒蓋 S3 循環仍待測） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -157,7 +159,10 @@ cat /sys/power/mem_sleep
   解鎖即成功、喚醒零延遲、日誌無 retry 行；黑屏問題未解決，使用者已接受）、2026-08-23
   （EC 90% 電池守護服務 + `c640-ec-sleep.sh` 零空窗喚醒鉤子 + standalone `ectool` LPC
   通訊已實機驗證；打包迭代 2 `1.94.10-2` 中繼資料已備妥，驅動原始碼未異動）、
-  2026-08-29（鍵盤背光同步已安裝——僅設定，CI smoke 通過，尚無新證據包；見 keyboard/README.zh-TW.md 選項 3）
-* **OS / 核心**：Ubuntu 26.04 LTS，`7.0.0-29-generic`
+  2026-08-29（鍵盤背光同步已安裝——當時僅設定、CI smoke 通過，已被下方 2026-10-31 條目取代），
+  2026-10-31（鍵盤頂排重新量測：hwdb 改映射真實 AT 掃描碼 `0x3b`-`0x44`；
+  keyd `overloadt2` 雙重角色 Search 以 uinput 測試與實體按鍵被動擷取驗證；
+  背光同步以 `--test-blank`、`ScreenSaver.ActiveChanged`、sleep hook 端到端驗證）
+* **OS / 核心**：Ubuntu 26.04 LTS；2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`，2026-08 證據包為 `7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）
