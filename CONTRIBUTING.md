@@ -71,7 +71,7 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
 
 ### 4. Documentation & GitHub Pages
 
-* **Local preview**:
+* **Local preview** (Python 3.11+ is required by the current docs toolchain):
 
   ```bash
   pip install -r requirements-docs.txt
