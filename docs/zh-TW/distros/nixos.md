@@ -76,13 +76,13 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. 鍵盤頂排映射 (udev hwdb)
-  #    以下是 Dratini（HP Pro c640）實測的掃描碼。pn*Hatch* 那行也會匹配
-  #    其他 Hatch 系列 Chromebook，它們可能送不同掃描碼——直接複製前請先
-  #    自行擷取驗證。
+  #    以下是 Dratini（HP Pro c640）實測的掃描碼，且只套用於下方明確列出的
+  #    Dratini / HP Pro c640 DMI 條目——不匹配其他 Hatch 機板。其他機型會送
+  #    各自的掃描碼：直接複製此區塊前，請用不加 --grab 的 `evtest` 或 `--scan`
+  #    自行擷取並建立自己的 hwdb 條目。
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
-    evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
      KEYBOARD_KEY_3b=back

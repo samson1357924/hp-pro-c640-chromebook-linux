@@ -76,13 +76,14 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. Keyboard top-row mapping (udev hwdb)
-  #    These are the scancodes measured on a Dratini (HP Pro c640). The
-  #    pn*Hatch* line also matches other Hatch-based Chromebooks, which may
-  #    emit different scancodes - capture yours before copying this block.
+  #    These are the scancodes measured on a Dratini (HP Pro c640) and apply
+  #    only to the explicit Dratini / HP Pro c640 DMI entries below — other
+  #    Hatch boards are NOT matched. Other models emit their own scancodes:
+  #    capture them with `evtest` (no --grab) or `--scan` and write your own
+  #    hwdb stanza before copying this block.
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
-    evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
      KEYBOARD_KEY_3b=back

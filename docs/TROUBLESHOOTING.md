@@ -166,13 +166,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   ./setup.sh --keyboard
   ```
 
-  > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`.
-  > Other Chromebooks, including other `Hatch` boards matched by the same hwdb
-  > entry, may emit the ChromeOS action scancodes (`0xea`, `0xe9`, ...) instead.
-  > `--listen` only shows the post-hwdb `KEY_*` events (EVIOCGKEY), not raw
-  > scancodes. To find yours, stop keyd (`sudo systemctl stop keyd`) and read
-  > `EV_MSC/MSC_SCAN` with `check-top-row-hwdb.py --scan 60` or plain `evtest`
-  > (no `--grab`), then infer the scancode against the standard AT table
+  > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`, and
+  > applies only to the explicit Dratini / HP Pro c640 DMI entries in
+  > `keyboard/90-chromebook-keyboard.hwdb` — it does **not** match other Hatch
+  > boards. Other Chromebooks may emit the ChromeOS action scancodes (`0xea`,
+  > `0xe9`, ...) instead and need their own hwdb entry. `--listen` only shows
+  > the post-hwdb `KEY_*` events (EVIOCGKEY), not raw scancodes. To find yours,
+  > stop keyd (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN` with
+  > `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then infer
+  > the scancode against the standard AT table and create your own hwdb entry
   > (see §10). When done, run `sudo systemctl start keyd` to restore the
   > service; otherwise Search tap/hold and brightness remapping stay disabled.
 

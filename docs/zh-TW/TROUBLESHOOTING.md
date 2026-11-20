@@ -140,14 +140,16 @@
   ./setup.sh --keyboard
   ```
 
-  > 本檔映射的是 Dratini 實測的 AT 掃描碼 `0x3b`-`0x44`。其他 Chromebook
-  > （包含同樣被這條 hwdb 匹配的其他 `Hatch` 機型）可能送 ChromeOS action
-  > 掃描碼（`0xea`、`0xe9`…）。`--listen` 只會顯示 hwdb 轉換後的 `KEY_*`
-  > 按鍵事件（EVIOCGKEY），不是原始掃描碼。請先停掉 keyd
-  > （`sudo systemctl stop keyd`），用 `check-top-row-hwdb.py --scan 60` 或
-  > 不加 `--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論
-  > 掃描碼（見 §10）。完成後請執行 `sudo systemctl start keyd` 恢復服務，
-  > 否則 Search 輕點/長按與亮度重映射會持續失效。
+  > 本檔映射的是 Dratini 實測的 AT 掃描碼 `0x3b`-`0x44`，且只套用於
+  > `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
+  > DMI 條目——**不匹配**其他 Hatch 機板。其他 Chromebook 可能送 ChromeOS
+  > action 掃描碼（`0xea`、`0xe9`…），需要建立自己的 hwdb 條目。`--listen`
+  > 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件（EVIOCGKEY），不是原始掃描碼。
+  > 請先停掉 keyd（`sudo systemctl stop keyd`），用
+  > `check-top-row-hwdb.py --scan 60` 或不加 `--grab` 的 `evtest` 讀
+  > `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論掃描碼並建立自己的 hwdb 條目
+  > （見 §10）。完成後請執行 `sudo systemctl start keyd` 恢復服務，否則
+  > Search 輕點/長按與亮度重映射會持續失效。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
@@ -185,8 +187,8 @@
   systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
   loginctl show-user "$USER" -p State
-  udevadm test /sys/class/leds/chromeos::kbd_backlight
-  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness
+  udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
+  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
   # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
   # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin

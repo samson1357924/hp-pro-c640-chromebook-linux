@@ -30,13 +30,17 @@ AT `F1`-`F10`）。在標準 Linux 下，這些按鍵可透過核心/硬體層�
 > `0x3b`-`0x44`；映射 action 掃描碼在這台機器上完全無效。量測表存於
 > `keyboard/tests/hwdb-top-row-scancodes.tsv`，CI 會逐條斷言。
 >
-> **其他 Chromebook：** hwdb 也會匹配 `pn*Hatch*`，因此這份映射會套用到其他
-> Hatch 系列機板；它們可能送不同掃描碼。沿用這張表前，請先停掉 keyd
+> **其他 Chromebook／其他 Hatch 機板：** 這份映射**只**套用於
+> `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
+> DMI 條目；它**不匹配**其他 Hatch 機板（在實機 Dratini 上，「Hatch」是產品
+> 家族而非產品名稱，因此不使用 `pn*Hatch*` 萬用字元）。其他機型會送各自的
+> 掃描碼，需要建立自己的 hwdb 條目。沿用這張表前，請先停掉 keyd
 > （`sudo systemctl stop keyd`），用 `check-top-row-hwdb.py --scan 60` 或
 > 不加 `--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論
-> 掃描碼。**擷取完成後請執行 `sudo systemctl start keyd` 恢復服務**，
-> 否則 Search 輕點/長按與亮度重映射會持續失效。`--listen` 只會顯示 hwdb
-> 轉換後的 `KEY_*` 按鍵事件，不是原始掃描碼。
+> 掃描碼並建立自己的 hwdb 條目。**擷取完成後請執行
+> `sudo systemctl start keyd` 恢復服務**，否則 Search 輕點/長按與亮度重映射
+> 會持續失效。`--listen` 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件，不是原始
+> 掃描碼。
 
 ---
 

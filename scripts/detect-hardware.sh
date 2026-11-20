@@ -13,6 +13,17 @@ source "$ROOT_DIR/lib/distro.sh"
 # shellcheck source=lib/syscheck.sh
 source "$ROOT_DIR/lib/syscheck.sh"
 
+# Keyboard/hwdb verification knobs. The sysfs roots and the query backend are
+# overridable so --self-test can exercise the exact same code with stubs.
+KB_FIXTURE="$ROOT_DIR/keyboard/tests/hwdb-top-row-scancodes.tsv"
+KB_HWDB_FILE="${KB_HWDB_FILE:-/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb}"
+DMI_BASE="${DMI_BASE:-/sys/class/dmi/id}"
+INPUT_BASE="${INPUT_BASE:-/sys/class/input}"
+KB_HWDB_QUERY_FN="${KB_HWDB_QUERY_FN:-kb_hwdb_query_systemd}"
+KB_UDEVADM_BIN="${KB_UDEVADM_BIN:-udevadm}"
+KB_EVENT_BASE="${KB_EVENT_BASE:-/dev/input}"
+KB_SUCCESS_MARKER="hwdb top-row verification PASSED"
+
 run_diagnostic() {
     log_section "HP Pro c640 Chromebook (Google Dratini) Full Diagnostic Report"
 
@@ -96,38 +107,7 @@ run_diagnostic() {
 
     # 4. Keyboard & Function Keys (+ Backlight Sync)
     log_step 4 6 "Keyboard Top-Row Action Mapping & Backlight Sync"
-    if [ -f /etc/udev/hwdb.d/90-chromebook-keyboard.hwdb ]; then
-        log_success "  90-chromebook-keyboard.hwdb installed in /etc/udev/hwdb.d/"
-        if command -v systemd-hwdb > /dev/null 2>&1; then
-            # The top row emits AT scancodes 0x3b-0x44 on this hardware; the
-            # ChromeOS action scancodes (0xea/...) are never sent. Check every
-            # row of the shared fixture (keyboard/tests/hwdb-top-row-scancodes.tsv).
-            FIXTURE="$ROOT_DIR/keyboard/tests/hwdb-top-row-scancodes.tsv"
-            QUERY="evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*"
-            missing=0
-            if [ -f "$FIXTURE" ]; then
-                while IFS=$'\t' read -r sc key name; do
-                    case "$sc" in '' | '#'*) continue ;; esac
-                    if ! systemd-hwdb query "$QUERY" 2> /dev/null | grep -q "KEYBOARD_KEY_${sc}=${key}"; then
-                        log_warn "  hwdb query missing ${sc}=${key} (${name})"
-                        missing=1
-                    fi
-                done < "$FIXTURE"
-                if [ "$missing" -eq 0 ]; then
-                    log_success "  hwdb Dratini query OK (all fixture scancodes present)"
-                fi
-            else
-                log_warn "  Fixture $FIXTURE not found; skipping per-scancode check"
-            fi
-            for q in "evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0" "evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnHP Pro c640 Chromebook:pvr1.0"; do
-                if ! systemd-hwdb query "$q" 2> /dev/null | grep -q "KEYBOARD_KEY_db=leftmeta"; then
-                    log_warn "  hwdb query missing db for $q"
-                fi
-            done
-        fi
-    else
-        log_warn "  Custom keyboard hwdb not deployed. Run './setup.sh --keyboard' to install."
-    fi
+    verify_keyboard_hwdb || true
 
     if [ -f /etc/udev/rules.d/61-chromeos-kbd-backlight.rules ]; then
         log_success "  61-chromeos-kbd-backlight.rules installed"
@@ -219,4 +199,496 @@ run_diagnostic() {
     log_info "Hardware diagnostic run complete! Log saved to $LOG_FILE."
 }
 
-run_diagnostic
+# ---------------------------------------------------------------------------
+# Keyboard / hwdb verification
+#
+# The old code queried `systemd-hwdb query` with a *hardcoded* Dratini
+# modalias. That only proves the DATABASE contains an entry; it says nothing
+# about the machine we are running on, so unrelated hardware got a false
+# "all fixture present" success. It also still probed the long-removed
+# `pnHatch` rule and only checked `db=leftmeta` for the HP stanza.
+#
+# We now separate two independent checks and require BOTH for success:
+#   STATIC  - all 11 fixture mappings exist in the hwdb source file AND in the
+#             compiled database, for the Dratini *and* HP/c640 DMI patterns.
+#   DYNAMIC - an actual AT keyboard device exists, and the modalias that udev
+#             would use for THAT device matches an entry with all 11 mappings.
+#             Additionally udevadm info is consulted for applied KEYBOARD_KEY_*
+#             properties on THAT device's event node. If udevadm or the event
+#             node is unavailable the result is inconclusive (warn), never a
+#             full success.
+# ---------------------------------------------------------------------------
+
+# Real backend: query the compiled hwdb with a modalias (the same operation
+# udev performs for a matched device).
+kb_hwdb_query_systemd() {
+    local modalias="$1"
+    if ! command -v systemd-hwdb > /dev/null 2>&1; then
+        return 127
+    fi
+    systemd-hwdb query "$modalias" 2> /dev/null
+}
+
+# Test backend: emulate `systemd-hwdb query` against a stub hwdb text file.
+# Consecutive modalias pattern lines share the following property block, just
+# like a real hwdb stanza.
+kb_hwdb_query_stub() {
+    local modalias="$1"
+    local db="${KB_STUB_HWDB:-}"
+    local line group_matched=0 in_props=0
+    [ -n "$db" ] && [ -f "$db" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '' | \#*)
+                continue
+                ;;
+            [[:space:]]*)
+                in_props=1
+                if [ "$group_matched" -eq 1 ]; then
+                    printf '%s\n' "${line#"${line%%[![:space:]]*}"}"
+                fi
+                ;;
+            *)
+                if [ "$in_props" -eq 1 ]; then
+                    group_matched=0
+                    in_props=0
+                fi
+                # Unquoted RHS is intentional: glob-match like hwdb patterns.
+                # shellcheck disable=SC2053
+                if [[ "$modalias" == $line ]]; then
+                    group_matched=1
+                fi
+                ;;
+        esac
+    done < "$db"
+}
+
+kb_read_dmi_value() {
+    local file="$1"
+    local value=""
+    if [ -r "$file" ]; then
+        value="$(cat "$file" 2> /dev/null || true)"
+    fi
+    # DMI files are single-line; strip line breaks (a tab/space is legal inside
+    # a product name and must be preserved for hwdb pattern matching).
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/}"
+    printf '%s' "$value"
+}
+
+# Compose the modalias udev's 60-evdev.rules uses for an AT keyboard:
+#   IMPORT{builtin}="hwdb 'evdev:atkbd:$attr{[dmi/id]modalias}'"
+# using the six requested DMI/id fields (bvn/bvr/bd/svn/pn/pvr).
+kb_compose_dmi_modalias() {
+    local dmi_base="$1"
+    local bvn bvr bd svn pn pvr
+    bvn="$(kb_read_dmi_value "$dmi_base/bios_vendor")"
+    bvr="$(kb_read_dmi_value "$dmi_base/bios_version")"
+    bd="$(kb_read_dmi_value "$dmi_base/bios_date")"
+    svn="$(kb_read_dmi_value "$dmi_base/sys_vendor")"
+    pn="$(kb_read_dmi_value "$dmi_base/product_name")"
+    pvr="$(kb_read_dmi_value "$dmi_base/product_version")"
+    printf 'evdev:atkbd:dmi:bvn%s:bvr%s:bd%s:svn%s:pn%s:pvr%s\n' \
+        "$bvn" "$bvr" "$bd" "$svn" "$pn" "$pvr"
+}
+
+# Normalize the TSV fixture to three tab-separated fields: scancode, key, label.
+# Rows in the fixture mix 3 and 4 columns (an empty third field for short key
+# names), so parse with awk and drop empty columns instead of relying on
+# `IFS=$'\t' read -r sc key name`, which mis-assigns the label.
+kb_fixture_rows() {
+    local fixture="$1"
+    awk -F'\t' '
+        /^[[:space:]]*($|#)/ { next }
+        {
+            sc = $1; key = $2; label = ""
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", sc)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            for (i = 3; i <= NF; i++) {
+                f = $i
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", f)
+                if (f != "") label = (label == "" ? f : label " " f)
+            }
+            if (sc != "" && key != "") printf "%s\t%s\t%s\n", sc, key, label
+        }
+    ' "$fixture"
+}
+
+# Print fixture rows whose KEYBOARD_KEY_<sc>=<key> is absent from TEXT.
+kb_missing_in_text() {
+    local text="$1"
+    local fixture="$2"
+    local sc key label
+    while IFS=$'\t' read -r sc key label; do
+        grep -qE "KEYBOARD_KEY_${sc}=${key}([[:space:]]|$)" <<< "$text" || \
+            printf '%s|%s|%s\n' "$sc" "$key" "$label"
+    done < <(kb_fixture_rows "$fixture")
+}
+
+# True when DEV shows any of the three AT-keyboard sysfs signals:
+#   1. a modalias already starting with evdev:atkbd: (stubs / newer udev),
+#   2. the device name "AT Translated Set 2 keyboard" (real hardware),
+#   3. a driver symlink whose basename is "atkbd" (DRIVERS=="atkbd" in udev).
+kb_is_atkbd_dev() {
+    local dev="$1"
+    local modalias name driver
+    modalias=""
+    [ -r "$dev/modalias" ] && modalias="$(cat "$dev/modalias" 2> /dev/null || true)"
+    case "$modalias" in
+        evdev:atkbd:*) return 0 ;;
+    esac
+    name=""
+    [ -r "$dev/name" ] && name="$(cat "$dev/name" 2> /dev/null || true)"
+    driver=""
+    [ -e "$dev/device/driver" ] && driver="$(basename "$(readlink -f "$dev/device/driver" 2> /dev/null || echo "")")"
+    [ "$name" = "AT Translated Set 2 keyboard" ] || [ "$driver" = "atkbd" ]
+}
+
+# Find an AT keyboard under INPUT_BASE and print the evdev:atkbd: modalias udev
+# would use for it. Signal (1) returns the device's modalias verbatim, but the
+# caller STILL queries the hwdb with it: a non-target DMI therefore cannot turn
+# into a false success. For signals (2)/(3) the modalias is built from DMI,
+# because the kernel's `input:b0011v...` modalias is NOT what hwdb matches for
+# atkbd; 60-evdev.rules substitutes the DMI modalias instead. A real AT
+# keyboard device is still required before ever claiming success.
+kb_find_atkbd_modalias() {
+    local input_base="$1"
+    local dmi_base="$2"
+    local dev modalias
+    for dev in "$input_base"/input*; do
+        [ -d "$dev" ] || continue
+        kb_is_atkbd_dev "$dev" || continue
+        modalias=""
+        [ -r "$dev/modalias" ] && modalias="$(cat "$dev/modalias" 2> /dev/null || true)"
+        case "$modalias" in
+            evdev:atkbd:*)
+                printf '%s\n' "$modalias"
+                return 0
+                ;;
+        esac
+        kb_compose_dmi_modalias "$dmi_base"
+        return 0
+    done
+    return 1
+}
+
+# Print the basename of the event node (e.g. event2) that belongs to the AT
+# keyboard found under INPUT_BASE, so the udevadm check can be scoped to that
+# one device. Prefer the sysfs inputN/eventM child; fall back to deriving M
+# from the inputN number for minimal/stub sysfs trees.
+kb_atkbd_event_node() {
+    local input_base="$1"
+    local dev ev num
+    for dev in "$input_base"/input*; do
+        [ -d "$dev" ] || continue
+        kb_is_atkbd_dev "$dev" || continue
+        for ev in "$dev"/event*; do
+            [ -e "$ev" ] || continue
+            printf '%s\n' "${ev##*/}"
+            return 0
+        done
+        num="${dev##*/input}"
+        case "$num" in
+            '' | *[!0-9]*) ;;
+            *) printf 'event%s\n' "$num"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Confirm the kernel/udev actually applied the mappings, scoped to the AT
+# keyboard's own event node (not just any /dev/input/event*). Return codes:
+#   0 = confirmed, 1 = confirmed missing properties, 2 = inconclusive.
+# A container without udevadm or without the event node stays inconclusive;
+# the caller must not turn that into a full-success claim.
+kb_check_kernel_applied() {
+    local fixture="$1"
+    local event_node="${2:-}"
+    local udevadm_bin="${KB_UDEVADM_BIN:-udevadm}"
+    local event_base="${KB_EVENT_BASE:-/dev/input}"
+    local dev info missing
+    if ! command -v "$udevadm_bin" > /dev/null 2>&1; then
+        log_warn "  kernel-applied check inconclusive: udevadm unavailable"
+        return 2
+    fi
+    if [ -z "$event_node" ]; then
+        log_warn "  kernel-applied check inconclusive: no event node for the AT keyboard"
+        return 2
+    fi
+    dev="$event_base/$event_node"
+    if [ ! -e "$dev" ]; then
+        log_warn "  kernel-applied check inconclusive: $dev missing"
+        return 2
+    fi
+    info="$("$udevadm_bin" info "$dev" 2> /dev/null || true)"
+    missing="$(kb_missing_in_text "$info" "$fixture")"
+    if [ -n "$missing" ]; then
+        log_warn "  kernel-applied check: $dev is missing KEYBOARD_KEY_* properties:"
+        printf '%s\n' "$missing" | sed 's/^/    /' >&2
+        return 1
+    fi
+    log_success "  kernel applied all KEYBOARD_KEY_* mappings on $dev (udevadm info)"
+    return 0
+}
+
+verify_keyboard_hwdb() {
+    local fixture="${1:-$KB_FIXTURE}"
+    local dmi_base="${2:-$DMI_BASE}"
+    local input_base="${3:-$INPUT_BASE}"
+    local hwdb_file="${4:-$KB_HWDB_FILE}"
+    local query_fn="${5:-$KB_HWDB_QUERY_FN}"
+
+    if [ ! -f "$fixture" ]; then
+        log_warn "  Fixture $fixture not found; cannot verify keyboard hwdb"
+        return 2
+    fi
+    local row_count
+    row_count="$(kb_fixture_rows "$fixture" | wc -l)"
+    log_info "  Fixture: $fixture ($row_count scancode mappings)"
+
+    # ---- STATIC: database/source file must contain all mappings ----
+    local static_ok=1
+    if [ ! -f "$hwdb_file" ]; then
+        log_warn "  Custom keyboard hwdb not deployed at $hwdb_file (run './setup.sh --keyboard')"
+        static_ok=0
+    else
+        local file_missing
+        file_missing="$(kb_missing_in_text "$(cat "$hwdb_file" 2> /dev/null || true)" "$fixture")"
+        if [ -n "$file_missing" ]; then
+            log_warn "  static: $hwdb_file is missing expected mappings:"
+            printf '%s\n' "$file_missing" | sed 's/^/    /' >&2
+            static_ok=0
+        else
+            log_success "  static: $hwdb_file contains all $row_count mappings"
+        fi
+    fi
+
+    # Probe both supported device families with CONCRETE modaliases (never a
+    # wildcard-only query). This checks the DB contents, not the local device.
+    local family label concrete query_out missing
+    for family in dratini hp; do
+        if [ "$family" = dratini ]; then
+            label="Dratini"
+            concrete="evdev:atkbd:dmi:bvnGoogle:bvrSTATIC:bdSTATIC:svnGoogle:pnDratini:pvrSTATIC"
+        else
+            label="HP Pro c640"
+            concrete="evdev:atkbd:dmi:bvnHP:bvrSTATIC:bdSTATIC:svnHP:pnHP Pro c640 Chromebook:pvrSTATIC"
+        fi
+        query_out="$("$query_fn" "$concrete" || true)"
+        missing="$(kb_missing_in_text "$query_out" "$fixture")"
+        if [ -n "$missing" ]; then
+            log_warn "  static: compiled hwdb is missing $label mappings:"
+            printf '%s\n' "$missing" | sed 's/^/    /' >&2
+            static_ok=0
+        else
+            log_success "  static: compiled hwdb has all $row_count mappings for $label"
+        fi
+    done
+
+    # ---- DYNAMIC: an AT keyboard must exist and match the DB ----
+    local atkbd_modalias event_node applied_rc
+    if ! atkbd_modalias="$(kb_find_atkbd_modalias "$input_base" "$dmi_base")"; then
+        log_warn "  no AT keyboard detected (no evdev:atkbd: device under $input_base): cannot verify live mapping"
+        return 3
+    fi
+    event_node="$(kb_atkbd_event_node "$input_base" || true)"
+    local dmi_modalias
+    dmi_modalias="$(kb_compose_dmi_modalias "$dmi_base")"
+    log_info "  DMI-composed modalias : $dmi_modalias"
+    log_info  "  AT keyboard modalias  : $atkbd_modalias"
+    log_info  "  AT keyboard event node: ${event_node:-<unknown>}"
+
+    # Prefer the device's own evdev:atkbd: modalias when present; otherwise use
+    # the DMI-composed one produced by kb_find_atkbd_modalias (same value as
+    # udev's atkbd branch of 60-evdev.rules).
+    local live_query_modalias="$atkbd_modalias"
+    local live_out live_missing
+    live_out="$("$query_fn" "$live_query_modalias" || true)"
+    live_missing="$(kb_missing_in_text "$live_out" "$fixture")"
+    if [ -n "$live_missing" ]; then
+        log_warn "  device not matched / unknown scancode configuration: current AT keyboard modalias has no complete top-row mapping"
+        printf '%s\n' "$live_missing" | sed 's/^/    /' >&2
+        return 4
+    fi
+    log_success "  dynamic: current AT keyboard matched by hwdb (all $row_count mappings present)"
+
+    applied_rc=0
+    kb_check_kernel_applied "$fixture" "$event_node" || applied_rc=$?
+    case "$applied_rc" in
+        0) ;;
+        1) log_warn "  dynamic: kernel application not confirmed; refusing to claim full success"; return 5 ;;
+        2) log_warn "  dynamic: kernel application inconclusive; refusing to claim full success"; return 7 ;;
+        *) log_warn "  dynamic: kernel application check failed (rc=$applied_rc); refusing to claim full success"; return 5 ;;
+    esac
+
+    if [ "$static_ok" -ne 1 ]; then
+        log_warn "  static check incomplete; refusing to claim full success"
+        return 6
+    fi
+    log_success "  $KB_SUCCESS_MARKER (static database + live AT-keyboard device)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# --self-test: run the exact verification code against stub sysfs trees and a
+# stub hwdb query backend. Stub files live in a mktemp directory under
+# ${TMPDIR:-/tmp} and are removed on exit; no developer-specific path needed.
+# ---------------------------------------------------------------------------
+run_self_test() {
+    set +e
+    local saved_log_file="$LOG_FILE"
+    local root="" rc=0 scenario=0
+    local sc key label d
+    LOG_FILE=""
+    root="$(mktemp -d "${TMPDIR:-/tmp}/detect-hwdb-selftest.XXXXXX")"
+    if [ -z "$root" ] || [ ! -d "$root" ]; then
+        log_error "self-test: could not create stub directory under ${TMPDIR:-/tmp}"
+        LOG_FILE="$saved_log_file"
+        set -e
+        return 1
+    fi
+
+    local fixture="$KB_FIXTURE"
+    local db="$root/hwdb.db"
+    local out="$root/out.txt"
+
+    # Build the stub hwdb from the SAME fixture so static checks stay in sync.
+    {
+        printf '%s\n' \
+            'evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*' \
+            'evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*' \
+            'evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*' \
+            'evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*'
+        while IFS=$'\t' read -r sc key label; do
+            printf ' KEYBOARD_KEY_%s=%s\n' "$sc" "$key"
+        done < <(kb_fixture_rows "$fixture")
+    } > "$db"
+
+    # Stub udevadm: report the applied properties from a generated file.
+    local bindir="$root/bin" evdir="$root/dev/input"
+    mkdir -p "$bindir" "$evdir"
+    local udev_info="$root/udev-info.txt"
+    : > "$udev_info"
+    while IFS=$'\t' read -r sc key label; do
+        printf 'E: KEYBOARD_KEY_%s=%s\n' "$sc" "$key" >> "$udev_info"
+    done < <(kb_fixture_rows "$fixture")
+    cat > "$bindir/udevadm" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = info ] || exit 0
+cat "$udev_info"
+EOF
+    chmod +x "$bindir/udevadm"
+    : > "$evdir/event2"
+
+    KB_STUB_HWDB="$db"
+    local query_stub="kb_hwdb_query_stub"
+
+    make_scenario() {
+        local name="$1" bvn="$2" svn="$3" pn="$4" with_kbd="$5" modalias="${6:-}"
+        local dir="$root/$name"
+        mkdir -p "$dir/dmi" "$dir/input/input2/event2"
+        printf '%s\n' "$bvn"        > "$dir/dmi/bios_vendor"
+        printf 'TEST\n'             > "$dir/dmi/bios_version"
+        printf '01/01/2020\n'       > "$dir/dmi/bios_date"
+        printf '%s\n' "$svn"        > "$dir/dmi/sys_vendor"
+        printf '%s\n' "$pn"         > "$dir/dmi/product_name"
+        printf '1.0\n'              > "$dir/dmi/product_version"
+        if [ "$with_kbd" = 1 ]; then
+            printf 'AT Translated Set 2 keyboard\n' > "$dir/input/input2/name"
+            if [ -n "$modalias" ]; then
+                printf '%s\n' "$modalias" > "$dir/input/input2/modalias"
+            else
+                printf 'input:b0011v0001p0001eAB83-e0,1,4,k71,ram4,l0,1,2,sfw\n' > "$dir/input/input2/modalias"
+            fi
+        fi
+        printf '%s\n' "$dir"
+    }
+
+    run_scenario() {
+        local dir="$1"
+        verify_keyboard_hwdb "$fixture" "$dir/dmi" "$dir/input" "$db" "$query_stub" > "$out" 2>&1
+    }
+
+    expect() {
+        local should="$1" needle="$2" desc="$3"
+        scenario=$((scenario + 1))
+        if grep -qF -- "$needle" "$out"; then
+            local found=1
+        else
+            local found=0
+        fi
+        if { [ "$should" = present ] && [ "$found" -eq 1 ]; } || \
+           { [ "$should" = absent ] && [ "$found" -eq 0 ]; }; then
+            printf '  PASS  %s\n' "$desc"
+        else
+            printf '  FAIL  %s (wanted %s: %s)\n' "$desc" "$should" "$needle"
+            sed 's/^/        /' "$out"
+            rc=1
+        fi
+    }
+
+    export KB_UDEVADM_BIN="$bindir/udevadm" KB_EVENT_BASE="$evdir"
+
+    printf 'self-test: keyboard hwdb verification\n'
+
+    d="$(make_scenario dratini Google Google Dratini 1)"
+    run_scenario "$d"
+    expect present "$KB_SUCCESS_MARKER" "Dratini: device matched -> success"
+    expect absent  "cannot verify"       "Dratini: AT keyboard detected"
+    expect present "$evdir/event2"       "Dratini: udevadm bound to AT keyboard event node"
+
+    d="$(make_scenario c640 HP 'HP' 'HP Pro c640 Chromebook' 1)"
+    run_scenario "$d"
+    expect present "$KB_SUCCESS_MARKER" "HP c640: device matched -> success"
+    expect absent  "device not matched" "HP c640: all 11 scancodes verified"
+
+    d="$(make_scenario hatch Google Google Hatch 1)"
+    run_scenario "$d"
+    expect present "device not matched" "other Hatch product: not matched"
+    expect absent  "$KB_SUCCESS_MARKER" "other Hatch product: no false success"
+
+    d="$(make_scenario noatk Google Google Dratini 0)"
+    run_scenario "$d"
+    expect present "cannot verify"      "no AT keyboard: cannot verify"
+    expect absent  "$KB_SUCCESS_MARKER" "no AT keyboard: no false success"
+
+    # Signal (1) shortcut: an evdev:atkbd: modalias alone must not bypass the
+    # hwdb lookup. A non-target DMI still yields "not matched", never success.
+    d="$(make_scenario atkbd-other Foo Foo OtherBook 1 'evdev:atkbd:dmi:bvnFoo:bvrTEST:bd01/01/2020:svnFoo:pnOtherBook:pvr1.0')"
+    run_scenario "$d"
+    expect present "device not matched" "atkbd modalias + non-target DMI: not matched"
+    expect absent  "$KB_SUCCESS_MARKER" "atkbd modalias + non-target DMI: no false success"
+
+    # No udevadm -> explicit inconclusive (warn), never a full-success claim.
+    KB_UDEVADM_BIN="$root/bin/no-such-udevadm"
+    d="$(make_scenario dratini-no-udevadm Google Google Dratini 1)"
+    run_scenario "$d"
+    expect present "inconclusive"       "udevadm unavailable: kernel check inconclusive"
+    expect absent  "$KB_SUCCESS_MARKER" "udevadm unavailable: no false success"
+    KB_UDEVADM_BIN="$bindir/udevadm"
+
+    printf 'SELF-TEST=%s (%d assertions)\n' "$([ "$rc" -eq 0 ] && echo PASS || echo FAIL)" "$scenario"
+
+    unset KB_UDEVADM_BIN KB_EVENT_BASE KB_STUB_HWDB
+    LOG_FILE="$saved_log_file"
+    rm -rf "$root"
+    set -e
+    return "$rc"
+}
+
+main() {
+    case "${1:-}" in
+        --self-test)
+            run_self_test
+            ;;
+        '')
+            run_diagnostic
+            ;;
+        *)
+            log_error "Unknown option: $1 (supported: --self-test)"
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

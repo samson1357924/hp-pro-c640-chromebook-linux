@@ -33,14 +33,18 @@ kernel/hardware level using `systemd-hwdb` or at the input daemon level using
 > scancodes has no effect on this machine. The measured table lives in
 > `keyboard/tests/hwdb-top-row-scancodes.tsv` and is asserted in CI.
 >
-> **Other Chromebooks:** hwdb also matches `pn*Hatch*`, so this mapping applies
-> to other Hatch boards that might emit different scancodes. Before relying on
-> this table, stop keyd (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN`
-> with `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then
-> infer the scancode against the standard AT table. **After capturing, run
-> `sudo systemctl start keyd` to restore the service** — otherwise Search
-> tap/hold and brightness remapping stay disabled. `--listen` only shows the
-> post-hwdb `KEY_*` events, not raw scancodes.
+> **Other Chromebooks / other Hatch boards:** this mapping applies **only** to
+> the Dratini / HP Pro c640 DMI entries explicitly listed in
+> `keyboard/90-chromebook-keyboard.hwdb`; it does **not** match other Hatch
+> boards (on real Dratini, "Hatch" is the product family, not the product name,
+> so no `pn*Hatch*` wildcard is used). Other models emit their own scancodes and
+> need their own hwdb entry. Before relying on this table, stop keyd
+> (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN` with
+> `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then infer
+> the scancode against the standard AT table and create your own hwdb entry.
+> **After capturing, run `sudo systemctl start keyd` to restore the service** —
+> otherwise Search tap/hold and brightness remapping stay disabled. `--listen`
+> only shows the post-hwdb `KEY_*` events, not raw scancodes.
 
 ---
 
