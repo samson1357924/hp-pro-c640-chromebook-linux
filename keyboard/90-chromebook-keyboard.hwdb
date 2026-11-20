@@ -13,14 +13,16 @@
 # 0x3b-0x44 is therefore what actually changes the behaviour here; the old
 # 0xea-0xb0 block never matched a real key press and was dead code.
 #
-# NOTE: the pn*Hatch* line matches every Hatch-based Chromebook, not just this
-# Dratini. Other Hatch boards may emit different (action) scancodes; capture
-# yours with keyboard/tests/check-top-row-hwdb.py --listen before reusing this
-# block, and add a model-specific stanza if they differ.
+# These scancodes were measured on this Dratini only. The mapping is applied
+# exclusively via the explicit DMI entries listed below (Dratini and the HP
+# Pro c640); it is NOT verified for any other Hatch-based board. On real
+# Dratini, "Hatch" appears in the product family (pfa), not the product name
+# (pn), so no wildcard pn*Hatch* match is needed. Raw scancodes on other
+# machines must be captured separately (e.g. with evtest without --grab)
+# before adding any model-specific stanza.
 
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
-evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Hatch*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHP*Pro*c640*Chromebook*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*c640*:pvr*
  KEYBOARD_KEY_3b=back

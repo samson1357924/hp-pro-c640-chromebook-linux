@@ -97,13 +97,21 @@ jobs:
           echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_db=leftmeta"
           echo "${HWDB_OUT2}" | grep -q "KEYBOARD_KEY_42=mute"
 
-          # Query assertion 3: Hatch baseboard fallback
-          QUERY_DMI3="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:pnHatch:pvr1.0"
-          HWDB_OUT3=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI3}")
-          echo "Query Output for Hatch (baseboard):"
-          echo "${HWDB_OUT3}"
-          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_3b=back"
-          echo "${HWDB_OUT3}" | grep -q "KEYBOARD_KEY_db=leftmeta"
+          # Query assertion 3: other product names containing "Hatch" must NOT match.
+          # "Hatch" is the product family on this hardware (pfaGoogle_Hatch),
+          # not the product name (pnDratini); a pn*Hatch* wildcard would leak
+          # the Dratini-only mapping to any product name that happens to
+          # contain "Hatch". These cases exercise that exact regression.
+          for BAD_PN in pnHatch pnHatch2 pnGoogle_Hatch; do
+            QUERY_DMI_BAD="evdev:atkbd:dmi:bvnGoogle:bvr13579:bd01/01/2021:svnGoogle:${BAD_PN}:pvr1.0"
+            HWDB_OUT_BAD=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI_BAD}")
+            echo "Query Output for ${BAD_PN} (expected: no Dratini mapping):"
+            echo "${HWDB_OUT_BAD}"
+            if echo "${HWDB_OUT_BAD}" | grep -qE "KEYBOARD_KEY_(3b=back|40=brightnessdown)"; then
+              echo "FAIL: non-Dratini product name ${BAD_PN} inherited the Dratini scancode mapping"
+              exit 1
+            fi
+          done
 
           # Query assertion 4: HP c640 generic wildcard (lower case, matches svnHP*:pn*c640*)
           QUERY_DMI4="evdev:atkbd:dmi:bvnHP:bvr13579:bd01/01/2021:svnHP:pnc640:pvr1.0"
@@ -133,7 +141,7 @@ jobs:
           echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_3b=back"
           echo "${HWDB_OUT6}" | grep -q "KEYBOARD_KEY_40=brightnessdown"
 
-          echo "All hwdb key mappings verified across Coreboot & OEM & Hatch/c640/dratini-lower strings!"
+          echo "All hwdb key mappings verified (Coreboot/OEM/c640/dratini-lower); non-Dratini Hatch names rejected!"
 
       - name: Validate udev Rules Syntax
         run: |
