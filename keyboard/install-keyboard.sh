@@ -30,6 +30,317 @@ KEYD_SRC="$SCRIPT_DIR/keyd/cros.conf"
 KEYD_DST="/etc/keyd/cros.conf"
 KEYD_LINK="/etc/keyd/default.conf"
 
+# Echo 1 when the manifest records $2 (optionally restricted to component $3)
+# as a pre-existing target, otherwise 0. Centralises the JSON probing used by
+# both install-time recovery and uninstall-time rollback preparation.
+_manifest_was_existing() {
+    local manifest="$1" target="$2" component="${3:-}"
+    [ -f "$manifest" ] || { echo 0; return 0; }
+    python3 - "$manifest" "$target" "$component" <<'PY' 2> /dev/null || echo 0
+import json, sys
+
+manifest, target, component = sys.argv[1:4]
+try:
+    for record in json.load(open(manifest)).get("records", []):
+        if record.get("target") != target:
+            continue
+        if component and record.get("component") != component:
+            continue
+        print(1 if record.get("was_existing") else 0)
+        break
+except Exception:
+    pass
+PY
+}
+
+# Mirror lib/backup.sh rollback's lookup: the oldest backup matching
+# "$BACKUP_BASE_DIR/*/<target without leading slash>". Used before creating
+# any placeholder so we never leave behind a file that rollback cannot
+# replace. Prints the backup path, or nothing when no backup exists.
+_find_rollback_backup() {
+    local target="$1"
+    [ -n "$target" ] || return 0
+    # shellcheck disable=SC2154 # BACKUP_BASE_DIR is defined in lib/backup.sh
+    find "$BACKUP_BASE_DIR" -path "$BACKUP_BASE_DIR/*/${target#/}" -print 2> /dev/null \
+        | LC_ALL=C sort | head -n 1 || true
+}
+
+# True when $1 (default: $KEYD_LINK) is a symlink pointing at keyd's cros.conf.
+# Accepts relative spellings such as "cros.conf", "./cros.conf" and
+# "../keyd/cros.conf" as well as absolute paths. Used by status check,
+# uninstall service detection and install cleanup so the readlink comparison
+# lives in exactly one place.
+is_our_legacy_keyd_link() {
+    local link="${1:-$KEYD_LINK}"
+    [ -L "$link" ] || return 1
+    local target target_abs expected resolved link_dir
+    target="$(readlink "$link" 2> /dev/null || echo "")"
+    [ -n "$target" ] || return 1
+    case "$target" in
+        /*) target_abs="$target" ;;
+        *)
+            link_dir="$(cd -P "$(dirname "$link")" 2> /dev/null && pwd)" || link_dir="$(dirname "$link")"
+            target_abs="$link_dir/$target"
+            ;;
+    esac
+    if ! resolved="$(readlink -m "$target_abs" 2> /dev/null)"; then
+        log_warn "Could not canonicalize keyd symlink target '$target_abs'; legacy-link detection may be inaccurate"
+        resolved="$target_abs"
+    fi
+    if ! expected="$(readlink -m "$KEYD_DST" 2> /dev/null)"; then
+        log_warn "Could not canonicalize $KEYD_DST; legacy-link detection may be inaccurate"
+        expected="$KEYD_DST"
+    fi
+    [ "$resolved" = "$expected" ]
+}
+
+# Restore our legacy default.conf symlink from its backup after a failed keyd
+# restart, so the system is reverted to its full pre-install state (not just
+# cros.conf). Uses the same manifest + backup semantics as rollback_component.
+# Returns 0 when restored or when there was nothing to restore, 1 when a
+# record existed but restoration could not be completed.
+_restore_our_keyd_link_after_failed_restart() {
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    local link_existed backup
+    link_existed="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_LINK" "keyboard")"
+    [ "$link_existed" = "1" ] || return 0
+
+    if [ -e "$KEYD_LINK" ] || [ -L "$KEYD_LINK" ]; then
+        log_warn "$KEYD_LINK already exists after failed restart; not overwriting it"
+        return 0
+    fi
+
+    backup="$(_find_rollback_backup "$KEYD_LINK")"
+    if [ -z "$backup" ] || { [ ! -e "$backup" ] && [ ! -L "$backup" ]; }; then
+        log_warn "No backup found for $KEYD_LINK; legacy symlink will be restored (if possible) by uninstall rollback"
+        return 1
+    fi
+    if sudo cp -a "$backup" "$KEYD_LINK" 2> /dev/null && [ -L "$KEYD_LINK" ]; then
+        log_info "Restored legacy symlink $KEYD_LINK -> $(readlink "$KEYD_LINK" 2> /dev/null || echo '?') after failed restart"
+        return 0
+    fi
+    # do not leave a partial/regular file behind
+    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
+    log_warn "Could not restore legacy symlink $KEYD_LINK from $backup; uninstall rollback will retry"
+    return 1
+}
+
+# Undo a failed keyd restart: put back the previous cros.conf (or remove the
+# file we just created if there was none), recreate the legacy default.conf
+# symlink when applicable, and try to restart the daemon once more so a
+# running keyd is not left talking to an unvalidated config.
+# Returns 0 only when the pre-install config was fully restored AND the final
+# restart succeeded; 1 otherwise (caller must not report dual-role as active).
+_restore_keyd_after_failed_restart() {
+    local existed=0 restored=0
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    existed="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_DST")"
+
+    if [ "$existed" = "1" ]; then
+        local backup
+        backup="$(_find_rollback_backup "$KEYD_DST")"
+        if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+            if sudo install -D -m 0644 "$backup" "$KEYD_DST" 2> /dev/null \
+                || sudo cp -a "$backup" "$KEYD_DST" 2> /dev/null; then
+                restored=1
+                log_info "Restored previous keyd config from $backup after failed restart"
+            else
+                log_warn "Could not restore previous keyd config from $backup after failed restart"
+            fi
+        else
+            log_warn "No backup found for $KEYD_DST; cannot restore previous keyd config"
+        fi
+    else
+        if sudo rm -f "$KEYD_DST" 2> /dev/null; then
+            restored=1
+            log_info "Removed newly deployed $KEYD_DST after failed restart (no previous config)"
+        else
+            log_warn "Could not remove newly deployed $KEYD_DST after failed restart"
+        fi
+    fi
+
+    if ! _restore_our_keyd_link_after_failed_restart; then
+        restored=0
+    fi
+
+    if sudo systemctl restart keyd 2> /dev/null; then
+        log_success "keyd restart succeeded after restoring previous config"
+    else
+        log_warn "keyd still failed to restart after restoring previous config; check 'journalctl -u keyd' manually"
+        return 1
+    fi
+    [ "$restored" -eq 1 ]
+}
+
+# lib/backup.sh only restores a pre-existing target when it still exists at
+# rollback time. The installer removes our legacy default.conf symlink, so
+# recreate a placeholder for that manifest record before rollback: rollback
+# still performs the actual restoration, replacing the placeholder with the
+# original symlink. A placeholder is created ONLY when a matching backup is
+# actually present; otherwise rollback would keep the record ([NOTE] Left
+# intact) and permanently leave a 0-byte regular file where the symlink was.
+_prepare_keyd_link_for_rollback() {
+    [ "${DRY_RUN:-0}" != "1" ] || return 0
+    [ ! -e "$KEYD_LINK" ] && [ ! -L "$KEYD_LINK" ] || return 0
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    [ -f "$MANIFEST_FILE" ] || return 0
+    local was_existing backup
+    was_existing="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_LINK" "keyboard")"
+    [ "$was_existing" = "1" ] || return 0
+
+    backup="$(_find_rollback_backup "$KEYD_LINK")"
+    if [ -z "$backup" ] || { [ ! -e "$backup" ] && [ ! -L "$backup" ]; }; then
+        log_warn "No backup found for $KEYD_LINK; cannot restore the original symlink on rollback, leaving no placeholder"
+        return 0
+    fi
+
+    if sudo install -D -m 0644 /dev/null "$KEYD_LINK" 2> /dev/null; then
+        log_info "Prepared placeholder at $KEYD_LINK so rollback can restore the original symlink"
+    else
+        log_warn "Could not prepare placeholder at $KEYD_LINK; rollback may not be able to restore the original symlink"
+    fi
+}
+
+# Older (version 1.0) manifests can contain a record for $KEYD_LINK with no
+# "component" field. backup_file_manifest_aware() keeps such a record on
+# re-install (first-wins), so neither _prepare_keyd_link_for_rollback() nor
+# rollback_component("keyboard") claims it and the symlink removed by the
+# installer is never restored. Backfill the component BEFORE that call: the
+# original backup and was_existing flag are left untouched, so first-wins
+# semantics are preserved while the record becomes visible to the
+# keyboard-scoped rollback helpers. Only records for $KEYD_LINK that have no
+# (truthy) component are changed; every other record and field is preserved.
+_normalize_keyd_link_manifest_component() {
+    # The manifest path comes from lib/backup.sh.
+    [ -f "$MANIFEST_FILE" ] || return 0
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Would backfill component=keyboard on legacy $KEYD_LINK manifest record (if present)"
+        return 0
+    fi
+    if ! command -v python3 > /dev/null 2>&1; then
+        log_warn "python3 not found; cannot backfill component on legacy $KEYD_LINK manifest record; rollback may not restore the original symlink"
+        return 0
+    fi
+
+    local updated
+    if ! updated="$(sudo python3 -c '
+import json, sys, os
+
+manifest_path, target, component = sys.argv[1:4]
+try:
+    with open(manifest_path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+changed = 0
+for record in data.get("records", []):
+    if record.get("target") != target or record.get("component"):
+        continue
+    record["component"] = component
+    changed += 1
+
+if changed:
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, manifest_path)
+print(changed)
+' "$MANIFEST_FILE" "$KEYD_LINK" "keyboard" 2> /dev/null)"; then
+        log_warn "Failed to backfill component on legacy $KEYD_LINK manifest record; rollback may not restore the original symlink"
+        return 0
+    fi
+    if [ "${updated:-0}" != "0" ]; then
+        log_info "Backfilled component=keyboard on $updated legacy manifest record(s) for $KEYD_LINK"
+    fi
+}
+
+# Single authority for the optional keyd step. Validation runs against the
+# source file *before* any deployment so an invalid config can never break a
+# running keyd daemon. Returns 1 when deployment was skipped, or when the
+# final restart still fails after recovery (dual-role is then not active).
+install_keyd_step() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        backup_file_manifest_aware "$KEYD_DST" "keyboard"
+        if is_our_legacy_keyd_link; then
+            _normalize_keyd_link_manifest_component
+            backup_file_manifest_aware "$KEYD_LINK" "keyboard"
+            log_dryrun "Would remove redundant symlink $KEYD_LINK -> $(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
+        fi
+        log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
+        log_dryrun "Would record service state: keyd (keyboard)"
+        log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
+        return 0
+    fi
+
+    if [ ! -f "$KEYD_SRC" ]; then
+        log_warn "keyd source not found at $KEYD_SRC, skipping"
+        return 1
+    fi
+
+    local rc=0 keyd_cmd=""
+    keyd_cmd="$(keyd_bin 2> /dev/null || true)"
+    if [ -n "$keyd_cmd" ]; then
+        keyd_check_config "$KEYD_SRC" || rc=$?
+        # keyd_check_config() also returns 2 (keyd binary not found), but this
+        # branch is only reached when $keyd_cmd is non-empty, so rc=2 is
+        # unreachable here. It is kept in the failure group defensively; do
+        # not read its presence as "the binary can disappear mid-check".
+        case "$rc" in
+            0) log_success "keyd config syntax valid ($KEYD_SRC)" ;;
+            1 | 2)
+                log_error "keyd config validation failed for $KEYD_SRC (rc=$rc): skipping deployment of $KEYD_DST and leaving the keyd service untouched. Fix the config and re-run with --with-keyd."
+                return 1
+                ;;
+            3) log_info "keyd < 2.6 has no 'check' subcommand; relying on daemon reload" ;;
+            *)
+                log_error "keyd config check returned unexpected rc=$rc for $KEYD_SRC: skipping deployment of $KEYD_DST and leaving the keyd service untouched."
+                return 1
+                ;;
+        esac
+    else
+        log_warn "keyd binary not found; cannot validate $KEYD_SRC. Deploying config only (no enable/restart). Install keyd for dual-role: sudo apt install keyd (Ubuntu>=25.04) or see keyboard/README.md"
+    fi
+
+    # Backups must be taken before the symlink is removed or cros.conf replaced.
+    backup_file_manifest_aware "$KEYD_DST" "keyboard"
+    if is_our_legacy_keyd_link; then
+        local link_target
+        link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
+        _normalize_keyd_link_manifest_component
+        backup_file_manifest_aware "$KEYD_LINK" "keyboard"
+        sudo rm -f "$KEYD_LINK" 2> /dev/null || true
+        log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
+    fi
+
+    sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"
+    manifest_add_service "keyd" "keyboard"
+
+    if [ -z "$keyd_cmd" ]; then
+        return 0
+    fi
+
+    if ! sudo systemctl enable keyd 2> /dev/null; then
+        log_warn "Failed to enable keyd (try: sudo systemctl enable keyd)"
+    fi
+    if ! sudo systemctl restart keyd 2> /dev/null; then
+        log_warn "Failed to restart keyd after deploying $KEYD_DST; restoring previous config and retrying"
+        if ! _restore_keyd_after_failed_restart; then
+            # The caller runs us inside `if install_keyd_step`, so this status
+            # is handled by its else-branch instead of aborting via `set -e`.
+            log_error "keyd restart could not be recovered; dual-role config is not active"
+            return 1
+        fi
+    fi
+
+    # Recommend libinput quirk for GNOME Wayland
+    if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
+        log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
+    fi
+    return 0
+}
+
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -125,7 +436,7 @@ check_keyboard_status() {
         if [ -L "$KEYD_LINK" ]; then
             local link_target
             link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
-            if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
+            if is_our_legacy_keyd_link; then
                 log_warn "  default.conf -> $link_target (redundant symlink; keyd loads all *.conf automatically)"
             else
                 log_info "  default.conf -> $link_target"
@@ -173,6 +484,15 @@ check_keyboard_status() {
 uninstall_keyboard() {
     log_section "Uninstalling Keyboard Top-Row hwdb Mapping & Backlight Sync"
 
+    # Backfill the component on legacy (v1.0) KEYD_LINK records BEFORE any
+    # rollback/placeholder decision. install_keyd_step() only normalizes while
+    # the symlink is still present; an earlier install may already have removed
+    # it, leaving a component-less record that neither
+    # _prepare_keyd_link_for_rollback() nor rollback_component("keyboard") can
+    # see. Doing it here is a no-op when no such record exists, and DRY_RUN
+    # only logs, so no existing uninstall behaviour changes.
+    _normalize_keyd_link_manifest_component
+
     # Disable user service before rollback (so manifest can capture state, but we also proactively disable)
     if [ "${DRY_RUN:-0}" != "1" ]; then
         local real_user
@@ -192,12 +512,8 @@ uninstall_keyboard() {
             local keyd_ours=0
             if [ -f "$KEYD_DST" ]; then
                 keyd_ours=1
-            elif [ -L "$KEYD_LINK" ]; then
-                local link_target
-                link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
-                if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
-                    keyd_ours=1
-                fi
+            elif is_our_legacy_keyd_link; then
+                keyd_ours=1
             fi
             if [ "$keyd_ours" = "1" ]; then
                 sudo systemctl disable --now keyd 2> /dev/null || true
@@ -209,22 +525,12 @@ uninstall_keyboard() {
         log_dryrun "Would disable keyd if active and config present"
     fi
 
+    # The installer deletes our legacy default.conf symlink; prepare the
+    # manifest target so rollback can restore the original symlink. There is
+    # deliberately no post-rollback deletion of default.conf here.
+    _prepare_keyd_link_for_rollback
     rollback_component "keyboard"
     remove_group_membership "plugdev" "$(get_real_user)" "keyboard"
-
-    # Clean up legacy default.conf symlink pointing to cros.conf if present
-    if [ -L "$KEYD_LINK" ]; then
-        local link_target
-        link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
-        if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
-            if [ "${DRY_RUN:-0}" = "1" ]; then
-                log_dryrun "Would remove legacy symlink: $KEYD_LINK -> $link_target"
-            else
-                sudo rm -f "$KEYD_LINK" 2> /dev/null || true
-                log_info "Removed legacy symlink: $KEYD_LINK -> $link_target"
-            fi
-        fi
-    fi
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemd-hwdb update 2> /dev/null || true
@@ -414,63 +720,24 @@ install_keyboard() {
     fi
 
     # Optional keyd dual-role step
+    KEYD_DEPLOYED=0
     if [ "${WITH_KEYD:-0}" = "1" ]; then
         log_step 6 $total_steps "Installing keyd dual-role config to $KEYD_DST..."
-        backup_file_manifest_aware "$KEYD_DST" "keyboard"
-        # Remove redundant default.conf symlink pointing to cros.conf if present,
-        # preventing keyd from loading duplicate configurations (keyd loads all *.conf)
-        if [ -L "$KEYD_LINK" ]; then
-            local link_target
-            link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
-            if [ "$link_target" = "cros.conf" ] || [ "$link_target" = "$KEYD_DST" ]; then
-                if [ "${DRY_RUN:-0}" = "1" ]; then
-                    log_dryrun "Would remove redundant symlink $KEYD_LINK -> $link_target"
-                else
-                    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
-                    log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
-                fi
-            fi
-        fi
-        if [ "${DRY_RUN:-0}" = "1" ]; then
-            log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
-            log_dryrun "Would record service state: keyd (keyboard)"
-            log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
+        if install_keyd_step; then
+            KEYD_DEPLOYED=1
         else
-            if [ ! -f "$KEYD_SRC" ]; then
-                log_warn "keyd source not found at $KEYD_SRC, skipping"
-            else
-                sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"
-                # Record service state before enabling (first-wins) - even if binary not yet installed, stub handles is-enabled=1 case
-                manifest_add_service "keyd" "keyboard"
-                # Validate syntax if keyd is available
-                local keyd_cmd=""
-                keyd_cmd="$(keyd_bin 2> /dev/null || true)"
-                if [ -n "$keyd_cmd" ]; then
-                    local rc=0
-                    keyd_check_config "$KEYD_DST" || rc=$?
-                    case "$rc" in
-                        0) log_success "keyd config syntax valid" ;;
-                        3) log_info "keyd < 2.6 has no 'check' subcommand; relying on daemon reload" ;;
-                        *) log_warn "keyd config syntax check failed for $KEYD_DST" ;;
-                    esac
-                    sudo systemctl enable keyd 2> /dev/null || log_warn "Failed to enable keyd (try: sudo systemctl enable keyd)"
-                    # The config is deployed after keyd's initial device scan; restart
-                    # so the daemon grabs the keyboard and applies the mapping now.
-                    sudo systemctl restart keyd 2> /dev/null || log_warn "Failed to restart keyd (try: sudo systemctl restart keyd)"
-                    # Recommend libinput quirk for GNOME Wayland
-                    if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
-                        log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
-                    fi
-                else
-                    log_warn "keyd not installed — config deployed but daemon not started. Install: sudo apt install keyd (Ubuntu>=25.04) or see keyboard/README.md for PPA/COPR/source"
-                fi
-            fi
+            KEYD_DEPLOYED=0
+            log_error "keyd step did not complete (config rejected or restart unrecoverable); keyboard hwdb/backlight changes are still installed"
         fi
     fi
 
     log_success "Chromebook top-row keyboard mapping and backlight sync installed! ⌨️"
     if [ "${WITH_KEYD:-0}" = "1" ]; then
-        log_success "keyd dual-role included (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
+        if [ "${KEYD_DEPLOYED:-0}" = "1" ]; then
+            log_success "keyd dual-role included (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
+        else
+            log_error "keyd dual-role NOT deployed (restart failed or config rejected; see errors above)"
+        fi
     fi
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_info "Dry-run: no system files were changed. Run without --dry-run to apply."

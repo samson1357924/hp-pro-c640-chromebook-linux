@@ -66,14 +66,30 @@ keyd_bin() {
 }
 
 # `keyd check <file>` exists only in keyd >= 2.6. Older builds (e.g. 2.5.0-5
-# on Ubuntu 26.04) print usage and exit 0, so probing the help text is the
-# only reliable feature test.
+# on Ubuntu 26.04) print usage and exit 0 for *any* `check` invocation, so
+# help text alone is not enough: probe with a known-good and a known-bad
+# config and only report support when the good one passes and the bad one
+# fails.
 keyd_supports_check() {
     local bin="${1:-}"
     if [ -z "$bin" ]; then
         bin="$(keyd_bin)" || return 1
     fi
-    "$bin" --help 2>&1 | grep -qE '^[[:space:]]+check([[:space:]]|$)'
+    "$bin" --help 2>&1 | grep -qE '^[[:space:]]+check([[:space:]]|$)' || return 1
+
+    local probe_dir valid_conf invalid_conf
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/keyd-check-probe.XXXXXX" 2> /dev/null)" || return 1
+    valid_conf="$probe_dir/valid.conf"
+    invalid_conf="$probe_dir/invalid.conf"
+    printf '[ids]\n*\n[main]\na = b\n' > "$valid_conf"
+    printf '[ids]\n*\n[main]\na = overload(\n' > "$invalid_conf"
+
+    local valid_rc=1 invalid_rc=0
+    "$bin" check "$valid_conf" > /dev/null 2>&1 && valid_rc=0 || valid_rc=$?
+    "$bin" check "$invalid_conf" > /dev/null 2>&1 && invalid_rc=0 || invalid_rc=$?
+    rm -rf -- "$probe_dir"
+
+    [ "$valid_rc" -eq 0 ] && [ "$invalid_rc" -ne 0 ]
 }
 
 # Returns 0 = valid, 1 = invalid, 2 = keyd not installed, 3 = unsupported version

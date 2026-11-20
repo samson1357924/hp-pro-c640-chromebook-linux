@@ -503,6 +503,1005 @@ test_kbd_backlight_double_install() {
 }
 
 # ---------------------------------------------------------------------------
+# 15-27. keyd step regression tests
+#
+# These tests build a sandbox copy of the installer with its CLI entry point
+# removed and ALL install destinations (hwdb/udev/daemon/service/sleep/keyd)
+# redirected into the sandbox, with PATH stubs for sudo/systemctl/udevadm/
+# systemd-hwdb/getent and a get_real_user() override where needed. They exercise
+# the real production helpers (is_our_legacy_keyd_link, install_keyd_step,
+# install_keyboard/uninstall_keyboard and lib/backup.sh's backup/rollback), not
+# a re-implementation. In particular the P1 regression calls the real
+# uninstall_keyboard() so a restored post-rollback symlink deletion is caught
+# behaviourally; the source-level check below is only an extra guard.
+# ---------------------------------------------------------------------------
+
+prepare_keyd_sandbox_script() {
+    local sandbox="$1"
+    sed \
+        -e "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"$REPO_ROOT/keyboard\"|" \
+        -e "s|^ROOT_DIR=.*|ROOT_DIR=\"$REPO_ROOT\"|" \
+        -e "s|^HWDB_DST=.*|HWDB_DST=\"$sandbox/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb\"|" \
+        -e "s|^UDEV_DST=.*|UDEV_DST=\"$sandbox/etc/udev/rules.d/61-chromeos-kbd-backlight.rules\"|" \
+        -e "s|^DAEMON_DST=.*|DAEMON_DST=\"$sandbox/usr/local/bin/c640-kbd-backlight-sync\"|" \
+        -e "s|^SERVICE_DST=.*|SERVICE_DST=\"$sandbox/etc/systemd/user/c640-kbd-backlight-sync.service\"|" \
+        -e "s|^SLEEP_DST=.*|SLEEP_DST=\"$sandbox/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh\"|" \
+        -e "s|^KEYD_SRC=.*|KEYD_SRC=\"$sandbox/keyd-src/cros.conf\"|" \
+        -e "s|^KEYD_DST=.*|KEYD_DST=\"$sandbox/etc/keyd/cros.conf\"|" \
+        -e "s|^KEYD_LINK=.*|KEYD_LINK=\"$sandbox/etc/keyd/default.conf\"|" \
+        -e '/^# CLI Argument Parsing/,$d' \
+        "$REPO_ROOT/keyboard/install-keyboard.sh" > "$sandbox/install-keyboard-sandbox.sh"
+}
+
+setup_keyd_stubs() {
+    local sandbox="$1" mode="$2"
+    mkdir -p "$sandbox/stub"
+
+    # sudo just runs the command: every destination is inside the sandbox.
+    printf '#!/usr/bin/env bash\nexec "$@"\n' > "$sandbox/stub/sudo"
+
+    # systemctl records every call and can fail the first (or every) restart
+    # on demand.
+    cat > "$sandbox/stub/systemctl" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_SYSTEMCTL_LOG:?}"
+case "$*" in
+    *"restart keyd"*)
+        if [ "${STUB_RESTART_FAIL_ALWAYS:-0}" = "1" ]; then
+            exit 1
+        fi
+        if [ "${STUB_RESTART_FAIL_FIRST:-0}" = "1" ] && [ ! -e "${STUB_RESTART_RETRY_FLAG:-}" ]; then
+            : > "${STUB_RESTART_RETRY_FLAG:?}"
+            exit 1
+        fi
+        ;;
+esac
+exit 0
+EOF
+
+    # Needed by uninstall_keyboard() (systemd-hwdb / udevadm refresh). getent
+    # reports an existing plugdev group so a full install never runs groupadd.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/udevadm"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/systemd-hwdb"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/getent"
+
+    case "$mode" in
+        valid)
+            cat > "$sandbox/stub/keyd" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --help) printf 'Usage: keyd [options]\n  check <file>  Check configuration\n' ;;
+    --version) printf 'keyd 2.6.0\n' ;;
+    check) if grep -q 'overload(' "$2"; then exit 1; fi; exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+            ;;
+        rvaiya)
+            # keyd_bin() falls back to keyd.rvaiya when keyd is absent.
+            cat > "$sandbox/stub/keyd.rvaiya" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --help) printf 'Usage: keyd [options]\n  check <file>  Check configuration\n' ;;
+    --version) printf 'keyd 2.6.0\n' ;;
+    check) if grep -q 'overload(' "$2"; then exit 1; fi; exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+            ;;
+        invalid)
+            # Accept the good/bad probe configs from keyd_supports_check(), but
+            # reject our INVALID_SRC file.
+            cat > "$sandbox/stub/keyd" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --help) printf 'Usage: keyd [options]\n  check <file>  Check configuration\n' ;;
+    --version) printf 'keyd 2.6.0\n' ;;
+    check)
+        if grep -q 'INVALID_SRC' "$2" || grep -q 'overload(' "$2"; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+            ;;
+        legacy25)
+            # Real 2.5.x behaviour: --help advertises check, but check only
+            # prints usage and always returns 0.
+            cat > "$sandbox/stub/keyd" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --help) printf 'Usage: keyd [options]\n  check <file>  Check configuration\n' ;;
+    --version) printf 'keyd 2.5.0\n' ;;
+    check) printf 'Usage: keyd [options]\n'; exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+            ;;
+        none)
+            # No keyd stub on purpose: tests that need keyd_cmd="" also
+            # override keyd_bin() because the host has /usr/bin/keyd.rvaiya.
+            ;;
+        *)
+            # Unknown modes create no keyd binary, like "none".
+            ;;
+    esac
+    chmod +x "$sandbox/stub/sudo" "$sandbox/stub/systemctl" \
+        "$sandbox/stub/udevadm" "$sandbox/stub/systemd-hwdb" "$sandbox/stub/getent"
+    [ ! -f "$sandbox/stub/keyd" ] || chmod +x "$sandbox/stub/keyd"
+    [ ! -f "$sandbox/stub/keyd.rvaiya" ] || chmod +x "$sandbox/stub/keyd.rvaiya"
+}
+
+run_keyd_install_step() {
+    local sandbox="$1"
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    '; then
+        return 0
+    fi
+    return 1
+}
+
+# Call the REAL uninstall_keyboard() in the sandbox. get_real_user is stubbed
+# to the empty string so user/group/systemd-per-user branches are skipped, and
+# udevadm/systemd-hwdb/systemctl are PATH stubs. This is the behavioural guard
+# for the "uninstall deletes the symlink rollback just restored" regression.
+run_keyd_uninstall() {
+    local sandbox="$1"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        uninstall_keyboard
+    '
+}
+
+assert_keyd_link_detection() {
+    local sandbox="$1" target="$2" expected="$3"
+    ln -sfn "$target" "$sandbox/etc/keyd/default.conf"
+    local rc=0
+    if run_sandboxed "$sandbox" '
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_LINK="$3"
+        is_our_legacy_keyd_link
+    ' "${sandbox}/etc/keyd/default.conf"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    assert_eq "$expected" "$rc" "legacy-link helper for target '$target'"
+}
+
+test_keyd_legacy_link_helper() {
+    local sandbox="/tmp/rollback-test-keyd-helper"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+
+    assert_keyd_link_detection "$sandbox" "cros.conf" 0
+    assert_keyd_link_detection "$sandbox" "./cros.conf" 0
+    assert_keyd_link_detection "$sandbox" "../keyd/cros.conf" 0
+    assert_keyd_link_detection "$sandbox" "$sandbox/etc/keyd/cros.conf" 0
+    assert_keyd_link_detection "$sandbox" "mylayout.conf" 1
+    assert_keyd_link_detection "$sandbox" "../mylayout.conf" 1
+
+    # A regular file is never "our" link.
+    rm -f "$sandbox/etc/keyd/default.conf"
+    echo "ORIGINAL" > "$sandbox/etc/keyd/default.conf"
+    local rc=0
+    if run_sandboxed "$sandbox" '
+        source "$2/install-keyboard-sandbox.sh"
+        is_our_legacy_keyd_link
+    '; then
+        rc=0
+    else
+        rc=$?
+    fi
+    assert_eq "1" "$rc" "regular default.conf is not our legacy link"
+}
+
+# $1 = absent | cros_link | other_link
+test_keyd_link_backup_and_rollback() {
+    local state="$1"
+    local sandbox="/tmp/rollback-test-keyd-link-$state"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" legacy25
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    case "$state" in
+        absent) ;;
+        cros_link)
+            printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+            ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+            ;;
+        other_link)
+            printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+            printf 'MYLAYOUT\n' > "$sandbox/etc/keyd/mylayout.conf"
+            ln -s mylayout.conf "$sandbox/etc/keyd/default.conf"
+            ;;
+    esac
+
+    if ! run_keyd_install_step "$sandbox"; then
+        fail "keyd install step failed for state $state"
+        return 0
+    fi
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf")" "[$state] cros.conf deployed"
+    if grep -q 'enable keyd' "$sandbox/systemctl.log" && grep -q 'restart keyd' "$sandbox/systemctl.log"; then
+        ok
+    else
+        fail "[$state] keyd service should be enabled and restarted on the rc=3 (no check) path"
+    fi
+
+    local expected_records=1
+    case "$state" in
+        cros_link)
+            expected_records=2
+            if [ -L "$sandbox/etc/keyd/default.conf" ]; then
+                fail "[$state] installer must remove our legacy default.conf symlink"
+            else
+                ok
+            fi
+            ;;
+        other_link)
+            if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "mylayout.conf" ]; then
+                ok
+            else
+                fail "[$state] installer must keep a foreign default.conf symlink"
+            fi
+            ;;
+    esac
+    local records
+    records="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records", [])))' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "$expected_records" "$records" "[$state] manifest records only backed-up targets"
+
+    # P1 regression guard: call the REAL uninstall_keyboard() so a restored
+    # post-rollback "clean up default.conf" deletion is caught behaviourally,
+    # not only via the source-level grep in
+    # test_uninstall_has_no_post_rollback_keyd_cleanup.
+    run_keyd_uninstall "$sandbox"
+
+    case "$state" in
+        absent)
+            if [ ! -e "$sandbox/etc/keyd/cros.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+                ok
+            else
+                fail "[$state] rollback should remove newly deployed cros.conf and leave no symlink"
+            fi
+            ;;
+        cros_link)
+            # The regression: uninstall must not delete the symlink rollback
+            # just restored.
+            assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf")" "[$state] rollback restores original cros.conf"
+            if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+                ok
+            else
+                fail "[$state] rollback must restore original default.conf -> cros.conf symlink"
+            fi
+            ;;
+        other_link)
+            assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf")" "[$state] rollback restores original cros.conf"
+            if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "mylayout.conf" ]; then
+                ok
+            else
+                fail "[$state] rollback must leave foreign default.conf symlink intact"
+            fi
+            ;;
+    esac
+}
+
+test_keyd_invalid_config_skips_deploy() {
+    local sandbox="/tmp/rollback-test-keyd-invalid"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" invalid
+    printf 'INVALID_SRC\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+
+    if run_keyd_install_step "$sandbox"; then
+        fail "keyd install step should reject an invalid config"
+    else
+        ok
+    fi
+
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf")" "invalid config: existing cros.conf left untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "invalid config: existing default.conf symlink left untouched"
+    fi
+    if [ -f "$sandbox/manifest/install-manifest.json" ] && [ "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records", [])))' "$sandbox/manifest/install-manifest.json")" != "0" ]; then
+        fail "invalid config: no file should be backed up or recorded"
+    else
+        ok
+    fi
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "invalid config: systemctl enable/restart must not be called"
+    else
+        ok
+    fi
+}
+
+# $1 = yes | no : whether a previous cros.conf exists to be restored
+test_keyd_restart_failure_recovery() {
+    local existing="$1"
+    local sandbox="/tmp/rollback-test-keyd-restart-$existing"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    [ "$existing" = "yes" ] || rm -f "$sandbox/etc/keyd/cros.conf"
+    # When a previous config existed, install also removed our legacy symlink;
+    # recovery must restore it from the backup, not just cros.conf.
+    if [ "$existing" = "yes" ]; then
+        ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    fi
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    '
+
+    local restarts
+    restarts="$(grep -c 'restart keyd' "$sandbox/systemctl.log" 2> /dev/null || true)"
+    restarts="${restarts:-0}"
+    if [ "$restarts" -ge 2 ]; then
+        ok
+    else
+        fail "restart failure: daemon should be restarted again after recovery (got $restarts calls)"
+    fi
+    if grep -q 'enable keyd' "$sandbox/systemctl.log"; then
+        ok
+    else
+        fail "valid config (rc=0) path must enable keyd"
+    fi
+    if [ "$existing" = "yes" ]; then
+        assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf")" "restart failure: previous cros.conf restored"
+        # P2.3c: recovery must also put back the legacy symlink from its backup.
+        if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+            ok
+        else
+            fail "restart failure recovery: legacy default.conf symlink restored from backup"
+        fi
+    else
+        if [ ! -e "$sandbox/etc/keyd/cros.conf" ]; then
+            ok
+        else
+            fail "restart failure: newly deployed cros.conf should be removed when there was no previous config"
+        fi
+    fi
+}
+
+test_keyd_supports_check_probe() {
+    local sandbox="/tmp/rollback-test-keyd-check-probe"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    prepare_keyd_sandbox_script "$sandbox"
+
+    setup_keyd_stubs "$sandbox" valid
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        keyd_supports_check "$2/stub/keyd"
+    '; then
+        ok
+    else
+        fail "keyd 2.6-style check should be detected as supported"
+    fi
+
+    setup_keyd_stubs "$sandbox" legacy25
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        keyd_supports_check "$2/stub/keyd"
+    '; then
+        fail "keyd 2.5.x fake check (usage + rc=0) must not be detected as supported"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 20. dangling symlink (default.conf -> cros.conf, target missing) is still ours
+# ---------------------------------------------------------------------------
+test_keyd_dangling_symlink_is_ours() {
+    local sandbox="/tmp/rollback-test-keyd-dangling"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+    # cros.conf is deliberately absent: the symlink target does not exist, but
+    # canonicalisation is lexical and the helper must still recognise it.
+    assert_keyd_link_detection "$sandbox" "cros.conf" 0
+}
+
+# ---------------------------------------------------------------------------
+# 21. keyd binary absent: deploy config only, no enable/restart, rollback drops it
+# ---------------------------------------------------------------------------
+test_keyd_no_binary_deploys_config_only() {
+    local sandbox="/tmp/rollback-test-keyd-no-binary"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" none
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    # The host ships /usr/bin/keyd.rvaiya, so force keyd_bin() to report "no
+    # binary" to deterministically exercise install_keyd_step's keyd_cmd=""
+    # branch (only deploy cros.conf, do not enable/restart).
+    if ! run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        keyd_bin() { return 1; }
+        install_keyd_step
+    '; then
+        fail "no-keyd: install_keyd_step should still deploy the config"
+        return 0
+    fi
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf")" "no-keyd: cros.conf deployed"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "no-keyd: no enable/restart should be attempted"
+    else
+        ok
+    fi
+    local rec
+    rec="$(python3 -c 'import json,sys; rs=json.load(open(sys.argv[1])).get("records",[]); r=[x for x in rs if x.get("target","").endswith("/cros.conf")]; print(len(r), r[0].get("was_existing") if r else "none")' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "1 False" "$rec" "no-keyd: new cros.conf recorded as not pre-existing"
+
+    # Rollback removes the newly deployed cros.conf (was_existing=0 branch).
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+        rollback_component "keyboard"
+    '
+    if [ ! -e "$sandbox/etc/keyd/cros.conf" ]; then
+        ok
+    else
+        fail "no-keyd: rollback should remove the newly deployed cros.conf"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 22. dry-run: no config deployed, no manifest record, no placeholder
+# ---------------------------------------------------------------------------
+test_keyd_dry_run_no_side_effects() {
+    local sandbox="/tmp/rollback-test-keyd-dry-run"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    # (a) install_keyd_step DRY_RUN branch: backup/record/deploy are logged but
+    # never executed, and systemctl is not called.
+    if ! run_sandboxed "$sandbox" '
+        export DRY_RUN=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    '; then
+        fail "dry-run: install_keyd_step should succeed"
+    fi
+    if [ ! -e "$sandbox/etc/keyd/cros.conf" ]; then
+        ok
+    else
+        fail "dry-run: cros.conf must not be created"
+    fi
+    if [ -f "$sandbox/manifest/install-manifest.json" ]; then
+        local recs
+        recs="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records",[])))' "$sandbox/manifest/install-manifest.json")"
+        assert_eq "0" "$recs" "dry-run: no manifest record written"
+    else
+        ok
+    fi
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "dry-run: systemctl must not be called"
+    else
+        ok
+    fi
+
+    # (b) _prepare_keyd_link_for_rollback DRY_RUN early exit: with a restorable
+    # record and backup present, still no placeholder is created.
+    python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+mp, target = sys.argv[1:3]
+d = {"version":"2.0","records":[{"target":target,"component":"keyboard","was_existing":True}],"services":[],"groups":[]}
+json.dump(d, open(mp, "w"), indent=2)
+EOF
+    mkdir -p "$sandbox/backups/20260101_000000000000000$sandbox/etc/keyd"
+    ln -s cros.conf "$sandbox/backups/20260101_000000000000000$sandbox/etc/keyd/default.conf"
+    run_sandboxed "$sandbox" '
+        export DRY_RUN=1 PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+    '
+    if [ ! -e "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        ok
+    else
+        fail "dry-run: placeholder must not be created"
+    fi
+    # Sanity check that the same setup DOES create a placeholder when not
+    # dry-running (so the assertion above is not vacuous).
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+    '
+    if [ -f "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        ok
+    else
+        fail "non-dry-run: placeholder should be created for a restorable record"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 23. missing backup: _prepare_keyd_link_for_rollback leaves no placeholder
+# ---------------------------------------------------------------------------
+test_keyd_prepare_link_without_backup() {
+    local sandbox="/tmp/rollback-test-keyd-no-backup"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" legacy25
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+
+    run_keyd_install_step "$sandbox" || {
+        fail "no-backup: install step failed"
+        return 0
+    }
+    # Install backed up and removed the symlink; simulate a lost backup.
+    rm -rf "$sandbox/backups"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+    '
+    if [ ! -e "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        ok
+    else
+        fail "no-backup: placeholder must not be created when backup is missing"
+    fi
+    assert_contains "No backup found for" "$(cat "$sandbox/log.txt")" "no-backup: helper should log a warning"
+    assert_contains "leaving no placeholder" "$(cat "$sandbox/log.txt")" "no-backup: warning mentions no placeholder"
+}
+
+# ---------------------------------------------------------------------------
+# 24. unrecoverable restart: step returns 1, caller sets KEYD_DEPLOYED=0 and
+#     never prints the keyd success line
+# ---------------------------------------------------------------------------
+setup_keyd_restart_fatal_sandbox() {
+    local sandbox="$1"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+}
+
+test_keyd_restart_unrecoverable_returns_failure() {
+    local step_sandbox="/tmp/rollback-test-keyd-fatal-step"
+    local caller_sandbox="/tmp/rollback-test-keyd-fatal-caller"
+    setup_keyd_restart_fatal_sandbox "$step_sandbox"
+    setup_keyd_restart_fatal_sandbox "$caller_sandbox"
+
+    # (a) install_keyd_step itself returns 1 when the retry also fails.
+    if run_sandboxed "$step_sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" STUB_RESTART_FAIL_ALWAYS=1
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$step_sandbox/step.log"; then
+        fail "unrecoverable restart: install_keyd_step must return 1"
+    else
+        ok
+    fi
+    assert_contains "keyd restart could not be recovered" "$(cat "$step_sandbox/step.log")" "unrecoverable restart: fatal error logged"
+
+    # (b) The real caller (install_keyboard) sets KEYD_DEPLOYED=0 and does not
+    # print the "keyd dual-role included" success line, but still completes the
+    # non-keyd install steps.
+    if ! run_sandboxed "$caller_sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_ALWAYS=1 WITH_KEYD=1
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        install_keyboard
+        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
+    ' 2> "$caller_sandbox/caller.log"; then
+        fail "unrecoverable restart: install_keyboard should still finish"
+    fi
+    assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "unrecoverable restart: caller sets KEYD_DEPLOYED=0"
+    assert_contains "keyd dual-role NOT deployed" "$(cat "$caller_sandbox/caller.log")" "unrecoverable restart: caller logs non-deployment"
+    if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
+        fail "unrecoverable restart: keyd success line must not be printed"
+    else
+        ok
+    fi
+    # Recovery still restored the pre-install state.
+    assert_eq "ORIGINAL" "$(cat "$caller_sandbox/etc/keyd/cros.conf")" "unrecoverable restart: previous cros.conf restored"
+    if [ -L "$caller_sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$caller_sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "unrecoverable restart: legacy symlink restored during recovery"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 25. a manifest record with was_existing=false is removed by rollback
+# ---------------------------------------------------------------------------
+test_keyd_was_existing_false_removes_new_link() {
+    local sandbox="/tmp/rollback-test-keyd-new-link"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+    # A default.conf WE created plus a was_existing=false record: rollback must
+    # take the "not pre-existing" branch and delete it; the prepare helper must
+    # not create a placeholder for it.
+    printf 'CREATED-BY-US\n' > "$sandbox/etc/keyd/default.conf"
+    python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+mp, target = sys.argv[1:3]
+d = {"version":"2.0","records":[{"target":target,"component":"keyboard","was_existing":False}],"services":[],"groups":[]}
+json.dump(d, open(mp, "w"), indent=2)
+EOF
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+        rollback_component "keyboard"
+    '
+    if [ ! -e "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        ok
+    else
+        fail "was_existing=false: default.conf created by us must be removed on rollback"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 26. legacy 1.0 manifest with a KEYD_LINK record but no component field
+# ---------------------------------------------------------------------------
+test_keyd_legacy_manifest_without_component() {
+    # (a) Unit-level guard: the rollback helpers alone do not claim an
+    # un-normalized record, so a symlink that was never removed stays intact.
+    # Normalization is deliberately an install-time step (see (b)/(c)).
+    local sandbox="/tmp/rollback-test-keyd-legacy-upgrade"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+mp, target = sys.argv[1:3]
+d = {"version":"1.0","records":[{"target":target,"was_existing":True}]}
+json.dump(d, open(mp, "w"), indent=2)
+EOF
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _prepare_keyd_link_for_rollback
+        rollback_component "keyboard"
+    '
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "legacy 1.0 record without component: untouched symlink must remain intact"
+    fi
+    if [ -f "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        fail "legacy 1.0 record without component: no placeholder should be created without a backup"
+    else
+        ok
+    fi
+
+    # (b) Full upgrade: simulate an old (1.0) install that left the
+    # default.conf -> cros.conf symlink in place, with a legacy backup and a
+    # manifest whose KEYD_LINK record has no "component" field. Then run the
+    # real new installer and uninstall. The installer must backfill the
+    # component so uninstall/rollback restore BOTH the symlink and the
+    # original cros.conf.
+    local up="/tmp/rollback-test-keyd-legacy-upgrade-full"
+    rm -rf "$up"
+    mkdir -p "$up/backups" "$up/manifest" "$up/etc/keyd" "$up/keyd-src"
+    prepare_keyd_sandbox_script "$up"
+    setup_keyd_stubs "$up" valid
+    printf 'VALID_CROS_CONF\n' > "$up/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$up/etc/keyd/cros.conf"
+    ln -s cros.conf "$up/etc/keyd/default.conf"
+    # Legacy backups: the old install backed up both original files. The
+    # timestamp directory mirrors lib/backup.sh's
+    # "$BACKUP_BASE_DIR/$timestamp$target" layout.
+    local legacy_ts="20250101_000000000000"
+    mkdir -p "$up/backups/$legacy_ts$up/etc/keyd"
+    cp -a "$up/etc/keyd/cros.conf" "$up/backups/$legacy_ts$up/etc/keyd/cros.conf"
+    cp -a "$up/etc/keyd/default.conf" "$up/backups/$legacy_ts$up/etc/keyd/default.conf"
+    # Only the KEYD_LINK record lacks "component"; the cros.conf record is
+    # already keyboard-scoped (first-wins keeps both records on re-install).
+    python3 - "$up/manifest/install-manifest.json" "$up/etc/keyd/cros.conf" "$up/etc/keyd/default.conf" << 'EOF'
+import json, sys
+mp, cros, link = sys.argv[1:4]
+json.dump({
+    "version": "1.0",
+    "records": [
+        {"target": cros, "component": "keyboard", "was_existing": True},
+        {"target": link, "was_existing": True},
+    ],
+}, open(mp, "w"), indent=2)
+EOF
+
+    run_keyd_install_step "$up" || {
+        fail "legacy upgrade: install step failed"
+        return 0
+    }
+    if [ -L "$up/etc/keyd/default.conf" ]; then
+        fail "legacy upgrade: installer must remove the redundant legacy symlink"
+    else
+        ok
+    fi
+    # Normalization keeps first-wins: record count, version, was_existing and
+    # the pre-existing cros.conf record must be unchanged; only the missing
+    # component is added.
+    local normalized
+    normalized="$(python3 - "$up/manifest/install-manifest.json" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+link = [r for r in d["records"] if r.get("target", "").endswith("/keyd/default.conf")]
+print(len(d["records"]), d.get("version"),
+      link[0].get("component") if link else "no-record",
+      link[0].get("was_existing") if link else "no-record")
+EOF
+)"
+    assert_eq "2 1.0 keyboard True" "$normalized" "legacy upgrade: component backfilled, first-wins fields preserved"
+
+    run_keyd_uninstall "$up"
+    assert_eq "ORIGINAL" "$(cat "$up/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "legacy upgrade: original cros.conf restored on uninstall"
+    if [ -L "$up/etc/keyd/default.conf" ] && [ "$(readlink "$up/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "legacy upgrade: uninstall/rollback must restore default.conf -> cros.conf symlink"
+    fi
+    if [ -e "$up/etc/keyd/default.conf" ] && [ ! -L "$up/etc/keyd/default.conf" ]; then
+        fail "legacy upgrade: rollback must replace the placeholder with the original symlink"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 26a. P3 upgrade gap: legacy 1.0 KEYD_LINK record without component, backup
+#      present, but the default.conf symlink already removed by an EARLIER
+#      install. install_keyd_step() only normalizes while the link is present,
+#      so uninstall_keyboard() must normalize on its own before preparing the
+#      placeholder and rolling back.
+# ---------------------------------------------------------------------------
+test_keyd_legacy_upgrade_link_already_removed() {
+    local sandbox="/tmp/rollback-test-keyd-legacy-upgrade-link-removed"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    # Post-(old-)install state: original cros.conf is present, but the legacy
+    # default.conf -> cros.conf symlink was already removed. Its original is
+    # still available in an older backup directory.
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    if [ -e "$sandbox/etc/keyd/default.conf" ] || [ -L "$sandbox/etc/keyd/default.conf" ]; then
+        fail "legacy link-removed: test setup requires default.conf to be absent"
+        return 0
+    fi
+    local legacy_ts="20250101_000000000000"
+    mkdir -p "$sandbox/backups/$legacy_ts$sandbox/etc/keyd"
+    cp -a "$sandbox/etc/keyd/cros.conf" "$sandbox/backups/$legacy_ts$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/backups/$legacy_ts$sandbox/etc/keyd/default.conf"
+
+    # Only the KEYD_LINK record lacks "component"; first-wins keeps both
+    # records when the new installer records cros.conf again.
+    python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/cros.conf" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+mp, cros, link = sys.argv[1:4]
+json.dump({
+    "version": "1.0",
+    "records": [
+        {"target": cros, "component": "keyboard", "was_existing": True},
+        {"target": link, "was_existing": True},
+    ],
+}, open(mp, "w"), indent=2)
+EOF
+
+    # Re-install with the new version: the symlink is absent, so the
+    # link-present-only normalization in install_keyd_step() cannot run.
+    run_keyd_install_step "$sandbox" || {
+        fail "legacy link-removed: install step failed"
+        return 0
+    }
+
+    # The new unconditional normalization in uninstall_keyboard() runs even in
+    # DRY_RUN, but must only log: no manifest write and no placeholder.
+    cp "$sandbox/manifest/install-manifest.json" "$sandbox/manifest/before-dryrun.json"
+    : > "$sandbox/log.txt"
+    run_sandboxed "$sandbox" '
+        export DRY_RUN=1 PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        uninstall_keyboard
+    '
+    if cmp -s "$sandbox/manifest/before-dryrun.json" "$sandbox/manifest/install-manifest.json"; then
+        ok
+    else
+        fail "legacy link-removed: DRY_RUN uninstall must not write the manifest"
+    fi
+    if [ ! -e "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        ok
+    else
+        fail "legacy link-removed: DRY_RUN uninstall must not create a placeholder"
+    fi
+    assert_contains "Would backfill component=keyboard" "$(cat "$sandbox/log.txt")" \
+        "legacy link-removed: DRY_RUN uninstall logs the normalization"
+
+    local before
+    before="$(python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+link = [r for r in d["records"] if r.get("target") == sys.argv[2]]
+print(len(link), link[0].get("component") if link else "no-record")
+EOF
+)"
+    assert_eq "1 None" "$before" "legacy link-removed: install leaves the un-normalized KEYD_LINK record"
+
+    # The real uninstall must normalize first, then prepare a placeholder and
+    # roll it back into the original symlink, cleaning up the record.
+    run_keyd_uninstall "$sandbox"
+
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "legacy link-removed: uninstall/rollback must restore default.conf -> cros.conf from backup"
+    fi
+    if [ -e "$sandbox/etc/keyd/default.conf" ] && [ ! -L "$sandbox/etc/keyd/default.conf" ]; then
+        fail "legacy link-removed: no placeholder may be left behind"
+    else
+        ok
+    fi
+    local after
+    after="$(python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+link = [r for r in d["records"] if r.get("target") == sys.argv[2]]
+print(len(link))
+EOF
+)"
+    assert_eq "0" "$after" "legacy link-removed: KEYD_LINK record must be cleaned up after rollback"
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "legacy link-removed: original cros.conf restored on uninstall"
+}
+
+# ---------------------------------------------------------------------------
+# 26b. normalization helper: selective backfill, DRY_RUN and failure handling
+# ---------------------------------------------------------------------------
+test_keyd_legacy_component_normalization() {
+    local sandbox="/tmp/rollback-test-keyd-normalize"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/failbin"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" none
+    local link="$sandbox/etc/keyd/default.conf"
+    local other="$sandbox/etc/keyd/other.conf"
+
+    python3 - "$sandbox/manifest/install-manifest.json" "$link" "$other" << 'EOF'
+import json, sys
+mp, link, other = sys.argv[1:4]
+json.dump({"version": "1.0", "records": [
+    {"target": link, "was_existing": True, "installed_at": "old"},
+    {"target": link, "component": "other", "was_existing": True},
+    {"target": other, "was_existing": False},
+]}, open(mp, "w"), indent=2)
+EOF
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _normalize_keyd_link_manifest_component
+    '
+    local result
+    result="$(python3 - "$sandbox/manifest/install-manifest.json" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rs = d["records"]
+print(d["version"], len(rs), rs[0].get("component"), rs[0].get("was_existing"),
+      rs[0].get("installed_at"), rs[1].get("component"), rs[2].get("component"))
+EOF
+)"
+    assert_eq "1.0 3 keyboard True old other None" "$result" \
+        "normalization: only missing component on KEYD_LINK is backfilled"
+
+    # DRY_RUN: no manifest write, only a log_dryrun line.
+    cp "$sandbox/manifest/install-manifest.json" "$sandbox/manifest/before.json"
+    : > "$sandbox/log.txt"
+    run_sandboxed "$sandbox" '
+        export DRY_RUN=1 PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _normalize_keyd_link_manifest_component
+    '
+    if cmp -s "$sandbox/manifest/before.json" "$sandbox/manifest/install-manifest.json"; then
+        ok
+    else
+        fail "normalization dry-run must not write the manifest"
+    fi
+    assert_contains "Would backfill component=keyboard" "$(cat "$sandbox/log.txt")" \
+        "normalization dry-run logs the intended change"
+
+    # Failure path: a failing python3 must only log a warning, never abort.
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$sandbox/failbin/python3"
+    chmod +x "$sandbox/failbin/python3"
+    : > "$sandbox/log.txt"
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _normalize_keyd_link_manifest_component
+    '; then
+        ok
+    else
+        fail "normalization: failing python3 must not abort the installer"
+    fi
+    assert_contains "Failed to backfill component" "$(cat "$sandbox/log.txt")" \
+        "normalization: failing python3 logs a warning"
+}
+
+# ---------------------------------------------------------------------------
+# 27. keyd_bin() falls back to keyd.rvaiya when keyd is not installed
+# ---------------------------------------------------------------------------
+test_keyd_rvaiya_fallback() {
+    local sandbox="/tmp/rollback-test-keyd-rvaiya"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" rvaiya
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    local resolved
+    resolved="$(run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        keyd_bin
+    ')"
+    assert_eq "$sandbox/stub/keyd.rvaiya" "$resolved" "keyd_bin falls back to keyd.rvaiya"
+
+    if ! run_keyd_install_step "$sandbox"; then
+        fail "rvaiya fallback: install step should succeed"
+        return 0
+    fi
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf")" "rvaiya fallback: cros.conf deployed"
+    if grep -q 'enable keyd' "$sandbox/systemctl.log" && grep -q 'restart keyd' "$sandbox/systemctl.log"; then
+        ok
+    else
+        fail "rvaiya fallback: keyd service enabled and restarted"
+    fi
+}
+
+test_uninstall_has_no_post_rollback_keyd_cleanup() {
+    if grep -q 'Clean up legacy default.conf symlink' "$REPO_ROOT/keyboard/install-keyboard.sh"; then
+        fail "uninstall must not delete default.conf after rollback_component"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -519,6 +1518,25 @@ test_service_reinstall_first_wins
 test_group_remove_keeps_record_on_failure
 test_kbd_backlight_sync_install
 test_kbd_backlight_double_install
+test_keyd_legacy_link_helper
+test_keyd_link_backup_and_rollback absent
+test_keyd_link_backup_and_rollback cros_link
+test_keyd_link_backup_and_rollback other_link
+test_keyd_invalid_config_skips_deploy
+test_keyd_supports_check_probe
+test_keyd_restart_failure_recovery yes
+test_keyd_restart_failure_recovery no
+test_keyd_dangling_symlink_is_ours
+test_keyd_no_binary_deploys_config_only
+test_keyd_dry_run_no_side_effects
+test_keyd_prepare_link_without_backup
+test_keyd_restart_unrecoverable_returns_failure
+test_keyd_was_existing_false_removes_new_link
+test_keyd_legacy_manifest_without_component
+test_keyd_legacy_upgrade_link_already_removed
+test_keyd_legacy_component_normalization
+test_keyd_rvaiya_fallback
+test_uninstall_has_no_post_rollback_keyd_cleanup
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
