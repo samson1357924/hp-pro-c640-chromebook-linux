@@ -100,8 +100,8 @@ is_our_legacy_keyd_link() {
 # Returns 0 when restored or when there was nothing to restore, 1 when a
 # record existed but restoration could not be completed.
 _restore_our_keyd_link_after_failed_restart() {
-    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
     local link_existed backup
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
     link_existed="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_LINK" "keyboard")"
     [ "$link_existed" = "1" ] || return 0
 
@@ -129,8 +129,11 @@ _restore_our_keyd_link_after_failed_restart() {
 # file we just created if there was none), recreate the legacy default.conf
 # symlink when applicable, and try to restart the daemon once more so a
 # running keyd is not left talking to an unvalidated config.
-# Returns 0 only when the pre-install config was fully restored AND the final
-# restart succeeded; 1 otherwise (caller must not report dual-role as active).
+# Returns 2 when the pre-install state was fully restored AND the final restart
+# succeeded (safe revert: the new dual-role config is NOT active), 1 when the
+# recovery could not be completed, and 0 when no revert was needed (the new
+# config is running normally). Callers MUST treat 2 like a failure: dual-role
+# must never be reported as active after a revert.
 _restore_keyd_after_failed_restart() {
     local existed=0 restored=0
     # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
@@ -140,8 +143,17 @@ _restore_keyd_after_failed_restart() {
         local backup
         backup="$(_find_rollback_backup "$KEYD_DST")"
         if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
-            if sudo install -D -m 0644 "$backup" "$KEYD_DST" 2> /dev/null \
-                || sudo cp -a "$backup" "$KEYD_DST" 2> /dev/null; then
+            if [ -L "$backup" ]; then
+                # install(1) dereferences its source, so a backup that is a
+                # symlink (e.g. NixOS / symlink farms) must be copied with
+                # cp -a to preserve the link instead of leaving a regular file.
+                if sudo cp -a "$backup" "$KEYD_DST" 2> /dev/null; then
+                    restored=1
+                    log_info "Restored previous keyd config symlink from $backup after failed restart"
+                else
+                    log_warn "Could not restore previous keyd config symlink from $backup after failed restart"
+                fi
+            elif sudo install -D -m 0644 "$backup" "$KEYD_DST" 2> /dev/null; then
                 restored=1
                 log_info "Restored previous keyd config from $backup after failed restart"
             else
@@ -169,7 +181,13 @@ _restore_keyd_after_failed_restart() {
         log_warn "keyd still failed to restart after restoring previous config; check 'journalctl -u keyd' manually"
         return 1
     fi
-    [ "$restored" -eq 1 ]
+    if [ "$restored" -eq 1 ]; then
+        # The system is back on its pre-install config, so the dual-role
+        # config we just deployed is NOT active even though keyd now runs.
+        return 2
+    fi
+    # A record existed but its restoration could not be completed.
+    return 1
 }
 
 # lib/backup.sh only restores a pre-existing target when it still exists at
@@ -258,8 +276,9 @@ print(changed)
 
 # Single authority for the optional keyd step. Validation runs against the
 # source file *before* any deployment so an invalid config can never break a
-# running keyd daemon. Returns 1 when deployment was skipped, or when the
-# final restart still fails after recovery (dual-role is then not active).
+# running keyd daemon. Returns 1 when deployment was skipped, when deployment
+# itself failed, or when the restart failed and recovery had to revert to the
+# pre-install config (dual-role is not active in all of those cases).
 install_keyd_step() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
         backup_file_manifest_aware "$KEYD_DST" "keyboard"
@@ -268,6 +287,7 @@ install_keyd_step() {
             backup_file_manifest_aware "$KEYD_LINK" "keyboard"
             log_dryrun "Would remove redundant symlink $KEYD_LINK -> $(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
         fi
+        log_dryrun "Would deploy keyd dual-role config"
         log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
         log_dryrun "Would record service state: keyd (keyboard)"
         log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
@@ -314,7 +334,19 @@ install_keyd_step() {
         log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
     fi
 
-    sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"
+    # Guard the deployment: under `set -e` an unguarded failure would abort
+    # the installer before the pre-install keyd state could be restored.
+    if ! sudo install -D -m 0644 "$KEYD_SRC" "$KEYD_DST"; then
+        log_error "Failed to deploy $KEYD_DST; restoring previous keyd state"
+        local recovery_rc=0
+        _restore_keyd_after_failed_restart || recovery_rc=$?
+        if [ "$recovery_rc" -eq 1 ]; then
+            log_error "keyd config could not be restored after the install failure"
+        else
+            log_warn "keyd config reverted after install failure; dual-role NOT active"
+        fi
+        return 1
+    fi
     manifest_add_service "keyd" "keyboard"
 
     if [ -z "$keyd_cmd" ]; then
@@ -326,12 +358,28 @@ install_keyd_step() {
     fi
     if ! sudo systemctl restart keyd 2> /dev/null; then
         log_warn "Failed to restart keyd after deploying $KEYD_DST; restoring previous config and retrying"
-        if ! _restore_keyd_after_failed_restart; then
-            # The caller runs us inside `if install_keyd_step`, so this status
-            # is handled by its else-branch instead of aborting via `set -e`.
-            log_error "keyd restart could not be recovered; dual-role config is not active"
-            return 1
-        fi
+        local recovery_rc=0
+        # `|| rc=$?` records the real status: `if ! cmd` would only expose the
+        # negated status (0) inside its then-branch. `set -e` is not triggered
+        # by the left-hand side of `||`.
+        _restore_keyd_after_failed_restart || recovery_rc=$?
+        case "$recovery_rc" in
+            0)
+                # Defensive: the new config is running normally; no revert.
+                ;;
+            2)
+                # The daemon was restarted, but on the ORIGINAL config. The
+                # system is safe, yet dual-role is NOT deployed: the caller
+                # runs us inside `if install_keyd_step` and sets
+                # KEYD_DEPLOYED=0 from our failure status.
+                log_warn "keyd config reverted after restart failure; dual-role NOT active"
+                return 1
+                ;;
+            *)
+                log_error "keyd restart could not be recovered; dual-role config is not active"
+                return 1
+                ;;
+        esac
     fi
 
     # Recommend libinput quirk for GNOME Wayland
@@ -724,15 +772,20 @@ install_keyboard() {
     if [ "${WITH_KEYD:-0}" = "1" ]; then
         log_step 6 $total_steps "Installing keyd dual-role config to $KEYD_DST..."
         if install_keyd_step; then
-            KEYD_DEPLOYED=1
+            # A dry run only previews the keyd step; never claim deployment.
+            if [ "${DRY_RUN:-0}" != "1" ]; then
+                KEYD_DEPLOYED=1
+            fi
         else
             KEYD_DEPLOYED=0
-            log_error "keyd step did not complete (config rejected or restart unrecoverable); keyboard hwdb/backlight changes are still installed"
+            log_error "keyd step did not complete (config rejected, install failed or restart failed/reverted); keyboard hwdb/backlight changes are still installed"
         fi
     fi
 
     log_success "Chromebook top-row keyboard mapping and backlight sync installed! ⌨️"
-    if [ "${WITH_KEYD:-0}" = "1" ]; then
+    # In a dry run install_keyd_step already printed "Would deploy keyd
+    # dual-role config"; do not claim deployment (or a real failure) here.
+    if [ "${WITH_KEYD:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
         if [ "${KEYD_DEPLOYED:-0}" = "1" ]; then
             log_success "keyd dual-role included (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
         else
@@ -745,9 +798,6 @@ install_keyboard() {
         log_info "Tip: re-login or run 'systemctl --user start c640-kbd-backlight-sync.service' to start the daemon immediately."
         log_info "Test blank: c640-kbd-backlight-sync --test-blank  && c640-kbd-backlight-sync --test-unblank"
         if [ "${WITH_KEYD:-0}" = "1" ]; then
-            local kd_hint=""
-            kd_hint="$(keyd_bin 2> /dev/null || true)"
-            [ -n "$kd_hint" ] || kd_hint="keyd"
             log_info "Test keyd: sudo python3 $SCRIPT_DIR/tests/capture-keyd-output.py  # tap Search -> capslock, hold -> meta"
             log_info "Automated check: sudo python3 $SCRIPT_DIR/tests/keyd-dualrole-uinput.py"
         fi

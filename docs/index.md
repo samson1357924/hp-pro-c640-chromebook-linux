@@ -164,7 +164,7 @@ Special thanks to **Abhinav Baid** (original `crfpmoc`), **Felix Niederer**, **M
 
 ## 📜 License & Compliance
 
-This project follows [REUSE 3.0](https://reuse.software/) with SPDX:
+This project follows [REUSE 3.3](https://reuse.software/) with SPDX:
 
 | Module | Path | License |
 | :--- | :--- | :--- |

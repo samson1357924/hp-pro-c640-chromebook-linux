@@ -74,7 +74,7 @@ chmod +x keyboard/install-keyboard.sh
 > 可用 `sudo python3 keyboard/tests/check-top-row-hwdb.py` 確認核心映射。
 > 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。
 
-1. 安裝 `keyd`（CI 固定 `v2.6.0` `7c0aecb8...`）：
+1. 安裝 `keyd`（CI 固定 `v2.6.0`，hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3`）：
 
    ```bash
    # Ubuntu 25.04+ / Debian 13+（原生）
@@ -100,7 +100,7 @@ chmod +x keyboard/install-keyboard.sh
    ```
 
    > **各發行版執行檔名稱不同（Ubuntu 26.04 實測）：** Debian/Ubuntu 套件安裝的是
-   > **`/usr/bin/keyd.rvaiya`**（2.5.0-5），`$PATH` 中沒有 `keyd`；systemd 服務名稱
+   > **`/usr/bin/keyd.rvaiya`**（2.5.0-5），而非 `/usr/bin/keyd`（`$PATH` 中沒有 `keyd`）；systemd 服務名稱
    > 仍是 `keyd`。請用實際存在的名稱，例如 `keyd.rvaiya --version`；安裝器會透過
    > `lib/syscheck.sh` 的 `keyd_bin()` 自動偵測。另外 **`keyd check` 僅存在於 keyd ≥ 2.6**，
    > 2.5.x 會直接印出用法並回傳 0。
@@ -327,7 +327,7 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 | 實體輕點 Search（被動擷取） | 🟢 | `18:14:52`：只有 `CAPSLOCK` down/up |
 | 實體單按亮度/靜音/音量（被動擷取） | 🟢 | `18:14:59-18:15:07`：`KEY_BRIGHTNESSDOWN`/`KEY_BRIGHTNESSUP`/`KEY_MUTE`/`KEY_VOLUMEDOWN`/`KEY_VOLUMEUP`；螢幕亮度與音量確實改變（畫面確認） |
 | 實體長按 Search + Back（被動擷取） | 🟢 | `18:15:18`：`KEY_F1` down/up（meta 層）；keyd 圖層在組合鍵時會夾帶 `LEFTCTRL` 防護，屬預期行為，不影響單獨長按 |
-| LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
+| LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後 `chromeos::kbd_backlight/brightness` 為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
 | daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
 | daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
 | sleep hook | 🟢 | `pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（本次以直接呼叫驗證；自動化 session 無法做真實盒蓋 S3 循環） |

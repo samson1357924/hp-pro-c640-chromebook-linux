@@ -829,10 +829,9 @@ test_keyd_invalid_config_skips_deploy() {
     fi
 }
 
-# $1 = yes | no : whether a previous cros.conf exists to be restored
-test_keyd_restart_failure_recovery() {
-    local existing="$1"
-    local sandbox="/tmp/rollback-test-keyd-restart-$existing"
+# $1 = sandbox, $2 = yes | no : whether a previous cros.conf exists to restore
+setup_keyd_restart_recoverable_sandbox() {
+    local sandbox="$1" existing="$2"
     rm -rf "$sandbox"
     mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
     prepare_keyd_sandbox_script "$sandbox"
@@ -845,13 +844,69 @@ test_keyd_restart_failure_recovery() {
     if [ "$existing" = "yes" ]; then
         ln -s cros.conf "$sandbox/etc/keyd/default.conf"
     fi
+}
 
-    run_sandboxed "$sandbox" '
+# $1 = yes | no : whether a previous cros.conf exists to be restored
+test_keyd_restart_failure_recovery() {
+    local existing="$1"
+    local sandbox="/tmp/rollback-test-keyd-restart-$existing"
+    local caller_sandbox="/tmp/rollback-test-keyd-restart-caller-$existing"
+    setup_keyd_restart_recoverable_sandbox "$sandbox" "$existing"
+
+    # P2: the first restart fails but the retry after recovery succeeds. The
+    # dual-role config was reverted, so install_keyd_step MUST report failure
+    # (return 1) instead of letting the caller claim dual-role is active.
+    # `if` avoids aborting this `set -e` test script when the step returns 1.
+    if run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
             STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
         source "$2/install-keyboard-sandbox.sh"
         install_keyd_step
-    '
+    ' 2> "$sandbox/step.log"; then
+        fail "restart failure: install_keyd_step must return 1 after a safe revert (dual-role NOT active)"
+    else
+        ok
+    fi
+
+    local step_output
+    step_output="$(cat "$sandbox/step.log")"
+    if grep -qF "keyd dual-role included" "$sandbox/step.log"; then
+        fail "restart failure: success line must not be printed after a safe revert"
+    else
+        ok
+    fi
+    assert_contains "keyd config reverted after restart failure" "$step_output" "restart failure: truthful revert notice printed"
+    assert_contains "dual-role NOT active" "$step_output" "restart failure: dual-role NOT active notice printed"
+    if grep -qF "could not be recovered" "$sandbox/step.log"; then
+        fail "restart failure: must not claim the config was unrecoverable (the system was safely reverted)"
+    else
+        ok
+    fi
+
+    # Also drive the REAL caller: it must set KEYD_DEPLOYED=0 and omit the
+    # "keyd dual-role included" success line, while still finishing install.
+    setup_keyd_restart_recoverable_sandbox "$caller_sandbox" "$existing"
+    if ! run_sandboxed "$caller_sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried" \
+            WITH_KEYD=1
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        install_keyboard
+        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
+    ' 2> "$caller_sandbox/caller.log"; then
+        fail "restart failure: install_keyboard should still finish after a safe revert"
+    fi
+    assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "restart failure: caller sets KEYD_DEPLOYED=0"
+    if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
+        fail "restart failure: caller must not report dual-role as deployed after a safe revert"
+    else
+        ok
+    fi
+    local caller_output
+    caller_output="$(cat "$caller_sandbox/caller.log")"
+    assert_contains "keyd config reverted after restart failure" "$caller_output" "restart failure: caller logs the safe revert"
+    assert_contains "dual-role NOT active" "$caller_output" "restart failure: caller logs dual-role NOT active"
 
     local restarts
     restarts="$(grep -c 'restart keyd' "$sandbox/systemctl.log" 2> /dev/null || true)"
@@ -881,6 +936,35 @@ test_keyd_restart_failure_recovery() {
             fail "restart failure: newly deployed cros.conf should be removed when there was no previous config"
         fi
     fi
+}
+
+# P3.1: a backup that is itself a symlink (NixOS / symlink farms) must be
+# restored as a symlink. install(1) would dereference it into a regular file.
+test_keyd_restart_failure_restores_symlink_backup() {
+    local sandbox="/tmp/rollback-test-keyd-symlink-backup"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/layout.conf"
+    ln -s layout.conf "$sandbox/etc/keyd/cros.conf"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "symlink backup: install_keyd_step must report failure after a safe revert"
+        return 0
+    fi
+    if [ -L "$sandbox/etc/keyd/cros.conf" ]; then
+        assert_eq "layout.conf" "$(readlink "$sandbox/etc/keyd/cros.conf")" "symlink backup: cros.conf restored as a symlink with its original target"
+    else
+        fail "symlink backup: cros.conf must stay a symlink (backup must not be dereferenced)"
+    fi
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" "symlink backup: restored link resolves to the original content"
 }
 
 test_keyd_supports_check_probe() {
@@ -989,8 +1073,18 @@ test_keyd_dry_run_no_side_effects() {
         export DRY_RUN=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
         source "$2/install-keyboard-sandbox.sh"
         install_keyd_step
-    '; then
+    ' 2> "$sandbox/step.log"; then
         fail "dry-run: install_keyd_step should succeed"
+    fi
+    if grep -qF "Would deploy keyd dual-role config" "$sandbox/step.log"; then
+        ok
+    else
+        fail "dry-run: should announce what would be deployed"
+    fi
+    if grep -qF "keyd dual-role included" "$sandbox/step.log"; then
+        fail "dry-run: must not claim keyd dual-role is deployed"
+    else
+        ok
     fi
     if [ ! -e "$sandbox/etc/keyd/cros.conf" ]; then
         ok
@@ -1041,6 +1135,36 @@ EOF
         ok
     else
         fail "non-dry-run: placeholder should be created for a restorable record"
+    fi
+
+    # (c) the full installer in DRY_RUN must not set KEYD_DEPLOYED=1 or print
+    # the "keyd dual-role included" success line, even though the dry-run keyd
+    # step itself succeeds.
+    local caller_sandbox="/tmp/rollback-test-keyd-dry-run-caller"
+    rm -rf "$caller_sandbox"
+    mkdir -p "$caller_sandbox/backups" "$caller_sandbox/manifest" "$caller_sandbox/etc/keyd" "$caller_sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$caller_sandbox"
+    setup_keyd_stubs "$caller_sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$caller_sandbox/keyd-src/cros.conf"
+    if ! run_sandboxed "$caller_sandbox" '
+        export DRY_RUN=1 WITH_KEYD=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        install_keyboard
+        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
+    ' 2> "$caller_sandbox/caller.log"; then
+        fail "dry-run: install_keyboard should finish"
+    fi
+    assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "dry-run: caller keeps KEYD_DEPLOYED=0"
+    if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
+        fail "dry-run: caller must not report dual-role as deployed"
+    else
+        ok
+    fi
+    if grep -qF "Would deploy keyd dual-role config" "$caller_sandbox/caller.log"; then
+        ok
+    else
+        fail "dry-run: caller should preview keyd dual-role deployment"
     fi
 }
 
@@ -1526,6 +1650,7 @@ test_keyd_invalid_config_skips_deploy
 test_keyd_supports_check_probe
 test_keyd_restart_failure_recovery yes
 test_keyd_restart_failure_recovery no
+test_keyd_restart_failure_restores_symlink_backup
 test_keyd_dangling_symlink_is_ours
 test_keyd_no_binary_deploys_config_only
 test_keyd_dry_run_no_side_effects

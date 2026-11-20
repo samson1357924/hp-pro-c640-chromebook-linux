@@ -162,7 +162,7 @@ Comet Lake SOF DSP 音效透過 ALSA UCM2 拓撲完美啟用：
 
 ## 📜 開源協議與合規宣告
 
-本專案遵循 [REUSE Specification 3.0](https://reuse.software/) 與 [SPDX 標準](https://spdx.dev/) 實施嚴謹的混合授權管理：
+本專案遵循 [REUSE Specification 3.3](https://reuse.software/) 與 [SPDX 標準](https://spdx.dev/) 實施嚴謹的混合授權管理：
 
 | 組件模組 | 適用路徑 | 授權條款 (SPDX) | 授權全文檔案 |
 | :--- | :--- | :--- | :--- |

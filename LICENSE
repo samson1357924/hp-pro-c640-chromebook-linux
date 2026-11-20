@@ -3,7 +3,7 @@ HP Pro c640 Chromebook Linux Integration Project Licensing
 ==============================================================================
 
 This project is licensed under a mixed-license (multi-license) model in
-compliance with the REUSE Specification 3.0 and SPDX standards.
+compliance with the REUSE Specification 3.3 and SPDX standards.
 
 The primary umbrella license for the repository, original orchestration scripts,
 utility libraries, diagnostic tools, and general documentation is the **MIT License**.

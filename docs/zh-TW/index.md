@@ -164,7 +164,7 @@ Comet Lake SOF DSP 經 ALSA UCM2：
 
 ## 📜 授權與合規
 
-本專案遵循 [REUSE 3.0](https://reuse.software/) 與 SPDX：
+本專案遵循 [REUSE 3.3](https://reuse.software/) 與 SPDX：
 
 | 組件模組 | 適用路徑 | 授權條款 |
 | :--- | :--- | :--- |

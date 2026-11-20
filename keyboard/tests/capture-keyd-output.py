@@ -35,6 +35,7 @@ Exit status:
 """
 import argparse
 import glob
+import math
 import os
 import select
 import sys
@@ -99,6 +100,10 @@ def main():
 
     if args.seconds is not None and args.seconds < 0:
         print("FAIL: --seconds must be >= 0 (use 0 to capture until Ctrl+C)")
+        return 1
+
+    if args.seconds is not None and not math.isfinite(args.seconds):
+        print("FAIL: --seconds must be finite")
         return 1
 
     if args.device:

@@ -148,8 +148,8 @@
   > 請先停掉 keyd（`sudo systemctl stop keyd`），用
   > `check-top-row-hwdb.py --scan 60` 或不加 `--grab` 的 `evtest` 讀
   > `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論掃描碼並建立自己的 hwdb 條目
-  > （見 §10）。完成後請執行 `sudo systemctl start keyd` 恢復服務，否則
-  > Search 輕點/長按與亮度重映射會持續失效。
+  > （見 `CONTRIBUTING.md` → §2 的「New Chromebook model?」）。完成後請執行
+  > `sudo systemctl start keyd` 恢復服務，否則 Search 輕點/長按與亮度重映射會持續失效。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
@@ -186,7 +186,7 @@
   systemctl --global is-enabled c640-kbd-backlight-sync.service
   systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
-  loginctl show-user "$USER" -p State
+  loginctl show-user "$USER" -p State       # 使用中?
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness

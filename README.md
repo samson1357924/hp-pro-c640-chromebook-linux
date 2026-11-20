@@ -177,7 +177,7 @@ hardware support:
 
 ## 📜 License & Compliance
 
-This project follows [REUSE Specification 3.0](https://reuse.software/) and the
+This project follows [REUSE Specification 3.3](https://reuse.software/) and the
 [SPDX standard](https://spdx.dev/) to implement rigorous mixed-license
 management:
 
