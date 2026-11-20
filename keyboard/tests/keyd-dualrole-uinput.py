@@ -26,8 +26,16 @@ at start-up (no hot-plug support), so the test creates the device first, then
 restarts keyd. The device advertises the AT keyboard id 0001:0001 so the
 `[ids] 0001:0001` stanza in cros.conf matches it.
 
+SIDE EFFECTS / SAFETY:
+  The virtual keyboard we inject into is the device the desktop actually
+  listens to, so injected events reach the real compositor. During the run
+  CapsLock is toggled, brightness/volume may change, and the GNOME overview is
+  opened ~11 times. Do not touch the keyboard while running. CapsLock state is
+  toggled — re-toggle it afterwards if needed.
+
 Requirements:
-  * root (needs /dev/uinput, EVIOCGRAB-reading /dev/input/event*, systemctl)
+  * root (needs /dev/uinput, read-only /dev/input/event*, systemctl)
+  * Python >= 3.7 (uses subprocess.run(text=True, capture_output=True))
   * python3-evdev (`sudo apt install python3-evdev`)
   * keyd installed, enabled and configured via
     `sudo ./keyboard/install-keyboard.sh --with-keyd`
@@ -105,6 +113,16 @@ def key_name(code):
     return name
 
 
+def close_quietly(dev):
+    """Close an evdev device without letting a cleanup-only error escape."""
+    if dev is None:
+        return
+    try:
+        dev.close()
+    except OSError:
+        pass
+
+
 def find_keyd():
     for path in list_devices():
         try:
@@ -113,22 +131,51 @@ def find_keyd():
             continue
         if dev.name == KEYD_NAME:
             return dev
+        dev.close()  # do not leak handles for devices that are not keyd's
     return None
 
 
 def collect(dev, seconds, label):
-    """Collect EV_KEY events for `seconds` and print them."""
+    """Collect EV_KEY events for `seconds` and print them.
+
+    Uses a monotonic clock so the window cannot be shortened by clock changes.
+    A select timeout does not end the window early — we keep waiting until
+    `end`. Returns ``(events, dropped)``: ``dropped`` is True when SYN_DROPPED
+    was seen or the device could not be read, i.e. the stream is incomplete and
+    must not be trusted for a PASS verdict.
+    """
     out = []
-    end = time.time() + seconds
-    while time.time() < end:
-        ready, _, _ = select.select([dev.fd], [], [], max(0, end - time.time()))
-        if not ready:
+    dropped = False
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            ready, _, _ = select.select([dev.fd], [], [], max(0.0, end - time.monotonic()))
+            if not ready:
+                continue
+            batch = dev.read()
+        except OSError as exc:
+            # Device vanished mid-capture (e.g. keyd died): fail cleanly
+            # instead of dumping a traceback.
+            print(f"WARN: [{label}] device read failed ({exc}); capture untrustworthy")
+            dropped = True
             break
-        for ev in dev.read():
+        for ev in batch:
             if ev.type == e.EV_KEY:
                 out.append((key_name(ev.code), ev.value))
+            elif ev.type == e.EV_SYN and ev.code == e.SYN_DROPPED:
+                print(f"WARN: [{label}] SYN_DROPPED seen — events may have been lost")
+                dropped = True
     print(f"[{label}] {out}")
-    return out
+    return out, dropped
+
+
+def collect_checked(dev, seconds, label, failures):
+    """collect() plus: an untrustworthy capture is a hard failure, never PASS."""
+    events, dropped = collect(dev, seconds, label)
+    if dropped:
+        print(f"FAIL: [{label}] event capture was incomplete; cannot trust this check")
+        failures.append(f"dropped:{label}")
+    return events
 
 
 def names(events):
@@ -148,20 +195,33 @@ def main():
         print("FAIL: keyd-dualrole-uinput.py requires root permissions (run with sudo)")
         return 1
 
-    ui = UInput(
-        {e.EV_KEY: KEYS},
-        name=TEST_DEVICE_NAME,
-        vendor=1,
-        product=1,
-        version=1,
-        bustype=e.BUS_USB,
-    )
-    failures = []
+    ui = None
     try:
+        ui = UInput(
+            {e.EV_KEY: KEYS},
+            name=TEST_DEVICE_NAME,
+            vendor=1,
+            product=1,
+            version=1,
+            bustype=e.BUS_USB,
+        )
         time.sleep(1.0)  # let udev settle
         subprocess.run(["systemctl", "restart", "keyd"], check=True)
         time.sleep(1.5)
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"FAIL: setup error (creating /dev/uinput device or restarting keyd): {exc}")
+        # A failed `systemctl restart keyd` may have stopped keyd already. Try
+        # to restore it, and say so explicitly if that best effort also fails.
+        try:
+            subprocess.run(["systemctl", "restart", "keyd"], check=True)
+        except (OSError, subprocess.CalledProcessError, FileNotFoundError) as restore_exc:
+            print(f"WARN: keyd may not be restored (restart failed: {restore_exc}); run `sudo systemctl restart keyd` manually")
+        close_quietly(ui)
+        return 1
 
+    failures = []
+    kd = None
+    try:
         print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
         kd = find_keyd()
         if kd is None:
@@ -191,7 +251,7 @@ def main():
         # META plus the LEFTCTRL guard here, so check the raw event names
         # instead of filtering modifiers out.
         press(ui, e.KEY_LEFTMETA, hold=0.05)
-        tap = names(collect(kd, 0.6, "tap Search"))
+        tap = names(collect_checked(kd, 0.6, "tap Search", failures))
         non_mods = [n for n in tap if n not in MODIFIERS]
         if (
             tap.count("KEY_CAPSLOCK") == 2
@@ -212,17 +272,20 @@ def main():
             press(ui, code)
             ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
             ui.syn()
-            held = names(collect(kd, 0.7, f"hold Search + {label}"))
-            if expected in held:
+            held = names(collect_checked(kd, 0.7, f"hold Search + {label}", failures))
+            # Require exactly the expected non-modifier key: emitting both the
+            # new F-key and the old media key would still pass a looser check.
+            held_non_mods = [n for n in held if n not in MODIFIERS]
+            if held_non_mods and set(held_non_mods) == {expected}:
                 print(f"PASS: hold Search + {label} -> {expected}")
             else:
-                print(f"FAIL: hold Search + {label} expected {expected}, got", held)
+                print(f"FAIL: hold Search + {label} expected only {expected}, got", held)
                 failures.append(f"hold-{expected.lower()}")
 
         # 3. each top-row key alone -> its own media key (pass-through).
         for label, code, _expected in TOP_ROW:
             press(ui, code)
-            media = names(collect(kd, 0.6, f"{label} alone"))
+            media = names(collect_checked(kd, 0.6, f"{label} alone", failures))
             own = key_name(code)
             if own in media:
                 print(f"PASS: {label} alone -> {own}")
@@ -238,7 +301,7 @@ def main():
         time.sleep(0.6)
         ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
         ui.syn()
-        lone = collect(kd, 0.8, "hold Search alone, release")
+        lone = collect_checked(kd, 0.8, "hold Search alone, release", failures)
         lone_names = names(lone)
         # Autorepeat events (value 2) are normal while the key is held; the
         # point is that the final release is a bare META (no LEFTCTRL guard).
@@ -250,17 +313,26 @@ def main():
             and lone[-1][1] == 0
             and "KEY_LEFTCTRL" not in lone_names
             and "KEY_RIGHTCTRL" not in lone_names
+            and "KEY_CAPSLOCK" not in lone_names
         ):
             print("PASS: hold Search alone -> bare META release (no guard)")
         else:
             print("FAIL: hold Search alone expected a META release without LEFTCTRL guard")
             failures.append("hold-meta-clean")
 
-        kd.close()
     finally:
-        ui.close()
-        # Drop the virtual device and let keyd re-scan without it.
-        subprocess.run(["systemctl", "restart", "keyd"], check=False)
+        # Close devices on every path (including early returns / exceptions),
+        # using a quiet close so cleanup errors cannot mask the real result.
+        close_quietly(kd)
+        close_quietly(ui)
+        # Drop the virtual device and let keyd re-scan without it. Do not fail
+        # silently: leave a clear warning if the cleanup restart did not work.
+        try:
+            res = subprocess.run(["systemctl", "restart", "keyd"], check=False)
+            if res.returncode != 0:
+                print(f"WARN: keyd restart after test exited {res.returncode}; restart keyd manually")
+        except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"WARN: could not restart keyd after test ({exc}); restart keyd manually")
 
     if failures:
         print("RESULT=FAIL", failures)

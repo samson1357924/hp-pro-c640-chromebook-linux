@@ -231,8 +231,42 @@ jobs:
           test -f /etc/keyd/cros.conf
           test ! -e /etc/keyd/default.conf
           test ! -L /etc/keyd/default.conf
-          # keyd check already validated in lint job, but verify file exists
-          grep -q "leftmeta = overload" /etc/keyd/cros.conf
+          # keyd check already validated in lint job, but verify the deployed
+          # config still carries the core dual-role fix. The old broad grep
+          # ("leftmeta = overload") also matched the broken plain overload()
+          # form, so it never guarded the regression.
+          check_dualrole() {
+            local conf="$1"
+            # Positive: exact overloadt2(meta, capslock, <ms>) form.
+            grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overloadt2\([[:space:]]*meta[[:space:]]*,[[:space:]]*capslock[[:space:]]*,[[:space:]]*[0-9]+[[:space:]]*\)[[:space:]]*$' "$conf" || return 1
+            # Negative: the known-broken plain overload() must not be present.
+            if grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overload[[:space:]]*\(' "$conf"; then
+              return 1
+            fi
+            return 0
+          }
+          if ! check_dualrole /etc/keyd/cros.conf; then
+            echo "::error::deployed keyd config lacks the precise overloadt2(meta, capslock, <ms>) dual-role fix (or still uses plain overload())"
+            exit 1
+          fi
+          # Deployed file must be byte-identical to the repo source.
+          diff -u keyboard/keyd/cros.conf /etc/keyd/cros.conf
+          # Self-negative test: the new check must reject the old broken form
+          # and accept the fixed form (temp files only, no repo changes).
+          SELF_TEST=$(mktemp)
+          printf 'leftmeta = overload(meta, capslock)\n' > "$SELF_TEST"
+          if check_dualrole "$SELF_TEST"; then
+            echo "::error::self-negative test failed: plain overload() was accepted"
+            rm -f "$SELF_TEST"
+            exit 1
+          fi
+          printf 'leftmeta = overloadt2(meta, capslock, 200)\n' > "$SELF_TEST"
+          if ! check_dualrole "$SELF_TEST"; then
+            echo "::error::self-positive test failed: overloadt2(...) was rejected"
+            rm -f "$SELF_TEST"
+            exit 1
+          fi
+          rm -f "$SELF_TEST"
 
       - name: Uninstall Round-Trip (manifest rollback)
         run: |

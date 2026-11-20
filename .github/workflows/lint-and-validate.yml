@@ -157,6 +157,12 @@ jobs:
           fi
           echo "udev rules verified successfully."
 
+      - name: Compile Python Test Tools (syntax check)
+        run: |
+          # compile()/py_compile does not import, so evdev is not required here.
+          # This gates syntax errors in keyboard/tests/*.py into CI.
+          python3 -m compileall -q keyboard/tests
+
       - name: Validate keyd Configuration
         run: |
           git clone --depth 1 --branch v2.6.0 https://github.com/rvaiya/keyd /tmp/keyd-src
@@ -164,4 +170,13 @@ jobs:
           make -C /tmp/keyd-src
           sudo make -C /tmp/keyd-src install
           keyd check keyboard/keyd/cros.conf
+          # Semantic assertion (mirrors the install-smoke check): the core
+          # dual-role fix must be the precise overloadt2(meta, capslock, <ms>)
+          # form. A plain overload() regresses the GNOME overview hold-on-
+          # Search behaviour and a loose grep would not catch it.
+          grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overloadt2\([[:space:]]*meta[[:space:]]*,[[:space:]]*capslock[[:space:]]*,[[:space:]]*[0-9]+[[:space:]]*\)[[:space:]]*$' keyboard/keyd/cros.conf
+          if grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overload[[:space:]]*\(' keyboard/keyd/cros.conf; then
+            echo "FAIL: plain 'leftmeta = overload()' found; overloadt2(...) is required"
+            exit 1
+          fi
           echo "keyd configuration valid."

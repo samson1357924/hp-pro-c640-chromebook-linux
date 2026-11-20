@@ -26,7 +26,12 @@ Usage:
 Then press the keys you want to verify (e.g. tap Search, or hold Search and
 press a top-row key) and read the output.
 
-Exit status: 0 when the capture window ends, 1 if no keyd device is found.
+Exit status:
+  0 - capture window ended normally, including --seconds 0 interrupted with
+      Ctrl+C, or a read OSError / the device disappearing (handled as a clean
+      end of capture, not an error),
+  1 - a bad argument (e.g. negative --seconds -> immediate exit 1), no keyd
+      device found, or the requested device could not be opened.
 """
 import argparse
 import glob
@@ -92,6 +97,10 @@ def key_name(code):
 def main():
     args = parse_args()
 
+    if args.seconds is not None and args.seconds < 0:
+        print("FAIL: --seconds must be >= 0 (use 0 to capture until Ctrl+C)")
+        return 1
+
     if args.device:
         try:
             dev = evdev.InputDevice(args.device)
@@ -137,6 +146,8 @@ def main():
                     print(f"{stamp} !!! SYN_DROPPED (events were lost)", flush=True)
     except KeyboardInterrupt:
         print("stopped", flush=True)
+    except OSError as exc:
+        print(f"{dev.path} read failed ({exc}); stopping capture", flush=True)
     finally:
         dev.close()
     return 0

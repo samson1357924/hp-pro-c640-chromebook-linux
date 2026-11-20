@@ -62,11 +62,13 @@ in
   #    （把使用者加入 `plugdev`：`users.users.<you>.extraGroups = [ "plugdev" ];`）
   #    注意：MODE=/GROUP=/uaccess 只作用於 /dev 節點；LED 亮度是純 sysfs
   #    檔案，必須用 RUN+= 明確 chgrp/chmod（與 repo 的
-  #    61-chromeos-kbd-backlight.rules 相同）。
+  #    61-chromeos-kbd-backlight.rules 相同）。%p 會在執行時展開為裝置的 sysfs
+  #    devpath；ACTION=="add|change" 在 add/change 時套用、remove 時不執行，
+  #    因此 `udevadm trigger`（預設 action 為 change）可立即套用權限。
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", ACTION=="add|change", TAG+="uaccess", GROUP="plugdev", MODE="0660", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys%p/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys%p/brightness"
   '';
 
   # 5. 只為 sudo 啟用指紋（不要加入 GDM：解鎖時 GDM 的 claim race

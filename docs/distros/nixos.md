@@ -61,11 +61,14 @@ in
   #    (add your user to `plugdev`: `users.users.<you>.extraGroups = [ "plugdev" ];`)
   #    NOTE: MODE=/GROUP=/uaccess only apply to /dev nodes. The LED brightness
   #    attribute is a plain sysfs file, so it needs explicit RUN+= chgrp/chmod
-  #    (same as 61-chromeos-kbd-backlight.rules in this repo).
+  #    (same as 61-chromeos-kbd-backlight.rules in this repo). %p expands to the
+  #    device's sysfs devpath at runtime; ACTION=="add|change" applies on add
+  #    and change but not remove, so `udevadm trigger` (default action change)
+  #    applies the permissions immediately.
   users.groups.plugdev = {};
   services.udev.extraRules = ''
     KERNEL=="cros_fp", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", TAG+="uaccess"
-    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", TAG+="uaccess", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys/class/leds/chromeos::kbd_backlight/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys/class/leds/chromeos::kbd_backlight/brightness"
+    SUBSYSTEM=="leds", KERNEL=="chromeos::kbd_backlight", ACTION=="add|change", TAG+="uaccess", GROUP="plugdev", MODE="0660", RUN+="${pkgs.coreutils}/bin/chgrp plugdev /sys%p/brightness", RUN+="${pkgs.coreutils}/bin/chmod 0660 /sys%p/brightness"
   '';
 
   # 5. Fingerprint for sudo only (NOT for GDM login: the GDM unlock claim
