@@ -3,13 +3,20 @@
 # HP Pro c640 Chromebook (Google Dratini / Hatch) Keyboard Top-Row Mapping
 # Matches both standard Google Coreboot DMI strings and OEM HP DMI tables
 #
-# Scancodes measured on real Dratini hardware (2026-10-31):
+# Scancodes inferred on real Dratini hardware (2026-10-31) from EVIOCGKEY
+# key state plus the standard AT scancode->keycode table, then verified with
+# EVIOCGKEYCODE on /dev/input/event2:
 #   EVIOCGKEYCODE /dev/input/event2 -> 0x3b..0x44 = keycode 59..68 (KEY_F1..F10)
-#   EVIOCGKEY while pressing brightness/mute BEFORE the fix -> KEY_F6/F7/F8
-#   (the firmware really sends F6-F8, i.e. scancodes 0x40-0x42)
-# In other words this machine's top row emits the *standard AT* F1-F10
-# scancodes, not the ChromeOS action scancodes (0xea/0xe9/0xe7/0x91/0x92/...)
-# that 60-keyboard.hwdb-style snippets use for some other Chromebooks. Mapping
+#   EVIOCGKEY while pressing brightness/mute BEFORE the fix -> KEY_F6/F7/F8,
+#   which via the AT standard table corresponds to scancodes 0x40-0x42.
+# EVIOCGKEY reports post-hwdb keycodes, not raw MSC_SCAN, so these are
+# inferences from the AT table rather than direct scancode captures. Confirm
+# the raw value with plain `evtest` (do NOT pass --grab) or with this repo's
+# `--scan` mode after stopping keyd (`sudo systemctl stop keyd`); when done run
+# `sudo systemctl start keyd` to restore the service.
+# In other words this machine's top row behaves like the *standard AT* F1-F10,
+# not the ChromeOS action scancodes (0xea/0xe9/0xe7/0x91/0x92/...) that
+# 60-keyboard.hwdb-style snippets use for some other Chromebooks. Mapping
 # 0x3b-0x44 is therefore what actually changes the behaviour here; the old
 # 0xea-0xb0 block never matched a real key press and was dead code.
 #

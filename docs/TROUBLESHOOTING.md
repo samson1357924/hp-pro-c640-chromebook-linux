@@ -160,7 +160,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 * **Solution**:
 
   ```bash
-  # Check the real scancodes first (read-only, never grabs the device):
+  # Verify the applied hwdb map first (read-only EVIOCGKEYCODE, no grab):
   sudo python3 keyboard/tests/check-top-row-hwdb.py
   # If it fails, install/refresh the mapping:
   ./setup.sh --keyboard
@@ -169,8 +169,12 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`.
   > Other Chromebooks, including other `Hatch` boards matched by the same hwdb
   > entry, may emit the ChromeOS action scancodes (`0xea`, `0xe9`, ...) instead.
-  > Capture your own with `check-top-row-hwdb.py --listen 60` before copying
-  > the mapping (see §10).
+  > `--listen` only shows the post-hwdb `KEY_*` events (EVIOCGKEY), not raw
+  > scancodes. To find yours, stop keyd (`sudo systemctl stop keyd`) and read
+  > `EV_MSC/MSC_SCAN` with `check-top-row-hwdb.py --scan 60` or plain `evtest`
+  > (no `--grab`), then infer the scancode against the standard AT table
+  > (see §10). When done, run `sudo systemctl start keyd` to restore the
+  > service; otherwise Search tap/hold and brightness remapping stay disabled.
 
 ### 10. Want the Search key to act as "CapsLock on tap, Super on hold"
 

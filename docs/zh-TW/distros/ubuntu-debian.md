@@ -63,7 +63,7 @@ sudo udevadm trigger --subsystem-match=leds
 sudo systemctl daemon-reload
 sudo systemctl --global enable c640-kbd-backlight-sync.service
 # keyd 雙重角色（Search 輕點=CapsLock 長按=Super）：
-# sudo apt install keyd  # Ubuntu 25.04+ 原生，否則 PPA keyd-team/ppa
+# sudo apt install keyd  # Ubuntu 25.04+ 原生，否則 PPA keyd-team/ppa 或 Copr/源碼
 # sudo ./keyboard/install-keyboard.sh --with-keyd
 ```
 

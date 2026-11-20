@@ -34,9 +34,13 @@ kernel/hardware level using `systemd-hwdb` or at the input daemon level using
 > `keyboard/tests/hwdb-top-row-scancodes.tsv` and is asserted in CI.
 >
 > **Other Chromebooks:** hwdb also matches `pn*Hatch*`, so this mapping applies
-> to other Hatch boards that might emit different scancodes. Run
-> `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` and press the
-> top row to verify before relying on this table.
+> to other Hatch boards that might emit different scancodes. Before relying on
+> this table, stop keyd (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN`
+> with `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then
+> infer the scancode against the standard AT table. **After capturing, run
+> `sudo systemctl start keyd` to restore the service** — otherwise Search
+> tap/hold and brightness remapping stay disabled. `--listen` only shows the
+> post-hwdb `KEY_*` events, not raw scancodes.
 
 ---
 
@@ -248,9 +252,13 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 The hwdb can only work if it maps the scancodes the hardware actually emits.
 This read-only check compares the kernel's `EVIOCGKEYCODE` map with
 `keyboard/tests/hwdb-top-row-scancodes.tsv` (no grab, safe while keyd runs). It
-proves which mapping the kernel applied; the raw scancodes themselves were
-measured before the fix, when every physical top-row press still arrived as
-`KEY_F1`-`KEY_F10` while the action-scancode hwdb did nothing.
+proves which mapping the kernel applied, not what the hardware emits: the raw
+scancodes were obtained separately, by reading `EV_MSC/MSC_SCAN` with plain
+`evtest` (no `--grab`) or `check-top-row-hwdb.py --scan` after stopping keyd,
+and inferring them against the standard AT table. The `--listen` mode only
+observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`; before the fix every
+physical top-row press still arrived as `KEY_F1`-`KEY_F10` while the
+action-scancode hwdb did nothing.
 
 ```bash
 sudo apt install -y python3-evdev
@@ -303,9 +311,12 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 # 18:15:18 KEY_F1 1           <- hold Search + Back (F2-F10 work the same)
 ```
 
-**Never grab the keyd virtual keyboard** (`evtest`, `evemu-record`, raw
-`EVIOCGRAB`). A grab takes the device away from the compositor and the whole
-keyboard stops working until the tool exits. `keyd monitor` is not a substitute
+**Never grab the keyd virtual keyboard** (`evtest --grab`, `evemu-record
+--grab`, raw `EVIOCGRAB`): a grab takes the device away from the compositor and
+the whole desktop keyboard stops working until the tool exits. Plain `evtest`
+with no `--grab` is read-only and safe. Once keyd grabs the physical AT
+keyboard, other readers cannot see its events at all — that is why this capture
+tool reads the keyd virtual keyboard instead. `keyd monitor` is not a substitute
 either: keyd 2.5.x cannot open a device it has already grabbed, so the internal
 keyboard never appears there.
 
@@ -320,7 +331,7 @@ matches (verified 2026-10-31).
 
 ### Real-hardware validation log (HP Pro c640 / Dratini, 2026-10-31)
 
-Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
+Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 (binary `/usr/bin/keyd.rvaiya`), `python3-evdev 1.9.3`, GNOME Wayland session.
 
 > Rows marked **uinput** use a virtual keyboard that injects keycodes *after*
@@ -350,8 +361,8 @@ Environment: Ubuntu 26.04.1 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 and `13:26` showed `KEY_F1`/`KEY_F6` and were initially recorded as proof of the
 keyd meta layer. They were not: the top row was sending raw `F1`-`F10`, hwdb was
 mapping scancodes the hardware never emits, and single presses of the media keys
-did nothing. Those rows were removed after `EVIOCGKEY` proved the real scancodes,
-and the post-fix capture above replaced them.
+did nothing. Those rows were removed after raw `EV_MSC/MSC_SCAN` readings proved
+the real scancodes, and the post-fix capture above replaced them.
 
 **Pitfalls found on real hardware (now fixed in this repo):**
 
@@ -374,9 +385,12 @@ and the post-fix capture above replaced them.
 6. A user `uinput` device is only grabbed by keyd if it exposes the full
    `keyboard_mask` (`KEY_1..0`, `Q..Y`) or `KEY_BRIGHTNESSUP`; adding a single
    `KEY_LEFTMETA` is not enough.
-7. Grabbing the keyd virtual keyboard (`EVIOCGRAB`, `evtest`) removes it from
-   the compositor and kills all keyboard input for the desktop. Verify with the
-   passive `capture-keyd-output.py` instead.
+7. Grabbing the keyd virtual keyboard (`EVIOCGRAB`, `evtest --grab`,
+   `evemu-record --grab`) removes it from the compositor and kills all desktop
+   keyboard input; plain `evtest` without `--grab` is read-only and safe. A
+   physical keyboard grabbed by keyd is invisible to other readers, which is
+   why verification uses the passive `capture-keyd-output.py` on the keyd
+   virtual keyboard.
 8. `udevadm test` reports `No entry found from hwdb` for the generic `evdev:`
    lookups even when the mapping works; only the `evdev:atkbd:` lookup applies
    `KEYBOARD_KEY_*`.
@@ -388,4 +402,7 @@ and the post-fix capture above replaced them.
    `check-top-row-hwdb.py`, not with the mapping table alone.
 10. `EVIOCGKEYCODE` shows the *map*; it does not prove the hardware emits those
     scancodes. `EVIOCGKEY` (`--listen` in the check script, or the
-    `active_keys()` probe) shows what a real press produces.
+    `active_keys()` probe) shows the post-hwdb `KEY_*` code a real press
+    produces, not the raw scancode. Read `EV_MSC/MSC_SCAN` with plain `evtest`
+    (no `--grab`) or `--scan` after stopping keyd to obtain the raw scancode,
+    then infer it against the standard AT table.

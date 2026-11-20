@@ -31,9 +31,12 @@ AT `F1`-`F10`）。在標準 Linux 下，這些按鍵可透過核心/硬體層�
 > `keyboard/tests/hwdb-top-row-scancodes.tsv`，CI 會逐條斷言。
 >
 > **其他 Chromebook：** hwdb 也會匹配 `pn*Hatch*`，因此這份映射會套用到其他
-> Hatch 系列機板；它們可能送不同掃描碼。請先在自己的機器上執行
-> `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` 並按頂排，
-> 確認真的相符再沿用這張表。
+> Hatch 系列機板；它們可能送不同掃描碼。沿用這張表前，請先停掉 keyd
+> （`sudo systemctl stop keyd`），用 `check-top-row-hwdb.py --scan 60` 或
+> 不加 `--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論
+> 掃描碼。**擷取完成後請執行 `sudo systemctl start keyd` 恢復服務**，
+> 否則 Search 輕點/長按與亮度重映射會持續失效。`--listen` 只會顯示 hwdb
+> 轉換後的 `KEY_*` 按鍵事件，不是原始掃描碼。
 
 ---
 
@@ -229,8 +232,11 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 
 hwdb 只有在映射到硬體真正送出的掃描碼時才有效。這支唯讀腳本會比對核心的
 `EVIOCGKEYCODE` 映射與 `keyboard/tests/hwdb-top-row-scancodes.tsv`（不下 grab，
-keyd 執行中也能跑）。它證明的是核心套用了哪份映射；真正的原始掃描碼是在修正前
-量到的——當時每次實體按鍵都仍以 `KEY_F1`-`KEY_F10` 抵達，而 action 掃描碼的
+keyd 執行中也能跑）。它證明的是核心套用了哪份映射，不是硬體實際送什麼：
+原始掃描碼是另外取得的——先停掉 keyd，再用不加 `--grab` 的 `evtest` 或
+`check-top-row-hwdb.py --scan` 讀 `EV_MSC/MSC_SCAN`，並對照標準 AT 表推論。
+`--listen` 模式只透過 `EVIOCGKEY` 觀察 hwdb 轉換後的 `KEY_*` 按鍵事件；
+修正前每次實體按鍵都仍以 `KEY_F1`-`KEY_F10` 抵達，而 action 掃描碼的
 hwdb 完全沒作用。
 
 ```bash
@@ -281,9 +287,12 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 # 18:15:18 KEY_F1 1           <- 長按 Search + Back（F2-F10 同理）
 ```
 
-**絕對不要對 keyd 虛擬鍵盤下 `EVIOCGRAB`**（`evtest`、`evemu-record` 等）：
-一旦獨占，compositor 就收不到鍵盤，整個桌面會失去輸入，直到程式結束為止。
-`keyd monitor` 也不能取代：keyd 2.5.x 無法開啟已被自己 grab 的裝置，所以內建鍵盤不會出現在那裡。
+**絕對不要對 keyd 虛擬鍵盤下 grab**（`evtest --grab`、`evemu-record
+--grab`、raw `EVIOCGRAB`）：一旦獨占，compositor 就收不到鍵盤，整個桌面
+會失去輸入，直到程式結束為止。不加 `--grab` 的一般 `evtest` 是唯讀且安全的。
+實體鍵盤一旦被 keyd grab，其它 reader 完全讀不到它的事件——這正是本擷取工具
+改讀 keyd 虛擬鍵盤的原因。`keyd monitor` 也不能取代：keyd 2.5.x 無法開啟
+已被自己 grab 的裝置，所以內建鍵盤不會出現在那裡。
 
 ### 怎麼看 `udevadm test` 的輸出
 
@@ -295,7 +304,7 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 
 ### 實機驗證記錄（HP Pro c640 / Dratini，2026-10-31）
 
-環境：Ubuntu 26.04.1 LTS、kernel `7.0.0-38-generic`、`keyd 2.5.0-5`
+環境：Ubuntu 26.04 LTS、kernel `7.0.0-38-generic`、`keyd 2.5.0-5`
 （執行檔 `/usr/bin/keyd.rvaiya`）、`python3-evdev 1.9.3`、GNOME Wayland。
 
 > 標示 **uinput** 的列使用虛擬鍵盤、注入的是 hwdb **之後**的鍵碼，只能證明 keyd
@@ -323,7 +332,7 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 **沿革（2026-10-31 已修）：** 先前 `12:49`、`13:25`、`13:26` 的被動擷取出現
 `KEY_F1`／`KEY_F6`，一度被當成 keyd meta 層有效的證據。事實並非如此：當時頂排送的是
 原始 `F1`-`F10`，hwdb 映射的是硬體不會送的掃描碼，單按媒體鍵完全沒作用。
-`EVIOCGKEY` 證實真實掃描碼後，已移除那些列，並以上方修正後的擷取取代。
+以 `EV_MSC/MSC_SCAN` 讀到真實掃描碼後，已移除那些列，並以上方修正後的擷取取代。
 
 **實機發現的坑（repo 已修）：**
 
@@ -341,13 +350,19 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
    `META`，測試可以直接斷言「只有 `CAPSLOCK`」。
 6. 使用者端 `uinput` 裝置必須提供完整 `keyboard_mask`（`KEY_1..0`、`Q..Y`）或
    `KEY_BRIGHTNESSUP`，keyd 才會視為鍵盤；只給 `KEY_LEFTMETA` 會被忽略。
-7. 對 keyd 虛擬鍵盤下 `EVIOCGRAB`（或跑 `evtest`）會把它從 compositor 手上搶走，
-   整個桌面鍵盤會失效到程式結束為止。請改用被動的 `capture-keyd-output.py`。
+7. 對 keyd 虛擬鍵盤下 grab（`EVIOCGRAB`、`evtest --grab`、`evemu-record
+   --grab`）會把它從 compositor 手上搶走，整個桌面鍵盤會失效到程式結束為止；
+   不加 `--grab` 的一般 `evtest` 是唯讀且安全的。實體鍵盤一旦被 keyd grab，
+   其它 reader 完全讀不到它的事件，因此改用被動的 `capture-keyd-output.py`
+   讀 keyd 虛擬鍵盤。
 8. `udevadm test` 對泛用 `evdev:` 查詢印 `No entry found from hwdb` 是正常現象；
    只有 `evdev:atkbd:` 那條會套用 `KEYBOARD_KEY_*`。
 9. 這台頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`（`KEY_F1`-`KEY_F10`），不是
    ChromeOS action 掃描碼（`0xea`、`0xe9`…）。從別台 Chromebook 抄來的 hwdb
    可能看起來正確、`udevadm info` 也顯示 `KEYBOARD_KEY_ea=back`，但每顆實體鍵
    仍是單純的 `F` 鍵。請用 `check-top-row-hwdb.py` 驗證，不要只看映射表。
-10. `EVIOCGKEYCODE` 只顯示「映射表」；不代表硬體會送那些掃描碼。要確認實際按下
-    的結果，請用 `EVIOCGKEY`（腳本的 `--listen`，或 `active_keys()` 探針）。
+10. `EVIOCGKEYCODE` 只顯示「映射表」；不代表硬體會送那些掃描碼。`EVIOCGKEY`
+    （腳本的 `--listen`，或 `active_keys()` 探針）顯示的是實際按下後 hwdb
+    轉換出的 `KEY_*` 鍵碼，不是原始掃描碼。請先停掉 keyd，再用不加 `--grab`
+    的 `evtest` 或 `--scan` 讀 `EV_MSC/MSC_SCAN` 取得原始掃描碼，
+    再對照標準 AT 表推論。

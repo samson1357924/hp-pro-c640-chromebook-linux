@@ -10,10 +10,13 @@ receives for a real key press.
 
 It never calls ``EVIOCGRAB``, so the desktop keeps working while it runs.
 
-WARNING: do not use ``evtest``, ``evemu-record`` or any other tool that grabs
-the keyd virtual keyboard. Grabbing it makes the whole desktop keyboard go dead
-until that tool exits. ``keyd monitor`` cannot be used either: keyd 2.5.x cannot
-open devices it already grabbed, so the physical keyboard never shows up there.
+WARNING: never grab the keyd virtual keyboard (``evtest --grab``,
+``evemu-record --grab``, raw ``EVIOCGRAB``): that kills desktop input until the
+tool exits. Plain ``evtest`` without ``--grab`` is read-only and safe. A physical
+keyboard grabbed by keyd is invisible to other readers, which is why this script
+reads the keyd virtual keyboard instead. ``keyd monitor`` cannot be used either:
+keyd 2.5.x cannot open devices it already grabbed, so the physical keyboard
+never shows up there.
 
 Usage:
   sudo python3 keyboard/tests/capture-keyd-output.py

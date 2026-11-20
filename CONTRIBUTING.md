@@ -31,21 +31,37 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   sudo udevadm trigger --subsystem-match=input
   # Read-only: compares EVIOCGKEYCODE with the measured scancode fixture.
   sudo python3 keyboard/tests/check-top-row-hwdb.py
-  # Live presses, without grabbing the keyboard away from the desktop:
+  # Live presses: post-hwdb KEY_* events via EVIOCGKEY, no grab:
   sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 30
+  # Synthetic-event self-check of the scanner logic; no device/evdev needed:
+  python3 keyboard/tests/check-top-row-hwdb.py --self-test
   ```
 
-  Do not use `evtest` here: it grabs the device, and grabbing the keyd virtual
-  keyboard kills desktop input until it exits.
+  `--self-test` checks the fixture parser against synthetic events, so it needs
+  no input device or evdev and is safe to run in CI. Plain `evtest` (no
+  `--grab`) is read-only and safe. Never put an `EVIOCGRAB` on the keyd virtual
+  keyboard (`evtest --grab`, `evemu-record --grab`): that kills desktop input
+  until the tool exits. Once keyd grabs the physical AT keyboard, other readers
+  cannot see its events at all — which is why keyd-stage capture reads the keyd
+  virtual keyboard instead. These grab caveats belong to the **keyd stage**;
+  see `keyboard/README.md` ("Verification & Testing") and
+  `docs/TROUBLESHOOTING.md` §10 for the full keyd guidance.
 
 * Ensure all HWDB properties start with a **single leading space** and match proper DMI strings (`cat /sys/class/dmi/id/product_name`).
-* **New Chromebook model?** Capture its own scancodes first — do not copy the
-  Dratini block. Press each top-row key with
-  `sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 60` and confirm
-  what the hardware emits; some Chromebooks send the ChromeOS action scancodes
-  (`0xea`, `0xe9`, ...), others standard AT `0x3b`-`0x44`. If the scancodes
-  differ, add a model-specific DMI block **and** a model-specific fixture (plus
-  a CI assertion for that DMI); do not append different scancodes to the shared
+* **New Chromebook model?** Find its raw scancodes first — do not copy the
+  Dratini block. Stop keyd (`sudo systemctl stop keyd`) and read
+  `EV_MSC/MSC_SCAN` for each top-row press with either
+  `sudo python3 keyboard/tests/check-top-row-hwdb.py --scan 60` or plain
+  `sudo evtest` (no `--grab`). **After capturing, run
+  `sudo systemctl start keyd` to restore the service**; otherwise Search
+  tap/hold and brightness remapping stay disabled. `--listen` is **not** for
+  this: it only observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`, not
+  the raw scancode.
+  Infer the scancode from the `MSC_SCAN` values against the standard AT table;
+  some Chromebooks send the ChromeOS action scancodes (`0xea`, `0xe9`, ...),
+  others standard AT `0x3b`-`0x44`. If the scancodes differ, add a
+  model-specific DMI block **and** a model-specific fixture (plus a CI
+  assertion for that DMI); do not append different scancodes to the shared
   `keyboard/tests/hwdb-top-row-scancodes.tsv`, because CI asserts that whole
   file against the Dratini DMI.
 
