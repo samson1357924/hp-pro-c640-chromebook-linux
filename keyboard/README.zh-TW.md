@@ -174,6 +174,13 @@ chmod +x keyboard/install-keyboard.sh
 閒置（`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` 對應 S3 盒蓋）與 ChromeOS EC
 `cros_kbd_led_backlight`（`/sys/class/leds/chromeos::kbd_backlight`）。
 
+**寫入鏈（single-writer）**：daemon 先寫 gsd-power 屬性
+`org.gnome.SettingsDaemon.Power.Keyboard.Brightness`（百分比）——它是唯一權威寫入者，
+可同步 gsd-power 自己的快取並驅動 UPower/LED。只有 gsd-power 不可用時才降級到
+UPower `KbdBacklight.SetBrightness`（raw），再降級到 `sysfs`/`ectool`。讀取走 UPower
+`GetBrightness`。`C640_KBD_FORCE_LEGACY=1` 會停用兩個 D-Bus 後端，強制走
+`sysfs`/`ectool`（便於 A/B 比較）。
+
 透過 `./keyboard/install-keyboard.sh` 自動安裝：
 
 ```bash
@@ -189,9 +196,19 @@ chmod +x keyboard/install-keyboard.sh
 * `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`，並以
   `RUN+=chgrp plugdev` / `RUN+=chmod 0660` 調整 brightness 屬性權限）
 * `c640-kbd-backlight-sync` → `/usr/local/bin/`（bash daemon，`gdbus`/`dbus-monitor` 事件驅動，預設無輪詢）
-* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`）
+* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`；
+  `StandardError=journal` 讓所有 daemon 日誌出現在 `journalctl`）
 * `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（S3 喚醒後恢復，
   0.6 秒 debounce 避免 `LED_CORE_SUSPENDRESUME` 競態）
+
+**儲存/還原語意**：亮度 `0` 也是有效的已存值。state 檔是否存在就是擁有權的依據：
+解鎖/喚醒時 daemon 與 sleep hook 會用已存值覆寫目前亮度（即使核心留下非 0 的殘值），
+然後清除 state；沒有 state 檔時完全不寫入，因此使用者手動調整會被保留。
+還原前兩者都會再查 `org.gnome.ScreenSaver.GetActive`（freedesktop 為 fallback）；
+若仍 active 就**延後**並保留 state，不會把已熄滅的螢幕點亮。sleep hook 以 root 執行，
+因此用 `sudo -u "$user" env XDG_RUNTIME_DIR=... DBUS_SESSION_BUS_ADDRESS=... timeout 2
+gdbus call --session ...` 探測 session bus；找不到 bus、timeout 或 D-Bus 錯誤都視為
+**fail-open**（照常還原，絕不卡住 suspend）。
 
 > **為何需要 `RUN+=chmod`？** `MODE=`、`GROUP=`、`uaccess` 只作用於 `/dev` 裝置節點。
 > `/sys/class/leds/chromeos::kbd_backlight/brightness` 是沒有裝置節點的純 sysfs 屬性，
@@ -231,11 +248,26 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 **Wayland/X11 相容性：** 主要路徑為 `org.gnome.ScreenSaver`（GNOME Wayland
 原生，事件驅動，無輪詢）。`IdleMonitor` 為選用。非 GNOME 工作階段由 `system-sleep` hook 覆蓋 S3 盒蓋情境。
 
-**日誌：**
+**日誌：** daemon 訊息全部寫到 stderr；unit 設了 `StandardError=journal`，因此
+（含 `backends probed: gsd=... upower=...`、`saved brightness`、`restoring
+brightness` 與 `[WARN]` 降級訊息）都可在使用者 journal 看到：
 
 ```bash
 journalctl --user -u c640-kbd-backlight-sync.service -f
 journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
+```
+
+**僅供測試的環境變數**（不碰系統檔案）：daemon 接受 `C640_KBD_SYSFS_BRIGHTNESS` /
+`C640_KBD_SYSFS_MAX` 指向假 LED 節點；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、
+`C640_KBD_SLEEP_STATE_DIR`，以及 bus 探測用的 `C640_KBD_SLEEP_USER` /
+`C640_KBD_SLEEP_UID` / `C640_KBD_SLEEP_BUS` / `C640_KBD_SLEEP_DELAY`。
+
+**單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
+所有狀態都在暫存目錄。
+
+```bash
+bash keyboard/tests/kbd-backlight-daemon-test.sh
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh
 ```
 
 ---

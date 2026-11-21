@@ -195,6 +195,14 @@ and restores it when the screen lights up. Handles both GNOME Wayland idle
 (`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` for S3 lid)
 and the ChromeOS EC `cros_kbd_led_backlight` (`/sys/class/leds/chromeos::kbd_backlight`).
 
+**Write chain (single-writer):** the daemon writes the gsd-power property
+`org.gnome.SettingsDaemon.Power.Keyboard.Brightness` (percent) **first** — that
+is the one authoritative writer, keeping gsd-power's own cache in sync and
+driving UPower/LED. Only when gsd-power is unavailable does it fall back to
+UPower `KbdBacklight.SetBrightness` (raw), then to `sysfs`/`ectool`. Reads use
+UPower `GetBrightness`. `C640_KBD_FORCE_LEGACY=1` disables both D-Bus backends
+and forces the `sysfs`/`ectool` path (useful for A/B comparison).
+
 Installed automatically via `./keyboard/install-keyboard.sh`:
 
 ```bash
@@ -212,9 +220,22 @@ Installed automatically via `./keyboard/install-keyboard.sh`:
 * `c640-kbd-backlight-sync` → `/usr/local/bin/` (bash daemon,
   `gdbus`/`dbus-monitor` event-driven, no polling by default)
 * `c640-kbd-backlight-sync.service` → `/etc/systemd/user/` (enabled globally,
-  `WantedBy=graphical-session.target`)
+  `WantedBy=graphical-session.target`, `StandardError=journal` so all daemon
+  log lines are visible in `journalctl`)
 * `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/` (S3 resume restore,
   0.6s debounce for `LED_CORE_SUSPENDRESUME`)
+
+**Save/restore semantics:** a brightness of `0` is a valid saved value. The
+state file's existence is the ownership signal: on unblank/resume the daemon
+and the sleep hook overwrite the current value with the saved one (even if the
+kernel left a non-zero residual), then consume the state. With no state file
+nothing is written, so manual adjustments are preserved. Before restoring,
+both re-check `org.gnome.ScreenSaver.GetActive` (freedesktop fallback); while
+still active they **defer** and keep the state instead of lighting a blanked
+screen back up. The sleep hook runs as root, so it probes the session bus with
+`sudo -u "$user" env XDG_RUNTIME_DIR=... DBUS_SESSION_BUS_ADDRESS=... timeout 2
+gdbus call --session ...`; a missing bus, timeout or D-Bus error is **fail-open**
+(the restore proceeds, so suspend never blocks).
 
 > **Why `RUN+=chmod`?** `MODE=`, `GROUP=` and `uaccess` only apply to `/dev`
 > device nodes. `/sys/class/leds/chromeos::kbd_backlight/brightness` is a plain
@@ -257,11 +278,28 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 native, event-driven, no polling). `IdleMonitor` is optional. Non-GNOME sessions
 fall back to the `system-sleep` hook for lid-close S3.
 
-**Logs:**
+**Logs:** all daemon messages go to stderr; the unit sets
+`StandardError=journal`, so they are visible in the user journal (including
+`backends probed: gsd=... upower=...`, `saved brightness`, `restoring
+brightness` and `[WARN]` fallback lines):
 
 ```bash
 journalctl --user -u c640-kbd-backlight-sync.service -f
 journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
+```
+
+**Test-only environment overrides** (no system files are touched): the daemon
+accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node;
+the sleep hook accepts `C640_KBD_SLEEP_SYSFS`, `C640_KBD_SLEEP_STATE_DIR` and,
+for the bus probe, `C640_KBD_SLEEP_USER` / `C640_KBD_SLEEP_UID` /
+`C640_KBD_SLEEP_BUS` / `C640_KBD_SLEEP_DELAY`.
+
+**Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
+all state is in a temp dir.
+
+```bash
+bash keyboard/tests/kbd-backlight-daemon-test.sh
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh
 ```
 
 ---

@@ -187,7 +187,9 @@
 
 * **症狀**：`c640-kbd-backlight-sync --check` 顯示 `brightness: 5/100` 但 `--test-blank`
   不會到 `0` 或不會恢復；`journalctl --user -u c640-kbd-backlight-sync` 空白或 `Daemon running: no`。
-* **排解**：
+  另一相關症狀是**閃爍/震盪**：LED 在熄滅/點亮前後於已存值與最大亮度間反覆跳動，
+  通常是 gsd-power 快取與 UPower 不一致，或 ScreenSaver 複查競態。
+* **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
   c640-kbd-backlight-sync --check          # brightness、STATE_FILE、Daemon running、ScreenSaver available
@@ -198,9 +200,23 @@
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
+  gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
+  gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower/KbdBacklight --method org.freedesktop.UPower.KbdBacklight.GetBrightness
+  # gsd 百分比應約等於 raw/max*100；不一致就可能閃爍
   # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
   # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin
   # ectool 回退：ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+  **日誌驗證**：unit 設了 `StandardError=journal`，下列訊息應該可見；若沒有，
+  代表安裝的是舊 unit 或 stderr 被導向別處：
+
+  ```bash
+  journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
+    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
   ```
 
 * **常見修復**：
@@ -218,6 +234,12 @@
   * 根因判斷：使用者 service 無法互動輸入 sudo 密碼。若
     `journalctl --user -u c640-kbd-backlight-sync` 出現 `sudo: a password is required`，
     表示問題在上述權限路徑，而非 D-Bus 事件。
+  * 閃爍/震盪：檢查上面兩條唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
+    UPower raw 值不一致，daemon 會記錄
+    `[WARN] gsd-power set ... forcing UPower + property refresh`；請確認部署的
+    daemon/unit 與 repo 完全一致（smoke 測試會檢查），並避免其他工具直接寫 LED。
+    若還原時 ScreenSaver 仍為 `true`，延後是預期行為——等待
+    `+0.5s/+1.5s/+3s` 重試，或檢查 sleep hook 的 fail-open bus 探測。
 
 ---
 

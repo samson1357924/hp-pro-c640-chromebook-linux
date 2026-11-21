@@ -171,6 +171,13 @@ jobs:
           python3 keyboard/tests/check-top-row-hwdb.py --self-test
           python3 keyboard/tests/keyd-dualrole-uinput.py --self-test
 
+      - name: Run Keyboard Backlight Shell Unit Tests
+        run: |
+          # Pure userspace: stub gdbus/sudo/ectool/flock + temp sysfs/state.
+          # No sudo, no real D-Bus and no brightness write.
+          bash keyboard/tests/kbd-backlight-daemon-test.sh
+          bash keyboard/tests/kbd-backlight-sleep-hook-test.sh
+
       - name: Validate keyd Configuration
         run: |
           git clone --depth 1 --branch v2.6.0 https://github.com/rvaiya/keyd /tmp/keyd-src

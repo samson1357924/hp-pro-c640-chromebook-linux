@@ -12,6 +12,10 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/c640-kbd-backlight-sync
+# Keep daemon stdout/stderr (including [WARN] diagnostics) in the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=c640-kbd-backlight-sync
 Restart=on-failure
 RestartSec=2
 RestartSteps=3

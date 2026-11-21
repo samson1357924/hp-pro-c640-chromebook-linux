@@ -218,8 +218,11 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
 * **Symptoms**: `c640-kbd-backlight-sync --check` shows `brightness: 5/100` but `--test-blank`
   stays `0` or doesn't restore; `journalctl --user -u c640-kbd-backlight-sync` is empty
-  or `Daemon running: no`.
-* **Triage**:
+  or `Daemon running: no`. A related symptom is **flicker / oscillation**: the LED
+  repeatedly jumps between the saved value and full brightness around blank/unblank,
+  usually meaning gsd-power's cache and UPower disagree or the ScreenSaver re-check
+  lost a race.
+* **Triage** (all gdbus queries below are read-only):
 
   ```bash
   c640-kbd-backlight-sync --check          # brightness, STATE_FILE, Daemon running, ScreenSaver available
@@ -230,9 +233,23 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # check TAG+="uaccess" rule
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # read-only D-Bus probes (no writes, safe while the daemon runs):
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
+  gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
+  gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower/KbdBacklight --method org.freedesktop.UPower.KbdBacklight.GetBrightness
+  # expect gsd percent ≈ raw/max*100; if they disagree you may see flicker
   # non-GNOME (Sway/KDE): org.gnome.ScreenSaver not available -> daemon falls back to org.freedesktop.ScreenSaver + system-sleep hook only
   # minimal image missing gdbus/dbus-monitor: sudo apt install dbus-x11 libglib2.0-bin
   # ectool fallback: ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+  **Log verification:** the unit sets `StandardError=journal`, so these lines must
+  be visible; absence means an old unit is installed or stderr is being redirected:
+
+  ```bash
+  journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
+    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
   ```
 
 * **Common fixes**:
@@ -251,6 +268,13 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * Root cause check: the user unit cannot prompt for sudo. `journalctl --user -u
     c640-kbd-backlight-sync` showing `sudo: a password is required` confirms the
     permission path above is the problem, not the D-Bus events.
+  * Flicker/oscillation: check the two read-only queries above. If gsd-power's
+    `Brightness` percent and UPower's raw value disagree, the daemon logs
+    `[WARN] gsd-power set ... forcing UPower + property refresh`; keep the
+    deployed daemon/unit byte-identical to the repo (the smoke test asserts this)
+    and avoid other tools writing the LED directly. If ScreenSaver is still
+    `true` during restore, deferral is expected — wait for the `+0.5s/+1.5s/+3s`
+    retries or check the sleep hook's fail-open bus probe.
 
 ---
 
