@@ -49,6 +49,12 @@ run_sandboxed() {
     # $1=sandbox, remaining args passed to bash -c "$1" _ "$REPO_ROOT" "$sandbox" ...
     local sandbox="$1"
     shift
+    # Provide a sane default snapshot base, but never overwrite a base that a
+    # security test deliberately created as world-writable or as a symlink.
+    if [ ! -d "$sandbox/snapshots" ] && [ ! -L "$sandbox/snapshots" ]; then
+        mkdir -p "$sandbox/snapshots"
+        chmod 700 "$sandbox/snapshots"
+    fi
     CROS_ENABLEMENT_BACKUP_DIR="$sandbox/backups" \
         CROS_ENABLEMENT_MANIFEST_DIR="$sandbox/manifest" \
         CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR="$sandbox/snapshots" \
@@ -1472,6 +1478,21 @@ test_keyd_restart_unrecoverable_returns_failure() {
     else
         fail "unrecoverable restart: legacy symlink restored during recovery"
     fi
+    # P2: recovery failed, so the V1 snapshot must be retained with a marker.
+    local retained
+    retained="$(snapshot_dir "$caller_sandbox")"
+    if [ -n "$retained" ] && sudo test -d "$retained"; then
+        ok
+    else
+        fail "unrecoverable restart: snapshot retained after failed recovery"
+    fi
+    if [ -n "$retained" ] && sudo test -f "$retained/.failed"; then
+        ok
+    else
+        fail "unrecoverable restart: retained snapshot carries a .failed marker"
+    fi
+    assert_contains "RETAINED at $retained" "$(cat "$caller_sandbox/log.txt" 2> /dev/null || echo "")" \
+        "unrecoverable restart: log names the retained snapshot"
 }
 
 # ---------------------------------------------------------------------------
@@ -1843,7 +1864,18 @@ snapshot_entries() {
         echo 0
         return 0
     }
-    find "$sandbox/snapshots" -mindepth 1 2> /dev/null | wc -l | tr -d '[:space:]'
+    sudo find "$sandbox/snapshots" -mindepth 1 2> /dev/null | wc -l | tr -d '[:space:]'
+}
+
+# First snapshot directory under the sandbox base (empty when none). The base
+# is root-owned 0700, so all inspection must be privileged.
+snapshot_dir() {
+    local sandbox="$1"
+    [ -d "$sandbox/snapshots" ] || {
+        echo ""
+        return 0
+    }
+    sudo find "$sandbox/snapshots" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | head -n 1
 }
 
 # Deploy V1 successfully, then stage a different V2 source for the next step.
@@ -2110,6 +2142,295 @@ test_keyd_unsupported_path_type_fails_closed() {
 }
 
 # ---------------------------------------------------------------------------
+# 33a. P1 SECURITY: a pre-created world-writable snapshot base must never be
+#      accepted (no chown/chmod "repair", no deploy, no backup).
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_world_writable_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-base-world-writable"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" \
+        "$sandbox/keyd-src" "$sandbox/snapshots"
+    chmod 777 "$sandbox/snapshots"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "world-writable base: install_keyd_step must fail closed (rc=1)"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "refusing to deploy keyd config" "$log" \
+        "world-writable base: fail-closed error logged"
+    assert_contains "unsafe mode '777'" "$log" \
+        "world-writable base: offending mode is named in the error"
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "world-writable base: cros.conf untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "world-writable base: legacy symlink must be untouched"
+    fi
+    assert_eq "0" "$(snapshot_entries "$sandbox")" \
+        "world-writable base: no snapshot directory created"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "world-writable base: no backup recorded"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "world-writable base: no service mutation allowed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33b. P1 SECURITY: a symlink at the snapshot base must be rejected without
+#      following it (dangling on purpose, so a resolved path would fail too).
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_symlink_rejected() {
+    local sandbox="/tmp/rollback-test-keyd-base-symlink"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    ln -s "$sandbox/snapshot-target" "$sandbox/snapshots"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "symlink base: install_keyd_step must fail closed (rc=1)"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "symlink" "$log" "symlink base: rejection names the symlink"
+    assert_contains "refusing to deploy keyd config" "$log" \
+        "symlink base: fail-closed error logged"
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "symlink base: cros.conf untouched"
+    if [ -L "$sandbox/snapshots" ]; then
+        ok
+    else
+        fail "symlink base: the attacker-provided symlink must not be replaced"
+    fi
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "symlink base: no snapshot created"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "symlink base: no backup recorded"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "symlink base: no service mutation allowed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33c. P2: when recovery fails, the snapshot is the only V1 evidence. It must
+#      be kept, marked .failed and named in the log (never silently deleted).
+# ---------------------------------------------------------------------------
+test_keyd_restore_failure_keeps_snapshot() {
+    local sandbox="/tmp/rollback-test-keyd-restore-failure-retain"
+    setup_keyd_restart_recoverable_sandbox "$sandbox" absent
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    : > "$sandbox/log.txt"
+
+    # Force restoration to fail while the retry restart succeeds: this is the
+    # final `return 1` branch of _restore_keyd_after_failed_restart. (The early
+    # branch is covered by test_keyd_restart_unrecoverable_returns_failure.)
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        _keyd_snapshot_restore() { return 1; }
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "restore failure: install_keyd_step must return 1"
+        return 0
+    fi
+    local d log
+    d="$(snapshot_dir "$sandbox")"
+    if [ -n "$d" ] && sudo test -d "$d"; then
+        ok
+    else
+        fail "restore failure: snapshot must be retained on disk"
+        return 0
+    fi
+    log="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
+    assert_contains "$d" "$log" "restore failure: log names the retained snapshot path"
+    assert_contains "RETAINED" "$log" "restore failure: log marks the snapshot as retained"
+    if sudo test -f "$d/.failed"; then
+        ok
+    else
+        fail "restore failure: retained snapshot must carry a .failed marker"
+    fi
+    assert_eq "failed" "$(sudo cat "$d/.failed" 2> /dev/null || echo MISSING)" \
+        "restore failure: .failed marker content"
+    assert_eq "file" "$(sudo cat "$d/cros.kind" 2> /dev/null || echo MISSING)" \
+        "restore failure: retained snapshot still has cros.kind"
+    assert_eq "V1_CONFIG" "$(sudo cat "$d/cros.data" 2> /dev/null || echo MISSING)" \
+        "restore failure: retained snapshot still holds the V1 evidence"
+    assert_contains "snapshot restore FAILED" "$(cat "$sandbox/step.log" 2> /dev/null || echo "")" \
+        "restore failure: explicit restore-failed warning printed"
+
+    # Pruning must never destroy a retained (marked) snapshot, even when old.
+    sudo touch -d '8 days ago' "$d" 2> /dev/null || true
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _keyd_snapshot_prune_old
+    '
+    if sudo test -d "$d"; then
+        ok
+    else
+        fail "restore failure: prune must skip a snapshot with a .failed marker"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33d. P2 mixed identity: after a sudo run created a 0700 root-owned base, a
+#      non-root caller with internal sudo must still be able to snapshot.
+#      Privilege wrappers deny non-sudo mutation of snapshot/keyd paths.
+# ---------------------------------------------------------------------------
+setup_keyd_snapshot_privilege_stubs() {
+    local sandbox="$1"
+    mkdir -p "$sandbox/snapbin"
+
+    cat > "$sandbox/stub/sudo" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_SUDO_LOG:?}"
+export STUB_SUDO_ELEVATED=1
+exec "$@"
+EOF
+
+    cat > "$sandbox/snapbin/priv-wrapper" << EOF
+#!/usr/bin/env bash
+name="\$(basename "\$0")"
+real=""
+for d in /usr/bin /bin /usr/sbin /sbin; do
+    if [ -x "\$d/\$name" ]; then real="\$d/\$name"; break; fi
+done
+[ -n "\$real" ] || exit 1
+if [ "\${STUB_SUDO_ELEVATED:-0}" = "1" ]; then
+    exec "\$real" "\$@"
+fi
+for arg in "\$@"; do
+    case "\$arg" in
+        $sandbox/snapshots* | $sandbox/etc/keyd | $sandbox/etc/keyd/*)
+            printf 'DENIED:%s %s\n' "\$name" "\$*" >> "\${STUB_PRIV_LOG:?}"
+            exit 1
+            ;;
+    esac
+done
+exec "\$real" "\$@"
+EOF
+    chmod +x "$sandbox/stub/sudo" "$sandbox/snapbin/priv-wrapper"
+    local cmd
+    for cmd in mkdir mktemp cp tee install stat; do
+        ln -s priv-wrapper "$sandbox/snapbin/$cmd"
+    done
+}
+
+test_keyd_snapshot_mixed_identity() {
+    local sandbox="/tmp/rollback-test-keyd-snapshot-mixed-identity"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    setup_keyd_snapshot_privilege_stubs "$sandbox"
+    printf 'V1_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    : > "$sandbox/sudo.log"
+    : > "$sandbox/priv.log"
+
+    # A fresh base forces the installer to create it through sudo as well;
+    # otherwise the harness already provided a 0700 root-owned base.
+    if ! run_sandboxed "$sandbox" '
+        export PATH="$2/snapbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SUDO_LOG="$2/sudo.log" STUB_PRIV_LOG="$2/priv.log"
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_SNAPSHOT_BASE="$2/snapshots-mixed"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "mixed identity: snapshot I/O through sudo must let the install succeed"
+        return 0
+    fi
+    local sudo_log denied
+    sudo_log="$(cat "$sandbox/sudo.log" 2> /dev/null || echo "")"
+    denied="$(grep -c 'DENIED:' "$sandbox/priv.log" 2> /dev/null || true)"
+    assert_eq "0" "${denied:-0}" \
+        "mixed identity: no unprivileged snapshot/keyd mutation"
+    assert_contains "install -d -m 700 -o 0 -g 0 -- $sandbox/snapshots-mixed" "$sudo_log" \
+        "mixed identity: sudo created the 0700 root-owned base"
+    assert_contains "mktemp -d -- $sandbox/snapshots-mixed/keyd." "$sudo_log" \
+        "mixed identity: sudo created the per-deploy snapshot directory"
+    assert_contains "cp -a -- $sandbox/etc/keyd/cros.conf" "$sudo_log" \
+        "mixed identity: sudo copied the config into the snapshot"
+    assert_contains "tee $sandbox/snapshots-mixed/keyd." "$sudo_log" \
+        "mixed identity: sudo wrote the snapshot metadata"
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "mixed identity: config deployed successfully"
+
+    # The inverse: an unsafe base still fails closed with an explicit error.
+    chmod 777 "$sandbox/snapshots"
+    : > "$sandbox/step2.log"
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/snapbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SUDO_LOG="$2/sudo.log" STUB_PRIV_LOG="$2/priv.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step2.log"; then
+        fail "mixed identity: unsafe base must fail closed"
+    else
+        assert_contains "unsafe mode '777'" "$(cat "$sandbox/step2.log" 2> /dev/null || echo "")" \
+            "mixed identity: unsafe base produces an explicit error"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33e. Pruning keeps old snapshots that carry a .failed marker.
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_prune_skips_failed() {
+    local sandbox="/tmp/rollback-test-keyd-snapshot-prune-failed"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/snapshots"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    local marked="$sandbox/snapshots/keyd.marked" plain="$sandbox/snapshots/keyd.plain"
+    mkdir -p "$marked" "$plain"
+    printf 'failed\n' > "$marked/.failed"
+    touch -d '8 days ago' "$marked" "$plain"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _keyd_snapshot_prune_old
+    '
+    if [ -d "$marked" ]; then
+        ok
+    else
+        fail "prune: snapshot with a .failed marker must be retained"
+    fi
+    if [ ! -e "$plain" ]; then
+        ok
+    else
+        fail "prune: old unmarked snapshot must be removed"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 34. P2 regression: a non-root user with passwordless sudo must be able to
 #     restore a snapshot of root-owned keyd paths. The simulation enforces the
 #     privilege boundary without needing a second real uid: the sudo stub logs
@@ -2297,6 +2618,14 @@ test_keyd_restore_uses_sudo_nonroot() {
         fail "restore-sudo: success line must NOT be printed when restored=0"
     else
         ok
+    fi
+    # The final `return 1` path also retains and marks the V1 evidence.
+    local retained
+    retained="$(snapshot_dir "$sandbox")"
+    if [ -n "$retained" ] && sudo test -f "$retained/.failed"; then
+        ok
+    else
+        fail "restore-sudo: failed restore retains a marked snapshot"
     fi
 }
 
@@ -2562,6 +2891,11 @@ test_keyd_snapshot_cleanup_on_success
 test_keyd_snapshot_create_failure_fails_closed
 test_keyd_unsupported_path_type_fails_closed dir
 test_keyd_unsupported_path_type_fails_closed fifo
+test_keyd_snapshot_base_world_writable_fails_closed
+test_keyd_snapshot_base_symlink_rejected
+test_keyd_restore_failure_keeps_snapshot
+test_keyd_snapshot_mixed_identity
+test_keyd_snapshot_prune_skips_failed
 test_keyd_restore_uses_sudo_nonroot
 test_uninstall_has_no_post_rollback_keyd_cleanup
 test_uninstall_leaves_foreign_keyd_alone

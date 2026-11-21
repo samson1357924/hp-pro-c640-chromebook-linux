@@ -32,8 +32,10 @@ KEYD_LINK="/etc/keyd/default.conf"
 # Per-deploy keyd state snapshot. This lives OUTSIDE BACKUP_BASE_DIR and
 # MANIFEST_DIR on purpose: lib/backup.sh's rollback helpers glob those trees
 # and would otherwise treat a snapshot as the oldest backup, breaking the
-# first-wins semantics that uninstall relies on.
-KEYD_SNAPSHOT_BASE="${CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR:-/var/tmp/cros-enablement-keyd-snapshots}"
+# first-wins semantics that uninstall relies on. The default base is a
+# root-owned sibling of MANIFEST_DIR under /var/lib, NOT a predictable path in
+# a world-writable temporary directory (see _keyd_snapshot_base_prepare).
+KEYD_SNAPSHOT_BASE="${CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR:-/var/lib/cros-enablement-keyd-snapshots}"
 KEYD_SNAPSHOT_DIR=""
 
 # Echo 1 when the manifest records $2 (optionally restricted to component $3)
@@ -156,14 +158,101 @@ _keyd_path_kind() {
     fi
 }
 
+# Fail-closed validation of the snapshot base. A predictable, world-writable
+# base would let an unprivileged user pre-create (or symlink) the directory and
+# later swap snapshot children, feeding arbitrary .kind/.data to the privileged
+# restore path. Every component is checked WITHOUT following symlinks, and an
+# existing base is never "repaired" (no chown/chmod): an unsafe one is rejected
+# so the installer refuses to hand a poisoned snapshot to a root restore.
+_keyd_snapshot_base_prepare() {
+    local base="$1" p="" part="" uid="" my_uid="" mode="" m=""
+    local -a parts=()
+
+    case "$base" in
+        /*) ;;
+        *)
+            log_error "Keyd snapshot base '$base' is not an absolute path; refusing to deploy keyd config"
+            return 1
+            ;;
+    esac
+    IFS='/' read -r -a parts <<< "${base#/}"
+    if [ "${#parts[@]}" -eq 0 ]; then
+        log_error "Keyd snapshot base '$base' is empty; refusing to deploy keyd config"
+        return 1
+    fi
+    my_uid="$(id -u)"
+
+    local idx=0 last=$((${#parts[@]} - 1))
+    for part in "${parts[@]}"; do
+        case "$part" in
+            "" | . | ..)
+                log_error "Keyd snapshot base '$base' has an unsafe path component '$part'; refusing to deploy keyd config"
+                return 1
+                ;;
+        esac
+        p="$p/$part"
+        if [ -L "$p" ]; then
+            log_error "Keyd snapshot base '$base' traverses a symlink at '$p'; refusing to deploy keyd config"
+            return 1
+        fi
+        if ! uid="$(sudo stat -c '%u' -- "$p" 2> /dev/null)"; then
+            if [ "$idx" -eq "$last" ] && [ "$p" = "$base" ]; then
+                # Absent base: create it atomically with the right owner/mode.
+                if ! sudo install -d -m 700 -o 0 -g 0 -- "$base" 2> /dev/null; then
+                    log_error "Could not create keyd snapshot base '$base'; refusing to deploy keyd config"
+                    return 1
+                fi
+                return 0
+            fi
+            log_error "Keyd snapshot base '$base' has a missing or unreadable parent '$p'; refusing to deploy keyd config"
+            return 1
+        fi
+        if [ "$uid" != "0" ] && [ "$uid" != "$my_uid" ]; then
+            log_error "Keyd snapshot base '$base' component '$p' is owned by uid '$uid'; refusing to deploy keyd config"
+            return 1
+        fi
+        if ! mode="$(sudo stat -c '%a' -- "$p" 2> /dev/null)"; then
+            log_error "Could not read the mode of '$p' in keyd snapshot base '$base'; refusing to deploy keyd config"
+            return 1
+        fi
+        case "$mode" in
+            "" | *[!0-7]*)
+                log_error "Invalid mode '$mode' on '$p' in keyd snapshot base '$base'; refusing to deploy keyd config"
+                return 1
+                ;;
+        esac
+        m=$((8#$mode))
+        if [ "$idx" -eq "$last" ]; then
+            # The base itself must be private (strict 0700; no special/sticky bits).
+            if (((m & 07777) != 0700)); then
+                log_error "Keyd snapshot base '$base' has unsafe mode '$mode' (must be 0700); refusing to deploy keyd config"
+                return 1
+            fi
+        else
+            # Ancestors must not be group/other writable (a sticky /tmp is OK).
+            if (((m & 022) != 0)) && (((m & 01000) == 0)); then
+                log_error "Keyd snapshot base '$base' traverses group/other-writable directory '$p' (mode $mode) without a sticky bit; refusing to deploy keyd config"
+                return 1
+            fi
+        fi
+        idx=$((idx + 1))
+    done
+    return 0
+}
+
 # Best-effort housekeeping: drop snapshot directories older than seven days.
-# Stale-snapshot cleanup must never fail a deployment.
+# Stale-snapshot cleanup must never fail a deployment. A .failed marker means
+# the snapshot is the only remaining V1 evidence after a failed restore, so it
+# is retained for manual recovery.
 _keyd_snapshot_prune_old() {
     [ -d "$KEYD_SNAPSHOT_BASE" ] || return 0
-    find "$KEYD_SNAPSHOT_BASE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -print 2> /dev/null \
+    sudo find "$KEYD_SNAPSHOT_BASE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -print 2> /dev/null \
         | while IFS= read -r old; do
             [ -n "$old" ] || continue
-            rm -rf -- "$old" 2> /dev/null || true
+            if sudo test -f "$old/.failed"; then
+                continue
+            fi
+            sudo rm -rf -- "$old" 2> /dev/null || true
         done
     return 0
 }
@@ -176,7 +265,15 @@ _keyd_snapshot_cleanup() {
     case "$d" in
         "" | "/" | "$KEYD_SNAPSHOT_BASE") return 0 ;;
     esac
-    rm -rf -- "$d" 2> /dev/null || true
+    sudo rm -rf -- "$d" 2> /dev/null || true
+}
+
+# Write one snapshot field through sudo. All snapshot I/O must stay on the
+# privileged side: a non-root caller may own the installer process but not the
+# root-owned snapshot base created by an earlier sudo run.
+_keyd_snapshot_write() {
+    local file="$1" content="$2"
+    printf '%s\n' "$content" | sudo tee "$file" > /dev/null 2>&1
 }
 
 # Create an isolated, per-deploy snapshot of the keyd paths and service state.
@@ -192,14 +289,12 @@ _keyd_snapshot_create() {
     fi
 
     local d="" prefix="" path="" kind="" target="" mode="" failed=0
-    # shellcheck disable=SC2174 # -m is intentionally limited to the snapshot base
-    if ! mkdir -p -m 700 "$KEYD_SNAPSHOT_BASE" 2> /dev/null; then
-        log_error "Could not create keyd snapshot base $KEYD_SNAPSHOT_BASE; refusing to deploy keyd config"
+    if ! _keyd_snapshot_base_prepare "$KEYD_SNAPSHOT_BASE"; then
         KEYD_SNAPSHOT_DIR=""
         return 1
     fi
     _keyd_snapshot_prune_old || true
-    if ! d="$(mktemp -d "$KEYD_SNAPSHOT_BASE/keyd.XXXXXXXX" 2> /dev/null)"; then
+    if ! d="$(sudo mktemp -d -- "$KEYD_SNAPSHOT_BASE/keyd.XXXXXXXX" 2> /dev/null)"; then
         log_error "Could not create a keyd snapshot directory under $KEYD_SNAPSHOT_BASE; refusing to deploy keyd config"
         KEYD_SNAPSHOT_DIR=""
         return 1
@@ -227,7 +322,7 @@ _keyd_snapshot_create() {
                 return 1
                 ;;
         esac
-        if ! printf '%s\n' "$kind" > "$d/$prefix.kind" 2> /dev/null; then
+        if ! _keyd_snapshot_write "$d/$prefix.kind" "$kind"; then
             failed=1
             break
         fi
@@ -238,22 +333,22 @@ _keyd_snapshot_create() {
                     failed=1
                     break
                 fi
-                if ! printf '%s\n' "$target" > "$d/$prefix.target" 2> /dev/null; then
+                if ! _keyd_snapshot_write "$d/$prefix.target" "$target"; then
                     failed=1
                     break
                 fi
                 ;;
             absent) ;;
             *)
-                if ! mode="$(stat -c '%a' "$path" 2> /dev/null)"; then
+                if ! mode="$(sudo stat -c '%a' "$path" 2> /dev/null)"; then
                     failed=1
                     break
                 fi
-                if ! printf '%s\n' "$mode" > "$d/$prefix.mode" 2> /dev/null; then
+                if ! _keyd_snapshot_write "$d/$prefix.mode" "$mode"; then
                     failed=1
                     break
                 fi
-                if ! cp -a -- "$path" "$d/$prefix.data" 2> /dev/null; then
+                if ! sudo cp -a -- "$path" "$d/$prefix.data" 2> /dev/null; then
                     failed=1
                     break
                 fi
@@ -271,9 +366,9 @@ _keyd_snapshot_create() {
         if systemctl is-active keyd > /dev/null 2>&1; then
             svc_active=1
         fi
-        if ! printf '%s\n' "$svc_enabled" > "$d/svc.enabled" 2> /dev/null; then
+        if ! _keyd_snapshot_write "$d/svc.enabled" "$svc_enabled"; then
             failed=1
-        elif ! printf '%s\n' "$svc_active" > "$d/svc.active" 2> /dev/null; then
+        elif ! _keyd_snapshot_write "$d/svc.active" "$svc_active"; then
             failed=1
         fi
     fi
@@ -293,11 +388,11 @@ _keyd_snapshot_create() {
 _keyd_restore_one() {
     local dst="$1" prefix="$2" d="${KEYD_SNAPSHOT_DIR:-}" kind="" target="" mode=""
     local kind_file="$d/$prefix.kind"
-    if [ ! -f "$kind_file" ]; then
+    if ! sudo test -f "$kind_file"; then
         log_warn "Keyd snapshot has no $prefix.kind; cannot restore $dst"
         return 1
     fi
-    if ! kind="$(cat "$kind_file" 2> /dev/null)"; then
+    if ! kind="$(sudo cat "$kind_file" 2> /dev/null)"; then
         log_warn "Could not read $kind_file; cannot restore $dst"
         return 1
     fi
@@ -312,7 +407,9 @@ _keyd_restore_one() {
     # Clear the current state first, symlink flag first (a dangling link is
     # still a link), then directories, then everything else. The keyd paths
     # are root-owned, so every mutation must go through sudo just like the
-    # deployment and service operations do. Reads (cat/-f/readlink) do not.
+    # deployment and service operations do. Snapshot metadata lives in the
+    # root-owned 0700 base, so its reads are privileged too; only the read of
+    # the destination path type (-L/-d/-e) stays unprivileged.
     if [ -L "$dst" ]; then
         if ! sudo rm -f -- "$dst" 2> /dev/null; then
             log_warn "Could not remove $dst symlink while restoring keyd snapshot"
@@ -335,7 +432,7 @@ _keyd_restore_one() {
             return 0
             ;;
         symlink)
-            if ! target="$(cat "$d/$prefix.target" 2> /dev/null)"; then
+            if ! target="$(sudo cat "$d/$prefix.target" 2> /dev/null)"; then
                 log_warn "Could not read $d/$prefix.target; cannot restore $dst"
                 return 1
             fi
@@ -349,11 +446,11 @@ _keyd_restore_one() {
             fi
             ;;
         file | dir)
-            if ! mode="$(cat "$d/$prefix.mode" 2> /dev/null)"; then
+            if ! mode="$(sudo cat "$d/$prefix.mode" 2> /dev/null)"; then
                 log_warn "Could not read $d/$prefix.mode; cannot restore $dst"
                 return 1
             fi
-            if [ ! -f "$d/$prefix.data" ]; then
+            if ! sudo test -f "$d/$prefix.data"; then
                 log_warn "Keyd snapshot has no $prefix.data; cannot restore $dst"
                 return 1
             fi
@@ -372,7 +469,7 @@ _keyd_restore_one() {
 # restart if it was inactive before deployment.
 _keyd_snapshot_restore() {
     local d="${KEYD_SNAPSHOT_DIR:-}" enabled="" active="" rc=0
-    if [ -z "$d" ] || [ ! -f "$d/cros.kind" ]; then
+    if [ -z "$d" ] || ! sudo test -f "$d/cros.kind"; then
         log_warn "No pre-deploy keyd snapshot available; cannot restore previous keyd state"
         return 1
     fi
@@ -383,7 +480,7 @@ _keyd_snapshot_restore() {
         rc=1
     fi
 
-    if [ ! -f "$d/svc.enabled" ] || ! enabled="$(cat "$d/svc.enabled" 2> /dev/null)"; then
+    if ! sudo test -f "$d/svc.enabled" || ! enabled="$(sudo cat "$d/svc.enabled" 2> /dev/null)"; then
         log_warn "Keyd snapshot has no readable svc.enabled; service enablement left unchanged"
         rc=1
     else
@@ -407,14 +504,29 @@ _keyd_snapshot_restore() {
         esac
     fi
 
-    if [ ! -f "$d/svc.active" ] || ! active="$(cat "$d/svc.active" 2> /dev/null)"; then
+    if ! sudo test -f "$d/svc.active" || ! active="$(sudo cat "$d/svc.active" 2> /dev/null)"; then
         log_warn "Keyd snapshot has no readable svc.active"
         rc=1
-    elif ! printf '%s\n' "$active" > "$d/.active_wanted" 2> /dev/null; then
+    elif ! _keyd_snapshot_write "$d/.active_wanted" "$active"; then
         log_warn "Could not record the pre-deploy keyd active state"
         rc=1
     fi
     return "$rc"
+}
+
+# After an unrecoverable restore the snapshot is the ONLY remaining evidence
+# of the pre-deploy (V1) keyd state. Mark it so pruning keeps it, and print an
+# absolute path so an operator can still recover manually.
+_keyd_snapshot_retain_notice() {
+    local d="${KEYD_SNAPSHOT_DIR:-}"
+    case "$d" in
+        "" | "/" | "$KEYD_SNAPSHOT_BASE") return 0 ;;
+    esac
+    if ! sudo test -d "$d"; then
+        return 0
+    fi
+    printf 'failed\n' | sudo tee "$d/.failed" > /dev/null 2>&1 || true
+    log_warn "Keyd snapshot RETAINED at $d (restore failed); manual recovery preserved"
 }
 
 # Undo a failed keyd deployment by restoring the PER-DEPLOY snapshot (V1,
@@ -441,6 +553,7 @@ _restore_keyd_after_failed_restart() {
 
     if ! sudo systemctl restart keyd 2> /dev/null; then
         log_warn "keyd still failed to restart after restoring previous config; check 'journalctl -u keyd' manually"
+        _keyd_snapshot_retain_notice
         return 1
     fi
     if [ "$restored" -eq 1 ]; then
@@ -451,8 +564,8 @@ _restore_keyd_after_failed_restart() {
         log_warn "keyd restarted, but snapshot restore FAILED — the active config may be the new (broken) one"
     fi
 
-    if [ "$restored" -eq 1 ] && [ -f "$KEYD_SNAPSHOT_DIR/.active_wanted" ]; then
-        if ! wanted_active="$(cat "$KEYD_SNAPSHOT_DIR/.active_wanted" 2> /dev/null)"; then
+    if [ "$restored" -eq 1 ] && sudo test -f "${KEYD_SNAPSHOT_DIR:-}/.active_wanted"; then
+        if ! wanted_active="$(sudo cat "${KEYD_SNAPSHOT_DIR:-}/.active_wanted" 2> /dev/null)"; then
             wanted_active=""
             log_warn "Could not read the recorded pre-deploy keyd active state"
         fi
@@ -472,6 +585,7 @@ _restore_keyd_after_failed_restart() {
         return 2
     fi
     # Snapshot restoration (or the final stop) could not be completed.
+    _keyd_snapshot_retain_notice
     return 1
 }
 
@@ -640,12 +754,13 @@ install_keyd_step() {
         log_error "Failed to deploy $KEYD_DST; restoring previous keyd state"
         local recovery_rc=0
         _restore_keyd_after_failed_restart || recovery_rc=$?
-        if [ "$recovery_rc" -eq 1 ]; then
-            log_error "keyd config could not be restored after the install failure"
-        else
+        if [ "$recovery_rc" -eq 2 ]; then
+            # Only a FULL revert consumes the snapshot: V1 is live again.
+            _keyd_snapshot_cleanup
             log_warn "keyd config reverted after install failure; dual-role NOT active"
+        else
+            log_error "keyd config could not be restored after the install failure; snapshot kept at ${KEYD_SNAPSHOT_DIR:-<none>} for manual recovery"
         fi
-        _keyd_snapshot_cleanup
         KEYD_STATE="failed"
         return 1
     fi
@@ -671,25 +786,24 @@ install_keyd_step() {
         # negated status (0) inside its then-branch. `set -e` is not triggered
         # by the left-hand side of `||`.
         _restore_keyd_after_failed_restart || recovery_rc=$?
-        # The snapshot has been consumed by recovery; drop it on every exit
-        # from this failure branch.
-        _keyd_snapshot_cleanup
         case "$recovery_rc" in
-            0)
-                # Defensive: the restart failed, so do not report success even
-                # if recovery claims the new config is running normally.
-                return 1
-                ;;
             2)
                 # The daemon was restarted, but on the ORIGINAL config. The
                 # system is safe, yet dual-role is NOT deployed: the caller
                 # captures our rc via `|| keyd_rc=$?` and keeps
-                # KEYD_DEPLOYED=0 from our failure status.
+                # KEYD_DEPLOYED=0 from our failure status. Only this fully
+                # reverted path consumes (cleans) the snapshot.
+                _keyd_snapshot_cleanup
                 log_warn "keyd config reverted after restart failure; dual-role NOT active"
                 return 1
                 ;;
-            *)
+            0 | 1 | *)
+                # Recovery did NOT finish, so the snapshot is the only V1
+                # evidence left. Keep it (with its .failed marker) instead of
+                # destroying the evidence. The restart failed, so dual-role
+                # must never be reported as active on any of these paths.
                 log_error "keyd restart could not be recovered; dual-role config is not active"
+                log_warn "Keyd snapshot kept at ${KEYD_SNAPSHOT_DIR:-<none>} for manual recovery; snapshot not consumed"
                 return 1
                 ;;
         esac
