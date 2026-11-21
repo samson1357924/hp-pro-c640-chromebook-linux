@@ -6,14 +6,21 @@
 # (Wayland/X11) and org.freedesktop.login1 PrepareForSleep (S3) to turn off
 # keyboard backlight when screen goes dark and restore it when screen lights up.
 #
-# State is stored atomically in $XDG_RUNTIME_DIR/c640-kbd-backlight.state
-# with first-wins semantics; 0 is never saved/restored to preserve user intent.
-# Handles LED_CORE_SUSPENDRESUME race with 0.5s debounce and re-checks
-# ScreenSaver Active before restoring (covers TROUBLESHOOTING.md §11).
+# Write chain (single-writer aware):
+#   gsd-power Keyboard.Brightness (pct) -> UPower SetBrightness (raw) -> LED.
+#   UPower's "external" signals are ignored by gsd-power, so writing UPower
+#   alone leaves gsd-power's cache stale.  We therefore write the property
+#   first and only fall back to direct UPower / sysfs / ectool writes.
+#
+# State is stored atomically in $XDG_RUNTIME_DIR/c640-kbd-backlight.state.
+# A 5s sampler keeps the last user-visible brightness (0 = user explicitly
+# switched it off) so a blank can be saved even when the LED was already
+# turned off by firmware.
 set -euo pipefail
 
-SYSFS_BRIGHTNESS="/sys/class/leds/chromeos::kbd_backlight/brightness"
-SYSFS_MAX="/sys/class/leds/chromeos::kbd_backlight/max_brightness"
+# Optional sysfs overrides (mainly for testing / non-standard kernels).
+SYSFS_BRIGHTNESS="${C640_KBD_SYSFS_BRIGHTNESS:-/sys/class/leds/chromeos::kbd_backlight/brightness}"
+SYSFS_MAX="${C640_KBD_SYSFS_MAX:-/sys/class/leds/chromeos::kbd_backlight/max_brightness}"
 
 # Secure per-user state directory
 # Prefer XDG_RUNTIME_DIR, fallback to /run/user/<uid>, then secure tmp
@@ -29,59 +36,249 @@ fi
 STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
 STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
 LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
+LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
+RESTORE_GEN_FILE="$STATE_DIR/c640-kbd-backlight.restore-gen"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
 C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
+# Force the legacy sysfs/ectool write path (A/B comparison, no D-Bus at all).
+C640_KBD_FORCE_LEGACY="${C640_KBD_FORCE_LEGACY:-0}"
+# Verbose monitor/debug logging (0=off default).
+C640_KBD_DEBUG="${C640_KBD_DEBUG:-0}"
+
+# D-Bus well-known paths / interfaces.
+UP_PATH="/org/freedesktop/UPower/KbdBacklight"
+UP_IFACE="org.freedesktop.UPower.KbdBacklight"
+GSD_PATH="/org/gnome/SettingsDaemon/Power"
+GSD_IFACE="org.gnome.SettingsDaemon.Power.Keyboard"
+DBUS_PROPS="org.freedesktop.DBus.Properties"
+
+# Backend availability, probed once at daemon start (empty = not probed yet).
+HAVE_GSD_KBD=""
+HAVE_UPOWER_KBD=""
+restore_gen=0
+# In-process mirror of the last user-visible brightness.  The value is also
+# persisted to LAST_USER_FILE so save_state (which runs in a subshell) can read
+# it.  A value of 0 means "the user explicitly turned the backlight off".
+last_user_brightness=""
+# Consecutive on-screen zero readings; two are required before a 0 is treated
+# as user intent rather than gsd-power's transient blank-side write.
+_C640_ZERO_STREAK=0
+# -g keeps the array global even when this file is sourced from a function
+# (used by the stub test harness).
+declare -gA _C640_WARNED=()
 
 log() {
     echo "[c640-kbd-backlight-sync] $*" >&2
 }
 
-get_brightness() {
-    if [ -f "$SYSFS_BRIGHTNESS" ]; then
-        cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo ""
-    elif command -v ectool > /dev/null 2>&1; then
-        local pct
-        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
-        if [[ "$pct" =~ ^[0-9]+$ ]]; then
-            local max
-            max="$(get_max)"
-            if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
-                max=100
-            fi
-            echo $((pct * max / 100))
-        else
-            echo ""
-        fi
-    elif [ -x /usr/local/bin/ectool ]; then
-        local pct2
-        pct2="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
-        if [[ "$pct2" =~ ^[0-9]+$ ]]; then
-            local max2
-            max2="$(get_max)"
-            if ! [[ "$max2" =~ ^[0-9]+$ ]] || [ "$max2" -eq 0 ]; then
-                max2=100
-            fi
-            echo $((pct2 * max2 / 100))
-        else
-            echo ""
-        fi
-    else
-        echo ""
+# Warnings are always visible (stderr -> journald via the user unit).
+log_warn() {
+    echo "[WARN] [c640-kbd-backlight-sync] $*" >&2
+}
+
+# Rate-limited warning: each key is emitted at most once per process.
+log_warn_once() {
+    local key="$1"
+    shift
+    if [ -z "${_C640_WARNED[$key]:-}" ]; then
+        _C640_WARNED[$key]=1
+        log_warn "$@"
     fi
 }
 
+log_debug() {
+    if [ "$C640_KBD_DEBUG" = "1" ]; then
+        echo "[DEBUG] [c640-kbd-backlight-sync] $*" >&2
+    fi
+}
+
+# Extract the first decimal number from a gdbus reply such as "(50,)" or
+# "(<0>,)".  The int32 type token is stripped first so "<int32 50>" parses
+# as 50 rather than 32.
+parse_first_int() {
+    local n
+    n="$(printf '%s\n' "${1//int32 /}" | grep -o '[0-9][0-9]*' | head -n1 || true)"
+    printf '%s' "$n"
+}
+
+# --- Backend probes -------------------------------------------------------
+
+gsd_kbd_present() {
+    local intro
+    intro="$(timeout 3 gdbus introspect --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" 2> /dev/null || true)"
+    grep -q "Brightness" <<< "$intro"
+}
+
+upower_kbd_present() {
+    local intro
+    intro="$(timeout 3 gdbus introspect --system --dest org.freedesktop.UPower --object-path "$UP_PATH" 2> /dev/null || true)"
+    grep -q "SetBrightness" <<< "$intro"
+}
+
+ensure_backends() {
+    if [ -n "$HAVE_GSD_KBD" ] && [ -n "$HAVE_UPOWER_KBD" ]; then
+        return 0
+    fi
+    if [ "$C640_KBD_FORCE_LEGACY" = "1" ]; then
+        HAVE_GSD_KBD=0
+        HAVE_UPOWER_KBD=0
+        log "C640_KBD_FORCE_LEGACY=1: D-Bus backends disabled"
+        return 0
+    fi
+    if [ -z "$HAVE_GSD_KBD" ]; then
+        if command -v gdbus > /dev/null 2>&1 && gsd_kbd_present; then
+            HAVE_GSD_KBD=1
+        else
+            HAVE_GSD_KBD=0
+        fi
+    fi
+    if [ -z "$HAVE_UPOWER_KBD" ]; then
+        if command -v gdbus > /dev/null 2>&1 && upower_kbd_present; then
+            HAVE_UPOWER_KBD=1
+        else
+            HAVE_UPOWER_KBD=0
+        fi
+    fi
+    log "backends probed: gsd=$HAVE_GSD_KBD upower=$HAVE_UPOWER_KBD"
+}
+
+# --- D-Bus helpers --------------------------------------------------------
+
+upower_get_raw() {
+    local out
+    out="$(timeout 3 gdbus call --system --dest org.freedesktop.UPower --object-path "$UP_PATH" --method "$UP_IFACE.GetBrightness" 2> /dev/null)" || return 1
+    parse_first_int "$out"
+}
+
+upower_set_raw() {
+    timeout 3 gdbus call --system --dest org.freedesktop.UPower --object-path "$UP_PATH" --method "$UP_IFACE.SetBrightness" "$1" > /dev/null 2>&1
+}
+
+gsd_get_pct() {
+    local out
+    out="$(timeout 3 gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" --method "$DBUS_PROPS.Get" "$GSD_IFACE" Brightness 2> /dev/null)" || return 1
+    parse_first_int "$out"
+}
+
+gsd_set_pct() {
+    timeout 3 gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" --method "$DBUS_PROPS.Set" "$GSD_IFACE" Brightness "<int32 $1>" > /dev/null 2>&1
+}
+
 get_max() {
-    if [ -f "$SYSFS_MAX" ]; then
-        cat "$SYSFS_MAX" 2> /dev/null || echo 100
+    local m
+    m="$(cat "$SYSFS_MAX" 2> /dev/null || echo "")"
+    if [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -gt 0 ]; then
+        echo "$m"
     else
         echo 100
     fi
 }
 
+# --- ectool fallback helpers ---------------------------------------------
+
+ectool_get_raw() {
+    local pct=""
+    local max
+    if command -v ectool > /dev/null 2>&1; then
+        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+            pct="$(sudo -n ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        fi
+    elif [ -x /usr/local/bin/ectool ]; then
+        pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+            pct="$(sudo -n /usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        fi
+    fi
+    if [[ "$pct" =~ ^[0-9]+$ ]]; then
+        max="$(get_max)"
+        if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
+            max=100
+        fi
+        echo $((pct * max / 100))
+    else
+        log_warn_once "ectool-read" "ectool pwmgetkblight unavailable or failed (sudo -n attempted)"
+        echo ""
+    fi
+}
+
+ectool_set_pct() {
+    local pct="$1"
+    if command -v ectool > /dev/null 2>&1; then
+        if ! ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            if ! sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+                log_warn_once "ectool-set" "ectool pwmsetkblight $pct failed even with sudo -n"
+            fi
+        fi
+    elif [ -x /usr/local/bin/ectool ]; then
+        if ! /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            if ! sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+                log_warn_once "ectool-local-set" "/usr/local/bin/ectool pwmsetkblight $pct failed even with sudo -n"
+            fi
+        fi
+    else
+        log_warn_once "ectool-missing" "no ectool available for legacy fallback"
+    fi
+}
+
+legacy_set_brightness() {
+    local val="$1"
+    local max="$2"
+    local pct
+    pct=$((val * 100 / max))
+
+    if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
+        log_warn_once "legacy-no-sysfs" "$SYSFS_BRIGHTNESS missing; using ectool only"
+        ectool_set_pct "$pct"
+        return 0
+    fi
+    if [ -w "$SYSFS_BRIGHTNESS" ]; then
+        if ! echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null; then
+            log_warn_once "sysfs-write" "direct write to $SYSFS_BRIGHTNESS failed"
+        fi
+    else
+        if ! echo "$val" | sudo -n tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1; then
+            log_warn_once "sysfs-sudo" "sudo -n tee $SYSFS_BRIGHTNESS failed (user service may lack passwordless sudo)"
+        fi
+    fi
+    local cur
+    cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
+    if [ "$cur" != "$val" ]; then
+        log_warn_once "sysfs-verify" "sysfs verify mismatch ($cur != $val); falling back to ectool"
+        ectool_set_pct "$pct"
+    fi
+}
+
+# --- Read / write chain ---------------------------------------------------
+
+get_brightness() {
+    local raw=""
+    if [ "$C640_KBD_FORCE_LEGACY" != "1" ]; then
+        ensure_backends
+        if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+            raw="$(upower_get_raw || echo "")"
+            if [[ "$raw" =~ ^[0-9]+$ ]]; then
+                echo "$raw"
+                return 0
+            fi
+            log_warn_once "upower-get" "UPower GetBrightness failed; falling back to sysfs/ectool"
+        fi
+    fi
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        local sys
+        sys="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "")"
+        if [[ "$sys" =~ ^[0-9]+$ ]]; then
+            echo "$sys"
+            return 0
+        fi
+    fi
+    ectool_get_raw
+}
+
 set_brightness() {
     local val="$1"
-    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
         return 0
     fi
     local max
@@ -95,51 +292,176 @@ set_brightness() {
     if [ "$val" -gt "$max" ]; then
         val="$max"
     fi
-    if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
-        local pct
-        pct=$((val * 100 / max))
-        if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
-        elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+
+    ensure_backends
+
+    # 1) gsd-power property (pct) is the single writer: it updates its own
+    #    cache and drives UPower -> LED.  Availability is proven by a
+    #    successful Properties.Get.
+    if [ "$HAVE_GSD_KBD" = "1" ]; then
+        local gpct
+        gpct="$(gsd_get_pct || echo "")"
+        if [[ "$gpct" =~ ^[0-9]+$ ]]; then
+            local pct
+            pct=$((val * 100 / max))
+            if gsd_set_pct "$pct"; then
+                if [ "$HAVE_UPOWER_KBD" != "1" ]; then
+                    return 0
+                fi
+                local cur
+                cur="$(upower_get_raw || echo "-1")"
+                if [ "$cur" = "$val" ]; then
+                    return 0
+                fi
+                # kbd_brightness_now == value short-circuit: the property was
+                # already at pct so gsd-power skipped the hardware write.
+                # Re-setting the property to the SAME pct would short-circuit
+                # again (gsd cache is already at target), so force the
+                # hardware only via UPower -- that is the missing write.
+                log_warn "gsd cache already at pct=$pct but UPower raw=$cur (expected $val); forcing hardware via UPower"
+                upower_set_raw "$val" || log_warn "UPower SetBrightness $val failed during gsd-power repair"
+                return 0
+            fi
+            log_warn_once "gsd-set" "gsd-power Properties.Set failed; trying UPower directly"
+        else
+            log_warn_once "gsd-get" "gsd-power Brightness Properties.Get failed; trying UPower directly"
         fi
+    fi
+
+    # 2) Direct UPower write.  gsd-power ignores UPower "external" signals,
+    #    so its cache may stay out of sync -> warn once.
+    if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+        if upower_set_raw "$val"; then
+            log_warn_once "upower-direct" "wrote UPower directly (raw=$val); gsd-power cache may be out of sync"
+            return 0
+        fi
+        log_warn_once "upower-set" "UPower SetBrightness $val failed; falling back to legacy path"
+    fi
+
+    # 3) Legacy sysfs / sudo tee / ectool fallback.
+    if [ "$HAVE_GSD_KBD" != "1" ] && [ "$HAVE_UPOWER_KBD" != "1" ]; then
+        log_warn_once "no-dbus-backend" "gsd-power and UPower keyboard backends unavailable; using legacy sysfs/ectool path"
+    fi
+    legacy_set_brightness "$val" "$max"
+}
+
+# --- ScreenSaver state helpers -------------------------------------------
+
+screensaver_is_active() {
+    local active=""
+    if command -v gdbus > /dev/null 2>&1; then
+        active="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
+        if ! grep -q "true" <<< "$active"; then
+            active="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+        fi
+        if grep -q "true" <<< "$active"; then
+            echo "true"
+        else
+            echo "false"
+        fi
+    elif command -v busctl > /dev/null 2>&1; then
+        active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
+        if ! grep -q "true" <<< "$active"; then
+            active="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+        fi
+        if grep -q "true" <<< "$active"; then
+            echo "true"
+        else
+            echo "false"
+        fi
+    else
+        echo "false"
+    fi
+}
+
+read_last_user_brightness() {
+    local v
+    v="$(cat "$LAST_USER_FILE" 2> /dev/null || echo "")"
+    # 0 is a legitimate recorded value: the user deliberately switched the
+    # backlight off while the screen was on. It must reach save_state so a
+    # later blank does not restore an old non-zero brightness.
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$v"
+    fi
+}
+
+# One sampler tick, kept separate from the infinite loop so it is unit
+# testable. Only observations made while the screen is ON count as user
+# intent; a blank-side transient 0 is ignored.
+sample_brightness_once() {
+    if [ "$(screensaver_is_active)" = "true" ]; then
+        _C640_ZERO_STREAK=0
         return 0
     fi
-    if [ -w "$SYSFS_BRIGHTNESS" ]; then
-        echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null || true
-    else
-        echo "$val" | sudo tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1 || true
+    local b pct
+    b="$(get_brightness)"
+    if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -ne 0 ]; then
+        _C640_ZERO_STREAK=0
+        last_user_brightness="$b"
+        printf '%s\n' "$b" > "$LAST_USER_FILE" 2> /dev/null || true
+        return 0
     fi
-    # Verify write and fallback to ectool if needed (covers both branches)
-    local cur
-    cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
-    if [ "$cur" != "$val" ]; then
-        local pct
-        pct=$((val * 100 / max))
-        if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
-        elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+    if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -eq 0 ]; then
+        pct="$(gsd_get_pct 2> /dev/null || echo "")"
+        # A non-zero gsd percentage means gsd still considers the light on;
+        # the zero is a transient/hardware artefact, not user intent.
+        if [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ne 0 ]; then
+            _C640_ZERO_STREAK=0
+            return 0
+        fi
+        _C640_ZERO_STREAK=$((_C640_ZERO_STREAK + 1))
+        if [ "$_C640_ZERO_STREAK" -ge 2 ]; then
+            last_user_brightness=0
+            printf '0\n' > "$LAST_USER_FILE" 2> /dev/null || true
+            log "sampler: two consecutive on-screen zeros (gsd pct=0) -> recording explicit off"
         fi
     fi
 }
 
+brightness_sampler_loop() {
+    log "brightness sampler started (interval 5s)"
+    _C640_ZERO_STREAK=0
+    while true; do
+        sample_brightness_once
+        sleep 5
+    done
+}
+
+# A LAST_USER_FILE left behind by a previous daemon run is stale. Re-seed it
+# from the brightness the user currently sees so the first blank after a
+# restart saves the real value (including 0) instead of an old one.
+seed_last_user_from_current() {
+    if [ "$(screensaver_is_active)" = "true" ]; then
+        return 0
+    fi
+    local cur
+    cur="$(get_brightness)"
+    if [[ "$cur" =~ ^[0-9]+$ ]]; then
+        last_user_brightness="$cur"
+        printf '%s\n' "$cur" > "$LAST_USER_FILE" 2> /dev/null || true
+    fi
+}
+
+# --- State save / restore -------------------------------------------------
+
 save_state() {
-    # Atomic first-wins with flock on STATE_LOCK
+    # Atomic first-wins with flock on STATE_LOCK.  A numeric reading is
+    # always saved (including 0); the sampler's last non-zero value is
+    # preferred so a firmware-side blank does not lose user intent.
     (
         flock -n 200 || return 0
         if [ -f "$STATE_FILE" ]; then
             return 0
         fi
-        if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
-            return 0
-        fi
         local curr
-        curr="$(get_brightness)"
-        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
-            return 0
+        curr="$(read_last_user_brightness)"
+        if [ -z "$curr" ]; then
+            curr="$last_user_brightness"
         fi
-        if [ "$curr" -eq 0 ]; then
+        if [ -z "$curr" ]; then
+            curr="$(get_brightness)"
+        fi
+        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
             return 0
         fi
         mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
@@ -150,86 +472,187 @@ save_state() {
         mv -f "$tmp" "$STATE_FILE" 2> /dev/null || cp "$tmp" "$STATE_FILE" 2> /dev/null || true
         rm -f "$tmp" 2> /dev/null || true
         log "saved brightness $curr"
-    ) 200> "$STATE_LOCK" 2> /dev/null || true
+    ) 200> "$STATE_LOCK" || true
+}
+
+bump_restore_gen() {
+    local g
+    g="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+    if ! [[ "$g" =~ ^[0-9]+$ ]]; then
+        g=0
+    fi
+    restore_gen=$((g + 1))
+    printf '%s\n' "$restore_gen" > "$RESTORE_GEN_FILE" 2> /dev/null || true
+}
+
+schedule_restore_retries() {
+    local gen="$1"
+    shift
+    local delay
+    for delay in "$@"; do
+        (
+            sleep "$delay"
+            local cur_gen
+            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ]; then
+                log_debug "restore retry +${delay}s gen=$gen superseded by $cur_gen"
+                exit 0
+            fi
+            if [ ! -f "$STATE_FILE" ]; then
+                exit 0
+            fi
+            if [ "$(screensaver_is_active)" = "true" ]; then
+                exit 0
+            fi
+            local saved
+            saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+            if ! [[ "$saved" =~ ^[0-9]+$ ]] || [ "$saved" -eq 0 ]; then
+                rm -f "$STATE_FILE" 2> /dev/null || true
+                exit 0
+            fi
+            if exec 202> "$STATE_LOCK"; then
+                if flock -n 202; then
+                    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+                    if [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
+                        rm -f "$STATE_FILE" 2> /dev/null || true
+                        log "restore retry +${delay}s (gen=$gen): restoring brightness $saved"
+                        set_brightness "$saved"
+                    fi
+                    flock -u 202
+                fi
+                exec 202>&-
+            fi
+        ) &
+    done
 }
 
 restore_state() {
-    (
-        flock -n 200 || return 0
-        if [ ! -f "$STATE_FILE" ]; then
-            return 0
-        fi
-        local saved
-        saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-        if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        if [ "$saved" -eq 0 ]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        local curr
-        curr="$(get_brightness)"
-        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
-            curr=0
-        fi
-        if [ "$curr" -ne 0 ]; then
-            log "skip restore: current brightness $curr != 0 (user changed manually)"
-            return 0
-        fi
-        # Re-check ScreenSaver still active -> defer restore (covers §11 re-blank)
-        local active="" active2=""
-        if command -v gdbus > /dev/null 2>&1; then
-            active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
-            if echo "$active" | grep -q "true"; then
-                active="true"
-            else
-                # Try freedesktop fallback
-                active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                if echo "$active2" | grep -q "true"; then
-                    active="true"
-                else
-                    active="false"
-                fi
-            fi
-        elif command -v busctl > /dev/null 2>&1; then
-            active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
-            if echo "$active" | grep -q "true"; then
-                active="true"
-            else
-                active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
-                if echo "$active2" | grep -q "true"; then
-                    active="true"
-                else
-                    active="false"
-                fi
-            fi
-        fi
-        if [ "$active" = "true" ]; then
-            log "skip restore: ScreenSaver still active, re-saving"
-            local tmp2
-            tmp2="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
-            echo "$saved" > "$tmp2" 2> /dev/null || true
-            chmod 600 "$tmp2" 2> /dev/null || true
-            mv -f "$tmp2" "$STATE_FILE" 2> /dev/null || true
-            rm -f "$tmp2" 2> /dev/null || true
-            return 0
-        fi
+    if ! exec 201> "$STATE_LOCK"; then
+        log_warn "cannot open state lock $STATE_LOCK"
+        return 0
+    fi
+    if ! flock -n 201; then
+        exec 201>&-
+        return 0
+    fi
+
+    # Bump the generation only after owning the lock: two concurrent restores
+    # can no longer stamp the file with the same generation and let a stale
+    # scheduled retry through.
+    bump_restore_gen
+    local gen="$restore_gen"
+
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    if ! [[ "$saved" =~ ^[0-9]+$ ]] || [ "$saved" -eq 0 ]; then
         rm -f "$STATE_FILE" 2> /dev/null || true
-        log "restoring brightness $saved"
-        set_brightness "$saved"
-    ) 200> "$STATE_LOCK" 2> /dev/null || true
+        flock -u 201
+        exec 201>&-
+        return 0
+    fi
+
+    # Defer while the screen is still active (re-blank race, TROUBLESHOOTING
+    # §11), but converge via +0.5s/+1.5s/+3s retries.  Old retries are
+    # invalidated by the generation counter; removing the state makes them
+    # no-ops.
+    if [ "$(screensaver_is_active)" = "true" ]; then
+        log "restore deferred: ScreenSaver still active (gen=$gen)"
+        flock -u 201
+        exec 201>&-
+        schedule_restore_retries "$gen" 0.5 1.5 3
+        return 0
+    fi
+
+    rm -f "$STATE_FILE" 2> /dev/null || true
+    log "restoring brightness $saved"
+    # Release the state lock BEFORE the D-Bus write. set_brightness can block
+    # for several seconds (gdbus timeouts); a blank arriving in that window
+    # must still be able to save_state() the new value with flock -n. The
+    # restore write itself is already protected by consuming STATE_FILE and by
+    # the generation counter, so no write needs the lock held here.
+    flock -u 201
+    exec 201>&-
+    set_brightness "$saved"
+}
+
+# --- Blank / unblank guards ----------------------------------------------
+
+guard_blank() {
+    local delay
+    for delay in 0.25 1.0; do
+        (
+            sleep "$delay"
+            if [ "$(screensaver_is_active)" != "true" ]; then
+                exit 0
+            fi
+            local cur
+            cur="$(get_brightness)"
+            if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ne 0 ]; then
+                log_warn "blank guard +${delay}s: brightness=$cur while ScreenSaver active; forcing 0"
+                set_brightness 0
+            fi
+        ) &
+    done
+}
+
+guard_unblank() {
+    local saved="$1"
+    local max
+    max="$(get_max)"
+    if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
+        max=100
+    fi
+    local want_pct
+    want_pct=$((saved * 100 / max))
+    local delay
+    for delay in 0.3 0.9; do
+        (
+            sleep "$delay"
+            if [ "$(screensaver_is_active)" = "true" ]; then
+                exit 0
+            fi
+            local ok=0
+            local raw
+            raw="$(get_brightness)"
+            if [ "$raw" = "$saved" ]; then
+                ok=1
+            fi
+            if [ "$HAVE_GSD_KBD" = "1" ]; then
+                local gpct
+                gpct="$(gsd_get_pct || echo "")"
+                if [ "$gpct" != "$want_pct" ]; then
+                    ok=0
+                fi
+            fi
+            if [ "$ok" -ne 1 ]; then
+                log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
+                set_brightness "$saved"
+            fi
+        ) &
+    done
+}
+
+handle_blank() {
+    save_state
+    set_brightness 0
+    guard_blank
+}
+
+handle_unblank() {
+    local saved=""
+    if [ -f "$STATE_FILE" ]; then
+        saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    fi
+    restore_state
+    if [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
+        guard_unblank "$saved"
+    fi
 }
 
 is_screensaver_available() {
     if command -v gdbus > /dev/null 2>&1; then
-        gdbus introspect --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
-        gdbus introspect --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+        timeout 3 gdbus introspect --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+        timeout 3 gdbus introspect --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
     fi
     if command -v busctl > /dev/null 2>&1; then
         busctl --user status org.gnome.ScreenSaver 2> /dev/null | grep -q "org.gnome.ScreenSaver" && return 0
@@ -243,6 +666,7 @@ monitor_screensaver_dbus_monitor() {
     # Monitor both GNOME and freedesktop ScreenSaver (covers GNOME Wayland + KDE/Sway fallback)
     # shellcheck disable=SC2094
     dbus-monitor --session "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'" "type='signal',interface='org.freedesktop.ScreenSaver',member='ActiveChanged'" 2> /dev/null | while IFS= read -r line; do
+        log_debug "dbus-monitor: $line"
         # Filter to ScreenSaver interfaces only - dbus-monitor already filtered, but keep guard for gdbus fallback
         if echo "$line" | grep -q "ActiveChanged"; then
             # Need to read next lines for boolean value; we handle per-line boolean
@@ -251,13 +675,12 @@ monitor_screensaver_dbus_monitor() {
         case "$line" in
             *boolean\ true*)
                 log "ScreenSaver active -> saving and turning off kbd backlight"
-                save_state
-                set_brightness 0
+                handle_blank
                 ;;
             *boolean\ false*)
                 log "ScreenSaver inactive -> restoring kbd backlight"
                 sleep 0.5
-                restore_state
+                handle_unblank
                 ;;
         esac
     done
@@ -266,16 +689,16 @@ monitor_screensaver_dbus_monitor() {
 monitor_screensaver_gdbus() {
     # Fallback via gdbus monitor: watch both destinations without --dest filter
     gdbus monitor --session 2> /dev/null | while IFS= read -r line; do
+        log_debug "gdbus monitor: $line"
         if echo "$line" | grep -q "ActiveChanged"; then
             if echo "$line" | grep -q "org.gnome.ScreenSaver\|org.freedesktop.ScreenSaver"; then
                 if echo "$line" | grep -q "true"; then
                     log "ScreenSaver active (gdbus) -> off"
-                    save_state
-                    set_brightness 0
+                    handle_blank
                 elif echo "$line" | grep -q "false"; then
                     log "ScreenSaver inactive (gdbus) -> restore"
                     sleep 0.5
-                    restore_state
+                    handle_unblank
                 fi
             fi
         fi
@@ -284,6 +707,7 @@ monitor_screensaver_gdbus() {
 
 monitor_login1() {
     dbus-monitor --system "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" 2> /dev/null | while IFS= read -r line; do
+        log_debug "login1: $line"
         case "$line" in
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
@@ -305,7 +729,7 @@ idle_poll_loop() {
     if ! command -v gdbus > /dev/null 2>&1; then
         return 0
     fi
-    if ! gdbus introspect --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core 2> /dev/null | grep -q "GetIdletime"; then
+    if ! timeout 3 gdbus introspect --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core 2> /dev/null | grep -q "GetIdletime"; then
         log "Mutter IdleMonitor not available, idle polling disabled"
         return 0
     fi
@@ -321,22 +745,21 @@ idle_poll_loop() {
     local was_idle=0
     while true; do
         local idletime
-        idletime="$(gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo 0)"
+        idletime="$(timeout 3 gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo 0)"
         if ! [[ "$idletime" =~ ^[0-9]+$ ]]; then
             idletime=0
         fi
         if [ "$idletime" -ge "$threshold" ]; then
             if [ "$was_idle" -eq 0 ]; then
                 log "idle threshold reached (${idletime}ms) -> off"
-                save_state
-                set_brightness 0
+                handle_blank
                 was_idle=1
             fi
         else
             if [ "$was_idle" -eq 1 ]; then
                 log "user active (idletime ${idletime}ms) -> restore"
                 sleep 0.5
-                restore_state
+                handle_unblank
                 was_idle=0
             fi
         fi
@@ -354,6 +777,10 @@ print_help() {
     echo ""
     echo "Env:"
     echo "  C640_KBD_ENABLE_IDLEMONITOR=1  Enable Mutter IdleMonitor polling"
+    echo "  C640_KBD_FORCE_LEGACY=1        Force sysfs/ectool path (no D-Bus)"
+    echo "  C640_KBD_DEBUG=1               Verbose monitor/debug logging"
+    echo "  C640_KBD_SYSFS_BRIGHTNESS=PATH Override sysfs brightness path"
+    echo "  C640_KBD_SYSFS_MAX=PATH        Override sysfs max_brightness path"
 }
 
 check_status() {
@@ -373,6 +800,11 @@ check_status() {
     echo "Daemon running: $(pgrep -f "[c]640-kbd-backlight-sync" > /dev/null && echo yes || echo no)"
     echo "ScreenSaver available: $(is_screensaver_available && echo yes || echo no)"
     echo "IdleMonitor enabled: $C640_KBD_ENABLE_IDLEMONITOR"
+    ensure_backends
+    echo "gsd-power keyboard backend: $([ "$HAVE_GSD_KBD" = "1" ] && echo yes || echo no)"
+    echo "UPower keyboard backend: $([ "$HAVE_UPOWER_KBD" = "1" ] && echo yes || echo no)"
+    echo "UPower raw: $(upower_get_raw 2> /dev/null || echo "?")"
+    echo "gsd-power pct: $(gsd_get_pct 2> /dev/null || echo "?")"
     if command -v gdbus > /dev/null 2>&1; then
         echo "gdbus: available"
     else
@@ -385,48 +817,6 @@ check_status() {
     fi
 }
 
-# Handle CLI
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    print_help
-    exit 0
-fi
-if [ "${1:-}" = "--test-blank" ]; then
-    save_state
-    set_brightness 0
-    echo "simulated blank: saved and set 0"
-    exit 0
-fi
-if [ "${1:-}" = "--test-unblank" ]; then
-    restore_state
-    echo "simulated unblank: restored"
-    exit 0
-fi
-if [ "${1:-}" = "--check" ]; then
-    check_status
-    exit 0
-fi
-
-# Main daemon
-if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
-    log "no backlight interface found, exiting"
-    exit 0
-fi
-
-# Single instance per user via flock (secure per-user lock)
-umask 077
-mkdir -p "$STATE_DIR" 2> /dev/null || true
-chmod 700 "$STATE_DIR" 2> /dev/null || true
-# Open lock file securely (do not fallback to world-writable /tmp)
-if ! exec 9> "$LOCK_FILE" 2> /dev/null; then
-    log "cannot open lock file $LOCK_FILE, exiting"
-    exit 1
-fi
-chmod 600 "$LOCK_FILE" 2> /dev/null || true
-if ! flock -n 9 2> /dev/null; then
-    log "another instance is running, exiting"
-    exit 0
-fi
-
 cleanup() {
     log "cleanup: restoring if needed"
     restore_state || true
@@ -434,84 +824,137 @@ cleanup() {
     jobs -p | xargs -r kill 2> /dev/null || true
     exit 0
 }
-trap cleanup TERM INT EXIT HUP
 
-log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR"
+main() {
+    # Handle CLI (semantics unchanged; --test-* do not touch ScreenSaver).
+    if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+        print_help
+        exit 0
+    fi
+    if [ "${1:-}" = "--test-blank" ]; then
+        save_state
+        set_brightness 0
+        echo "simulated blank: saved and set 0"
+        exit 0
+    fi
+    if [ "${1:-}" = "--test-unblank" ]; then
+        restore_state
+        echo "simulated unblank: restored"
+        exit 0
+    fi
+    if [ "${1:-}" = "--check" ]; then
+        check_status
+        exit 0
+    fi
 
-# Start optional idle polling in background
-if [ "$C640_KBD_ENABLE_IDLEMONITOR" = "1" ]; then
-    idle_poll_loop &
-fi
+    # Probe gsd-power / UPower once at daemon start.
+    ensure_backends
 
-# Start login1 monitor in background if dbus-monitor available (with retry)
-if command -v dbus-monitor > /dev/null 2>&1; then
-    (while true; do
-        monitor_login1 || log "login1 monitor exited $?, retry in 2s"
-        sleep 2
-    done) &
-fi
+    if [ ! -f "$SYSFS_BRIGHTNESS" ] && [ "$HAVE_UPOWER_KBD" != "1" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+        log "no backlight interface found, exiting"
+        exit 0
+    fi
 
-# Main screensaver monitor (foreground) with retry to avoid Restart storm
-# dbus-monitor may exit if session bus disappears (e.g. gnome-shell restart)
-if command -v dbus-monitor > /dev/null 2>&1; then
-    while true; do
-        monitor_screensaver_dbus_monitor || log "dbus-monitor exited $?, retry in 2s"
-        sleep 2
-    done &
-    wait || true
-else
-    if command -v gdbus > /dev/null 2>&1; then
-        log "dbus-monitor not found, falling back to gdbus"
+    # Single instance per user via flock (secure per-user lock)
+    umask 077
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
+    # Open lock file securely.  Never redirect stderr here: daemon warnings
+    # must reach the journal (see the unit's StandardError=journal).
+    if ! exec 9> "$LOCK_FILE"; then
+        log "cannot open lock file $LOCK_FILE, exiting"
+        exit 1
+    fi
+    chmod 600 "$LOCK_FILE" 2> /dev/null || true
+    if ! flock -n 9; then
+        log "another instance is running, exiting"
+        exit 0
+    fi
+
+    trap cleanup TERM INT EXIT HUP
+
+    log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR Legacy=$C640_KBD_FORCE_LEGACY"
+
+    # Discard any last-user value persisted by a previous daemon run.
+    seed_last_user_from_current
+
+    # Always-on sampler for the last user-visible brightness (0 = explicit off).
+    brightness_sampler_loop &
+
+    # Start optional idle polling in background
+    if [ "$C640_KBD_ENABLE_IDLEMONITOR" = "1" ]; then
+        idle_poll_loop &
+    fi
+
+    # Start login1 monitor in background if dbus-monitor available (with retry)
+    if command -v dbus-monitor > /dev/null 2>&1; then
+        (while true; do
+            monitor_login1 || log "login1 monitor exited $?, retry in 2s"
+            sleep 2
+        done) &
+    fi
+
+    # Main screensaver monitor (foreground) with retry to avoid Restart storm
+    # dbus-monitor may exit if session bus disappears (e.g. gnome-shell restart)
+    if command -v dbus-monitor > /dev/null 2>&1; then
         while true; do
-            monitor_screensaver_gdbus || log "gdbus monitor exited $?, retry in 2s"
+            monitor_screensaver_dbus_monitor || log "dbus-monitor exited $?, retry in 2s"
             sleep 2
         done &
         wait || true
     else
-        log "no dbus monitor tool found, entering poll loop"
-        prev=""
-        while true; do
-            active=""
-            if command -v gdbus > /dev/null 2>&1; then
-                active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                if echo "$active" | grep -q "true"; then
-                    active="true"
-                else
-                    # try freedesktop fallback
-                    active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                    if echo "$active2" | grep -q "true"; then
+        if command -v gdbus > /dev/null 2>&1; then
+            log "dbus-monitor not found, falling back to gdbus"
+            while true; do
+                monitor_screensaver_gdbus || log "gdbus monitor exited $?, retry in 2s"
+                sleep 2
+            done &
+            wait || true
+        else
+            log "no dbus monitor tool found, entering poll loop"
+            prev=""
+            while true; do
+                active=""
+                if command -v gdbus > /dev/null 2>&1; then
+                    active="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                    if ! grep -q "true" <<< "$active"; then
+                        active="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                    fi
+                    if grep -q "true" <<< "$active"; then
                         active="true"
                     else
                         active="false"
                     fi
-                fi
-            elif command -v busctl > /dev/null 2>&1; then
-                active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
-                if echo "$active" | grep -q "true"; then
-                    active="true"
-                else
-                    active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
-                    if echo "$active2" | grep -q "true"; then
+                elif command -v busctl > /dev/null 2>&1; then
+                    active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
+                    if ! grep -q "true" <<< "$active"; then
+                        active="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+                    fi
+                    if grep -q "true" <<< "$active"; then
                         active="true"
                     else
                         active="false"
                     fi
-                fi
-            else
-                sleep 5
-                continue
-            fi
-            if [ "$active" != "$prev" ]; then
-                if [ "$active" = "true" ]; then
-                    save_state
-                    set_brightness 0
                 else
-                    sleep 0.5
-                    restore_state
+                    sleep 5
+                    continue
                 fi
-                prev="$active"
-            fi
-            sleep 2
-        done
+                if [ "$active" != "$prev" ]; then
+                    if [ "$active" = "true" ]; then
+                        handle_blank
+                    else
+                        sleep 0.5
+                        handle_unblank
+                    fi
+                    prev="$active"
+                fi
+                sleep 2
+            done
+        fi
     fi
+}
+
+# Safe to source for stub/unit testing: only run when executed directly.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

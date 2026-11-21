@@ -8,7 +8,31 @@ if [ -n "${_LIB_LOGGER_SH_LOADED:-}" ]; then
 fi
 _LIB_LOGGER_SH_LOADED=1
 
-LOG_FILE="${LOG_FILE:-/tmp/cros-linux-setup.log}"
+# Log file selection:
+#  - root runs write to /var/log (a /tmp file created by the user is not
+#    writable by root after sudo re-runs, and vice versa)
+#  - user runs fall back to a per-uid file if the shared /tmp log belongs to
+#    another user, avoiding "Permission denied" noise on every log line
+if [ -z "${LOG_FILE:-}" ]; then
+    if [ "$(id -u 2> /dev/null || echo 0)" -eq 0 ]; then
+        LOG_FILE="/var/log/cros-linux-setup.log"
+    else
+        LOG_FILE="${TMPDIR:-/tmp}/cros-linux-setup.log"
+        if ! { : >> "$LOG_FILE"; } 2> /dev/null; then
+            LOG_FILE="${TMPDIR:-/tmp}/cros-linux-setup.$(id -u 2> /dev/null || echo unknown).log"
+        fi
+    fi
+fi
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2> /dev/null || true
+    if ! { : >> "$LOG_FILE"; } 2> /dev/null; then
+        LOG_FILE=""
+    fi
+fi
+
+_log_file_append() {
+    printf '%s\n' "$1" >> "$LOG_FILE"
+}
 
 # Color codes
 CLR_RESET="\033[0m"
@@ -35,7 +59,7 @@ _log_write() {
     # File output (strip ANSI colors)
     if [ -n "$LOG_FILE" ]; then
         mkdir -p "$(dirname "$LOG_FILE")" 2> /dev/null || true
-        echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2> /dev/null || true
+        _log_file_append "[$timestamp] [$level] $msg" 2> /dev/null || true
     fi
 }
 
@@ -65,7 +89,8 @@ log_step() {
     shift 2
     echo -e "\n${CLR_CYAN}${CLR_BOLD}===> [${step_num}/${total_steps}] ${*}${CLR_RESET}" >&2
     if [ -n "$LOG_FILE" ]; then
-        echo -e "\n=== [${step_num}/${total_steps}] ${*} ===" >> "$LOG_FILE" 2> /dev/null || true
+        _log_file_append "" 2> /dev/null || true
+        _log_file_append "=== [${step_num}/${total_steps}] ${*} ===" 2> /dev/null || true
     fi
 }
 

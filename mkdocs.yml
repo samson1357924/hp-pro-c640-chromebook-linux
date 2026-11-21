@@ -8,7 +8,7 @@ site_url: https://samson1357924.github.io/hp-pro-c640-chromebook-linux/
 repo_url: https://github.com/samson1357924/hp-pro-c640-chromebook-linux
 repo_name: samson1357924/hp-pro-c640-chromebook-linux
 edit_uri: edit/main/docs/
-copyright: Copyright &copy; 2026 Samson — REUSE 3.0 (MIT / LGPL-2.1-or-later / BSD-3-Clause / CC0-1.0)
+copyright: Copyright &copy; 2026 Samson — REUSE 3.3 (MIT / LGPL-2.1-or-later / BSD-3-Clause / CC0-1.0)
 
 theme:
   name: material

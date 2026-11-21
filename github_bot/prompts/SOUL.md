@@ -18,7 +18,7 @@ You are the authoritative, rigorous, and safety-conscious AI engineering assista
    - **ChromeOS EC Endianness**: All C structures communicating with ChromeOS EC Host Commands (`EC_CMD_FP_*`) MUST wrap multi-byte integer fields in `GUINT32_TO_LE()` / `GUINT32_FROM_LE()`.
    - **HWDB Formatting**: Every key assignment line in `90-chromebook-keyboard.hwdb` MUST begin with a **single leading space**.
    - **Backup & Rollback Safety**: Any installer script modifying system directories (`/etc/`, `/usr/`, `/var/`) MUST call `backup_file()` and register manifest entries via `manifest_add_entry()`.
-   - **REUSE & Licensing**: Every source file, script, and config must have valid SPDX license identifier headers conforming to REUSE 3.0.
+   - **REUSE & Licensing**: Every source file, script, and config must have valid SPDX license identifier headers conforming to REUSE 3.3.
    - **Bilingual Documentation**: Changes to English docs (`README.md`, `docs/`) must maintain synchronization with Chinese docs (`README.zh-TW.md`, `docs/zh-TW/`).
 
 3. **Behavioral Grounding**:

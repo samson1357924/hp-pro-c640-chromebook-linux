@@ -153,12 +153,40 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
 ### 9. Top-row function keys (Back/Reload/Brightness/Volume) don't respond
 
-* **Root cause**: the system is missing the `90-chromebook-keyboard.hwdb` scancode mapping.
+* **Root cause**: the system is missing the `90-chromebook-keyboard.hwdb`
+  scancode mapping, **or** it has a mapping for scancodes this machine never
+  emits (for example a hwdb file copied from another Chromebook). Installing
+  the hwdb again will not fix the second case.
 * **Solution**:
 
   ```bash
+  # Verify the applied hwdb map first (read-only EVIOCGKEYCODE, no grab):
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # If it fails, install/refresh the mapping:
   ./setup.sh --keyboard
   ```
+
+  > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`, and
+  > applies only to the explicit Dratini / HP Pro c640 DMI entries in
+  > `keyboard/90-chromebook-keyboard.hwdb` — it does **not** match other Hatch
+  > boards. Other Chromebooks may emit the ChromeOS action scancodes (`0xea`,
+  > `0xe9`, ...) instead and need their own hwdb entry. `--listen` only shows
+  > the post-hwdb `KEY_*` events (EVIOCGKEY), not raw scancodes. To find yours,
+  > stop keyd (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN` with
+  > `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then infer
+  > the scancode against the standard AT table and create your own hwdb entry
+  > (see `CONTRIBUTING.md` → "New Chromebook model?" in §2). On an unknown model
+  > or when `EVIOCGKEYCODE` is unsupported, use
+  > `check-top-row-hwdb.py --scan-only 60`: it skips the table check entirely, so
+  > a fixture mismatch or ioctl failure cannot block raw capture. When done, run
+  > `sudo systemctl start keyd` to restore the service; otherwise Search
+  > tap/hold and brightness remapping stay disabled.
+  >
+  > `RESULT=` is only the EVIOCGKEYCODE mapping verdict. With `--scan SECONDS`,
+  > no observed `MSC_SCAN` (keyd still grabbing, or no key pressed) still prints
+  > `RESULT=PASS (mapping check only; raw capture FAILED)` but exits non-zero.
+  > Judge overall success by the exit code / `RAW_CAPTURE=`, not `RESULT=PASS`
+  > alone.
 
 ### 10. Want the Search key to act as "CapsLock on tap, Super on hold"
 
@@ -166,16 +194,35 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   sudo apt install -y keyd   # (or dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # required: keyd 2.5.x reads config only at start-up
   ```
+
+  > On Ubuntu 26.04 the package installs `/usr/bin/keyd.rvaiya` (2.5.0); `keyd check`
+  > only exists in >= 2.6. The recommended path is
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`, which handles both.
+  > If the top row does nothing, first check the **scancodes**, not just the hwdb
+  > text: `sudo python3 keyboard/tests/check-top-row-hwdb.py` must print
+  > `RESULT=PASS`. This hardware emits AT scancodes `0x3b`-`0x44`, not the
+  > ChromeOS action scancodes some other Chromebooks use.
+  > If Search tap/hold misbehaves, use `overloadt2(meta, capslock, 200)`, not
+  > `overload`: plain overload injects a `LEFTCTRL` guard on release and Mutter
+  > then never opens Activities.
+  > Verify with `sudo python3 keyboard/tests/capture-keyd-output.py` (read-only;
+  > `keyd monitor` cannot open a device keyd already grabbed). Also check that
+  > keyd grabbed the internal AT keyboard:
+  > `journalctl -u keyd | grep 'DEVICE: match'` should show `0001:0001`.
 
 ### 11. Keyboard backlight doesn't turn off / restore with screen blank
 
 * **Symptoms**: `c640-kbd-backlight-sync --check` shows `brightness: 5/100` but `--test-blank`
   stays `0` or doesn't restore; `journalctl --user -u c640-kbd-backlight-sync` is empty
-  or `Daemon running: no`.
-* **Triage**:
+  or `Daemon running: no`. A related symptom is **flicker / oscillation**: the LED
+  repeatedly jumps between the saved value and full brightness around blank/unblank,
+  usually meaning gsd-power's cache and UPower disagree or the ScreenSaver re-check
+  lost a race.
+* **Triage** (all gdbus queries below are read-only):
 
   ```bash
   c640-kbd-backlight-sync --check          # brightness, STATE_FILE, Daemon running, ScreenSaver available
@@ -186,9 +233,23 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # check TAG+="uaccess" rule
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # read-only D-Bus probes (no writes, safe while the daemon runs):
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
+  gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
+  gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower/KbdBacklight --method org.freedesktop.UPower.KbdBacklight.GetBrightness
+  # expect gsd percent ≈ raw/max*100; if they disagree you may see flicker
   # non-GNOME (Sway/KDE): org.gnome.ScreenSaver not available -> daemon falls back to org.freedesktop.ScreenSaver + system-sleep hook only
   # minimal image missing gdbus/dbus-monitor: sudo apt install dbus-x11 libglib2.0-bin
   # ectool fallback: ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+  **Log verification:** the unit sets `StandardError=journal`, so these lines must
+  be visible; absence means an old unit is installed or stderr is being redirected:
+
+  ```bash
+  journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
+    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
   ```
 
 * **Common fixes**:
@@ -198,6 +259,22 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     for lid close (`suspend`), but not for idle blank - enable IdleMonitor:
     see `keyboard/README.md` `C640_KBD_ENABLE_IDLEMONITOR=1`.
   * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
+  * On Ubuntu 26.04 the LED attribute is only writable if the udev rule applied its
+    `RUN+=chgrp plugdev` + `RUN+=chmod 0660` (verified: `-rw-rw---- root plugdev`).
+    `MODE=`/`GROUP=`/`uaccess` alone cannot chmod sysfs, so if
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` shows `root root 0644`,
+    run `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`;
+    the daemon then stops falling back to `sudo -n tee`.
+  * Root cause check: the user unit cannot prompt for sudo. `journalctl --user -u
+    c640-kbd-backlight-sync` showing `sudo: a password is required` confirms the
+    permission path above is the problem, not the D-Bus events.
+  * Flicker/oscillation: check the two read-only queries above. If gsd-power's
+    `Brightness` percent and UPower's raw value disagree, the daemon logs
+    `[WARN] gsd-power set ... forcing UPower + property refresh`; keep the
+    deployed daemon/unit byte-identical to the repo (the smoke test asserts this)
+    and avoid other tools writing the LED directly. If ScreenSaver is still
+    `true` during restore, deferral is expected — wait for the `+0.5s/+1.5s/+3s`
+    retries or check the sleep hook's fail-open bus probe.
 
 ---
 

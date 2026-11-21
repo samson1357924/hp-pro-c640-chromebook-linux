@@ -130,12 +130,34 @@
 
 ### 9. 頂排功能鍵（上一頁/重新整理/亮度/音量）按了無反應
 
-* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射。
+* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射，**或**映射的是這台機器根本不會送的掃描碼（例如直接複製別台 Chromebook 的 hwdb）。第二種情況重裝 hwdb 不會修好。
 * **解決方法**：
 
   ```bash
+  # 先驗證核心套用的 hwdb 鍵碼映射（唯讀 EVIOCGKEYCODE，不 grab）：
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # 若失敗，再安裝/重裝映射：
   ./setup.sh --keyboard
   ```
+
+  > 本檔映射的是 Dratini 實測的 AT 掃描碼 `0x3b`-`0x44`，且只套用於
+  > `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
+  > DMI 條目——**不匹配**其他 Hatch 機板。其他 Chromebook 可能送 ChromeOS
+  > action 掃描碼（`0xea`、`0xe9`…），需要建立自己的 hwdb 條目。`--listen`
+  > 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件（EVIOCGKEY），不是原始掃描碼。
+  > 請先停掉 keyd（`sudo systemctl stop keyd`），用
+  > `check-top-row-hwdb.py --scan 60` 或不加 `--grab` 的 `evtest` 讀
+  > `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論掃描碼並建立自己的 hwdb 條目
+  > （見 `CONTRIBUTING.md` → §2 的「New Chromebook model?」）。未知機型或
+  > `EVIOCGKEYCODE` 不支援時，改用 `check-top-row-hwdb.py --scan-only 60`：
+  > 它完全跳過表格檢查，fixture 不符或 ioctl 失敗都不會擋住原始擷取。
+  > 完成後請執行
+  > `sudo systemctl start keyd` 恢復服務，否則 Search 輕點/長按與亮度重映射會持續失效。
+  >
+  > `RESULT=` 只是 EVIOCGKEYCODE 映射的判定。使用 `--scan SECONDS` 時，
+  > 若沒觀測到 `MSC_SCAN`（keyd 仍抓住裝置，或期間沒按鍵），仍會印出
+  > `RESULT=PASS (mapping check only; raw capture FAILED)`，但結束碼非 0。
+  > 判斷整體成功請看結束碼／`RAW_CAPTURE=`，不要只看 `RESULT=PASS`。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
@@ -143,27 +165,58 @@
 
   ```bash
   sudo apt install -y keyd   # (或 dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # 必要：keyd 2.5.x 只在啟動時讀取設定
   ```
+
+  > Ubuntu 26.04 套件安裝的是 `/usr/bin/keyd.rvaiya`（2.5.0）；
+  > `keyd check` 僅存在於 ≥ 2.6。建議直接執行
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`，上述差異它都已處理。
+  > 若頂排仍無反應，先驗證**掃描碼**而不是只看 hwdb 文字：
+  > `sudo python3 keyboard/tests/check-top-row-hwdb.py` 必須印出
+  > `RESULT=PASS`。這台機器送的是 AT 掃描碼 `0x3b`-`0x44`，不是部分
+  > Chromebook 使用的 ChromeOS action 掃描碼。
+  > 若 Search 輕點/長按異常，請用 `overloadt2(meta, capslock, 200)`，
+  > 不要用 `overload`：後者放開時會插入 `LEFTCTRL` 防護，Mutter 就不會開總覽。
+  > 驗證請用 `sudo python3 keyboard/tests/capture-keyd-output.py`（唯讀；
+  > `keyd monitor` 無法開啟已被 keyd grab 的裝置），並確認 keyd 有 grab 內建
+  > AT 鍵盤：`journalctl -u keyd | grep 'DEVICE: match'` 應出現 `0001:0001`。
 
 ### 11. 鍵盤背光不會隨螢幕熄滅/點亮而開關
 
 * **症狀**：`c640-kbd-backlight-sync --check` 顯示 `brightness: 5/100` 但 `--test-blank`
   不會到 `0` 或不會恢復；`journalctl --user -u c640-kbd-backlight-sync` 空白或 `Daemon running: no`。
-* **排解**：
+  另一相關症狀是**閃爍/震盪**：LED 在熄滅/點亮前後於已存值與最大亮度間反覆跳動，
+  通常是 gsd-power 快取與 UPower 不一致，或 ScreenSaver 複查競態。
+* **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
   c640-kbd-backlight-sync --check          # brightness、STATE_FILE、Daemon running、ScreenSaver available
   systemctl --global is-enabled c640-kbd-backlight-sync.service
   systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
-  loginctl show-user "$USER" -p State
-  udevadm test /sys/class/leds/chromeos::kbd_backlight
-  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness
+  loginctl show-user "$USER" -p State       # 使用中?
+  udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
+  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
+  cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
+  gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
+  gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower/KbdBacklight --method org.freedesktop.UPower.KbdBacklight.GetBrightness
+  # gsd 百分比應約等於 raw/max*100；不一致就可能閃爍
   # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
   # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin
   # ectool 回退：ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  ```
+
+  **日誌驗證**：unit 設了 `StandardError=journal`，下列訊息應該可見；若沒有，
+  代表安裝的是舊 unit 或 stderr 被導向別處：
+
+  ```bash
+  journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
+    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
   ```
 
 * **常見修復**：
@@ -172,6 +225,21 @@
   * KDE/Sway 上 `ScreenSaver available: no` 時，仍由 `system-sleep` 處理盒蓋 `suspend`，
     閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
   * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
+  * Ubuntu 26.04 上，LED 屬性只有在 udev 規則的 `RUN+=chgrp plugdev` +
+    `RUN+=chmod 0660` 生效時才可寫（實測為 `-rw-rw---- root plugdev`）。
+    `MODE=`/`GROUP=`/`uaccess` 無法 chmod sysfs；若
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` 顯示 `root root 0644`，
+    請執行 `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`，
+    daemon 才不會退回 `sudo -n tee`。
+  * 根因判斷：使用者 service 無法互動輸入 sudo 密碼。若
+    `journalctl --user -u c640-kbd-backlight-sync` 出現 `sudo: a password is required`，
+    表示問題在上述權限路徑，而非 D-Bus 事件。
+  * 閃爍/震盪：檢查上面兩條唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
+    UPower raw 值不一致，daemon 會記錄
+    `[WARN] gsd-power set ... forcing UPower + property refresh`；請確認部署的
+    daemon/unit 與 repo 完全一致（smoke 測試會檢查），並避免其他工具直接寫 LED。
+    若還原時 ScreenSaver 仍為 `true`，延後是預期行為——等待
+    `+0.5s/+1.5s/+3s` 重試，或檢查 sleep hook 的 fail-open bus 探測。
 
 ---
 
