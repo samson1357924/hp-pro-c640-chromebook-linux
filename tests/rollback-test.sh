@@ -1379,7 +1379,8 @@ EOF
     # the pre-existing cros.conf record must be unchanged; only the missing
     # component is added.
     local normalized
-    normalized="$(python3 - "$up/manifest/install-manifest.json" << 'EOF'
+    normalized="$(
+        python3 - "$up/manifest/install-manifest.json" << 'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 link = [r for r in d["records"] if r.get("target", "").endswith("/keyd/default.conf")]
@@ -1387,7 +1388,7 @@ print(len(d["records"]), d.get("version"),
       link[0].get("component") if link else "no-record",
       link[0].get("was_existing") if link else "no-record")
 EOF
-)"
+    )"
     assert_eq "2 1.0 keyboard True" "$normalized" "legacy upgrade: component backfilled, first-wins fields preserved"
 
     run_keyd_uninstall "$up"
@@ -1478,13 +1479,14 @@ EOF
         "legacy link-removed: DRY_RUN uninstall logs the normalization"
 
     local before
-    before="$(python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+    before="$(
+        python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 link = [r for r in d["records"] if r.get("target") == sys.argv[2]]
 print(len(link), link[0].get("component") if link else "no-record")
 EOF
-)"
+    )"
     assert_eq "1 None" "$before" "legacy link-removed: install leaves the un-normalized KEYD_LINK record"
 
     # The real uninstall must normalize first, then prepare a placeholder and
@@ -1502,13 +1504,14 @@ EOF
         ok
     fi
     local after
-    after="$(python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
+    after="$(
+        python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" << 'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 link = [r for r in d["records"] if r.get("target") == sys.argv[2]]
 print(len(link))
 EOF
-)"
+    )"
     assert_eq "0" "$after" "legacy link-removed: KEYD_LINK record must be cleaned up after rollback"
     assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
         "legacy link-removed: original cros.conf restored on uninstall"
@@ -1542,14 +1545,15 @@ EOF
         _normalize_keyd_link_manifest_component
     '
     local result
-    result="$(python3 - "$sandbox/manifest/install-manifest.json" << 'EOF'
+    result="$(
+        python3 - "$sandbox/manifest/install-manifest.json" << 'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 rs = d["records"]
 print(d["version"], len(rs), rs[0].get("component"), rs[0].get("was_existing"),
       rs[0].get("installed_at"), rs[1].get("component"), rs[2].get("component"))
 EOF
-)"
+    )"
     assert_eq "1.0 3 keyboard True old other None" "$result" \
         "normalization: only missing component on KEYD_LINK is backfilled"
 

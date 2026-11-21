@@ -320,8 +320,8 @@ kb_missing_in_text() {
     local fixture="$2"
     local sc key label
     while IFS=$'\t' read -r sc key label; do
-        grep -qE "KEYBOARD_KEY_${sc}=${key}([[:space:]]|$)" <<< "$text" || \
-            printf '%s|%s|%s\n' "$sc" "$key" "$label"
+        grep -qE "KEYBOARD_KEY_${sc}=${key}([[:space:]]|$)" <<< "$text" \
+            || printf '%s|%s|%s\n' "$sc" "$key" "$label"
     done < <(kb_fixture_rows "$fixture")
 }
 
@@ -390,7 +390,10 @@ kb_atkbd_event_node() {
         num="${dev##*/input}"
         case "$num" in
             '' | *[!0-9]*) ;;
-            *) printf 'event%s\n' "$num"; return 0 ;;
+            *)
+                printf 'event%s\n' "$num"
+                return 0
+                ;;
         esac
     done
     return 1
@@ -495,8 +498,8 @@ verify_keyboard_hwdb() {
     local dmi_modalias
     dmi_modalias="$(kb_compose_dmi_modalias "$dmi_base")"
     log_info "  DMI-composed modalias : $dmi_modalias"
-    log_info  "  AT keyboard modalias  : $atkbd_modalias"
-    log_info  "  AT keyboard event node: ${event_node:-<unknown>}"
+    log_info "  AT keyboard modalias  : $atkbd_modalias"
+    log_info "  AT keyboard event node: ${event_node:-<unknown>}"
 
     # Prefer the device's own evdev:atkbd: modalias when present; otherwise use
     # the DMI-composed one produced by kb_find_atkbd_modalias (same value as
@@ -516,9 +519,18 @@ verify_keyboard_hwdb() {
     kb_check_kernel_applied "$fixture" "$event_node" || applied_rc=$?
     case "$applied_rc" in
         0) ;;
-        1) log_warn "  dynamic: kernel application not confirmed; refusing to claim full success"; return 5 ;;
-        2) log_warn "  dynamic: kernel application inconclusive; refusing to claim full success"; return 7 ;;
-        *) log_warn "  dynamic: kernel application check failed (rc=$applied_rc); refusing to claim full success"; return 5 ;;
+        1)
+            log_warn "  dynamic: kernel application not confirmed; refusing to claim full success"
+            return 5
+            ;;
+        2)
+            log_warn "  dynamic: kernel application inconclusive; refusing to claim full success"
+            return 7
+            ;;
+        *)
+            log_warn "  dynamic: kernel application check failed (rc=$applied_rc); refusing to claim full success"
+            return 5
+            ;;
     esac
 
     if [ "$static_ok" -ne 1 ]; then
@@ -572,7 +584,7 @@ run_self_test() {
     while IFS=$'\t' read -r sc key label; do
         printf 'E: KEYBOARD_KEY_%s=%s\n' "$sc" "$key" >> "$udev_info"
     done < <(kb_fixture_rows "$fixture")
-    cat > "$bindir/udevadm" <<EOF
+    cat > "$bindir/udevadm" << EOF
 #!/usr/bin/env bash
 [ "\$1" = info ] || exit 0
 cat "$udev_info"
@@ -587,12 +599,12 @@ EOF
         local name="$1" bvn="$2" svn="$3" pn="$4" with_kbd="$5" modalias="${6:-}"
         local dir="$root/$name"
         mkdir -p "$dir/dmi" "$dir/input/input2/event2"
-        printf '%s\n' "$bvn"        > "$dir/dmi/bios_vendor"
-        printf 'TEST\n'             > "$dir/dmi/bios_version"
-        printf '01/01/2020\n'       > "$dir/dmi/bios_date"
-        printf '%s\n' "$svn"        > "$dir/dmi/sys_vendor"
-        printf '%s\n' "$pn"         > "$dir/dmi/product_name"
-        printf '1.0\n'              > "$dir/dmi/product_version"
+        printf '%s\n' "$bvn" > "$dir/dmi/bios_vendor"
+        printf 'TEST\n' > "$dir/dmi/bios_version"
+        printf '01/01/2020\n' > "$dir/dmi/bios_date"
+        printf '%s\n' "$svn" > "$dir/dmi/sys_vendor"
+        printf '%s\n' "$pn" > "$dir/dmi/product_name"
+        printf '1.0\n' > "$dir/dmi/product_version"
         if [ "$with_kbd" = 1 ]; then
             printf 'AT Translated Set 2 keyboard\n' > "$dir/input/input2/name"
             if [ -n "$modalias" ]; then
@@ -617,8 +629,8 @@ EOF
         else
             local found=0
         fi
-        if { [ "$should" = present ] && [ "$found" -eq 1 ]; } || \
-           { [ "$should" = absent ] && [ "$found" -eq 0 ]; }; then
+        if { [ "$should" = present ] && [ "$found" -eq 1 ]; } \
+            || { [ "$should" = absent ] && [ "$found" -eq 0 ]; }; then
             printf '  PASS  %s\n' "$desc"
         else
             printf '  FAIL  %s (wanted %s: %s)\n' "$desc" "$should" "$needle"
@@ -634,37 +646,37 @@ EOF
     d="$(make_scenario dratini Google Google Dratini 1)"
     run_scenario "$d"
     expect present "$KB_SUCCESS_MARKER" "Dratini: device matched -> success"
-    expect absent  "cannot verify"       "Dratini: AT keyboard detected"
-    expect present "$evdir/event2"       "Dratini: udevadm bound to AT keyboard event node"
+    expect absent "cannot verify" "Dratini: AT keyboard detected"
+    expect present "$evdir/event2" "Dratini: udevadm bound to AT keyboard event node"
 
     d="$(make_scenario c640 HP 'HP' 'HP Pro c640 Chromebook' 1)"
     run_scenario "$d"
     expect present "$KB_SUCCESS_MARKER" "HP c640: device matched -> success"
-    expect absent  "device not matched" "HP c640: all 11 scancodes verified"
+    expect absent "device not matched" "HP c640: all 11 scancodes verified"
 
     d="$(make_scenario hatch Google Google Hatch 1)"
     run_scenario "$d"
     expect present "device not matched" "other Hatch product: not matched"
-    expect absent  "$KB_SUCCESS_MARKER" "other Hatch product: no false success"
+    expect absent "$KB_SUCCESS_MARKER" "other Hatch product: no false success"
 
     d="$(make_scenario noatk Google Google Dratini 0)"
     run_scenario "$d"
-    expect present "cannot verify"      "no AT keyboard: cannot verify"
-    expect absent  "$KB_SUCCESS_MARKER" "no AT keyboard: no false success"
+    expect present "cannot verify" "no AT keyboard: cannot verify"
+    expect absent "$KB_SUCCESS_MARKER" "no AT keyboard: no false success"
 
     # Signal (1) shortcut: an evdev:atkbd: modalias alone must not bypass the
     # hwdb lookup. A non-target DMI still yields "not matched", never success.
     d="$(make_scenario atkbd-other Foo Foo OtherBook 1 'evdev:atkbd:dmi:bvnFoo:bvrTEST:bd01/01/2020:svnFoo:pnOtherBook:pvr1.0')"
     run_scenario "$d"
     expect present "device not matched" "atkbd modalias + non-target DMI: not matched"
-    expect absent  "$KB_SUCCESS_MARKER" "atkbd modalias + non-target DMI: no false success"
+    expect absent "$KB_SUCCESS_MARKER" "atkbd modalias + non-target DMI: no false success"
 
     # No udevadm -> explicit inconclusive (warn), never a full-success claim.
     KB_UDEVADM_BIN="$root/bin/no-such-udevadm"
     d="$(make_scenario dratini-no-udevadm Google Google Dratini 1)"
     run_scenario "$d"
-    expect present "inconclusive"       "udevadm unavailable: kernel check inconclusive"
-    expect absent  "$KB_SUCCESS_MARKER" "udevadm unavailable: no false success"
+    expect present "inconclusive" "udevadm unavailable: kernel check inconclusive"
+    expect absent "$KB_SUCCESS_MARKER" "udevadm unavailable: no false success"
     KB_UDEVADM_BIN="$bindir/udevadm"
 
     printf 'SELF-TEST=%s (%d assertions)\n' "$([ "$rc" -eq 0 ] && echo PASS || echo FAIL)" "$scenario"

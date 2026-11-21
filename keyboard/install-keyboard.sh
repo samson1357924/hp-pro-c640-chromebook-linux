@@ -35,8 +35,11 @@ KEYD_LINK="/etc/keyd/default.conf"
 # both install-time recovery and uninstall-time rollback preparation.
 _manifest_was_existing() {
     local manifest="$1" target="$2" component="${3:-}"
-    [ -f "$manifest" ] || { echo 0; return 0; }
-    python3 - "$manifest" "$target" "$component" <<'PY' 2> /dev/null || echo 0
+    [ -f "$manifest" ] || {
+        echo 0
+        return 0
+    }
+    python3 - "$manifest" "$target" "$component" << 'PY' 2> /dev/null || echo 0
 import json, sys
 
 manifest, target, component = sys.argv[1:4]
