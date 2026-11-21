@@ -51,6 +51,7 @@ run_sandboxed() {
     shift
     CROS_ENABLEMENT_BACKUP_DIR="$sandbox/backups" \
         CROS_ENABLEMENT_MANIFEST_DIR="$sandbox/manifest" \
+        CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR="$sandbox/snapshots" \
         CROS_ENABLEMENT_ALLOWED_PREFIXES="/tmp/rollback-test-* /etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/" \
         CROS_ENABLEMENT_INSTALLED_TESTS_PREFIXES="$sandbox/root/usr/libexec/installed-tests/ $sandbox/root/usr/share/installed-tests/" \
         LOG_FILE="$sandbox/log.txt" \
@@ -555,6 +556,8 @@ case "$*" in
             exit 1
         fi
         ;;
+    *"is-enabled keyd"*) [ "${STUB_SVC_ENABLED:-1}" = "1" ] && exit 0 || exit 3 ;;
+    *"is-active keyd"*) [ "${STUB_SVC_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
 esac
 exit 0
 EOF
@@ -1103,6 +1106,9 @@ test_keyd_dry_run_no_side_effects() {
     else
         ok
     fi
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "dry-run: no snapshot directory created"
+    assert_contains "Would create pre-deploy keyd snapshot" "$(cat "$sandbox/step.log" 2> /dev/null || echo "")" \
+        "dry-run: snapshot creation is previewed"
 
     # (b) _prepare_keyd_link_for_rollback DRY_RUN early exit: with a restorable
     # record and backup present, still no placeholder is created.
@@ -1621,6 +1627,284 @@ test_keyd_rvaiya_fallback() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 28-33. per-deploy keyd snapshot: a failed UPGRADE must restore V1, while the
+#        first-wins manifest/backups keep serving uninstall.
+# ---------------------------------------------------------------------------
+
+# Number of files/dirs left under the sandbox's snapshot base (0 when clean).
+snapshot_entries() {
+    local sandbox="$1"
+    [ -d "$sandbox/snapshots" ] || {
+        echo 0
+        return 0
+    }
+    find "$sandbox/snapshots" -mindepth 1 2> /dev/null | wc -l | tr -d '[:space:]'
+}
+
+# Deploy V1 successfully, then stage a different V2 source for the next step.
+# $2 = absent | original (whether a pre-V1 cros.conf existed).
+setup_keyd_upgrade_sandbox() {
+    local sandbox="$1" initial="${2:-absent}"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    [ "$initial" != "original" ] || printf 'ORIGINAL_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+
+    if ! run_keyd_install_step "$sandbox"; then
+        fail "upgrade setup: V1 install step failed"
+        return 1
+    fi
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+}
+
+# Run a V2 deploy whose first restart fails (recovery's retry succeeds).
+run_keyd_failing_upgrade() {
+    local sandbox="$1"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"
+}
+
+# Scenario A: no initial conf -> V1 -> V2 restart failure. V1 must survive,
+# the snapshot must be cleaned, and uninstall must still remove cros.conf.
+test_keyd_upgrade_failure_preserves_v1() {
+    local sandbox="/tmp/rollback-test-keyd-upgrade-v1"
+    setup_keyd_upgrade_sandbox "$sandbox" absent || return 0
+
+    if run_keyd_failing_upgrade "$sandbox"; then
+        fail "upgrade failure: install_keyd_step must return 1 after a safe revert"
+        return 0
+    fi
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "upgrade failure: V1 config preserved (not deleted)"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "upgrade failure: snapshot cleaned up"
+    local was_existing
+    was_existing="$(python3 -c 'import json,sys; rs=json.load(open(sys.argv[1]))["records"]; r=[x for x in rs if x["target"].endswith("/keyd/cros.conf")]; print(r[0]["was_existing"] if r else "none")' "$sandbox/manifest/install-manifest.json")"
+    assert_eq "False" "$was_existing" "upgrade failure: manifest keeps first-wins was_existing=false"
+    local backup_count
+    backup_count="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "0" "$backup_count" "upgrade failure: no cros.conf backup was created"
+
+    run_keyd_uninstall "$sandbox"
+    if [ ! -e "$sandbox/etc/keyd/cros.conf" ] && [ ! -L "$sandbox/etc/keyd/cros.conf" ]; then
+        ok
+    else
+        fail "upgrade failure: uninstall must remove the newly deployed cros.conf"
+    fi
+}
+
+# Scenario B: initial ORIGINAL -> V1 -> V2 failure. Recovery must restore V1
+# (not ORIGINAL), while uninstall must still restore ORIGINAL from backup.
+test_keyd_upgrade_failure_preserves_v1_with_original() {
+    local sandbox="/tmp/rollback-test-keyd-upgrade-original"
+    setup_keyd_upgrade_sandbox "$sandbox" original || return 0
+
+    if run_keyd_failing_upgrade "$sandbox"; then
+        fail "upgrade failure (original): install_keyd_step must return 1 after a safe revert"
+        return 0
+    fi
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "upgrade failure (original): V1 restored, NOT the oldest ORIGINAL"
+    local backup_count backup_file
+    backup_count="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "1" "$backup_count" "upgrade failure (original): first-wins keeps one backup"
+    backup_file="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | head -n 1)"
+    assert_eq "ORIGINAL_CONFIG" "$(cat "$backup_file" 2> /dev/null || echo MISSING)" \
+        "upgrade failure (original): backup still holds ORIGINAL"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "upgrade failure (original): snapshot cleaned up"
+
+    run_keyd_uninstall "$sandbox"
+    assert_eq "ORIGINAL_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "upgrade failure (original): uninstall still restores ORIGINAL via first-wins"
+}
+
+# Scenario C: a symlink cros.conf must be restored as the same symlink, not
+# dereferenced into a regular file by install(1).
+test_keyd_upgrade_failure_preserves_symlink_type() {
+    local sandbox="/tmp/rollback-test-keyd-upgrade-symlink"
+    setup_keyd_upgrade_sandbox "$sandbox" absent || return 0
+
+    rm -f "$sandbox/etc/keyd/cros.conf"
+    printf 'ORIGINAL_CONFIG\n' > "$sandbox/etc/keyd/layout.conf"
+    ln -s layout.conf "$sandbox/etc/keyd/cros.conf"
+
+    if run_keyd_failing_upgrade "$sandbox"; then
+        fail "upgrade failure (symlink): install_keyd_step must return 1 after a safe revert"
+        return 0
+    fi
+    if [ -L "$sandbox/etc/keyd/cros.conf" ]; then
+        assert_eq "layout.conf" "$(readlink "$sandbox/etc/keyd/cros.conf")" \
+            "upgrade failure (symlink): original symlink target restored"
+    else
+        fail "upgrade failure (symlink): cros.conf must be restored as a symlink"
+    fi
+    assert_eq "ORIGINAL_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "upgrade failure (symlink): restored symlink still resolves"
+}
+
+# Service state is part of the snapshot: a service that was disabled/inactive
+# before the failed upgrade must be disabled/stopped after recovery.
+test_keyd_upgrade_failure_restores_service_state() {
+    local sandbox="/tmp/rollback-test-keyd-upgrade-svc"
+    setup_keyd_upgrade_sandbox "$sandbox" absent || return 0
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried" \
+            STUB_SVC_ENABLED=0 STUB_SVC_ACTIVE=0
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "upgrade failure (service): install_keyd_step must return 1 after a safe revert"
+        return 0
+    fi
+    local systemctl_log
+    systemctl_log="$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")"
+    assert_contains "disable keyd" "$systemctl_log" "service restore: keyd disabled again (was disabled)"
+    assert_contains "stop keyd" "$systemctl_log" "service restore: keyd stopped after health-check (was inactive)"
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "service restore: V1 config preserved"
+}
+
+# A successful deploy must consume its snapshot. A custom systemctl stub
+# records SNAP:<n> at restart time so the assertion cannot pass vacuously.
+test_keyd_snapshot_cleanup_on_success() {
+    local sandbox="/tmp/rollback-test-keyd-snapshot-cleanup"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    cat > "$sandbox/stub/systemctl" << EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${STUB_SYSTEMCTL_LOG:?}"
+case "\$*" in
+    *"restart keyd"*)
+        printf 'SNAP:%s\n' "\$(find '$sandbox/snapshots' -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l)" >> "\${STUB_SYSTEMCTL_LOG:?}"
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "$sandbox/stub/systemctl"
+
+    if ! run_keyd_install_step "$sandbox"; then
+        fail "snapshot cleanup: install step should succeed"
+        return 0
+    fi
+    assert_contains "SNAP:1" "$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")" \
+        "snapshot cleanup: one snapshot existed at restart time (not vacuous)"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "snapshot cleanup: snapshot removed after success"
+}
+
+# A snapshot that cannot be created must fail closed: no deploy, no symlink
+# removal, no partial snapshot left behind.
+test_keyd_snapshot_create_failure_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-snapshot-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src" "$sandbox/failbin"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'ORIGINAL_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$sandbox/failbin/mktemp"
+    chmod +x "$sandbox/failbin/mktemp"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "snapshot failure: install_keyd_step must fail closed (return 1)"
+        return 0
+    fi
+    assert_eq "ORIGINAL_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "snapshot failure: cros.conf left untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "snapshot failure: default.conf symlink must not be removed"
+    fi
+    assert_contains "refusing to deploy" "$(cat "$sandbox/step.log" 2> /dev/null || echo "")" \
+        "snapshot failure: fail-closed error logged"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "snapshot failure: no partial snapshot left behind"
+}
+
+# P2: a directory or special file (e.g. FIFO) at a keyd path can be
+# snapshotted with cp -a but cannot be restored via install(1). Fail closed:
+# return 1, log an explicit unsupported-type error and leave everything else
+# (legacy symlink, backups, partial snapshot) untouched. $1 = dir | fifo.
+test_keyd_unsupported_path_type_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-unsupported-$1" kind="$1"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+    # A pre-existing legacy default.conf symlink must be left untouched.
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+
+    case "$kind" in
+        dir) mkdir -p "$sandbox/etc/keyd/cros.conf" ;;
+        fifo) mkfifo "$sandbox/etc/keyd/cros.conf" ;;
+    esac
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "unsupported path ($kind): install_keyd_step must fail closed (return 1)"
+        return 0
+    fi
+
+    # _keyd_path_kind reports a FIFO as "other"; a directory as "dir".
+    local expected_kind
+    case "$kind" in
+        dir) expected_kind="dir" ;;
+        fifo) expected_kind="other" ;;
+    esac
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "Unsupported keyd path type '$expected_kind'" "$log" \
+        "unsupported path ($kind): explicit unsupported-type error logged"
+    assert_contains "refusing to deploy" "$log" \
+        "unsupported path ($kind): fail-closed error logged"
+    # The original path type survives: nothing was deployed over it.
+    case "$kind" in
+        dir)
+            if [ -d "$sandbox/etc/keyd/cros.conf" ]; then
+                ok
+            else
+                fail "unsupported path (dir): cros.conf must remain a directory"
+            fi
+            ;;
+        fifo)
+            if [ -p "$sandbox/etc/keyd/cros.conf" ]; then
+                ok
+            else
+                fail "unsupported path (fifo): cros.conf must remain a FIFO"
+            fi
+            ;;
+    esac
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "unsupported path ($kind): default.conf symlink must be left untouched"
+    fi
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "unsupported path ($kind): no partial snapshot left behind"
+    local backup_count
+    backup_count="$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "0" "$backup_count" "unsupported path ($kind): no backup created before refusal"
+}
+
 test_uninstall_has_no_post_rollback_keyd_cleanup() {
     if grep -q 'Clean up legacy default.conf symlink' "$REPO_ROOT/keyboard/install-keyboard.sh"; then
         fail "uninstall must not delete default.conf after rollback_component"
@@ -1665,6 +1949,14 @@ test_keyd_legacy_manifest_without_component
 test_keyd_legacy_upgrade_link_already_removed
 test_keyd_legacy_component_normalization
 test_keyd_rvaiya_fallback
+test_keyd_upgrade_failure_preserves_v1
+test_keyd_upgrade_failure_preserves_v1_with_original
+test_keyd_upgrade_failure_preserves_symlink_type
+test_keyd_upgrade_failure_restores_service_state
+test_keyd_snapshot_cleanup_on_success
+test_keyd_snapshot_create_failure_fails_closed
+test_keyd_unsupported_path_type_fails_closed dir
+test_keyd_unsupported_path_type_fails_closed fifo
 test_uninstall_has_no_post_rollback_keyd_cleanup
 
 echo ""

@@ -29,6 +29,12 @@ SLEEP_DST="/usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh"
 KEYD_SRC="$SCRIPT_DIR/keyd/cros.conf"
 KEYD_DST="/etc/keyd/cros.conf"
 KEYD_LINK="/etc/keyd/default.conf"
+# Per-deploy keyd state snapshot. This lives OUTSIDE BACKUP_BASE_DIR and
+# MANIFEST_DIR on purpose: lib/backup.sh's rollback helpers glob those trees
+# and would otherwise treat a snapshot as the oldest backup, breaking the
+# first-wins semantics that uninstall relies on.
+KEYD_SNAPSHOT_BASE="${CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR:-/var/tmp/cros-enablement-keyd-snapshots}"
+KEYD_SNAPSHOT_DIR=""
 
 # Echo 1 when the manifest records $2 (optionally restricted to component $3)
 # as a pre-existing target, otherwise 0. Centralises the JSON probing used by
@@ -97,99 +103,329 @@ is_our_legacy_keyd_link() {
     [ "$resolved" = "$expected" ]
 }
 
-# Restore our legacy default.conf symlink from its backup after a failed keyd
-# restart, so the system is reverted to its full pre-install state (not just
-# cros.conf). Uses the same manifest + backup semantics as rollback_component.
-# Returns 0 when restored or when there was nothing to restore, 1 when a
-# record existed but restoration could not be completed.
-_restore_our_keyd_link_after_failed_restart() {
-    local link_existed backup
-    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
-    link_existed="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_LINK" "keyboard")"
-    [ "$link_existed" = "1" ] || return 0
-
-    if [ -e "$KEYD_LINK" ] || [ -L "$KEYD_LINK" ]; then
-        log_warn "$KEYD_LINK already exists after failed restart; not overwriting it"
-        return 0
+# Print the on-disk kind of $1: absent, symlink, file, dir or other. The
+# symlink flag is tested FIRST so a dangling symlink is still reported as a
+# symlink; -e/-f/-d follow the link and would misclassify it.
+_keyd_path_kind() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        echo symlink
+    elif [ -d "$path" ]; then
+        echo dir
+    elif [ -f "$path" ]; then
+        echo file
+    elif [ -e "$path" ]; then
+        echo other
+    else
+        echo absent
     fi
-
-    backup="$(_find_rollback_backup "$KEYD_LINK")"
-    if [ -z "$backup" ] || { [ ! -e "$backup" ] && [ ! -L "$backup" ]; }; then
-        log_warn "No backup found for $KEYD_LINK; legacy symlink will be restored (if possible) by uninstall rollback"
-        return 1
-    fi
-    if sudo cp -a "$backup" "$KEYD_LINK" 2> /dev/null && [ -L "$KEYD_LINK" ]; then
-        log_info "Restored legacy symlink $KEYD_LINK -> $(readlink "$KEYD_LINK" 2> /dev/null || echo '?') after failed restart"
-        return 0
-    fi
-    # do not leave a partial/regular file behind
-    sudo rm -f "$KEYD_LINK" 2> /dev/null || true
-    log_warn "Could not restore legacy symlink $KEYD_LINK from $backup; uninstall rollback will retry"
-    return 1
 }
 
-# Undo a failed keyd restart: put back the previous cros.conf (or remove the
-# file we just created if there was none), recreate the legacy default.conf
-# symlink when applicable, and try to restart the daemon once more so a
-# running keyd is not left talking to an unvalidated config.
-# Returns 2 when the pre-install state was fully restored AND the final restart
-# succeeded (safe revert: the new dual-role config is NOT active), 1 when the
+# Best-effort housekeeping: drop snapshot directories older than seven days.
+# Stale-snapshot cleanup must never fail a deployment.
+_keyd_snapshot_prune_old() {
+    [ -d "$KEYD_SNAPSHOT_BASE" ] || return 0
+    find "$KEYD_SNAPSHOT_BASE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -print 2> /dev/null \
+        | while IFS= read -r old; do
+            [ -n "$old" ] || continue
+            rm -rf -- "$old" 2> /dev/null || true
+        done
+    return 0
+}
+
+# Forget and remove the active snapshot. The path is guarded so an unexpected
+# empty or base path can never turn into a destructive rm -rf.
+_keyd_snapshot_cleanup() {
+    local d="${KEYD_SNAPSHOT_DIR:-}"
+    KEYD_SNAPSHOT_DIR=""
+    case "$d" in
+        "" | "/" | "$KEYD_SNAPSHOT_BASE") return 0 ;;
+    esac
+    rm -rf -- "$d" 2> /dev/null || true
+}
+
+# Create an isolated, per-deploy snapshot of the keyd paths and service state.
+# The first-wins manifest exists only for uninstall; this snapshot always
+# captures the state RIGHT NOW, so a failed upgrade restores V1 rather than
+# the original pre-V1 file (or nothing at all). Fail closed: if anything
+# cannot be recorded, nothing is deployed.
+_keyd_snapshot_create() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Would create pre-deploy keyd snapshot"
+        KEYD_SNAPSHOT_DIR=""
+        return 0
+    fi
+
+    local d="" prefix="" path="" kind="" target="" mode="" failed=0
+    # shellcheck disable=SC2174 # -m is intentionally limited to the snapshot base
+    if ! mkdir -p -m 700 "$KEYD_SNAPSHOT_BASE" 2> /dev/null; then
+        log_error "Could not create keyd snapshot base $KEYD_SNAPSHOT_BASE; refusing to deploy keyd config"
+        KEYD_SNAPSHOT_DIR=""
+        return 1
+    fi
+    _keyd_snapshot_prune_old || true
+    if ! d="$(mktemp -d "$KEYD_SNAPSHOT_BASE/keyd.XXXXXXXX" 2> /dev/null)"; then
+        log_error "Could not create a keyd snapshot directory under $KEYD_SNAPSHOT_BASE; refusing to deploy keyd config"
+        KEYD_SNAPSHOT_DIR=""
+        return 1
+    fi
+    KEYD_SNAPSHOT_DIR="$d"
+
+    for prefix in cros link; do
+        if [ "$prefix" = "cros" ]; then
+            path="$KEYD_DST"
+        else
+            path="$KEYD_LINK"
+        fi
+        kind="$(_keyd_path_kind "$path")"
+        # Fail closed on path types we cannot round-trip safely. cp -a would
+        # snapshot a directory as a directory .data and a special file (e.g. a
+        # FIFO) as that special file, but _keyd_restore_one puts paths back via
+        # install(1), which cannot restore directories or special files. A
+        # snapshot that "succeeded" but could not be restored would leave a
+        # failed deploy unrecoverable. Real keyd paths are always a regular
+        # file or symlink, so this only guards against unusual on-disk states.
+        case "$kind" in
+            dir | other)
+                _keyd_snapshot_cleanup
+                log_error "Unsupported keyd path type '$kind' at $path; keyd paths must be a regular file, symlink or absent; refusing to deploy keyd config"
+                return 1
+                ;;
+        esac
+        if ! printf '%s\n' "$kind" > "$d/$prefix.kind" 2> /dev/null; then
+            failed=1
+            break
+        fi
+        case "$kind" in
+            symlink)
+                # One field per file, always quoted: no eval/source of targets.
+                if ! target="$(readlink "$path" 2> /dev/null)"; then
+                    failed=1
+                    break
+                fi
+                if ! printf '%s\n' "$target" > "$d/$prefix.target" 2> /dev/null; then
+                    failed=1
+                    break
+                fi
+                ;;
+            absent) ;;
+            *)
+                if ! mode="$(stat -c '%a' "$path" 2> /dev/null)"; then
+                    failed=1
+                    break
+                fi
+                if ! printf '%s\n' "$mode" > "$d/$prefix.mode" 2> /dev/null; then
+                    failed=1
+                    break
+                fi
+                if ! cp -a -- "$path" "$d/$prefix.data" 2> /dev/null; then
+                    failed=1
+                    break
+                fi
+                ;;
+        esac
+    done
+
+    if [ "$failed" -eq 0 ]; then
+        local svc_enabled=0 svc_active=0
+        # A non-zero is-enabled/is-active is a legitimate "not enabled/active"
+        # state, not a snapshot failure.
+        if systemctl is-enabled keyd > /dev/null 2>&1; then
+            svc_enabled=1
+        fi
+        if systemctl is-active keyd > /dev/null 2>&1; then
+            svc_active=1
+        fi
+        if ! printf '%s\n' "$svc_enabled" > "$d/svc.enabled" 2> /dev/null; then
+            failed=1
+        elif ! printf '%s\n' "$svc_active" > "$d/svc.active" 2> /dev/null; then
+            failed=1
+        fi
+    fi
+
+    if [ "$failed" -ne 0 ]; then
+        _keyd_snapshot_cleanup
+        log_error "Keyd pre-deploy snapshot is incomplete; refusing to deploy keyd config"
+        return 1
+    fi
+    log_info "Created pre-deploy keyd snapshot at $d"
+    return 0
+}
+
+# Restore one keyd path from snapshot prefix <prefix>. Symlinks are rebuilt
+# from .target with ln -s; we deliberately do NOT restore them from .data
+# (cp -a of a dangling link would leave a dangling link in the snapshot dir).
+_keyd_restore_one() {
+    local dst="$1" prefix="$2" d="${KEYD_SNAPSHOT_DIR:-}" kind="" target="" mode=""
+    local kind_file="$d/$prefix.kind"
+    if [ ! -f "$kind_file" ]; then
+        log_warn "Keyd snapshot has no $prefix.kind; cannot restore $dst"
+        return 1
+    fi
+    if ! kind="$(cat "$kind_file" 2> /dev/null)"; then
+        log_warn "Could not read $kind_file; cannot restore $dst"
+        return 1
+    fi
+    case "$kind" in
+        absent | symlink | file | dir) ;;
+        *)
+            log_warn "Keyd snapshot has unknown kind '$kind' for $dst"
+            return 1
+            ;;
+    esac
+
+    # Clear the current state first, symlink flag first (a dangling link is
+    # still a link), then directories, then everything else.
+    if [ -L "$dst" ]; then
+        if ! rm -f -- "$dst" 2> /dev/null; then
+            log_warn "Could not remove $dst symlink while restoring keyd snapshot"
+            return 1
+        fi
+    elif [ -d "$dst" ]; then
+        if ! rm -rf -- "$dst" 2> /dev/null; then
+            log_warn "Could not remove $dst directory while restoring keyd snapshot"
+            return 1
+        fi
+    elif [ -e "$dst" ]; then
+        if ! rm -f -- "$dst" 2> /dev/null; then
+            log_warn "Could not remove $dst while restoring keyd snapshot"
+            return 1
+        fi
+    fi
+
+    case "$kind" in
+        absent)
+            return 0
+            ;;
+        symlink)
+            if ! target="$(cat "$d/$prefix.target" 2> /dev/null)"; then
+                log_warn "Could not read $d/$prefix.target; cannot restore $dst"
+                return 1
+            fi
+            if ! mkdir -p -- "$(dirname "$dst")" 2> /dev/null; then
+                log_warn "Could not create parent directory for $dst"
+                return 1
+            fi
+            if ! ln -s -- "$target" "$dst" 2> /dev/null; then
+                log_warn "Could not recreate $dst as a symlink to $target"
+                return 1
+            fi
+            ;;
+        file | dir)
+            if ! mode="$(cat "$d/$prefix.mode" 2> /dev/null)"; then
+                log_warn "Could not read $d/$prefix.mode; cannot restore $dst"
+                return 1
+            fi
+            if [ ! -f "$d/$prefix.data" ]; then
+                log_warn "Keyd snapshot has no $prefix.data; cannot restore $dst"
+                return 1
+            fi
+            if ! install -D -m "$mode" "$d/$prefix.data" "$dst" 2> /dev/null; then
+                log_warn "Could not restore $dst from keyd snapshot"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# Restore the per-deploy snapshot: both keyd paths (including their symlink
+# types) and the service's enabled state. The active state is recorded in
+# .active_wanted for the caller, which stops keyd after the health-check
+# restart if it was inactive before deployment.
+_keyd_snapshot_restore() {
+    local d="${KEYD_SNAPSHOT_DIR:-}" enabled="" active="" rc=0
+    if [ -z "$d" ] || [ ! -f "$d/cros.kind" ]; then
+        log_warn "No pre-deploy keyd snapshot available; cannot restore previous keyd state"
+        return 1
+    fi
+    if ! _keyd_restore_one "$KEYD_DST" "cros"; then
+        rc=1
+    fi
+    if ! _keyd_restore_one "$KEYD_LINK" "link"; then
+        rc=1
+    fi
+
+    if [ ! -f "$d/svc.enabled" ] || ! enabled="$(cat "$d/svc.enabled" 2> /dev/null)"; then
+        log_warn "Keyd snapshot has no readable svc.enabled; service enablement left unchanged"
+        rc=1
+    else
+        case "$enabled" in
+            1)
+                if ! sudo systemctl enable keyd > /dev/null 2>&1; then
+                    log_warn "Could not re-enable keyd while restoring the pre-deploy snapshot"
+                    rc=1
+                fi
+                ;;
+            0)
+                if ! sudo systemctl disable keyd > /dev/null 2>&1; then
+                    log_warn "Could not disable keyd while restoring the pre-deploy snapshot"
+                    rc=1
+                fi
+                ;;
+            *)
+                log_warn "Keyd snapshot has an invalid svc.enabled value '$enabled'"
+                rc=1
+                ;;
+        esac
+    fi
+
+    if [ ! -f "$d/svc.active" ] || ! active="$(cat "$d/svc.active" 2> /dev/null)"; then
+        log_warn "Keyd snapshot has no readable svc.active"
+        rc=1
+    elif ! printf '%s\n' "$active" > "$d/.active_wanted" 2> /dev/null; then
+        log_warn "Could not record the pre-deploy keyd active state"
+        rc=1
+    fi
+    return "$rc"
+}
+
+# Undo a failed keyd deployment by restoring the PER-DEPLOY snapshot (V1,
+# not the first-ever backup that only serves uninstall), then run a final
+# health-check restart. If keyd was inactive before deployment it is stopped
+# again afterwards: the brief health-check start is acceptable, the final
+# state is not.
+# Returns 2 when the snapshot was fully restored AND the final restart
+# succeeded (safe revert: the new dual-role config is NOT active), 1 when
 # recovery could not be completed, and 0 when no revert was needed (the new
 # config is running normally). Callers MUST treat 2 like a failure: dual-role
 # must never be reported as active after a revert.
 _restore_keyd_after_failed_restart() {
-    local existed=0 restored=0
-    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
-    existed="$(_manifest_was_existing "$MANIFEST_FILE" "$KEYD_DST")"
-
-    if [ "$existed" = "1" ]; then
-        local backup
-        backup="$(_find_rollback_backup "$KEYD_DST")"
-        if [ -n "$backup" ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
-            if [ -L "$backup" ]; then
-                # install(1) dereferences its source, so a backup that is a
-                # symlink (e.g. NixOS / symlink farms) must be copied with
-                # cp -a to preserve the link instead of leaving a regular file.
-                if sudo cp -a "$backup" "$KEYD_DST" 2> /dev/null; then
-                    restored=1
-                    log_info "Restored previous keyd config symlink from $backup after failed restart"
-                else
-                    log_warn "Could not restore previous keyd config symlink from $backup after failed restart"
-                fi
-            elif sudo install -D -m 0644 "$backup" "$KEYD_DST" 2> /dev/null; then
-                restored=1
-                log_info "Restored previous keyd config from $backup after failed restart"
-            else
-                log_warn "Could not restore previous keyd config from $backup after failed restart"
-            fi
-        else
-            log_warn "No backup found for $KEYD_DST; cannot restore previous keyd config"
-        fi
+    local restored=0 wanted_active=""
+    if _keyd_snapshot_restore; then
+        restored=1
+        log_info "Restored pre-deploy keyd state from snapshot after failed restart"
     else
-        if sudo rm -f "$KEYD_DST" 2> /dev/null; then
-            restored=1
-            log_info "Removed newly deployed $KEYD_DST after failed restart (no previous config)"
-        else
-            log_warn "Could not remove newly deployed $KEYD_DST after failed restart"
-        fi
+        log_warn "Could not fully restore the pre-deploy keyd state from snapshot after failed restart"
     fi
 
-    if ! _restore_our_keyd_link_after_failed_restart; then
-        restored=0
-    fi
-
-    if sudo systemctl restart keyd 2> /dev/null; then
-        log_success "keyd restart succeeded after restoring previous config"
-    else
+    if ! sudo systemctl restart keyd 2> /dev/null; then
         log_warn "keyd still failed to restart after restoring previous config; check 'journalctl -u keyd' manually"
         return 1
     fi
+    log_success "keyd restart succeeded after restoring previous config"
+
+    if [ "$restored" -eq 1 ] && [ -f "$KEYD_SNAPSHOT_DIR/.active_wanted" ]; then
+        if ! wanted_active="$(cat "$KEYD_SNAPSHOT_DIR/.active_wanted" 2> /dev/null)"; then
+            wanted_active=""
+            log_warn "Could not read the recorded pre-deploy keyd active state"
+        fi
+        if [ "$wanted_active" = "0" ]; then
+            if ! sudo systemctl stop keyd 2> /dev/null; then
+                log_warn "Could not stop keyd after recovery; service was inactive before deployment"
+                restored=0
+            else
+                log_info "Stopped keyd after recovery: service was inactive before deployment (brief health-check start only)"
+            fi
+        fi
+    fi
+
     if [ "$restored" -eq 1 ]; then
-        # The system is back on its pre-install config, so the dual-role
-        # config we just deployed is NOT active even though keyd now runs.
+        # The system is back on its pre-deploy config, so the config we just
+        # deployed is NOT active even though keyd now runs.
         return 2
     fi
-    # A record existed but its restoration could not be completed.
+    # Snapshot restoration (or the final stop) could not be completed.
     return 1
 }
 
@@ -290,6 +526,7 @@ install_keyd_step() {
             backup_file_manifest_aware "$KEYD_LINK" "keyboard"
             log_dryrun "Would remove redundant symlink $KEYD_LINK -> $(readlink "$KEYD_LINK" 2> /dev/null || echo "?")"
         fi
+        log_dryrun "Would create pre-deploy keyd snapshot"
         log_dryrun "Would deploy keyd dual-role config"
         log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
         log_dryrun "Would record service state: keyd (keyboard)"
@@ -326,6 +563,13 @@ install_keyd_step() {
         log_warn "keyd binary not found; cannot validate $KEYD_SRC. Deploying config only (no enable/restart). Install keyd for dual-role: sudo apt install keyd (Ubuntu>=25.04) or see keyboard/README.md"
     fi
 
+    # Capture the state we are about to replace. This is independent of the
+    # first-wins manifest/uninstall backups: a failed upgrade must restore the
+    # version that was live just before THIS deploy (V1), not the original.
+    if ! _keyd_snapshot_create; then
+        return 1
+    fi
+
     # Backups must be taken before the symlink is removed or cros.conf replaced.
     backup_file_manifest_aware "$KEYD_DST" "keyboard"
     if is_our_legacy_keyd_link; then
@@ -348,11 +592,13 @@ install_keyd_step() {
         else
             log_warn "keyd config reverted after install failure; dual-role NOT active"
         fi
+        _keyd_snapshot_cleanup
         return 1
     fi
     manifest_add_service "keyd" "keyboard"
 
     if [ -z "$keyd_cmd" ]; then
+        _keyd_snapshot_cleanup
         return 0
     fi
 
@@ -366,6 +612,9 @@ install_keyd_step() {
         # negated status (0) inside its then-branch. `set -e` is not triggered
         # by the left-hand side of `||`.
         _restore_keyd_after_failed_restart || recovery_rc=$?
+        # The snapshot has been consumed by recovery; drop it on every exit
+        # from this failure branch.
+        _keyd_snapshot_cleanup
         case "$recovery_rc" in
             0)
                 # Defensive: the new config is running normally; no revert.
@@ -389,6 +638,7 @@ install_keyd_step() {
     if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
         log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
     fi
+    _keyd_snapshot_cleanup
     return 0
 }
 
