@@ -162,10 +162,14 @@ jobs:
           # compile()/py_compile does not import, so evdev is not required here.
           # This gates syntax errors in keyboard/tests/*.py into CI.
           python3 -m compileall -q keyboard/tests
-          # --self-test returns before the evdev check, so no extra packages are
-          # needed on the runner. This is the only automated behavioural test of
-          # MSC_SCAN output, SYN_DROPPED, EV_ABS collisions and keyd hints.
+          # --self-test returns before the evdev/root checks, so no extra
+          # packages are needed on the runner. These are the automated
+          # behavioural self-tests: MSC_SCAN output, SYN_DROPPED, EV_ABS
+          # collisions and keyd hints, plus the 1/0 down/up pairing assertions
+          # (a stuck press with no release must not PASS). A failing self-test
+          # exits non-zero; the step's default `bash -e` fails the job.
           python3 keyboard/tests/check-top-row-hwdb.py --self-test
+          python3 keyboard/tests/keyd-dualrole-uinput.py --self-test
 
       - name: Validate keyd Configuration
         run: |

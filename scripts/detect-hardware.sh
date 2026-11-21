@@ -23,6 +23,11 @@ KB_HWDB_QUERY_FN="${KB_HWDB_QUERY_FN:-kb_hwdb_query_systemd}"
 KB_UDEVADM_BIN="${KB_UDEVADM_BIN:-udevadm}"
 KB_EVENT_BASE="${KB_EVENT_BASE:-/dev/input}"
 KB_SUCCESS_MARKER="hwdb top-row verification PASSED"
+# Real EVIOCGKEYCODE comparison is delegated to check-top-row-hwdb.py. The
+# result-file backend lets --self-test exercise all three outcomes without a
+# real event node. Return codes: 0 confirmed, 1 mismatch, 2 inconclusive.
+KB_KEYCODE_CHECK_FN="${KB_KEYCODE_CHECK_FN:-kb_keycode_check_tool}"
+KB_STUB_KEYCODE_RESULT="${KB_STUB_KEYCODE_RESULT:-}"
 
 run_diagnostic() {
     log_section "HP Pro c640 Chromebook (Google Dratini) Full Diagnostic Report"
@@ -213,10 +218,15 @@ run_diagnostic() {
 #             compiled database, for the Dratini *and* HP/c640 DMI patterns.
 #   DYNAMIC - an actual AT keyboard device exists, and the modalias that udev
 #             would use for THAT device matches an entry with all 11 mappings.
-#             Additionally udevadm info is consulted for applied KEYBOARD_KEY_*
-#             properties on THAT device's event node. If udevadm or the event
-#             node is unavailable the result is inconclusive (warn), never a
-#             full success.
+#             On THAT device's event node, udevadm info is consulted for
+#             applied KEYBOARD_KEY_* properties. That only proves the
+#             *properties are present*, NOT that the kernel translation table
+#             was actually changed, so it is reported as a neutral info line.
+#             A second, independent check delegates EVIOCGKEYCODE comparison to
+#             keyboard/tests/check-top-row-hwdb.py on the SAME event node; only
+#             a matching kernel map allows a full-success claim. Missing
+#             udevadm/event node, a mismatch, or an unavailable ioctl is a
+#             warning and never a full success.
 # ---------------------------------------------------------------------------
 
 # Real backend: query the compiled hwdb with a modalias (the same operation
@@ -399,17 +409,60 @@ kb_atkbd_event_node() {
     return 1
 }
 
-# Confirm the kernel/udev actually applied the mappings, scoped to the AT
-# keyboard's own event node (not just any /dev/input/event*). Return codes:
-#   0 = confirmed, 1 = confirmed missing properties, 2 = inconclusive.
-# A container without udevadm or without the event node stays inconclusive;
-# the caller must not turn that into a full-success claim.
+# Real backend: ask check-top-row-hwdb.py to compare EVIOCGKEYCODE on the SAME
+# event node the udevadm check used. It opens the node via os.open() and needs
+# neither python3-evdev nor a grab. Return: 0 PASS, 1 FAIL/MISMATCH, 2 anything
+# inconclusive (no python3, permission/ioctl failure, missing RESULT, ...).
+kb_keycode_check_tool() {
+    local dev="$1"
+    local fixture="${2:-$KB_FIXTURE}"
+    local tool="$ROOT_DIR/keyboard/tests/check-top-row-hwdb.py"
+    local output
+    if ! command -v python3 > /dev/null 2>&1; then
+        return 2
+    fi
+    if [ ! -f "$tool" ]; then
+        return 2
+    fi
+    # `|| true` keeps set -e from aborting on a failed/inaccessible device;
+    # the RESULT line below is the sole verdict contract.
+    output="$(python3 "$tool" --device "$dev" --fixture "$fixture" 2>&1 || true)"
+    case "$output" in
+        *RESULT=PASS*) return 0 ;;
+        *RESULT=FAIL* | *MISMATCH*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Test backend: read ok|mismatch|inconclusive from KB_STUB_KEYCODE_RESULT.
+kb_keycode_check_stub() {
+    local result_file="${KB_STUB_KEYCODE_RESULT:-}"
+    local value=""
+    if [ -z "$result_file" ] || [ ! -r "$result_file" ]; then
+        return 2
+    fi
+    value="$(cat "$result_file" 2> /dev/null || true)"
+    case "$value" in
+        ok) return 0 ;;
+        mismatch) return 1 ;;
+        inconclusive) return 2 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Confirm the kernel map on the AT keyboard's OWN event node (not just any
+# /dev/input/event*). udevadm KEYBOARD_KEY_* properties only prove presence;
+# the delegated EVIOCGKEYCODE comparison is the independent proof. Return:
+#   0 = confirmed by EVIOCGKEYCODE (udev properties also present)
+#   1 = udev properties missing, or EVIOCGKEYCODE mismatch
+#   2 = inconclusive (no udevadm/event node, or EVIOCGKEYCODE unavailable)
 kb_check_kernel_applied() {
     local fixture="$1"
     local event_node="${2:-}"
     local udevadm_bin="${KB_UDEVADM_BIN:-udevadm}"
     local event_base="${KB_EVENT_BASE:-/dev/input}"
-    local dev info missing
+    local keycode_fn="${KB_KEYCODE_CHECK_FN:-kb_keycode_check_tool}"
+    local dev info missing keycode_rc=0
     if ! command -v "$udevadm_bin" > /dev/null 2>&1; then
         log_warn "  kernel-applied check inconclusive: udevadm unavailable"
         return 2
@@ -430,8 +483,27 @@ kb_check_kernel_applied() {
         printf '%s\n' "$missing" | sed 's/^/    /' >&2
         return 1
     fi
-    log_success "  kernel applied all KEYBOARD_KEY_* mappings on $dev (udevadm info)"
-    return 0
+    log_info "  udev properties present on $dev (not an independent kernel-map proof)"
+
+    "$keycode_fn" "$dev" "$fixture" || keycode_rc=$?
+    case "$keycode_rc" in
+        0)
+            log_success "  kernel map confirmed on $dev (EVIOCGKEYCODE matches fixture)"
+            return 0
+            ;;
+        1)
+            log_warn "  kernel map on $dev MISMATCHES expected scancode->keycode table"
+            return 1
+            ;;
+        2)
+            log_warn "  kernel map check inconclusive (EVIOCGKEYCODE unavailable); udev properties only"
+            return 2
+            ;;
+        *)
+            log_warn "  kernel map check inconclusive (EVIOCGKEYCODE unavailable); udev properties only"
+            return 2
+            ;;
+    esac
 }
 
 verify_keyboard_hwdb() {
@@ -592,6 +664,14 @@ EOF
     chmod +x "$bindir/udevadm"
     : > "$evdir/event2"
 
+    # Result files for the delegated EVIOCGKEYCODE check (one per outcome).
+    local keycode_ok="$root/keycode-ok"
+    local keycode_mismatch="$root/keycode-mismatch"
+    local keycode_inconclusive="$root/keycode-inconclusive"
+    printf 'ok\n' > "$keycode_ok"
+    printf 'mismatch\n' > "$keycode_mismatch"
+    printf 'inconclusive\n' > "$keycode_inconclusive"
+
     KB_STUB_HWDB="$db"
     local query_stub="kb_hwdb_query_stub"
 
@@ -640,6 +720,7 @@ EOF
     }
 
     export KB_UDEVADM_BIN="$bindir/udevadm" KB_EVENT_BASE="$evdir"
+    export KB_KEYCODE_CHECK_FN="kb_keycode_check_stub" KB_STUB_KEYCODE_RESULT="$keycode_ok"
 
     printf 'self-test: keyboard hwdb verification\n'
 
@@ -648,11 +729,14 @@ EOF
     expect present "$KB_SUCCESS_MARKER" "Dratini: device matched -> success"
     expect absent "cannot verify" "Dratini: AT keyboard detected"
     expect present "$evdir/event2" "Dratini: udevadm bound to AT keyboard event node"
+    expect present "EVIOCGKEYCODE matches fixture" "Dratini: kernel map independently confirmed"
+    expect present "not an independent kernel-map proof" "Dratini: udev properties reported as presence-only"
 
     d="$(make_scenario c640 HP 'HP' 'HP Pro c640 Chromebook' 1)"
     run_scenario "$d"
     expect present "$KB_SUCCESS_MARKER" "HP c640: device matched -> success"
     expect absent "device not matched" "HP c640: all 11 scancodes verified"
+    expect present "EVIOCGKEYCODE matches fixture" "HP c640: kernel map independently confirmed"
 
     d="$(make_scenario hatch Google Google Hatch 1)"
     run_scenario "$d"
@@ -679,9 +763,27 @@ EOF
     expect absent "$KB_SUCCESS_MARKER" "udevadm unavailable: no false success"
     KB_UDEVADM_BIN="$bindir/udevadm"
 
+    # EVIOCGKEYCODE mismatch: udev properties look fine, but the kernel table
+    # does not match the fixture -> warning, never the success marker.
+    KB_STUB_KEYCODE_RESULT="$keycode_mismatch"
+    d="$(make_scenario dratini-keycode-mismatch Google Google Dratini 1)"
+    run_scenario "$d"
+    expect present "MISMATCHES expected scancode->keycode table" "keycode mismatch: reported"
+    expect absent "$KB_SUCCESS_MARKER" "keycode mismatch: no false success"
+    KB_STUB_KEYCODE_RESULT="$keycode_ok"
+
+    # EVIOCGKEYCODE inconclusive (permission/ioctl unavailable) -> warning,
+    # never the success marker.
+    KB_STUB_KEYCODE_RESULT="$keycode_inconclusive"
+    d="$(make_scenario dratini-keycode-inconclusive Google Google Dratini 1)"
+    run_scenario "$d"
+    expect present "kernel map check inconclusive" "keycode check inconclusive: reported"
+    expect absent "$KB_SUCCESS_MARKER" "keycode check inconclusive: no false success"
+    KB_STUB_KEYCODE_RESULT="$keycode_ok"
+
     printf 'SELF-TEST=%s (%d assertions)\n' "$([ "$rc" -eq 0 ] && echo PASS || echo FAIL)" "$scenario"
 
-    unset KB_UDEVADM_BIN KB_EVENT_BASE KB_STUB_HWDB
+    unset KB_UDEVADM_BIN KB_EVENT_BASE KB_STUB_HWDB KB_KEYCODE_CHECK_FN KB_STUB_KEYCODE_RESULT
     LOG_FILE="$saved_log_file"
     rm -rf "$root"
     set -e

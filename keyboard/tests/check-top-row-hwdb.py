@@ -10,6 +10,9 @@ this carefully before drawing conclusions about what the firmware sends:
      in ``hwdb-top-row-scancodes.tsv``, compare the kernel's current scancode
      -> keycode translation with the expected hwdb key name. This proves the
      *kernel/udev side* is set up correctly, not what the hardware emitted.
+     With ``--device PATH`` and no ``--listen``/``--scan`` this table check is
+     performed directly on PATH via ``os.open()`` and does not require
+     python3-evdev at all.
 
   2. ``--listen SECONDS`` -- polls EVIOCGKEY and prints **post-hwdb KEY_*
      state** (keycodes after udev translation). It never sees the raw
@@ -36,10 +39,15 @@ Usage:
   sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 15
   sudo python3 keyboard/tests/check-top-row-hwdb.py --scan 20
   sudo python3 keyboard/tests/check-top-row-hwdb.py --device /dev/input/event2 --scan 20
+  sudo python3 keyboard/tests/check-top-row-hwdb.py --device /dev/input/event2  # table only, no evdev needed
   python3 keyboard/tests/check-top-row-hwdb.py --self-test   # no device needed
 
+``--fixture PATH`` overrides the scancode/key TSV (used by detect-hardware.sh).
+
 Exit status: 0 all expected mappings present (and self-test passed), 1
-otherwise.
+otherwise. Prints RESULT=PASS or RESULT=FAIL on stdout for the table check.
+A missing fixture or an unavailable EVIOCGKEYCODE ioctl prints FAIL with NO
+RESULT line, so callers (detect-hardware.sh) treat it as inconclusive.
 """
 import argparse
 import fcntl
@@ -74,7 +82,23 @@ EV_SYN = 0       # 0x00 (== e.EV_SYN); 3 is EV_ABS, NOT EV_SYN
 EV_ABS = 3       # 0x03; used by --self-test to prove code=3 alone is not SYN_DROPPED
 SYN_DROPPED = 3  # 0x03 SYN_* code value, only meaningful when type == EV_SYN
 KEY_BACK = 158
-_FALLBACK_KEY_NAMES = {KEY_BACK: "KEY_BACK"}
+# Stable Linux input-event-code numbers (linux/input-event-codes.h). They let
+# the pure EVIOCGKEYCODE table check run without python3-evdev installed, which
+# is the mode detect-hardware.sh delegates to. Keep in sync with evdev.ecodes.
+_FALLBACK_KEY_CODES = {
+    "BACK": 158,
+    "FORWARD": 159,
+    "REFRESH": 173,
+    "F11": 87,
+    "SCALE": 120,
+    "BRIGHTNESSDOWN": 224,
+    "BRIGHTNESSUP": 225,
+    "MUTE": 113,
+    "VOLUMEDOWN": 114,
+    "VOLUMEUP": 115,
+    "LEFTMETA": 125,
+}
+_FALLBACK_KEY_NAMES = {code: f"KEY_{name}" for name, code in _FALLBACK_KEY_CODES.items()}
 _KEY_STATE_NAMES = {0: "up", 1: "down", 2: "repeat"}
 
 KEYD_HINT = (
@@ -102,8 +126,11 @@ def find_at_keyboard():
 
 
 def expected_keycode(name):
-    """hwdb key name (back) -> KEY_BACK code."""
-    code = getattr(e, "KEY_" + name.upper(), None)
+    """hwdb key name (back) -> KEY_BACK code; works without evdev too."""
+    if evdev is not None:
+        code = getattr(e, "KEY_" + name.upper(), None)
+    else:
+        code = _FALLBACK_KEY_CODES.get(name.upper())
     if code is None:
         raise SystemExit(f"FAIL: unknown hwdb key name {name!r} in {FIXTURE}")
     return code
@@ -151,9 +178,9 @@ def keyd_hint(saw_scan):
     return None if saw_scan else KEYD_HINT
 
 
-def read_fixture():
+def read_fixture(path=FIXTURE):
     rows = []
-    with open(FIXTURE, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.rstrip("\n")
             if not line or line.startswith("#"):
@@ -165,7 +192,7 @@ def read_fixture():
             try:
                 scancode = int(sc, 16)
             except ValueError:
-                raise SystemExit(f"FAIL: bad scancode {sc!r} in {FIXTURE}") from None
+                raise SystemExit(f"FAIL: bad scancode {sc!r} in {path}") from None
             label = " ".join(f.strip() for f in fields[2:] if f.strip())
             rows.append((scancode, key, label))
     return rows
@@ -307,12 +334,18 @@ def parse_args(argv=None):
             "  sudo ...py --listen 15             post-hwdb KEY_* state (NOT raw scancodes)\n"
             "  sudo ...py --scan 20               raw MSC_SCAN + EV_KEY (stop keyd first)\n"
             "  ...py --self-test                  synthetic-event check, no device needed\n"
+            "  ...py --device EVENT --fixture TSV table check with an explicit fixture\n"
         ),
+    )
+    parser.add_argument(
+        "--fixture", metavar="PATH", default=FIXTURE,
+        help=f"scancode/key TSV to compare against (default: {FIXTURE})",
     )
     parser.add_argument(
         "--device", metavar="PATH",
         help=f"event node to check (default: auto-detect {AT_KEYBOARD_NAME!r}); "
-             "prints dev.path and dev.phys for identification",
+             "a table-only check opens PATH directly (no python3-evdev needed); "
+             "with --listen/--scan, dev.path and dev.phys are printed for identification",
     )
     parser.add_argument(
         "--listen", type=float, metavar="SECONDS",
@@ -342,65 +375,96 @@ def parse_args(argv=None):
     return args
 
 
+def run_table_check(fd, path, fixture_path, ident):
+    """Print and run the read-only EVIOCGKEYCODE table check; return failures."""
+    print(f"{path}{ident}")
+    print(f"{'scancode':8s} {'hwdb key':16s} {'expected':<20s} {'kernel':<20s} result")
+    failures = 0
+    for scancode, key, label in read_fixture(fixture_path):
+        want = expected_keycode(key)
+        got = get_keycode(fd, scancode)
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"0x{scancode:02x}     {key:16s} {key_name(want):<20s} {key_name(got):<20s} "
+              f"{'OK' if ok else 'MISMATCH'}  # {label}")
+    return failures
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
     print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    if evdev is None:
+
+    # Only --listen/--scan/auto-detect need InputDevice. A --device table check
+    # can open the event node directly, so it works without python3-evdev.
+    need_input_device = args.listen is not None or args.scan is not None or not args.device
+    if need_input_device and evdev is None:
         print("FAIL: python3-evdev is missing; install it with: sudo apt install python3-evdev")
         return 1
 
-    if args.device:
-        try:
-            dev = InputDevice(args.device)
-        except PermissionError:
-            print("FAIL: Insufficient permissions to read /dev/input/event* (run with sudo)")
-            return 1
-        except OSError as exc:
-            print(f"FAIL: cannot open {args.device}: {exc}")
-            return 1
-        if dev.name != AT_KEYBOARD_NAME:
-            print(f"WARN: {dev.path} is {dev.name!r}, not {AT_KEYBOARD_NAME!r}")
+    dev = None
+    if need_input_device:
+        if args.device:
+            try:
+                dev = InputDevice(args.device)
+            except PermissionError:
+                print("FAIL: Insufficient permissions to read /dev/input/event* (run with sudo)")
+                return 1
+            except OSError as exc:
+                print(f"FAIL: cannot open {args.device}: {exc}")
+                return 1
+            if dev.name != AT_KEYBOARD_NAME:
+                print(f"WARN: {dev.path} is {dev.name!r}, not {AT_KEYBOARD_NAME!r}")
+        else:
+            try:
+                dev = find_at_keyboard()
+            except PermissionError as exc:
+                print(f"FAIL: {exc}")
+                return 1
+            if dev is None:
+                print(f"FAIL: {AT_KEYBOARD_NAME!r} not found")
+                return 1
+        path = dev.path
+        ident = f": {dev.name} (phys {dev.phys})"
     else:
-        try:
-            dev = find_at_keyboard()
-        except PermissionError as exc:
-            print(f"FAIL: {exc}")
-            return 1
-        if dev is None:
-            print(f"FAIL: {AT_KEYBOARD_NAME!r} not found")
-            return 1
+        # Pure --device table check: deliberately no InputDevice/name probe so
+        # this path works without python3-evdev (detect-hardware.sh uses it).
+        path = args.device
+        ident = " (EVIOCGKEYCODE table check; python3-evdev not required)"
 
     try:
-        fd = os.open(dev.path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY)
     except PermissionError:
-        print(f"FAIL: cannot read {dev.path} (EVIOCGKEYCODE needs root); re-run with sudo")
+        print(f"FAIL: cannot read {path} (EVIOCGKEYCODE needs root); re-run with sudo")
         return 1
     failures = 0
     try:
-        print(f"{dev.path}: {dev.name} (phys {dev.phys})")
-        print(f"{'scancode':8s} {'hwdb key':16s} {'expected':<20s} {'kernel':<20s} result")
-        for scancode, key, label in read_fixture():
-            want = expected_keycode(key)
-            got = get_keycode(fd, scancode)
-            ok = got == want
-            failures += 0 if ok else 1
-            print(f"0x{scancode:02x}     {key:16s} {key_name(want):<20s} {key_name(got):<20s} "
-                  f"{'OK' if ok else 'MISMATCH'}  # {label}")
+        failures = run_table_check(fd, path, args.fixture, ident)
+    except FileNotFoundError as exc:
+        # A missing --fixture TSV is not an ioctl failure. Still no RESULT line
+        # is printed, so callers treat this as inconclusive rather than PASS.
+        print(f"FAIL: fixture unavailable ({args.fixture}): {exc}")
+        return 1
+    except OSError as exc:
+        # e.g. not an event node, or the ioctl is unavailable: no RESULT line
+        # is printed, so callers treat this as inconclusive rather than PASS.
+        print(f"FAIL: EVIOCGKEYCODE unavailable on {path}: {exc}")
+        return 1
     finally:
         os.close(fd)
 
-    if args.listen:
-        listen(dev, args.listen)
-    if args.scan:
-        scan(dev, args.scan)
+    if dev is not None:
+        if args.listen:
+            listen(dev, args.listen)
+        if args.scan:
+            scan(dev, args.scan)
+        dev.close()
 
-    dev.close()
     if failures:
         print(f"RESULT=FAIL ({failures} scancode(s) not mapped as expected)")
         print("Reinstall with: sudo ./keyboard/install-keyboard.sh --with-keyd")
-        print(f"then check:     udevadm info {dev.path} | grep KEYBOARD_KEY")
+        print(f"then check:     udevadm info {path} | grep KEYBOARD_KEY")
         return 1
     print("RESULT=PASS")
     return 0

@@ -10,8 +10,23 @@ press the real one, then reads what keyd's virtual keyboard emits. It verifies:
   2. hold Search + each top-row key   -> F1 ... F10 (all ten)
   3. each top-row key alone           -> its media key (pass-through)
   4. hold Search, release alone       -> lone META down/up, NO LEFTCTRL guard
-                                         (this is what lets Mutter open the
-                                         GNOME overview)
+                                          (this is what lets Mutter open the
+                                          GNOME overview)
+
+VALUE 1/0 PAIRING IS A PASS REQUIREMENT:
+  Merely seeing a key's *name* was not enough: a stuck press with no release
+  (or a second down) could still PASS. Each assertion now requires exactly one
+  clean down(1) -> up(0) transition for the key under test, via
+  ``clean_press(values_for(events, key))``. Autorepeat events (value 2) are
+  tolerated and filtered out. A leading reset 0 (fresh virtual device) and
+  trailing 0s are tolerated; a missing release or a repeated/second **down**
+  is a FAIL. A second up (an extra trailing 0) is NOT a FAIL, because the
+  single final 0 already satisfies the release requirement. Guard keys
+  ("must not appear") are checked by name and are NOT required to be paired,
+  to avoid false FAILs.
+
+  Run ``python3 keyboard/tests/keyd-dualrole-uinput.py --self-test`` to verify
+  these assertions with synthetic events (no root, device or evdev needed).
 
 LIMITATION: this test feeds keycodes *after* the hwdb translation. It cannot
 tell whether the physical keyboard really emits KEY_BACK/KEY_BRIGHTNESSDOWN,
@@ -33,7 +48,7 @@ SIDE EFFECTS / SAFETY:
   opened ~11 times. Do not touch the keyboard while running. CapsLock state is
   toggled — re-toggle it afterwards if needed.
 
-Requirements:
+Requirements (live run only):
   * root (needs /dev/uinput, read-only /dev/input/event*, systemctl)
   * Python >= 3.7 (uses subprocess.run(text=True, capture_output=True))
   * python3-evdev (`sudo apt install python3-evdev`)
@@ -41,61 +56,32 @@ Requirements:
     `sudo ./keyboard/install-keyboard.sh --with-keyd`
 
 Run:
-  sudo python3 keyboard/tests/keyd-dualrole-uinput.py
+  sudo python3 keyboard/tests/keyd-dualrole-uinput.py        # live test
+  python3 keyboard/tests/keyd-dualrole-uinput.py --self-test # synthetic, no root
 
 Exit code 0 = all checks passed. NOTE: restarting keyd briefly drops the real
 keyboard remapping, so run this from a TTY/SSH or accept a ~1s interruption.
 """
+import argparse
 import os
 import select
 import subprocess
 import sys
 import time
 
-import evdev
-from evdev import ecodes as e, UInput, InputDevice, list_devices
+try:
+    import evdev
+    from evdev import ecodes as e, UInput, InputDevice, list_devices
+except ImportError:
+    # Defer the failure so --help / --self-test still work without python3-evdev.
+    evdev = None
+    e = None
+    UInput = None
+    InputDevice = None
+    list_devices = None
 
 KEYD_NAME = "keyd virtual keyboard"
 TEST_DEVICE_NAME = "c640-dualrole-test"
-
-# keyd 2.5.x classifies a device as a keyboard only when it exposes the full
-# `keyboard_mask` (KEY_1..0, Q..Y) or KEY_BRIGHTNESSUP. Without them the device
-# gets ID_INPUT_KEY=1 but is silently ignored by keyd.
-KEYS = (
-    [getattr(e, f"KEY_{c}") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
-    + [getattr(e, f"KEY_{d}") for d in "1234567890"]
-    + [
-        e.KEY_ENTER,
-        e.KEY_SPACE,
-        e.KEY_LEFTSHIFT,
-        e.KEY_LEFTMETA,
-        # Post-hwdb top-row keycodes: Back..VolumeUp plus F11.
-        e.KEY_BACK,
-        e.KEY_FORWARD,
-        e.KEY_REFRESH,
-        e.KEY_F11,
-        e.KEY_SCALE,
-        e.KEY_BRIGHTNESSDOWN,
-        e.KEY_BRIGHTNESSUP,
-        e.KEY_MUTE,
-        e.KEY_VOLUMEDOWN,
-        e.KEY_VOLUMEUP,
-    ]
-)
-
-# The top row after hwdb: injected keycode -> expected keycode on the meta layer.
-TOP_ROW = (
-    ("Back", e.KEY_BACK, "KEY_F1"),
-    ("Forward", e.KEY_FORWARD, "KEY_F2"),
-    ("Refresh", e.KEY_REFRESH, "KEY_F3"),
-    ("Fullscreen (F11)", e.KEY_F11, "KEY_F4"),
-    ("Overview (Scale)", e.KEY_SCALE, "KEY_F5"),
-    ("BrightnessDown", e.KEY_BRIGHTNESSDOWN, "KEY_F6"),
-    ("BrightnessUp", e.KEY_BRIGHTNESSUP, "KEY_F7"),
-    ("Mute", e.KEY_MUTE, "KEY_F8"),
-    ("VolumeDown", e.KEY_VOLUMEDOWN, "KEY_F9"),
-    ("VolumeUp", e.KEY_VOLUMEUP, "KEY_F10"),
-)
 
 # Modifier key names, filtered out where only the non-modifier result matters.
 # The tap assertion additionally requires that no META/CTRL pair appears at all:
@@ -103,14 +89,163 @@ TOP_ROW = (
 # made Mutter treat it as Meta+Ctrl.
 MODIFIERS = ("KEY_LEFTMETA", "KEY_LEFTCTRL", "KEY_RIGHTMETA", "KEY_RIGHTCTRL")
 
+# EV_KEY autorepeat value. values_for() drops these so a held key does not
+# break the down/up pairing assertion.
+REPEAT = 2
+
+
+def build_keys():
+    """Keycodes advertised by the synthetic keyboard (needs evdev)."""
+    # keyd 2.5.x classifies a device as a keyboard only when it exposes the
+    # full `keyboard_mask` (KEY_1..0, Q..Y) or KEY_BRIGHTNESSUP. Without them
+    # the device gets ID_INPUT_KEY=1 but is silently ignored by keyd.
+    return (
+        [getattr(e, f"KEY_{c}") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+        + [getattr(e, f"KEY_{d}") for d in "1234567890"]
+        + [
+            e.KEY_ENTER,
+            e.KEY_SPACE,
+            e.KEY_LEFTSHIFT,
+            e.KEY_LEFTMETA,
+            # Post-hwdb top-row keycodes: Back..VolumeUp plus F11.
+            e.KEY_BACK,
+            e.KEY_FORWARD,
+            e.KEY_REFRESH,
+            e.KEY_F11,
+            e.KEY_SCALE,
+            e.KEY_BRIGHTNESSDOWN,
+            e.KEY_BRIGHTNESSUP,
+            e.KEY_MUTE,
+            e.KEY_VOLUMEDOWN,
+            e.KEY_VOLUMEUP,
+        ]
+    )
+
+
+def build_top_row():
+    """Injected keycode -> expected keycode on the meta layer (needs evdev)."""
+    return (
+        ("Back", e.KEY_BACK, "KEY_F1"),
+        ("Forward", e.KEY_FORWARD, "KEY_F2"),
+        ("Refresh", e.KEY_REFRESH, "KEY_F3"),
+        ("Fullscreen (F11)", e.KEY_F11, "KEY_F4"),
+        ("Overview (Scale)", e.KEY_SCALE, "KEY_F5"),
+        ("BrightnessDown", e.KEY_BRIGHTNESSDOWN, "KEY_F6"),
+        ("BrightnessUp", e.KEY_BRIGHTNESSUP, "KEY_F7"),
+        ("Mute", e.KEY_MUTE, "KEY_F8"),
+        ("VolumeDown", e.KEY_VOLUMEDOWN, "KEY_F9"),
+        ("VolumeUp", e.KEY_VOLUMEUP, "KEY_F10"),
+    )
+
 
 def key_name(code):
     """Return one readable name for a keycode (resolve evdev aliases)."""
+    if evdev is None:
+        return str(code)
     name = evdev.ecodes.KEY.get(code, str(code))
     if isinstance(name, tuple):
         # e.g. (KEY_MIN_INTERESTING, KEY_MUTE): prefer the descriptive alias.
         return next((n for n in name if n != "KEY_MIN_INTERESTING"), name[0])
     return name
+
+
+# --- Pure assertion helpers (no evdev dependency; exercised by --self-test) ---
+
+def names(events):
+    return [name for name, _ in events]
+
+
+def values_for(events, key):
+    """Values emitted for `key`, with autorepeat (value 2) filtered out."""
+    return [value for name, value in events if name == key and value != REPEAT]
+
+
+def clean_press(values):
+    """True iff `values` hold exactly one clean down(1) -> up(0) transition.
+
+    Leading reset 0s (fresh virtual device) and trailing 0s (extra ups) are
+    tolerated; autorepeat 2s are expected to be removed by values_for()
+    already. A missing release or a repeated/second down is a FAIL; a second
+    up is tolerated because v[-1] == 0 already proves the release.
+    """
+    v = list(values)
+    while v and v[0] == 0:
+        v = v[1:]
+    return bool(v) and v[0] == 1 and v[-1] == 0 and v.count(1) == 1
+
+
+def unexpected_mods(events, allowed=()):
+    """Modifier names in `events` beyond those explicitly allowed.
+
+    Checking the full MODIFIERS tuple (not just the two left-side names) also
+    covers RIGHTCTRL/RIGHTMETA. Filtering modifiers out of ``non_mods`` alone
+    would silently hide a stray right-side guard.
+    """
+    return sorted({n for n in names(events) if n in MODIFIERS and n not in allowed})
+
+
+def check_tap(events):
+    """tap Search -> exactly one CAPSLOCK down/up, no modifier guard at all."""
+    tap = names(events)
+    cap_values = values_for(events, "KEY_CAPSLOCK")
+    # A reset 0 of a non-target key on a fresh virtual device must not cause a
+    # false FAIL; only real (value != 0) name appearances count as "else".
+    non_mods = [n for n, v in events if v != 0 and n not in MODIFIERS]
+    ok = (
+        clean_press(cap_values)
+        and set(non_mods) == {"KEY_CAPSLOCK"}
+        and not unexpected_mods(events)
+    )
+    return ok, {"values": cap_values, "names": tap}
+
+
+def check_hold(events, expected):
+    """hold Search + key -> one down/up of `expected`, no unexpected modifier.
+
+    The `[meta:M]` layer legitimately holds LEFTMETA while active, so that one
+    modifier is allowed; a clear_mod() CTRL guard (or RIGHTMETA) is not.
+    """
+    held = names(events)
+    exp_values = values_for(events, expected)
+    # Tolerate reset 0s of non-target keys, just like clean_press() does for
+    # the target key's leading/trailing resets.
+    held_non_mods = [n for n, v in events if v != 0 and n not in MODIFIERS]
+    ok = (
+        clean_press(exp_values)
+        and set(held_non_mods) == {expected}
+        and not unexpected_mods(events, allowed=("KEY_LEFTMETA",))
+    )
+    return ok, {"values": exp_values, "names": held}
+
+
+def check_media(events, own):
+    """top-row key alone -> one clean down/up of `own`, no stray down/mod."""
+    media = names(events)
+    own_values = values_for(events, own)
+    stray = sorted({n for n, v in events if v == 1 and n not in MODIFIERS and n != own})
+    ok = (
+        clean_press(own_values)
+        and not stray
+        and not unexpected_mods(events)
+    )
+    return ok, {"values": own_values, "names": media, "stray_downs": stray}
+
+
+def check_lone(events):
+    """hold Search, release alone -> clean META down/up, no other guard."""
+    lone = names(events)
+    meta_values = values_for(events, "KEY_LEFTMETA")
+    ok = (
+        clean_press(meta_values)
+        and bool(lone)
+        and lone[0] == "KEY_LEFTMETA"
+        and lone[-1] == "KEY_LEFTMETA"
+        # LEFTMETA is the expected result; all other modifiers (including the
+        # previously unchecked RIGHTMETA) are forbidden guards.
+        and not unexpected_mods(events, allowed=("KEY_LEFTMETA",))
+        and "KEY_CAPSLOCK" not in lone
+    )
+    return ok, {"values": meta_values, "names": lone}
 
 
 def close_quietly(dev):
@@ -178,10 +313,6 @@ def collect_checked(dev, seconds, label, failures):
     return events
 
 
-def names(events):
-    return [name for name, _ in events]
-
-
 def press(ui, code, hold=0.05):
     ui.write(e.EV_KEY, code, 1)
     ui.syn()
@@ -190,15 +321,132 @@ def press(ui, code, hold=0.05):
     ui.syn()
 
 
-def main():
+def run_self_test():
+    """Verify the value 1/0 pairing assertions with synthetic events.
+
+    No root, evdev or device needed. Events are ``(name, value)`` tuples,
+    exactly like ``collect()`` produces.
+    """
+    def seq(key, values):
+        return [(key, v) for v in values]
+
+    failures = []
+    results = []
+
+    def expect(label, check, events, want):
+        ok, detail = check(events)
+        results.append((label, ok, detail))
+        if ok != want:
+            failures.append(
+                f"{label}: expected {'PASS' if want else 'FAIL'}, "
+                f"got {'PASS' if ok else 'FAIL'} ({detail})"
+            )
+
+    # 1. tap Search: name appearance alone is not enough.
+    expect("tap [1] only down", check_tap, seq("KEY_CAPSLOCK", [1]), False)
+    expect("tap [1,1] repeated down", check_tap, seq("KEY_CAPSLOCK", [1, 1]), False)
+    expect("tap [1,2] repeat, no up", check_tap, seq("KEY_CAPSLOCK", [1, 2]), False)
+    expect("tap [1,2,0]", check_tap, seq("KEY_CAPSLOCK", [1, 2, 0]), True)
+    expect("tap [0,1,0] leading reset", check_tap, seq("KEY_CAPSLOCK", [0, 1, 0]), True)
+    expect("tap with LEFTCTRL guard", check_tap,
+           seq("KEY_CAPSLOCK", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), False)
+    expect("tap with RIGHTCTRL guard", check_tap,
+           seq("KEY_CAPSLOCK", [1, 2, 0]) + seq("KEY_RIGHTCTRL", [1, 0]), False)
+    expect("tap with RIGHTMETA guard", check_tap,
+           seq("KEY_CAPSLOCK", [1, 2, 0]) + seq("KEY_RIGHTMETA", [1, 0]), False)
+    expect("tap with non-target reset 0", check_tap,
+           seq("KEY_CAPSLOCK", [1, 2, 0]) + [("KEY_BACK", 0)], True)
+
+    # 2. hold Search + top-row key -> expected F-key. The meta layer holds
+    # LEFTMETA, so that modifier is allowed but a CTRL guard is not.
+    hold_f1 = lambda ev: check_hold(ev, "KEY_F1")
+    expect("hold [1] only down", hold_f1, seq("KEY_F1", [1]), False)
+    expect("hold [1,2,0]", hold_f1, seq("KEY_F1", [1, 2, 0]), True)
+    expect("hold with LEFTMETA layer down", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTMETA", [1, 0]), True)
+    expect("hold with LEFTCTRL guard", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), False)
+    expect("hold with RIGHTMETA guard", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_RIGHTMETA", [1, 0]), False)
+    expect("hold with non-target reset 0", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + [("KEY_BACK", 0)], True)
+
+    # 3. top-row key alone -> its own media key.
+    media_back = lambda ev: check_media(ev, "KEY_BACK")
+    expect("media [1] only down", media_back, seq("KEY_BACK", [1]), False)
+    expect("media [1,2,0]", media_back, seq("KEY_BACK", [1, 2, 0]), True)
+    expect("media stray non-mod down", media_back,
+           seq("KEY_BACK", [1, 2, 0]) + seq("KEY_F1", [1, 0]), False)
+    expect("media with modifier guard", media_back,
+           seq("KEY_BACK", [1, 2, 0]) + seq("KEY_RIGHTCTRL", [1, 0]), False)
+
+    # 4. hold Search, release alone -> bare META, no guard.
+    expect("lone [1,1,0]", check_lone, seq("KEY_LEFTMETA", [1, 1, 0]), False)
+    expect("lone [1,0,1]", check_lone, seq("KEY_LEFTMETA", [1, 0, 1]), False)
+    expect("lone with LEFTCTRL guard", check_lone,
+           seq("KEY_LEFTMETA", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), False)
+    expect("lone with RIGHTMETA guard", check_lone,
+           seq("KEY_LEFTMETA", [1, 2, 0]) + seq("KEY_RIGHTMETA", [1, 0]), False)
+    expect("lone with RIGHTCTRL guard", check_lone,
+           seq("KEY_LEFTMETA", [1, 2, 0]) + seq("KEY_RIGHTCTRL", [1, 0]), False)
+    expect("lone [1,2,0]", check_lone, seq("KEY_LEFTMETA", [1, 2, 0]), True)
+
+    # Direct helper checks (repeat filtering / leading-reset tolerance).
+    if values_for(seq("KEY_A", [1, 2, 2, 0]), "KEY_A") != [1, 0]:
+        failures.append("values_for() must drop autorepeat (value 2)")
+    if not clean_press([0, 0, 1, 2, 0, 0]):
+        failures.append("clean_press() must tolerate leading/trailing resets and repeat")
+
+    print("self-test: synthetic EV_KEY value 1/0 pairing (no device needed)")
+    for label, ok, detail in results:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}: {detail}")
+    if failures:
+        for msg in failures:
+            print(f"FAIL: {msg}")
+        print("SELF-TEST=FAIL")
+        return 1
+    print(f"SELF-TEST=PASS ({len(results)} pairing cases)")
+    return 0
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Live functional test for the keyd dual-role Search key via uinput.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  sudo ...py                 live test (needs root + python3-evdev)\n"
+            "  ...py --self-test          synthetic 1/0 pairing check, no root/device needed\n"
+        ),
+    )
+    parser.add_argument(
+        "--self-test", action="store_true",
+        help="run a synthetic-event self-test (no root, evdev or device needed) and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    # --self-test returns before the root / evdev / device checks so CI (and a
+    # developer machine without python3-evdev) can run it.
+    if args.self_test:
+        return run_self_test()
+
     if os.geteuid() != 0:
         print("FAIL: keyd-dualrole-uinput.py requires root permissions (run with sudo)")
         return 1
+    if evdev is None:
+        print("FAIL: python3-evdev is missing; install it with: sudo apt install python3-evdev")
+        return 1
+
+    keys = build_keys()
+    top_row = build_top_row()
 
     ui = None
     try:
         ui = UInput(
-            {e.EV_KEY: KEYS},
+            {e.EV_KEY: keys},
             name=TEST_DEVICE_NAME,
             vendor=1,
             product=1,
@@ -248,49 +496,42 @@ def main():
             failures.append("attach")
 
         # 1. tap Search -> CAPSLOCK only. A plain overload() would also emit
-        # META plus the LEFTCTRL guard here, so check the raw event names
-        # instead of filtering modifiers out.
+        # META plus the LEFTCTRL guard here, so check the raw names AND require
+        # a clean CAPSLOCK down/up pair.
         press(ui, e.KEY_LEFTMETA, hold=0.05)
-        tap = names(collect_checked(kd, 0.6, "tap Search", failures))
-        non_mods = [n for n in tap if n not in MODIFIERS]
-        if (
-            tap.count("KEY_CAPSLOCK") == 2
-            and set(non_mods) == {"KEY_CAPSLOCK"}
-            and "KEY_LEFTMETA" not in tap
-            and "KEY_LEFTCTRL" not in tap
-        ):
-            print("PASS: tap Search -> CAPSLOCK only (no META, no guard)")
+        ok, detail = check_tap(collect_checked(kd, 0.6, "tap Search", failures))
+        if ok:
+            print(f"PASS: tap Search -> CAPSLOCK only (no META, no guard) {detail}")
         else:
-            print("FAIL: tap Search expected CAPSLOCK only, got", tap)
+            print(f"FAIL: tap Search expected CAPSLOCK only (one down/up), got {detail}")
             failures.append("tap")
 
         # 2. hold Search + each top-row key -> F1 ... F10.
-        for label, code, expected in TOP_ROW:
+        for label, code, expected in top_row:
             ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
             ui.syn()
             time.sleep(0.6)  # exceed the tap timeout and enter the meta layer
             press(ui, code)
             ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
             ui.syn()
-            held = names(collect_checked(kd, 0.7, f"hold Search + {label}", failures))
-            # Require exactly the expected non-modifier key: emitting both the
-            # new F-key and the old media key would still pass a looser check.
-            held_non_mods = [n for n in held if n not in MODIFIERS]
-            if held_non_mods and set(held_non_mods) == {expected}:
-                print(f"PASS: hold Search + {label} -> {expected}")
+            ok, detail = check_hold(
+                collect_checked(kd, 0.7, f"hold Search + {label}", failures), expected
+            )
+            if ok:
+                print(f"PASS: hold Search + {label} -> {expected} {detail}")
             else:
-                print(f"FAIL: hold Search + {label} expected only {expected}, got", held)
+                print(f"FAIL: hold Search + {label} expected only {expected} (one down/up), got {detail}")
                 failures.append(f"hold-{expected.lower()}")
 
         # 3. each top-row key alone -> its own media key (pass-through).
-        for label, code, _expected in TOP_ROW:
+        for label, code, _expected in top_row:
             press(ui, code)
-            media = names(collect_checked(kd, 0.6, f"{label} alone", failures))
             own = key_name(code)
-            if own in media:
-                print(f"PASS: {label} alone -> {own}")
+            ok, detail = check_media(collect_checked(kd, 0.6, f"{label} alone", failures), own)
+            if ok:
+                print(f"PASS: {label} alone -> {own} {detail}")
             else:
-                print(f"FAIL: {label} alone expected {own}, got", media)
+                print(f"FAIL: {label} alone expected {own} (one down/up, no stray down), got {detail}")
                 failures.append(f"media-{label.lower().split()[0]}")
 
         # 4. hold Search and release it alone -> clean lone META, no LEFTCTRL.
@@ -301,23 +542,11 @@ def main():
         time.sleep(0.6)
         ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
         ui.syn()
-        lone = collect_checked(kd, 0.8, "hold Search alone, release", failures)
-        lone_names = names(lone)
-        # Autorepeat events (value 2) are normal while the key is held; the
-        # point is that the final release is a bare META (no LEFTCTRL guard).
-        if (
-            lone_names
-            and lone_names[0] == "KEY_LEFTMETA"
-            and lone_names[-1] == "KEY_LEFTMETA"
-            and lone[0][1] == 1
-            and lone[-1][1] == 0
-            and "KEY_LEFTCTRL" not in lone_names
-            and "KEY_RIGHTCTRL" not in lone_names
-            and "KEY_CAPSLOCK" not in lone_names
-        ):
-            print("PASS: hold Search alone -> bare META release (no guard)")
+        ok, detail = check_lone(collect_checked(kd, 0.8, "hold Search alone, release", failures))
+        if ok:
+            print(f"PASS: hold Search alone -> bare META release (no guard) {detail}")
         else:
-            print("FAIL: hold Search alone expected a META release without LEFTCTRL guard")
+            print(f"FAIL: hold Search alone expected a META release without LEFTCTRL guard, got {detail}")
             failures.append("hold-meta-clean")
 
     finally:
