@@ -39,7 +39,7 @@
 | udev rules（已安裝版） | 🟢 | 2026-08-18 已安裝 repo 版（`GROUP="plugdev", MODE="0660", TAG+="uaccess"`），重開機後以 `getfacl` 驗證；舊 `0666` 版已備份 |
 | 單元測試 | 🟢 | `test-crfpmoc-unit`（`/usr/libexec/installed-tests/libfprint-2/`）4/4 全過：`fp_info_v3`、`fp_info_v1`、`enc_status_bitmask`、`payload_bounds` |
 | 休眠喚醒後鎖定畫面指紋 | 🟢 | **2026-08-19 完整驗證**：(1) PAM Claim 競賽 2026-08-18 修復（fprintd 移出 `common-auth`，僅保留 `gdm-fingerprint` + `sudo`——先前為 "Device was already claimed"，GNOME/gdm#1071）；(2) 喚醒後 FPMCU open 立即失敗由驅動層 open 重試修復（crfpmoc.c 的 `CRFPMOC_OPEN_MAX_RETRIES` × 500ms）+ system-sleep hook（`fprintd-sleep.sh` 睡前停 fprintd）。使用者盒蓋測試：**第一次解鎖即有指紋提示、喚醒零延遲、日誌無 retry 行**。見 [TROUBLESHOOTING.md §14](TROUBLESHOOTING.md) |
-| `sudo` PAM 授權 | 🟢 | `fprintd` 僅存在於 `/etc/pam.d/sudo`（2026-08-18 Claim 競賽修復——不在 `common-auth`）；`sudo -k` 後執行 `sudo whoami` 會跳出指紋提示並接受驗證（測試方法見 [fingerprint README](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/fingerprint/README.md#test)）。PAM 堆疊與上述鎖定畫面修復同一 session 驗證 |
+| `sudo` PAM 授權 | 🟢 | `fprintd` 僅存在於 `/etc/pam.d/sudo`（2026-08-18 Claim 競賽修復——不在 `common-auth`）；`sudo -k` 後執行 `sudo whoami` 會跳出指紋提示並接受驗證（測試方法見 [fingerprint README](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/fingerprint/README.md#2-verify-enrolled-fingerprint)）。PAM 堆疊與上述鎖定畫面修復同一 session 驗證 |
 
 ### 2. 音訊 (Intel SOF DSP + ALSA UCM2 + PipeWire)
 
@@ -132,7 +132,7 @@
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（244 daemon + 73 hook）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（244 daemon + 73 hook）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
