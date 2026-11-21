@@ -1146,6 +1146,67 @@ export STUB_GNOME_ACTIVE=false
 assert_file "handoff 0 active: adopted state is 0" "$STATE_FILE" "0"
 assert_file "handoff 0 active: LED untouched" "$RAW_FILE" "42"
 
+# P4b-8a (real S3 Branch A).  The screen was already blank at suspend time, so
+# the hook's 0 is the blanked LED hardware value, not the user's intent.  The
+# daemon's saved 30 must survive, the stale handoff must still be consumed,
+# and the active screen must defer any brightness write.
+reset_case
+write_state 30
+write_handoff_suspend 0
+write_handoff_resume
+export STUB_GNOME_ACTIVE=true
+run_fn handle_resume
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false
+assert_file "blank-side handoff 0: saved user brightness 30 retained" "$STATE_FILE" "30"
+assert_absent "blank-side handoff 0: stale handoff consumed" "$HANDOFF_SUSPEND_FILE"
+assert_present "blank-side handoff 0: resume flag retained while deferred" "$HANDOFF_RESUME_FILE"
+assert_file "blank-side handoff 0: LED untouched" "$RAW_FILE" "42"
+assert_eq "blank-side handoff 0: no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'ignoring blank-side suspend handoff 0; keeping saved user brightness 30' "$DAEMON_ERR"; then
+    ok "blank-side handoff 0: override is logged and explained"
+else
+    bad "blank-side handoff 0: no ignore log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+if grep -q 'resume deferred: ScreenSaver still active (saved=30)' "$DAEMON_ERR"; then
+    ok "blank-side handoff 0: resume defers with the saved value 30"
+else
+    bad "blank-side handoff 0: no deferred-resume log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-8b.  A handoff 0 with a valid saved 0 (or with no usable saved state) is
+# still a real "user switched it off" and must be adopted as before.
+reset_case
+write_state 0
+write_handoff_suspend 0
+run_fn adopt_suspend_handoff
+assert_file "handoff 0 + saved 0: adopted 0 is retained" "$STATE_FILE" "0"
+assert_absent "handoff 0 + saved 0: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'ignoring blank-side' "$DAEMON_ERR"; then
+    bad "handoff 0 + saved 0: incorrectly treated as blank-side (stderr: $(cat "$DAEMON_ERR"))"
+else
+    ok "handoff 0 + saved 0: not treated as a blank-side handoff"
+fi
+reset_case
+printf 'garbage\n' > "$STATE_FILE"
+write_handoff_suspend 0
+run_fn adopt_suspend_handoff
+assert_file "handoff 0 + invalid saved state: adopted 0" "$STATE_FILE" "0"
+assert_absent "handoff 0 + invalid saved state: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+
+# P4b-8c.  A non-zero handoff keeps unconditional priority over daemon state.
+reset_case
+write_state 8
+write_handoff_suspend 30
+run_fn adopt_suspend_handoff
+assert_file "handoff 30: overrides daemon state 8" "$STATE_FILE" "30"
+assert_absent "handoff 30: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'suspend handoff 30 overrides differing daemon state 8' "$DAEMON_ERR"; then
+    ok "handoff 30: override is logged"
+else
+    bad "handoff 30: override not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
 # P4b-9. Legacy/sysfs/ectool writers must never be called by the resume path.
 reset_case
 write_handoff_suspend 7

@@ -1096,6 +1096,19 @@ _adopt_suspend_handoff_locked() {
     fi
     val=$((10#$raw))
     existing="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    # Branch A (screen already blank at suspend time): the hook reads the LED,
+    # which is 0 because the screen blank turned it off.  That 0 is a hardware
+    # reading, NOT user intent, while STATE_FILE holds the last user-visible
+    # brightness.  Never let the blank-side 0 overwrite a valid non-zero saved
+    # value: the next unlock must restore the user's brightness, not 0.  The
+    # handoff is still consumed so a later cycle cannot re-adopt this stale 0.
+    # All other cases are unchanged: 0 with no/absent/invalid saved state is
+    # adopted (a real "user switched it off"), and a non-zero handoff wins.
+    if [ "$val" -eq 0 ] && [ -f "$STATE_FILE" ] && [[ "$existing" =~ ^[0-9]+$ ]] && [ "$((10#$existing))" -ne 0 ]; then
+        log "ignoring blank-side suspend handoff 0; keeping saved user brightness $((10#$existing))"
+        rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+        return 0
+    fi
     if [ -n "$existing" ] && [ "$existing" != "$val" ]; then
         log "suspend handoff $val overrides differing daemon state $existing"
     fi
