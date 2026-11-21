@@ -181,6 +181,12 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > a fixture mismatch or ioctl failure cannot block raw capture. When done, run
   > `sudo systemctl start keyd` to restore the service; otherwise Search
   > tap/hold and brightness remapping stay disabled.
+  >
+  > `RESULT=` is only the EVIOCGKEYCODE mapping verdict. With `--scan SECONDS`,
+  > no observed `MSC_SCAN` (keyd still grabbing, or no key pressed) still prints
+  > `RESULT=PASS (mapping check only; raw capture FAILED)` but exits non-zero.
+  > Judge overall success by the exit code / `RAW_CAPTURE=`, not `RESULT=PASS`
+  > alone.
 
 ### 10. Want the Search key to act as "CapsLock on tap, Super on hold"
 

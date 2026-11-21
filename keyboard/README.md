@@ -74,6 +74,12 @@ chmod +x keyboard/install-keyboard.sh
   accepts the config-only outcome (no keyd binary/service) with rc 0. The installer still
   reports that dual-role is **not** active.
 
+**Keyd snapshot base (advanced):** `CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR` overrides the default
+`/var/lib/cros-enablement-keyd-snapshots`. A custom path must be absolute: the base must be
+root-owned with mode `0700`, every ancestor must be root-owned, and the direct parent must not
+be group/other-writable (a sticky bit does not exempt it). Paths under a user's home directory
+are rejected; if any check fails the installer refuses to deploy keyd config.
+
 ---
 
 ### Option 2: `keyd` Daemon (Advanced Multi-Layer & Dual-Role)
@@ -283,6 +289,13 @@ sudo python3 keyboard/tests/check-top-row-hwdb.py
 # 0xdb  leftmeta         KEY_LEFTMETA         KEY_LEFTMETA         OK
 # RESULT=PASS
 ```
+
+`RESULT=` reports only the EVIOCGKEYCODE mapping verdict. If you pass
+`--scan SECONDS`, raw `MSC_SCAN` is required as well: with no scan observed
+(keyd still holds the grab, or no key was pressed) the tool prints
+`RESULT=PASS (mapping check only; raw capture FAILED)` but exits **non-zero**.
+Judge overall success by the exit code and the `RAW_CAPTURE=` line, not by
+grepping `RESULT=PASS` alone.
 
 A `MISMATCH ... KEY_F1` row means hwdb is not applied (or maps the wrong
 scancode). Reinstall with `sudo ./keyboard/install-keyboard.sh --with-keyd`.

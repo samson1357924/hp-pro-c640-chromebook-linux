@@ -161,11 +161,15 @@ _keyd_path_kind() {
 # Fail-closed validation of the snapshot base. A predictable, world-writable
 # base would let an unprivileged user pre-create (or symlink) the directory and
 # later swap snapshot children, feeding arbitrary .kind/.data to the privileged
-# restore path. Every component is checked WITHOUT following symlinks, and an
-# existing base is never "repaired" (no chown/chmod): an unsafe one is rejected
-# so the installer refuses to hand a poisoned snapshot to a root restore.
+# restore path. EVERY component (including the base and any custom path) must be
+# root-owned: a caller-owned directory is NOT acceptable because root's sudo
+# writes into it could be renamed/replaced by that directory's owner. Every
+# component is checked WITHOUT following symlinks, and an existing base is never
+# "repaired" (no chown/chmod): an unsafe one is rejected so the installer
+# refuses to hand a poisoned snapshot to a root restore. The default base under
+# /var/lib is root-owned and unaffected; custom paths are held to the same bar.
 _keyd_snapshot_base_prepare() {
-    local base="$1" p="" part="" uid="" my_uid="" mode="" m=""
+    local base="$1" p="" part="" uid="" mode="" m=""
     local -a parts=()
 
     case "$base" in
@@ -180,7 +184,6 @@ _keyd_snapshot_base_prepare() {
         log_error "Keyd snapshot base '$base' is empty; refusing to deploy keyd config"
         return 1
     fi
-    my_uid="$(id -u)"
 
     local idx=0 last=$((${#parts[@]} - 1))
     for part in "${parts[@]}"; do
@@ -207,8 +210,8 @@ _keyd_snapshot_base_prepare() {
             log_error "Keyd snapshot base '$base' has a missing or unreadable parent '$p'; refusing to deploy keyd config"
             return 1
         fi
-        if [ "$uid" != "0" ] && [ "$uid" != "$my_uid" ]; then
-            log_error "Keyd snapshot base '$base' component '$p' is owned by uid '$uid'; refusing to deploy keyd config"
+        if [ "$uid" != "0" ]; then
+            log_error "Keyd snapshot base '$base' component '$p' is owned by uid '$uid' (must be root-owned); refusing to deploy keyd config"
             return 1
         fi
         if ! mode="$(sudo stat -c '%a' -- "$p" 2> /dev/null)"; then
@@ -229,10 +232,18 @@ _keyd_snapshot_base_prepare() {
                 return 1
             fi
         else
-            # Ancestors must not be group/other writable (a sticky /tmp is OK).
-            if (((m & 022) != 0)) && (((m & 01000) == 0)); then
-                log_error "Keyd snapshot base '$base' traverses group/other-writable directory '$p' (mode $mode) without a sticky bit; refusing to deploy keyd config"
-                return 1
+            # A sticky intermediate ancestor (e.g. /tmp) is tolerated, but the
+            # DIRECT parent must never be group/other-writable: even with a
+            # sticky bit, its owner could rename/replace the base's children.
+            if (((m & 022) != 0)); then
+                if [ "$idx" -eq "$((last - 1))" ]; then
+                    log_error "Keyd snapshot base '$base' has a group/other-writable parent directory '$p' (mode $mode); refusing to deploy keyd config"
+                    return 1
+                fi
+                if (((m & 01000) == 0)); then
+                    log_error "Keyd snapshot base '$base' traverses group/other-writable directory '$p' (mode $mode) without a sticky bit; refusing to deploy keyd config"
+                    return 1
+                fi
             fi
         fi
         idx=$((idx + 1))

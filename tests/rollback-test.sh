@@ -51,9 +51,11 @@ run_sandboxed() {
     shift
     # Provide a sane default snapshot base, but never overwrite a base that a
     # security test deliberately created as world-writable or as a symlink.
+    # The production base check now requires EVERY component to be root-owned,
+    # so create this base with sudo/root ownership rather than as the (possibly
+    # non-root) test user.
     if [ ! -d "$sandbox/snapshots" ] && [ ! -L "$sandbox/snapshots" ]; then
-        mkdir -p "$sandbox/snapshots"
-        chmod 700 "$sandbox/snapshots"
+        sudo install -d -m 700 -o 0 -g 0 -- "$sandbox/snapshots"
     fi
     CROS_ENABLEMENT_BACKUP_DIR="$sandbox/backups" \
         CROS_ENABLEMENT_MANIFEST_DIR="$sandbox/manifest" \
@@ -2365,6 +2367,9 @@ test_keyd_snapshot_base_world_writable_fails_closed() {
     mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" \
         "$sandbox/keyd-src" "$sandbox/snapshots"
     chmod 777 "$sandbox/snapshots"
+    # Keep the base root-owned so the unsafe MODE check (not the uid check)
+    # is the one that rejects it, matching the asserted 'unsafe mode' error.
+    sudo chown 0:0 "$sandbox/snapshots"
     prepare_keyd_sandbox_script "$sandbox"
     setup_keyd_stubs "$sandbox" valid
     printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
@@ -2402,6 +2407,263 @@ test_keyd_snapshot_base_world_writable_fails_closed() {
     else
         ok
     fi
+}
+
+# ---------------------------------------------------------------------------
+# 33a.1 P2 SECURITY: a private (0700) base owned by a non-root user must be
+#      rejected - root's sudo writes into such a directory could be renamed or
+#      replaced by that owner. Fails closed with no deploy and no mutation.
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_nonroot_owner_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-base-nonroot-owner"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    sudo install -d -m 700 -o 0 -g 0 -- "$sandbox/snapshots"
+    sudo chown 1000:1000 "$sandbox/snapshots"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    # Simulate a non-root caller. The security check must reject this base by
+    # inspecting the *base's* uid against root, never by accepting the caller's
+    # uid: a regression to `[ "$uid" != "$my_uid" ]` with `my_uid="$(id -u)"`
+    # would otherwise stay invisible while the suite runs as root and deploy.
+    printf '#!/usr/bin/env bash\nif [ "$1" = "-u" ]; then echo 1000; else /usr/bin/id "$@"; fi\n' > "$sandbox/stub/id"
+    chmod +x "$sandbox/stub/id"
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "non-root-owned base: install_keyd_step must fail closed (rc=1)"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "owned by uid '1000'" "$log" \
+        "non-root-owned base: offending uid is named in the error"
+    assert_contains "must be root-owned" "$log" \
+        "non-root-owned base: error states the root-owned requirement"
+    assert_contains "refusing to deploy keyd config" "$log" \
+        "non-root-owned base: fail-closed error logged"
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "non-root-owned base: cros.conf untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "non-root-owned base: legacy symlink must be untouched"
+    fi
+    assert_eq "0" "$(snapshot_entries "$sandbox")" \
+        "non-root-owned base: no snapshot directory created"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "non-root-owned base: no backup recorded"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "non-root-owned base: no service mutation allowed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33a.2 P2 SECURITY: a non-root-owned DIRECT PARENT of a custom snapshot base
+#      must be rejected by uid, and the base itself must never be created.
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_nonroot_parent_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-base-nonroot-parent"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" \
+        "$sandbox/keyd-src" "$sandbox/nonroot-parent"
+    sudo chown 1000:1000 "$sandbox/nonroot-parent"
+    sudo chmod 755 "$sandbox/nonroot-parent"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    # Simulate a non-root caller so a regression that accepts the caller's uid
+    # (instead of requiring the parent to be root-owned) changes behaviour here
+    # rather than staying green under the root test runner.
+    printf '#!/usr/bin/env bash\nif [ "$1" = "-u" ]; then echo 1000; else /usr/bin/id "$@"; fi\n' > "$sandbox/stub/id"
+    chmod +x "$sandbox/stub/id"
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_SNAPSHOT_BASE="$2/nonroot-parent/snapshots"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "non-root-owned parent: install_keyd_step must fail closed (rc=1)"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "nonroot-parent' is owned by uid '1000'" "$log" \
+        "non-root-owned parent: parent path and uid are named in the error"
+    assert_contains "must be root-owned" "$log" \
+        "non-root-owned parent: error states the root-owned requirement"
+    assert_contains "refusing to deploy keyd config" "$log" \
+        "non-root-owned parent: fail-closed error logged"
+    if [ -e "$sandbox/nonroot-parent/snapshots" ]; then
+        fail "non-root-owned parent: snapshot base must not be created"
+    else
+        ok
+    fi
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "non-root-owned parent: cros.conf untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "non-root-owned parent: legacy symlink must be untouched"
+    fi
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "non-root-owned parent: no backup recorded"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "non-root-owned parent: no service mutation allowed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33a.2.1 CONTROL: a non-root caller must NOT make a root-owned 0700 base
+#      invalid - the rule is about the base's (and parent's) uid, never the
+#      caller's uid. Together with 33a.1/33a.2 this pins the contract to
+#      "root-owned only": accepting `id -u` is caught by the two fail-closed
+#      tests, while checking *only* against `id -u` is caught here.
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_root_owned_nonroot_caller_succeeds() {
+    local sandbox="/tmp/rollback-test-keyd-base-root-owned-nonroot-caller"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    sudo install -d -m 700 -o 0 -g 0 -- "$sandbox/snapshots"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf '#!/usr/bin/env bash\nif [ "$1" = "-u" ]; then echo 1000; else /usr/bin/id "$@"; fi\n' > "$sandbox/stub/id"
+    chmod +x "$sandbox/stub/id"
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if ! run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "root-owned base + non-root caller: install_keyd_step should succeed"
+        return 0
+    fi
+    assert_eq "V2_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "root-owned base + non-root caller: config deployed"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" \
+        "root-owned base + non-root caller: snapshot cleaned on success"
+}
+
+# ---------------------------------------------------------------------------
+# 33a.3 P2 SECURITY: a group/other-writable DIRECT PARENT must be rejected even
+#      when it carries a sticky bit (a sticky /tmp ancestor is still allowed).
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_world_parent_rejected() {
+    local sandbox="/tmp/rollback-test-keyd-base-world-parent"
+    local custom_base="$sandbox/world-parent/snapshots"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" \
+        "$sandbox/keyd-src" "$sandbox/world-parent"
+    sudo chmod 1777 "$sandbox/world-parent"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_SNAPSHOT_BASE="$2/world-parent/snapshots"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "world-writable parent: install_keyd_step must fail closed (rc=1)"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "group/other-writable parent directory" "$log" \
+        "world-writable parent: error names the parent's group/other-writable mode"
+    assert_contains "refusing to deploy keyd config" "$log" \
+        "world-writable parent: fail-closed error logged"
+    if [ -e "$custom_base" ]; then
+        fail "world-writable parent: snapshot base must not be created"
+    else
+        ok
+    fi
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "world-writable parent: cros.conf untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "world-writable parent: legacy symlink must be untouched"
+    fi
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "world-writable parent: no backup recorded"
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "world-writable parent: no service mutation allowed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 33a.4 P2 SECURITY: a custom base with root-owned ancestors and a root-owned
+#      0700 base is accepted; the snapshot is created and cleaned on success.
+#      (A home-directory/non-root-owned custom path is rejected above.)
+# ---------------------------------------------------------------------------
+test_keyd_snapshot_base_custom_root_owned_succeeds() {
+    local sandbox="/tmp/rollback-test-keyd-base-custom-root-owned"
+    local custom_base="$sandbox/custom-root/snapshots"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" \
+        "$sandbox/keyd-src" "$sandbox/custom-root"
+    sudo install -d -m 700 -o 0 -g 0 -- "$custom_base"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
+
+    # Record the snapshot count at restart time so the cleanup assertion cannot
+    # pass vacuously (no snapshot ever created).
+    cat > "$sandbox/stub/systemctl" << EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${STUB_SYSTEMCTL_LOG:?}"
+case "\$*" in
+    *"restart keyd"*)
+        printf 'SNAP:%s\n' "\$(find '$custom_base' -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l)" >> "\${STUB_SYSTEMCTL_LOG:?}"
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "$sandbox/stub/systemctl"
+
+    if ! run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_SNAPSHOT_BASE="$2/custom-root/snapshots"
+        install_keyd_step
+    '; then
+        fail "custom root-owned base: install step should succeed"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")"
+    assert_contains "SNAP:1" "$log" \
+        "custom root-owned base: one snapshot existed at restart time (not vacuous)"
+    assert_eq "0" "$(sudo find "$custom_base" -mindepth 1 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "custom root-owned base: snapshot removed after success"
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "custom root-owned base: config deployed successfully"
 }
 
 # ---------------------------------------------------------------------------
@@ -2599,6 +2861,8 @@ test_keyd_snapshot_mixed_identity() {
 
     # The inverse: an unsafe base still fails closed with an explicit error.
     chmod 777 "$sandbox/snapshots"
+    # Keep the base root-owned so the mode check (not the uid check) fires.
+    sudo chown 0:0 "$sandbox/snapshots"
     : > "$sandbox/step2.log"
     if run_sandboxed "$sandbox" '
         export PATH="$2/snapbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
@@ -3111,6 +3375,11 @@ test_keyd_link_backup_failure_fails_closed
 test_backup_helper_copy_failure_returns_nonzero
 test_backup_helper_manifest_failure_returns_nonzero
 test_keyd_snapshot_base_world_writable_fails_closed
+test_keyd_snapshot_base_nonroot_owner_fails_closed
+test_keyd_snapshot_base_nonroot_parent_fails_closed
+test_keyd_snapshot_base_root_owned_nonroot_caller_succeeds
+test_keyd_snapshot_base_world_parent_rejected
+test_keyd_snapshot_base_custom_root_owned_succeeds
 test_keyd_snapshot_base_symlink_rejected
 test_keyd_restore_failure_keeps_snapshot
 test_keyd_snapshot_mixed_identity

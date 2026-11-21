@@ -66,6 +66,11 @@ chmod +x keyboard/install-keyboard.sh
   服務無法啟動會回傳非 0：只寫入設定檔但沒有 keyd binary 時回傳 3；設定被拒絕或重啟/回復失敗時回傳 1。
 * `./keyboard/install-keyboard.sh --keyd-config-only`：隱含 `--with-keyd`，但明確接受「只有設定檔、沒有 keyd 服務」的結果（rc 0）；安裝器仍會標明雙重角色**未**生效。
 
+**keyd 快照目錄（進階）：** `CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR` 可覆寫預設的
+`/var/lib/cros-enablement-keyd-snapshots`。自訂路徑必須是絕對路徑：base 需為 root 擁有且權限
+`0700`，所有上層目錄也需 root 擁有，直接父目錄不得為群組/其他人可寫（即使有 sticky 位也一樣）。
+家目錄下的路徑會被拒絕；任一檢查失敗時安裝器會拒絕部署 keyd 設定。
+
 ---
 
 ### 選項 2：`keyd` 常駐程式（進階多層與雙重角色）
@@ -256,6 +261,12 @@ sudo python3 keyboard/tests/check-top-row-hwdb.py
 # 0xdb  leftmeta         KEY_LEFTMETA         KEY_LEFTMETA         OK
 # RESULT=PASS
 ```
+
+`RESULT=` 只報告 EVIOCGKEYCODE 映射的判定。若加上 `--scan SECONDS`，
+也必須觀測到原始 `MSC_SCAN`：沒看到時（keyd 仍抓住裝置，或期間沒按鍵），
+工具會印出 `RESULT=PASS (mapping check only; raw capture FAILED)`，
+但**結束碼非 0**。判斷整體成功請看結束碼與 `RAW_CAPTURE=` 行，
+不要只 grep `RESULT=PASS`。
 
 若出現 `MISMATCH ... KEY_F1`，代表 hwdb 沒套用（或映射錯掃描碼），請重跑
 `sudo ./keyboard/install-keyboard.sh --with-keyd`。

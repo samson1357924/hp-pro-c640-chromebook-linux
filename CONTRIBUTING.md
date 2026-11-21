@@ -60,6 +60,11 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   tap/hold and brightness remapping stay disabled. `--listen` is **not** for
   this: it only observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`, not
   the raw scancode.
+  `--scan` additionally requires an observed `MSC_SCAN`: with no raw scan
+  (keyd still grabbing the device, or no key pressed) it prints
+  `RESULT=PASS (mapping check only; raw capture FAILED)` but exits
+  **non-zero**. `RESULT=` is only the EVIOCGKEYCODE mapping verdict — judge
+  overall success by the exit code / `RAW_CAPTURE=`, not `RESULT=PASS` alone.
   Infer the scancode from the `MSC_SCAN` values against the standard AT table;
   some Chromebooks send the ChromeOS action scancodes (`0xea`, `0xe9`, ...),
   others standard AT `0x3b`-`0x44`. If the scancodes differ, add a

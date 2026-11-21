@@ -51,8 +51,13 @@ Usage:
 
 ``--fixture PATH`` overrides the scancode/key TSV (used by detect-hardware.sh).
 
-Exit status: 0 all expected mappings present (and self-test passed), 1
-otherwise. Prints RESULT=PASS or RESULT=FAIL on stdout for the table check.
+Exit status: 0 when every *requested* check succeeded, 1 otherwise. RESULT=
+reflects ONLY the EVIOCGKEYCODE mapping verdict: the table-only delegation path
+(no --scan) prints the bare RESULT=PASS that detect-hardware.sh greps verbatim.
+With --scan SECONDS, raw MSC_SCAN is required too: a PASS mapping that saw no
+MSC_SCAN still prints "RESULT=PASS (mapping check only; raw capture FAILED)"
+but exits 1, so judge overall success by the exit code / RAW_CAPTURE line,
+never by grepping RESULT=PASS alone. RESULT=FAIL means a mapping mismatch.
 A missing fixture or an unavailable EVIOCGKEYCODE ioctl prints FAIL with NO
 RESULT line, so callers (detect-hardware.sh) treat it as inconclusive.
 The two checks are also reported separately as MAPPING_CHECK=<status> and
@@ -189,6 +194,33 @@ def format_listen_state(code, down):
 def keyd_hint(saw_scan):
     """Return the keyd-grab warning when --scan saw no MSC_SCAN, else None."""
     return None if saw_scan else KEYD_HINT
+
+
+def final_verdict(mapping_status, raw_ok, raw_requested, failures, path):
+    """Return ``(lines, exit_code)`` separating mapping from raw capture.
+
+    ``RESULT=`` reflects ONLY the EVIOCGKEYCODE mapping verdict. An explicitly
+    requested ``--scan`` that saw no MSC_SCAN still reports a PASS mapping, but
+    exits non-zero so callers cannot mistake it for full success. The delegated
+    table-only path (no raw requested) keeps the bare RESULT=PASS token that
+    detect-hardware.sh greps; UNAVAILABLE_* prints no RESULT line at all.
+    """
+    if mapping_status.startswith("UNAVAILABLE_"):
+        return ([], 1)
+    if mapping_status == "FAIL":
+        return (
+            [
+                f"RESULT=FAIL ({failures} scancode(s) not mapped as expected)",
+                "Reinstall with: sudo ./keyboard/install-keyboard.sh --with-keyd",
+                f"then check:     udevadm info {path} | grep KEYBOARD_KEY",
+            ],
+            1,
+        )
+    if raw_requested and raw_ok is not True:
+        return (["RESULT=PASS (mapping check only; raw capture FAILED)"], 1)
+    if raw_requested:
+        return (["RESULT=PASS (mapping check only; raw capture PASS)"], 0)
+    return (["RESULT=PASS"], 0)
 
 
 def read_fixture(path=FIXTURE):
@@ -336,6 +368,31 @@ def run_self_test():
         )
     if guarded_status != "UNAVAILABLE_IOCTL" or guarded_failures is not None:
         failures.append("guarded table check must return (None, UNAVAILABLE_IOCTL) on ioctl OSError")
+
+    # final_verdict(): RESULT= is a mapping verdict only; a requested raw capture
+    # that saw no MSC_SCAN must exit non-zero, while the delegation path keeps
+    # the bare RESULT=PASS token detect-hardware.sh greps.
+    verdict_cases = [
+        # (mapping_status, raw_ok, raw_requested, failures, expected_rc, expectations)
+        ("PASS", False, True, 0, 1, ("raw capture FAILED",)),
+        ("PASS", None, False, 0, 0, ("EXACT:RESULT=PASS",)),
+        ("PASS", True, True, 0, 0, ("RESULT=PASS",)),
+        ("UNAVAILABLE_IOCTL", False, True, None, 1, ("NO_RESULT",)),
+        ("FAIL", 3, False, 3, 1, ("RESULT=FAIL",)),
+    ]
+    for status, raw, requested, bad, want_rc, expect in verdict_cases:
+        v_lines, v_rc = final_verdict(status, raw, requested, bad, "/dev/input/eventX")
+        if v_rc != want_rc:
+            failures.append(f"final_verdict({status}) must exit {want_rc}, got {v_rc}")
+        for token in expect:
+            if token == "EXACT:RESULT=PASS":
+                ok = v_lines == ["RESULT=PASS"]
+            elif token == "NO_RESULT":
+                ok = not any("RESULT=" in line for line in v_lines)
+            else:
+                ok = any(token in line for line in v_lines)
+            if not ok:
+                failures.append(f"final_verdict({status}) missing {token!r}: {v_lines}")
 
     # --scan-only: exercise scan() itself (not just format_scan_event) with a
     # pipe-backed fake device; it must return saw_scan=True and print 0xea.
@@ -583,9 +640,9 @@ def main(argv=None):
             print(f"RAW_CAPTURE={'PASS' if raw_ok else 'FAIL'} "
                   f"(MSC_SCAN {'observed' if raw_ok else 'not observed'})")
         else:
-            if args.listen:
+            if args.listen is not None:
                 listen(dev, args.listen)
-            if args.scan:
+            if args.scan is not None:
                 raw_ok = scan(dev, args.scan)
                 print(f"RAW_CAPTURE={'PASS' if raw_ok else 'FAIL'} "
                       f"(MSC_SCAN {'observed' if raw_ok else 'not observed'})")
@@ -593,19 +650,18 @@ def main(argv=None):
 
     # --- separate verdicts: only a genuine table verdict emits RESULT= ---
     if args.scan_only is not None:
-        # detect-hardware.sh greps RESULT=/MISMATCH; never emit them here.
+        # Keep this BEFORE final_verdict: --scan-only never prints RESULT=/MISMATCH,
+        # which detect-hardware.sh greps. Raw capture is the whole test here.
         return 0 if raw_ok else 1
-    if mapping_status == "PASS":
-        print("RESULT=PASS")
-        return 0
-    if mapping_status == "FAIL":
-        print(f"RESULT=FAIL ({failures} scancode(s) not mapped as expected)")
-        print("Reinstall with: sudo ./keyboard/install-keyboard.sh --with-keyd")
-        print(f"then check:     udevadm info {path} | grep KEYBOARD_KEY")
-        return 1
-    # UNAVAILABLE_*: inconclusive contract, no RESULT line. Any requested raw
-    # capture has already run and been reported above; overall status is still 1.
-    return 1
+    # UNAVAILABLE_* has no RESULT line; a FAIL mapping and a requested raw capture
+    # that saw no MSC_SCAN both exit 1. The table-only delegation path keeps the
+    # bare RESULT=PASS substring detect-hardware.sh relies on.
+    lines, code = final_verdict(
+        mapping_status, raw_ok, args.scan is not None, failures, path,
+    )
+    for line in lines:
+        print(line)
+    return code
 
 
 if __name__ == "__main__":

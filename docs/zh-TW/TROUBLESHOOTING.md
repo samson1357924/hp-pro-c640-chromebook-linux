@@ -153,6 +153,11 @@
   > 它完全跳過表格檢查，fixture 不符或 ioctl 失敗都不會擋住原始擷取。
   > 完成後請執行
   > `sudo systemctl start keyd` 恢復服務，否則 Search 輕點/長按與亮度重映射會持續失效。
+  >
+  > `RESULT=` 只是 EVIOCGKEYCODE 映射的判定。使用 `--scan SECONDS` 時，
+  > 若沒觀測到 `MSC_SCAN`（keyd 仍抓住裝置，或期間沒按鍵），仍會印出
+  > `RESULT=PASS (mapping check only; raw capture FAILED)`，但結束碼非 0。
+  > 判斷整體成功請看結束碼／`RAW_CAPTURE=`，不要只看 `RESULT=PASS`。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
