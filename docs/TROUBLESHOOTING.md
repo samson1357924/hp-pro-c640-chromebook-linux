@@ -225,9 +225,9 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   > [!IMPORTANT]
   > On a real S3 cycle systemd **freezes `user.slice`** before the sleep hook's
-  > `post` phase ([systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html),
-  > [systemd sleep design](https://systemd.io/SLEEP/)). A session-bus probe from the
-  > root hook therefore always fails or times out; the hook is now a **pure handoff
+  > `post` phase ([systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)).
+  > A session-bus probe from the root hook therefore always fails or times out;
+  > the hook is now a **pure handoff
   > writer**: `pre` publishes `c640-kbd-backlight.suspend` (one integer, `0` valid),
   > `post` publishes `c640-kbd-backlight.resume` (`<epoch> <action>`), both `0600` +
   > chowned to the session user + atomically `mv`-ed into `$XDG_RUNTIME_DIR`

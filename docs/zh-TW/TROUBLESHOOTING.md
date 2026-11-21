@@ -192,9 +192,8 @@
 
   > [!IMPORTANT]
   > 真實 S3 週期中，systemd 會在 sleep hook 的 `post` 階段前**凍結 `user.slice`**
-  > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)、
-  > [systemd sleep 設計](https://systemd.io/SLEEP/)）。因此從 root hook 查詢 session
-  > bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
+  > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)）。
+  > 因此從 root hook 查詢 session bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
   > `c640-kbd-backlight.suspend`（單一整數，`0` 有效），`post` 發佈
   > `c640-kbd-backlight.resume`（`<epoch> <action>`），兩者皆 `0600` + chown 給
   > session user + 原子 `mv` 進 `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。
