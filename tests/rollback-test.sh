@@ -639,14 +639,18 @@ EOF
 
 run_keyd_install_step() {
     local sandbox="$1"
-    if run_sandboxed "$sandbox" '
+    # Propagate the EXACT status (0/1/3): callers distinguish config-only (3)
+    # from a real failure (1) or success (0). The sourced installer enables
+    # `set -e`, so the step call itself must be guarded to persist its state.
+    run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
         source "$2/install-keyboard-sandbox.sh"
-        install_keyd_step
-    '; then
-        return 0
-    fi
-    return 1
+        step_rc=0
+        install_keyd_step || step_rc=$?
+        printf "%s\n" "$step_rc" > "$2/step-rc.txt"
+        printf "%s\n" "${KEYD_STATE:-unset}" > "$2/step-state.txt"
+        exit "$step_rc"
+    '
 }
 
 # Call the REAL uninstall_keyboard() in the sandbox. get_real_user is stubbed
@@ -661,6 +665,39 @@ run_keyd_uninstall() {
         get_real_user() { echo ""; }
         uninstall_keyboard
     '
+}
+
+# Drive the REAL install_keyboard() in the sandbox, persisting its rc and keyd
+# state so the parent test can assert them precisely. Optional parameters:
+# $2=WITH_KEYD (default 1), $3=KEYD_ALLOW_CONFIG_ONLY (default 0),
+# $4=DRY_RUN (default 0), $5=force keyd_bin failure (default 0).
+run_keyd_caller() {
+    local sandbox="$1" with_keyd="${2:-1}" allow="${3:-0}" dry="${4:-0}" no_bin="${5:-0}"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            WITH_KEYD="$3" KEYD_ALLOW_CONFIG_ONLY="$4" DRY_RUN="$5"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        if [ "$6" = "1" ]; then
+            keyd_bin() { return 1; }
+        fi
+        install_rc=0
+        install_keyboard || install_rc=$?
+        printf "%s\n" "$install_rc" > "$2/install-rc.txt"
+        printf "%s\n" "${KEYD_STATE:-unset}" > "$2/keyd-state.txt"
+        printf "%s\n" "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
+        exit "$install_rc"
+    ' "$with_keyd" "$allow" "$dry" "$no_bin"
+}
+
+# Fresh caller sandbox with a valid cros.conf source and the requested stub mode.
+setup_keyd_caller_sandbox() {
+    local sandbox="$1" mode="$2"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" "$mode"
+    printf 'VALID_CROS_CONF\n' > "$sandbox/keyd-src/cros.conf"
 }
 
 assert_keyd_link_detection() {
@@ -886,20 +923,17 @@ test_keyd_restart_failure_recovery() {
         ok
     fi
 
-    # Also drive the REAL caller: it must set KEYD_DEPLOYED=0 and omit the
-    # "keyd dual-role included" success line, while still finishing install.
+    # Also drive the REAL caller: explicit --with-keyd + a safe revert is a
+    # failure (rc 1). The non-keyd install still completes, but the caller must
+    # set KEYD_DEPLOYED=0/state=failed and omit the "included" success line.
     setup_keyd_restart_recoverable_sandbox "$caller_sandbox" "$existing"
-    if ! run_sandboxed "$caller_sandbox" '
-        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
-            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried" \
-            WITH_KEYD=1
-        source "$2/install-keyboard-sandbox.sh"
-        get_real_user() { echo ""; }
-        install_keyboard
-        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
-    ' 2> "$caller_sandbox/caller.log"; then
-        fail "restart failure: install_keyboard should still finish after a safe revert"
+    if STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$caller_sandbox/retried" \
+        run_keyd_caller "$caller_sandbox" 1 0 0 0 2> "$caller_sandbox/caller.log"; then
+        fail "restart failure: caller must return 1 after a safe revert"
+    else
+        assert_eq "1" "$(cat "$caller_sandbox/install-rc.txt")" "restart failure: caller returns 1"
     fi
+    assert_eq "failed" "$(cat "$caller_sandbox/keyd-state.txt")" "restart failure: caller state is failed"
     assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "restart failure: caller sets KEYD_DEPLOYED=0"
     if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
         fail "restart failure: caller must not report dual-role as deployed after a safe revert"
@@ -1025,17 +1059,23 @@ test_keyd_no_binary_deploys_config_only() {
 
     # The host ships /usr/bin/keyd.rvaiya, so force keyd_bin() to report "no
     # binary" to deterministically exercise install_keyd_step's keyd_cmd=""
-    # branch (only deploy cros.conf, do not enable/restart).
-    if ! run_sandboxed "$sandbox" '
+    # branch (only deploy cros.conf, do not enable/restart). rc=3 is a distinct
+    # "config deployed, no service" outcome, not a generic failure.
+    local step_rc=0
+    run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
         source "$2/install-keyboard-sandbox.sh"
         keyd_bin() { return 1; }
-        install_keyd_step
-    '; then
-        fail "no-keyd: install_keyd_step should still deploy the config"
-        return 0
-    fi
+        install_rc=0
+        install_keyd_step || install_rc=$?
+        printf "%s\n" "$install_rc" > "$2/install-rc.txt"
+        printf "%s\n" "${KEYD_STATE:-unset}" > "$2/keyd-state.txt"
+        exit "$install_rc"
+    ' || step_rc=$?
+    assert_eq "3" "$step_rc" "no-keyd: install_keyd_step returns 3 (config-only)"
+    assert_eq "config-only" "$(cat "$sandbox/keyd-state.txt")" "no-keyd: step state is config-only"
     assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf")" "no-keyd: cros.conf deployed"
+    assert_eq "0" "$(snapshot_entries "$sandbox")" "no-keyd: snapshot cleaned up on config-only exit"
     if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
         fail "no-keyd: no enable/restart should be attempted"
     else
@@ -1075,10 +1115,16 @@ test_keyd_dry_run_no_side_effects() {
     if ! run_sandboxed "$sandbox" '
         export DRY_RUN=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
         source "$2/install-keyboard-sandbox.sh"
-        install_keyd_step
+        step_rc=0
+        install_keyd_step || step_rc=$?
+        printf "%s\n" "$step_rc" > "$2/step-rc.txt"
+        printf "%s\n" "${KEYD_STATE:-unset}" > "$2/step-state.txt"
+        exit "$step_rc"
     ' 2> "$sandbox/step.log"; then
         fail "dry-run: install_keyd_step should succeed"
     fi
+    assert_eq "0" "$(cat "$sandbox/step-rc.txt")" "dry-run: step returns 0"
+    assert_eq "planned" "$(cat "$sandbox/step-state.txt")" "dry-run: step state is planned"
     if grep -qF "Would deploy keyd dual-role config" "$sandbox/step.log"; then
         ok
     else
@@ -1152,15 +1198,11 @@ EOF
     prepare_keyd_sandbox_script "$caller_sandbox"
     setup_keyd_stubs "$caller_sandbox" valid
     printf 'VALID_CROS_CONF\n' > "$caller_sandbox/keyd-src/cros.conf"
-    if ! run_sandboxed "$caller_sandbox" '
-        export DRY_RUN=1 WITH_KEYD=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
-        source "$2/install-keyboard-sandbox.sh"
-        get_real_user() { echo ""; }
-        install_keyboard
-        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
-    ' 2> "$caller_sandbox/caller.log"; then
+    if ! run_keyd_caller "$caller_sandbox" 1 0 1 0 2> "$caller_sandbox/caller.log"; then
         fail "dry-run: install_keyboard should finish"
     fi
+    assert_eq "0" "$(cat "$caller_sandbox/install-rc.txt")" "dry-run: caller returns 0"
+    assert_eq "planned" "$(cat "$caller_sandbox/keyd-state.txt")" "dry-run: caller state is planned"
     assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "dry-run: caller keeps KEYD_DEPLOYED=0"
     if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
         fail "dry-run: caller must not report dual-role as deployed"
@@ -1171,6 +1213,128 @@ EOF
         ok
     else
         fail "dry-run: caller should preview keyd dual-role deployment"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 22a-22g. explicit --with-keyd must not exit 0 unless dual-role took effect.
+# The six KEYD_STATE values are exercised through the REAL install_keyboard().
+# ---------------------------------------------------------------------------
+
+test_with_keyd_verified_returns_zero() {
+    local sandbox="/tmp/rollback-test-keyd-explicit-verified"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    if ! run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "verified: install_keyboard must return 0"
+        return 0
+    fi
+    assert_eq "0" "$(cat "$sandbox/install-rc.txt")" "verified: rc 0"
+    assert_eq "verified" "$(cat "$sandbox/keyd-state.txt")" "verified: state=verified"
+    assert_eq "1" "$(cat "$sandbox/keyd-deployed.txt")" "verified: deployed=1"
+    assert_contains "keyd dual-role included (verified)" "$(cat "$sandbox/caller.log")" \
+        "verified: success line names the verified state"
+}
+
+test_with_keyd_active_unverified_returns_zero() {
+    local sandbox="/tmp/rollback-test-keyd-explicit-active"
+    setup_keyd_caller_sandbox "$sandbox" legacy25
+    if ! run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "active: keyd < 2.6 without check must still succeed"
+        return 0
+    fi
+    assert_eq "0" "$(cat "$sandbox/install-rc.txt")" "active: rc 0"
+    assert_eq "active" "$(cat "$sandbox/keyd-state.txt")" "active: state=active"
+    assert_eq "1" "$(cat "$sandbox/keyd-deployed.txt")" "active: deployed=1"
+    assert_contains "keyd dual-role active (check unavailable)" "$(cat "$sandbox/caller.log")" \
+        "active: log says check is unavailable"
+    if grep -qF "keyd dual-role included" "$sandbox/caller.log"; then
+        fail "active: must not claim a verified 'included' deployment"
+    else
+        ok
+    fi
+}
+
+test_with_keyd_config_only_returns_nonzero() {
+    local sandbox="/tmp/rollback-test-keyd-explicit-config-only"
+    setup_keyd_caller_sandbox "$sandbox" none
+    if run_keyd_caller "$sandbox" 1 0 0 1 2> "$sandbox/caller.log"; then
+        fail "config-only: strict --with-keyd must not return 0"
+        return 0
+    fi
+    assert_eq "3" "$(cat "$sandbox/install-rc.txt")" "config-only: rc 3"
+    assert_eq "config-only" "$(cat "$sandbox/keyd-state.txt")" "config-only: state=config-only"
+    assert_eq "0" "$(cat "$sandbox/keyd-deployed.txt")" "config-only: deployed=0"
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "config-only: config was still deployed"
+    local caller_log
+    caller_log="$(cat "$sandbox/caller.log")"
+    assert_contains "no keyd service is active" "$caller_log" "config-only: warning names the missing service"
+    if grep -qF "keyd dual-role included" "$sandbox/caller.log"; then
+        fail "config-only: must NOT print 'dual-role included'"
+    else
+        ok
+    fi
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "config-only: no enable/restart should be attempted"
+    else
+        ok
+    fi
+}
+
+test_with_keyd_config_only_optin() {
+    local sandbox="/tmp/rollback-test-keyd-config-only-optin"
+    setup_keyd_caller_sandbox "$sandbox" none
+    if ! run_keyd_caller "$sandbox" 1 1 0 1 2> "$sandbox/caller.log"; then
+        fail "config-only opt-in: --keyd-config-only must return 0"
+        return 0
+    fi
+    assert_eq "0" "$(cat "$sandbox/install-rc.txt")" "config-only opt-in: rc 0"
+    assert_eq "config-only" "$(cat "$sandbox/keyd-state.txt")" "config-only opt-in: state stays config-only"
+    assert_eq "0" "$(cat "$sandbox/keyd-deployed.txt")" "config-only opt-in: deployed stays 0"
+    local caller_log
+    caller_log="$(cat "$sandbox/caller.log")"
+    assert_contains "no keyd service is active" "$caller_log" "config-only opt-in: log still marks config-only"
+    if grep -qF "keyd dual-role included" "$sandbox/caller.log"; then
+        fail "config-only opt-in: must NOT print 'dual-role included'"
+    else
+        ok
+    fi
+}
+
+test_with_keyd_source_missing_returns_failure() {
+    local sandbox="/tmp/rollback-test-keyd-explicit-missing-src"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    rm -f "$sandbox/keyd-src/cros.conf"
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "source missing: install_keyboard must return 1"
+        return 0
+    fi
+    assert_eq "1" "$(cat "$sandbox/install-rc.txt")" "source missing: rc 1"
+    assert_eq "failed" "$(cat "$sandbox/keyd-state.txt")" "source missing: state=failed"
+    assert_eq "0" "$(cat "$sandbox/keyd-deployed.txt")" "source missing: deployed=0"
+    assert_contains "keyd source not found" "$(cat "$sandbox/caller.log")" "source missing: warning logged"
+    if grep -qF "keyd dual-role included" "$sandbox/caller.log"; then
+        fail "source missing: must NOT print 'dual-role included'"
+    else
+        ok
+    fi
+}
+
+test_without_with_keyd_stays_zero() {
+    local sandbox="/tmp/rollback-test-keyd-not-requested"
+    setup_keyd_caller_sandbox "$sandbox" none
+    # keyd_bin is forced to fail on purpose: without --with-keyd none of it matters.
+    if ! run_keyd_caller "$sandbox" 0 0 0 1 2> "$sandbox/caller.log"; then
+        fail "not requested: install_keyboard must return 0"
+        return 0
+    fi
+    assert_eq "0" "$(cat "$sandbox/install-rc.txt")" "not requested: rc 0"
+    assert_eq "not-requested" "$(cat "$sandbox/keyd-state.txt")" "not requested: state=not-requested"
+    assert_eq "0" "$(cat "$sandbox/keyd-deployed.txt")" "not requested: deployed=0"
+    if grep -qE 'keyd dual-role|no keyd service is active|keyd step did not complete' "$sandbox/caller.log"; then
+        fail "not requested: no keyd success/failure line should be printed"
+    else
+        ok
     fi
 }
 
@@ -1241,19 +1405,17 @@ test_keyd_restart_unrecoverable_returns_failure() {
     fi
     assert_contains "keyd restart could not be recovered" "$(cat "$step_sandbox/step.log")" "unrecoverable restart: fatal error logged"
 
-    # (b) The real caller (install_keyboard) sets KEYD_DEPLOYED=0 and does not
-    # print the "keyd dual-role included" success line, but still completes the
-    # non-keyd install steps.
-    if ! run_sandboxed "$caller_sandbox" '
-        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
-            STUB_RESTART_FAIL_ALWAYS=1 WITH_KEYD=1
-        source "$2/install-keyboard-sandbox.sh"
-        get_real_user() { echo ""; }
-        install_keyboard
-        echo "${KEYD_DEPLOYED:-unset}" > "$2/keyd-deployed.txt"
-    ' 2> "$caller_sandbox/caller.log"; then
-        fail "unrecoverable restart: install_keyboard should still finish"
+    # (b) The real caller (install_keyboard) returns 1 for an explicit
+    # --with-keyd that could not be activated. It sets KEYD_DEPLOYED=0/state=failed
+    # and does not print the "keyd dual-role included" success line, but still
+    # completes the non-keyd install steps.
+    if STUB_RESTART_FAIL_ALWAYS=1 \
+        run_keyd_caller "$caller_sandbox" 1 0 0 0 2> "$caller_sandbox/caller.log"; then
+        fail "unrecoverable restart: caller must return 1"
+    else
+        assert_eq "1" "$(cat "$caller_sandbox/install-rc.txt")" "unrecoverable restart: caller returns 1"
     fi
+    assert_eq "failed" "$(cat "$caller_sandbox/keyd-state.txt")" "unrecoverable restart: caller state is failed"
     assert_eq "0" "$(cat "$caller_sandbox/keyd-deployed.txt")" "unrecoverable restart: caller sets KEYD_DEPLOYED=0"
     assert_contains "keyd dual-role NOT deployed" "$(cat "$caller_sandbox/caller.log")" "unrecoverable restart: caller logs non-deployment"
     if grep -qF "keyd dual-role included" "$caller_sandbox/caller.log"; then
@@ -1942,6 +2104,12 @@ test_keyd_restart_failure_restores_symlink_backup
 test_keyd_dangling_symlink_is_ours
 test_keyd_no_binary_deploys_config_only
 test_keyd_dry_run_no_side_effects
+test_with_keyd_verified_returns_zero
+test_with_keyd_active_unverified_returns_zero
+test_with_keyd_config_only_returns_nonzero
+test_with_keyd_config_only_optin
+test_with_keyd_source_missing_returns_failure
+test_without_with_keyd_stays_zero
 test_keyd_prepare_link_without_backup
 test_keyd_restart_unrecoverable_returns_failure
 test_keyd_was_existing_false_removes_new_link

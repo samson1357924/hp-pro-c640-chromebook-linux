@@ -531,11 +531,13 @@ install_keyd_step() {
         log_dryrun "Install -D -m 0644 $KEYD_SRC -> $KEYD_DST"
         log_dryrun "Would record service state: keyd (keyboard)"
         log_dryrun "keyd check (only >= 2.6) then systemctl enable keyd && systemctl restart keyd (if keyd installed)"
+        KEYD_STATE="planned"
         return 0
     fi
 
     if [ ! -f "$KEYD_SRC" ]; then
         log_warn "keyd source not found at $KEYD_SRC, skipping"
+        KEYD_STATE="failed"
         return 1
     fi
 
@@ -551,11 +553,15 @@ install_keyd_step() {
             0) log_success "keyd config syntax valid ($KEYD_SRC)" ;;
             1 | 2)
                 log_error "keyd config validation failed for $KEYD_SRC (rc=$rc): skipping deployment of $KEYD_DST and leaving the keyd service untouched. Fix the config and re-run with --with-keyd."
+                KEYD_STATE="failed"
                 return 1
                 ;;
+            # No state change: rc=3 still allows an active service (the daemon
+            # reload validates the config on keyd < 2.6).
             3) log_info "keyd < 2.6 has no 'check' subcommand; relying on daemon reload" ;;
             *)
                 log_error "keyd config check returned unexpected rc=$rc for $KEYD_SRC: skipping deployment of $KEYD_DST and leaving the keyd service untouched."
+                KEYD_STATE="failed"
                 return 1
                 ;;
         esac
@@ -567,6 +573,7 @@ install_keyd_step() {
     # first-wins manifest/uninstall backups: a failed upgrade must restore the
     # version that was live just before THIS deploy (V1), not the original.
     if ! _keyd_snapshot_create; then
+        KEYD_STATE="failed"
         return 1
     fi
 
@@ -593,19 +600,25 @@ install_keyd_step() {
             log_warn "keyd config reverted after install failure; dual-role NOT active"
         fi
         _keyd_snapshot_cleanup
+        KEYD_STATE="failed"
         return 1
     fi
     manifest_add_service "keyd" "keyboard"
 
     if [ -z "$keyd_cmd" ]; then
+        # Config was deployed, but there is no keyd service to validate or
+        # activate it. This is a distinct, non-success state: the caller must
+        # not report dual-role as included unless it explicitly opted in.
+        KEYD_STATE="config-only"
         _keyd_snapshot_cleanup
-        return 0
+        return 3
     fi
 
     if ! sudo systemctl enable keyd 2> /dev/null; then
         log_warn "Failed to enable keyd (try: sudo systemctl enable keyd)"
     fi
     if ! sudo systemctl restart keyd 2> /dev/null; then
+        KEYD_STATE="failed"
         log_warn "Failed to restart keyd after deploying $KEYD_DST; restoring previous config and retrying"
         local recovery_rc=0
         # `|| rc=$?` records the real status: `if ! cmd` would only expose the
@@ -617,12 +630,14 @@ install_keyd_step() {
         _keyd_snapshot_cleanup
         case "$recovery_rc" in
             0)
-                # Defensive: the new config is running normally; no revert.
+                # Defensive: the restart failed, so do not report success even
+                # if recovery claims the new config is running normally.
+                return 1
                 ;;
             2)
                 # The daemon was restarted, but on the ORIGINAL config. The
                 # system is safe, yet dual-role is NOT deployed: the caller
-                # runs us inside `if install_keyd_step` and sets
+                # captures our rc via `|| keyd_rc=$?` and keeps
                 # KEYD_DEPLOYED=0 from our failure status.
                 log_warn "keyd config reverted after restart failure; dual-role NOT active"
                 return 1
@@ -638,6 +653,13 @@ install_keyd_step() {
     if [ ! -f /etc/libinput/local-overrides.quirks ] || ! grep -q "keyd" /etc/libinput/local-overrides.quirks 2> /dev/null; then
         log_info "Tip: for GNOME Wayland trackpad, consider adding /etc/libinput/local-overrides.quirks (see keyboard/README.md)"
     fi
+    # rc=0 means keyd check verified the config; rc=3 means the old daemon
+    # (no check subcommand) is running the config without a usable verifier.
+    if [ "$rc" -eq 0 ]; then
+        KEYD_STATE="verified"
+    else
+        KEYD_STATE="active"
+    fi
     _keyd_snapshot_cleanup
     return 0
 }
@@ -648,7 +670,9 @@ show_help() {
     echo "Options:"
     echo "  --install, -i      Install Chromebook top-row udev hwdb mapping + kbd backlight sync (default)"
     echo "  --with-keyd        Also install keyd advanced dual-role config (Search tap= CapsLock, hold=Super, Search+TopRow=F1-F10)"
+    echo "                     Fails if the keyd service cannot be activated (rc 1/3)"
     echo "  --keyd             Alias for --with-keyd"
+    echo "  --keyd-config-only Also install the keyd config but accept that no keyd service is active (implies --with-keyd)"
     echo "  --check, -c        Check current keyboard hwdb and backlight sync status"
     echo "  --uninstall, -u    Uninstall top-row hwdb mapping and backlight sync (and keyd config if present)"
     echo "  --dry-run, -n      Preview changes without modifying files"
@@ -658,6 +682,7 @@ show_help() {
     echo "  $0                              # hwdb + backlight"
     echo "  $0 --with-keyd                  # hwdb + backlight + keyd dual-role"
     echo "  $0 --with-keyd --dry-run        # preview all"
+    echo "  $0 --keyd-config-only           # deploy keyd config only (no keyd service)"
 }
 
 check_keyboard_status() {
@@ -909,6 +934,13 @@ install_keyboard() {
     log_section "Installing Chromebook Top-Row Function Keys Mapping & Backlight Sync"
     check_dmi_board || true
 
+    # Always reset: an earlier call in the same shell (or an inherited
+    # environment) must not leak a keyd result into this run. Do NOT reset
+    # KEYD_ALLOW_CONFIG_ONLY here: it is a CLI opt-in set before this function
+    # runs, and resetting it would silently discard `--keyd-config-only`.
+    KEYD_STATE="not-requested"
+    KEYD_DEPLOYED=0
+
     local total_steps=5
     if [ "${WITH_KEYD:-0}" = "1" ]; then
         total_steps=6
@@ -1021,29 +1053,51 @@ install_keyboard() {
     fi
 
     # Optional keyd dual-role step
-    KEYD_DEPLOYED=0
     if [ "${WITH_KEYD:-0}" = "1" ]; then
         log_step 6 $total_steps "Installing keyd dual-role config to $KEYD_DST..."
-        if install_keyd_step; then
-            # A dry run only previews the keyd step; never claim deployment.
-            if [ "${DRY_RUN:-0}" != "1" ]; then
-                KEYD_DEPLOYED=1
-            fi
-        else
-            KEYD_DEPLOYED=0
-            log_error "keyd step did not complete (config rejected, install failed or restart failed/reverted); keyboard hwdb/backlight changes are still installed"
-        fi
+        # Guard with || under set -e so the step's real status can be handled.
+        local keyd_rc=0
+        install_keyd_step || keyd_rc=$?
+        case "$keyd_rc" in
+            0)
+                # A dry run only previews the keyd step; never claim deployment.
+                if [ "${DRY_RUN:-0}" != "1" ]; then
+                    # shellcheck disable=SC2034 # consumed by callers/tests after install_keyboard returns
+                    KEYD_DEPLOYED=1
+                fi
+                ;;
+            3)
+                log_warn "keyd config deployed but no keyd service is active; dual-role NOT active (install keyd or use --keyd-config-only to accept this explicitly)"
+                ;;
+            *)
+                log_error "keyd step did not complete (config rejected, install failed or restart failed/reverted; rc=$keyd_rc); keyboard hwdb/backlight changes are still installed"
+                ;;
+        esac
     fi
 
     log_success "Chromebook top-row keyboard mapping and backlight sync installed! ⌨️"
     # In a dry run install_keyd_step already printed "Would deploy keyd
     # dual-role config"; do not claim deployment (or a real failure) here.
     if [ "${WITH_KEYD:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
-        if [ "${KEYD_DEPLOYED:-0}" = "1" ]; then
-            log_success "keyd dual-role included (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
-        else
-            log_error "keyd dual-role NOT deployed (restart failed or config rejected; see errors above)"
-        fi
+        case "${KEYD_STATE:-not-requested}" in
+            verified)
+                log_success "keyd dual-role included (verified) (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
+                ;;
+            active)
+                log_success "keyd dual-role active (check unavailable) (Search tap=CapsLock hold=Super, Search+TopRow=F1-F10)"
+                ;;
+            config-only)
+                # The config was written, but no keyd service is active. Never
+                # claim dual-role is included; the caller's warning above
+                # explains the missing service.
+                ;;
+            failed)
+                log_error "keyd dual-role NOT deployed (restart failed or config rejected; see errors above)"
+                ;;
+            *)
+                log_error "keyd dual-role NOT deployed (keyd step reported state '${KEYD_STATE:-unset}'; see errors above)"
+                ;;
+        esac
     fi
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_info "Dry-run: no system files were changed. Run without --dry-run to apply."
@@ -1055,11 +1109,26 @@ install_keyboard() {
             log_info "Automated check: sudo python3 $SCRIPT_DIR/tests/keyd-dualrole-uinput.py"
         fi
     fi
+
+    # An explicit --with-keyd that did not take effect is a failure (rc 3 for
+    # config-only, rc 1 otherwise). --check/--uninstall and dry runs keep rc 0.
+    local final_rc=0
+    if [ "${WITH_KEYD:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+        case "${KEYD_STATE:-not-requested}" in
+            verified | active) : ;;
+            config-only) [ "${KEYD_ALLOW_CONFIG_ONLY:-0}" = "1" ] || final_rc=3 ;;
+            *) final_rc=1 ;;
+        esac
+    fi
+    return "$final_rc"
 }
 
 # CLI Argument Parsing
 ACTION="install"
 WITH_KEYD=0
+# Reset before parsing so an inherited KEYD_ALLOW_CONFIG_ONLY=1 cannot opt in
+# to config-only mode implicitly; `--keyd-config-only` re-enables it below.
+KEYD_ALLOW_CONFIG_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --install | -i)
@@ -1069,6 +1138,13 @@ while [ $# -gt 0 ]; do
         --with-keyd | --keyd | --enable-keyd)
             WITH_KEYD=1
             export WITH_KEYD
+            shift
+            ;;
+        --keyd-config-only)
+            WITH_KEYD=1
+            export WITH_KEYD
+            KEYD_ALLOW_CONFIG_ONLY=1
+            export KEYD_ALLOW_CONFIG_ONLY
             shift
             ;;
         --check | -c)
@@ -1097,6 +1173,8 @@ done
 
 case "$ACTION" in
     install)
+        # Bare call: as an `||` left operand the whole function would run with
+        # errexit suppressed, swallowing failures in later install steps.
         install_keyboard
         ;;
     check)
@@ -1106,3 +1184,4 @@ case "$ACTION" in
         uninstall_keyboard
         ;;
 esac
+exit $?

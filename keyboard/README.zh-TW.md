@@ -60,7 +60,8 @@ chmod +x keyboard/install-keyboard.sh
 * `./keyboard/install-keyboard.sh --check`：檢查 hwdb 是否已部署。
 * `./keyboard/install-keyboard.sh --dry-run`：預覽操作。
 * `./keyboard/install-keyboard.sh --uninstall`：移除頂排 hwdb、背光同步與（若已安裝的）keyd 設定。
-* `./keyboard/install-keyboard.sh --with-keyd`：連 keyd 一起安裝（進階雙重角色）。
+* `./keyboard/install-keyboard.sh --with-keyd`：連 keyd 一起安裝（進階雙重角色）。若 keyd 服務無法啟動會回傳非 0：只寫入設定檔但沒有 keyd binary 時回傳 3；設定被拒絕或重啟/回復失敗時回傳 1。
+* `./keyboard/install-keyboard.sh --keyd-config-only`：隱含 `--with-keyd`，但明確接受「只有設定檔、沒有 keyd 服務」的結果（rc 0）；安裝器仍會標明雙重角色**未**生效。
 
 ---
 
@@ -72,7 +73,7 @@ chmod +x keyboard/install-keyboard.sh
 > 頂排掃描碼 `0x3b`-`0x44` 轉為 `KEY_BACK`/`KEY_BRIGHTNESSDOWN`…，以及
 > `0xDB`→`KEY_LEFTMETA`；`cros.conf` 使用這些名稱（`back`、`leftmeta`）。
 > 可用 `sudo python3 keyboard/tests/check-top-row-hwdb.py` 確認核心映射。
-> 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。
+> 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。若系統尚未安裝 keyd，此指令現在會回傳 rc 3，而不會宣稱雙重角色已生效；若刻意只想部署設定檔（例如 CI 容器），請改用 `--keyd-config-only`。
 
 1. 安裝 `keyd`（CI 固定 `v2.6.0`，hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3`）：
 

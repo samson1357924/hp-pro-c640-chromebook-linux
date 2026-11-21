@@ -226,8 +226,11 @@ jobs:
       - name: Install keyd Dual-Role (optional)
         run: |
           set -euo pipefail
-          # install with keyd flag (keyd binary not present in container, but config should be deployed)
-          USER=smoketest ./keyboard/install-keyboard.sh --with-keyd
+          # keyd binary is deliberately absent in the container: the config is
+          # still deployed, but no keyd service can be activated. Config-only
+          # is explicitly accepted here so rc stays 0; a strict --with-keyd
+          # would correctly return 3.
+          USER=smoketest ./keyboard/install-keyboard.sh --with-keyd --keyd-config-only
           test -f /etc/keyd/cros.conf
           test ! -e /etc/keyd/default.conf
           test ! -L /etc/keyd/default.conf

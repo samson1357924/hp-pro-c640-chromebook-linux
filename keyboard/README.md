@@ -64,7 +64,8 @@ chmod +x keyboard/install-keyboard.sh
 * `./keyboard/install-keyboard.sh --check` : Check if hwdb is deployed.
 * `./keyboard/install-keyboard.sh --dry-run` : Preview operations.
 * `./keyboard/install-keyboard.sh --uninstall` : Remove the top-row hwdb, backlight sync and (if installed) the keyd config.
-* `./keyboard/install-keyboard.sh --with-keyd` : Install with keyd (advanced dual-role).
+* `./keyboard/install-keyboard.sh --with-keyd` : Install with keyd (advanced dual-role). Fails (non-zero) if the keyd service cannot be activated: rc 3 when only the config was written (no keyd binary), rc 1 for a rejected config or a failed restart/revert.
+* `./keyboard/install-keyboard.sh --keyd-config-only` : Implies `--with-keyd`, but explicitly accepts the config-only outcome (no keyd binary/service) with rc 0. The installer still reports that dual-role is **not** active.
 
 ---
 
@@ -78,7 +79,7 @@ on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 > `KEY_BACK`/`KEY_BRIGHTNESSDOWN`/... and `0xDB` to `KEY_LEFTMETA`; `cros.conf`
 > uses those names (`back`, `leftmeta`). Run
 > `sudo python3 keyboard/tests/check-top-row-hwdb.py` to confirm the kernel map.
-> Recommended: `sudo ./keyboard/install-keyboard.sh --with-keyd` (installs hwdb+backlight+keyd atomically).
+> Recommended: `sudo ./keyboard/install-keyboard.sh --with-keyd` (installs hwdb+backlight+keyd atomically). If keyd is not installed yet, this now returns rc 3 instead of claiming dual-role is active; use `--keyd-config-only` if you intentionally want only the config deployed (e.g. CI containers).
 
 1. Install `keyd` (pinned to v2.6.0, hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3` in CI):
 
