@@ -2151,7 +2151,7 @@ test_keyd_unsupported_path_type_fails_closed() {
 # $4 = expected number of manifest records for the two keyd paths (default 0).
 # ---------------------------------------------------------------------------
 assert_keyd_backup_failure_fails_closed() {
-    local sandbox="$1" label="$2" expected_backups="$3" expected_keyd_records="${4:-0}"
+    local sandbox="$1" label="$2" expected_backups="$3" expected_keyd_records="${4:-0}" reason="${5:-backup failed}"
     assert_eq "1" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
         "$label: CLI returns 1"
     assert_eq "failed" "$(cat "$sandbox/keyd-state.txt" 2> /dev/null || echo MISSING)" \
@@ -2183,8 +2183,8 @@ assert_keyd_backup_failure_fails_closed() {
     else
         fail "$label: retained snapshot must carry a .failed marker"
     fi
-    assert_contains "backup failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
-        "$label: retain log names the backup failure"
+    assert_contains "$reason" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "$label: retain log names the failure reason"
     assert_contains "refusing to deploy keyd config" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
         "$label: fail-closed error logged"
     local keyd_records
@@ -2300,6 +2300,177 @@ print(sum(1 for r in data.get("records", []) if r.get("target") == sys.argv[2]))
     assert_eq "0" "$link_records" "link backup failure: no manifest record for the legacy link"
     assert_contains "failed for $sandbox/etc/keyd/default.conf" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
         "link backup failure: refusal names the legacy link"
+}
+
+# ---------------------------------------------------------------------------
+# 32c/32d. P2: the keyd SERVICE manifest write must be checked too. A failed
+# file backup is already fail-closed, but an unchecked service-write failure
+# would still enable/restart keyd with NO ownership record, so uninstall would
+# leave the service running. The narrow python3 stub below refuses only the
+# service write (8 args, script mentioning was_enabled): manifest_add_entry
+# (7 args) and all readers still succeed, proving the failure point is the
+# service manifest and not the earlier file backup/record.
+# ---------------------------------------------------------------------------
+test_keyd_service_manifest_failure_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-service-manifest-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 8 ] && printf '%s' "${2:-}" | grep -q 'was_enabled'; then
+    printf 'STUB: service manifest write refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    local rc=0
+    run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log" || rc=$?
+    assert_eq "1" "$rc" "service manifest failure: CLI returns 1"
+    # Both file backups/records precede the guard, so both are kept.
+    assert_keyd_backup_failure_fails_closed "$sandbox" "service manifest failure" 1 2 "service manifest failed"
+    local cros_backups
+    cros_backups="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "1" "$cros_backups" "service manifest failure: cros.conf backup succeeded before the guard"
+    local services
+    services="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' \
+        "$sandbox/manifest/install-manifest.json" 2> /dev/null || echo MISSING)"
+    assert_eq "0" "$services" "service manifest failure: no service ownership record was written"
+    assert_contains "service manifest write failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "service manifest failure: root cause logged"
+    assert_contains "refusing to deploy keyd config or enable/restart keyd" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "service manifest failure: explicit refusal logged"
+
+    # No ownership record: uninstall's sole authority would leave keyd alone.
+    # Read it without running uninstall, which would consume the manifest
+    # records the recovery test below needs to prove first-wins.
+    local managed
+    managed="$(run_sandboxed "$sandbox" '
+        source "$2/install-keyboard-sandbox.sh"
+        _keyd_managed_by_us
+    ')"
+    assert_eq "0" "$managed" "service manifest failure: keyd has no ownership record"
+}
+
+# Retry the SAME sandbox without the stub: a later install must succeed, keep
+# first-wins backups, and leave the earlier marked snapshot intact.
+test_keyd_service_manifest_failure_recovery() {
+    local sandbox="/tmp/rollback-test-keyd-service-manifest-fail"
+    if [ ! -d "$sandbox/manifest" ]; then
+        fail "service manifest recovery: prerequisite failure test did not run"
+        return 0
+    fi
+    local failed_snap
+    failed_snap="$(snapshot_dir "$sandbox")"
+    if [ -z "$failed_snap" ] || ! sudo test -f "$failed_snap/.failed"; then
+        fail "service manifest recovery: prerequisite marked snapshot missing"
+        return 0
+    fi
+
+    # Make --global cat keyd fail so the service record gets the real system
+    # scope (the shared default stub answers every --global cat with success).
+    # Also log the snapshot count at restart time so "two snapshots existed"
+    # cannot pass vacuously.
+    rm -f "$sandbox/stub/python3"
+    cat > "$sandbox/stub/systemctl" << EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${STUB_SYSTEMCTL_LOG:?}"
+case "\$*" in
+    "--global cat keyd")
+        exit 1
+        ;;
+    *"restart keyd"*)
+        printf 'SNAP:%s\n' "\$(find '$sandbox/snapshots' -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l)" >> "\${STUB_SYSTEMCTL_LOG:?}"
+        ;;
+    *"is-enabled keyd"*|*"is-enabled --quiet keyd"*) [ "\${STUB_SVC_ENABLED:-1}" = "1" ] && exit 0 || exit 3 ;;
+    *"is-active keyd"*|*"is-active --quiet keyd"*) [ "\${STUB_SVC_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
+esac
+exit 0
+EOF
+    chmod +x "$sandbox/stub/systemctl"
+    : > "$sandbox/systemctl.log"
+
+    local rc=0
+    run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller-retry.log" || rc=$?
+    assert_eq "0" "$rc" "service manifest recovery: retry returns 0"
+    assert_eq "0" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
+        "service manifest recovery: install_keyboard rc"
+    assert_eq "1" "$(cat "$sandbox/keyd-deployed.txt" 2> /dev/null || echo MISSING)" \
+        "service manifest recovery: KEYD_DEPLOYED=1"
+    case "$(cat "$sandbox/keyd-state.txt" 2> /dev/null || echo MISSING)" in
+        verified | active) ok ;;
+        *) fail "service manifest recovery: KEYD_STATE must be verified/active" ;;
+    esac
+    assert_eq "VALID_CROS_CONF" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "service manifest recovery: valid config deployed"
+    local svc
+    svc="$(python3 -c '
+import json, sys
+try:
+    s = [x for x in json.load(open(sys.argv[1])).get("services", [])
+         if x.get("name") in ("keyd", "keyd.service")]
+except Exception:
+    print("MISSING")
+    raise SystemExit
+print(len(s), s[0].get("name", "") if s else "", s[0].get("component", "") if s else "", s[0].get("scope", "") if s else "")
+' "$sandbox/manifest/install-manifest.json" 2> /dev/null || echo MISSING)"
+    assert_eq "1 keyd keyboard system" "$svc" \
+        "service manifest recovery: one system-scoped keyd service record"
+    local cros_backups
+    cros_backups="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "1" "$cros_backups" "service manifest recovery: first-wins keeps one cros.conf backup"
+    local log
+    log="$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")"
+    assert_contains "enable keyd" "$log" "service manifest recovery: keyd enabled"
+    assert_contains "restart keyd" "$log" "service manifest recovery: keyd restarted"
+    assert_contains "SNAP:2" "$log" \
+        "service manifest recovery: second snapshot existed at restart time (failure + new)"
+    local snap_dirs
+    snap_dirs="$(sudo find "$sandbox/snapshots" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "1" "$snap_dirs" "service manifest recovery: new snapshot cleaned up after success"
+    assert_eq "$failed_snap" "$(snapshot_dir "$sandbox")" \
+        "service manifest recovery: the first marked snapshot was retained"
+    if sudo test -d "$failed_snap" && sudo test -f "$failed_snap/.failed"; then
+        ok
+    else
+        fail "service manifest recovery: first snapshot still carries its .failed marker"
+    fi
+
+    : > "$sandbox/systemctl.log"
+    run_keyd_uninstall "$sandbox"
+    assert_contains "disable --now keyd" "$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")" \
+        "service manifest recovery: uninstall disables the now-owned keyd service"
+}
+
+# The helper itself must propagate the python write failure (otherwise the new
+# preflight guard could never see it).
+test_manifest_add_service_failure_returns_nonzero() {
+    local sandbox="/tmp/rollback-test-manifest-add-service-helper-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+    setup_keyd_stubs "$sandbox" valid
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 8 ] && printf '%s' "${2:-}" | grep -q 'was_enabled'; then
+    printf 'STUB: service manifest write refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        manifest_add_service "keyd" "keyboard"
+        printf "%s\n" "$?" > "$2/helper-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "manifest_add_service: a failed python write returns 1"
 }
 
 # Direct helper-level checks: both primitives must propagate a real failure.
@@ -3372,6 +3543,9 @@ test_keyd_unsupported_path_type_fails_closed fifo
 test_keyd_backup_copy_failure_fails_closed
 test_keyd_manifest_write_failure_fails_closed
 test_keyd_link_backup_failure_fails_closed
+test_keyd_service_manifest_failure_fails_closed
+test_keyd_service_manifest_failure_recovery
+test_manifest_add_service_failure_returns_nonzero
 test_backup_helper_copy_failure_returns_nonzero
 test_backup_helper_manifest_failure_returns_nonzero
 test_keyd_snapshot_base_world_writable_fails_closed

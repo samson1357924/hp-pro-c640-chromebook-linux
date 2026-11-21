@@ -691,6 +691,7 @@ print(changed)
 # itself failed, or when the restart failed and recovery had to revert to the
 # pre-install config (dual-role is not active in all of those cases).
 install_keyd_step() {
+    local had_legacy_link=0 link_target=""
     if [ "${DRY_RUN:-0}" = "1" ]; then
         backup_file_manifest_aware "$KEYD_DST" "keyboard"
         if is_our_legacy_keyd_link; then
@@ -760,7 +761,6 @@ install_keyd_step() {
         return 1
     fi
     if is_our_legacy_keyd_link; then
-        local link_target
         link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
         _normalize_keyd_link_manifest_component
         # Keep the snapshot and the symlink intact on any backup failure: the
@@ -772,6 +772,21 @@ install_keyd_step() {
             KEYD_STATE="failed"
             return 1
         fi
+        had_legacy_link=1
+    fi
+
+    # Ownership must be claimed BEFORE any deployment or service mutation:
+    # enabling/restarting keyd without a service record would leave the unit
+    # active but unknown to uninstall's ownership guard. This stays AFTER both
+    # file backups so a failed backup keeps its own fail-closed semantics, and
+    # BEFORE the symlink removal/config deploy so no half-deployed state remains.
+    if ! manifest_add_service "keyd" "keyboard"; then
+        log_error "Keyd service manifest write failed; refusing to deploy keyd config or enable/restart keyd (uninstall would not restore service state)"
+        _keyd_snapshot_retain_notice "service manifest failed"
+        KEYD_STATE="failed"
+        return 1
+    fi
+    if [ "$had_legacy_link" -eq 1 ]; then
         sudo rm -f "$KEYD_LINK" 2> /dev/null || true
         log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
     fi
@@ -792,7 +807,6 @@ install_keyd_step() {
         KEYD_STATE="failed"
         return 1
     fi
-    manifest_add_service "keyd" "keyboard"
 
     if [ -z "$keyd_cmd" ]; then
         # Config was deployed, but there is no keyd service to validate or
