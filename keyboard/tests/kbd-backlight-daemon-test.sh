@@ -22,6 +22,7 @@ RAW_FILE="$TMP_DIR/upower-raw"
 PCT_FILE="$TMP_DIR/gsd-pct"
 DAEMON_ERR="$TMP_DIR/daemon.err"
 FLOCK_DIR="$TMP_DIR/flock"
+RECOVER_LOG="$TMP_DIR/recover.log"
 mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR"
 
 passed=0
@@ -181,6 +182,9 @@ printf 'ectool %s\n' "$*" >> "$STUB_ECTOOL_LOG"
 if [ "${1:-}" = "pwmgetkblight" ]; then
     printf '100\n'
 fi
+if [ "${1:-}" = "pwmsetkblight" ] && [ "${STUB_ECTOOL_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
 exit 0
 STUB
 
@@ -203,6 +207,22 @@ for arg in "$@"; do
     esac
 done
 [ -n "$fd" ] || exit 0
+# Fault injection: fail the first N flock calls for one fd, modelling a
+# transient flock error even in blocking mode.  The counter lives next to the
+# lock files so reset_case's `rm -f "$FLOCK_DIR"/flock.*` clears it.
+fail_fd="${STUB_FLOCK_FAIL_FD:-}"
+fail_n="${STUB_FLOCK_FAIL_COUNT:-0}"
+if [ -n "$fail_fd" ] && [ "$fd" = "$fail_fd" ] && [ "$fail_n" -gt 0 ]; then
+    counter="$lock_dir/flock.fail.$fail_fd"
+    used="$(cat "$counter" 2> /dev/null || echo 0)"
+    case "$used" in
+        '' | *[!0-9]*) used=0 ;;
+    esac
+    if [ "$used" -lt "$fail_n" ]; then
+        printf '%s\n' "$((used + 1))" > "$counter" 2> /dev/null || true
+        exit 1
+    fi
+fi
 target="$(readlink "/proc/self/fd/$fd" 2> /dev/null || true)"
 [ -n "$target" ] || target="fd$fd"
 key="$(printf '%s\n' "$target" | cksum | cut -d' ' -f1)"
@@ -265,6 +285,7 @@ export STATE_LOCK="$D_STATE_DIR/c640-kbd-backlight.state.lock"
 export LOCK_FILE="$D_STATE_DIR/c640-kbd-backlight.lock"
 export LAST_USER_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user"
 export RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
+export RESTORE_PENDING_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-pending"
 export HAVE_GSD_KBD=""
 export HAVE_UPOWER_KBD=""
 
@@ -280,13 +301,18 @@ export STUB_UPOWER_FAIL="0"
 export STUB_GNOME_ACTIVE="false"
 export STUB_FDO_ACTIVE="false"
 export STUB_GSD_NOOP="0"
+export STUB_ECTOOL_FAIL="0"
 
 reset_case() {
+    # Retire retry subshells from the previous case before removing their files.
+    wait 2> /dev/null || true
     : > "$GDBUS_LOG"
     : > "$SET_LOG"
     : > "$DAEMON_ERR"
+    : > "$RECOVER_LOG"
     : > "$TMP_DIR/ectool.log"
     rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$RESTORE_GEN_FILE" \
+        "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending "$D_STATE_DIR"/*.meta \
         "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE"
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
@@ -303,6 +329,7 @@ reset_case() {
     export STUB_FDO_ACTIVE="false"
     export C640_KBD_FORCE_LEGACY=0
     export STUB_GSD_NOOP=0
+    export STUB_ECTOOL_FAIL=0
     _C640_WARNED=()
     _C640_ZERO_STREAK=0
     last_user_brightness=""
@@ -317,6 +344,14 @@ run_fn() {
     # Function call with stderr captured; never let an internal `return 1`
     # abort the test harness.
     "$@" 2> "$DAEMON_ERR" || true
+}
+
+run_fn_rc() {
+    # Same as run_fn but prints the function's rc on stdout, so failure paths
+    # can be asserted without tripping `set -e` in the harness.
+    local rc=0
+    "$@" 2> "$DAEMON_ERR" || rc=$?
+    printf '%s' "$rc"
 }
 
 # --- tests -----------------------------------------------------------------
@@ -432,7 +467,7 @@ run_fn save_state
 assert_file "save_state keeps the manual 0" "$STATE_FILE" "0"
 run_fn restore_state
 assert_file "unblank after manual 0 leaves the light off" "$RAW_FILE" "0"
-assert_absent "manual 0: restore consumes state without writing" "$STATE_FILE"
+assert_absent "manual 0: restore consumes state after writing 0" "$STATE_FILE"
 
 # 10. A zero while gsd still reports a non-zero percentage is a transient,
 #     not user intent, even if seen twice.
@@ -552,6 +587,258 @@ set_count="$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 assert_eq "runtime recovery restores exactly one Properties.Set" "1" "$set_count"
 assert_eq "runtime recovery re-caches HAVE_GSD_KBD=1" "1" "$HAVE_GSD_KBD"
 assert_file "runtime recovery reaches the LED via gsd-power" "$RAW_FILE" "22"
+
+# set_brightness rc contract: a non-numeric input is a failure, and a write
+# with no readback path at all is reported as "no verifier" (rc 2) so callers
+# can accept it as authoritative.
+reset_case
+rc="$(run_fn_rc set_brightness not-a-number)"
+assert_eq "set_brightness rejects non-numeric input with rc 1" "1" "$rc"
+reset_case
+rm -f "$FAKE_SYSFS"
+export C640_KBD_FORCE_LEGACY=1
+rc="$(run_fn_rc verify_brightness 7)"
+assert_eq "verify_brightness reports no readback path as rc 2" "2" "$rc"
+
+# (a) A saved 0 is a real value: the restore must write it instead of
+#     discarding it, otherwise a non-zero residual brightness survives.
+reset_case
+write_state 0
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+rc="$(run_fn_rc restore_state)"
+assert_eq "saved 0: restore returns 0" "0" "$rc"
+assert_file "saved 0: LED is written off" "$RAW_FILE" "0"
+assert_absent "saved 0: state consumed after verified write" "$STATE_FILE"
+assert_absent "saved 0: pending consumed after verified write" "$RESTORE_PENDING_FILE"
+if grep -q 'Properties.Set' "$SET_LOG"; then
+    ok "saved 0: restore performs a real writer call"
+else
+    bad "saved 0: no writer call in SET_LOG: $(cat "$SET_LOG")"
+fi
+
+# (a2) The same valid 0 is deferred while the screen is still active.
+reset_case
+write_state 0
+printf '30\n' > "$RAW_FILE"
+export STUB_GNOME_ACTIVE=true
+rc="$(run_fn_rc restore_state)"
+export STUB_GNOME_ACTIVE=false
+assert_eq "deferred saved 0: initial restore returns 0" "0" "$rc"
+assert_file "deferred saved 0: LED stays at 30 while ScreenSaver active" "$RAW_FILE" "30"
+assert_file "deferred saved 0: state retained while deferred" "$STATE_FILE" "0"
+rc="$(run_fn_rc restore_state)"
+assert_eq "deferred saved 0: later restore returns 0" "0" "$rc"
+assert_file "deferred saved 0: LED written off after unlock" "$RAW_FILE" "0"
+assert_absent "deferred saved 0: state consumed after unlock" "$STATE_FILE"
+assert_absent "deferred saved 0: pending consumed after unlock" "$RESTORE_PENDING_FILE"
+
+# (c) Every writer fails: the restore must report failure and keep the state.
+reset_case
+write_state 7
+export STUB_GSD_FAIL=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1
+rm -f "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+if [ "$rc" -ne 0 ]; then
+    ok "all writers fail: restore returns non-zero (rc=$rc)"
+else
+    bad "all writers fail: restore incorrectly returned 0"
+fi
+assert_file "all writers fail: state value preserved" "$STATE_FILE" "7"
+assert_absent "all writers fail: pending rolled back" "$RESTORE_PENDING_FILE"
+if grep -q 'restore failed' "$DAEMON_ERR"; then
+    ok "all writers fail: logs 'restore failed'"
+else
+    bad "all writers fail: no 'restore failed' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# (c2) gsd-power reports success but never touches the hardware ("fake
+#      success"); a readback mismatch must NOT consume the saved state.
+reset_case
+write_state 7
+export STUB_GSD_NOOP=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1
+rm -f "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+if grep -q 'Properties.Set' "$SET_LOG"; then
+    ok "gsd fake success: Properties.Set was accepted"
+else
+    bad "gsd fake success: no Properties.Set in SET_LOG: $(cat "$SET_LOG")"
+fi
+assert_file "gsd fake success: UPower raw stayed stale" "$RAW_FILE" "42"
+if [ "$rc" -ne 0 ]; then
+    ok "gsd fake success: restore returns non-zero (rc=$rc)"
+else
+    bad "gsd fake success: gsd's Set rc=0 was mistaken for a completed restore"
+fi
+assert_file "gsd fake success: state value preserved" "$STATE_FILE" "7"
+assert_absent "gsd fake success: pending rolled back" "$RESTORE_PENDING_FILE"
+
+# (d) A verified write consumes both the staged and the live state file.
+reset_case
+write_state 7
+printf '9\n' > "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+assert_eq "write success: restore returns 0" "0" "$rc"
+assert_file "write success: UPower raw reaches the saved value" "$RAW_FILE" "7"
+assert_absent "write success: state consumed" "$STATE_FILE"
+assert_absent "write success: pending consumed" "$RESTORE_PENDING_FILE"
+
+# (f) A failed restore leaves the state for a later, successful retry.
+reset_case
+write_state 7
+export STUB_GSD_FAIL=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1
+rm -f "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+if [ "$rc" -ne 0 ]; then
+    ok "retry scenario: first attempt fails (rc=$rc)"
+else
+    bad "retry scenario: first attempt unexpectedly succeeded"
+fi
+assert_file "retry scenario: state kept after failure" "$STATE_FILE" "7"
+export STUB_GSD_FAIL=0 STUB_UPOWER_FAIL=0 STUB_ECTOOL_FAIL=0
+printf '99\n' > "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+assert_eq "retry scenario: second attempt returns 0" "0" "$rc"
+assert_file "retry scenario: second attempt reaches the LED" "$RAW_FILE" "7"
+assert_absent "retry scenario: state consumed after success" "$STATE_FILE"
+assert_absent "retry scenario: pending consumed after success" "$RESTORE_PENDING_FILE"
+
+# (g) The CLI --test-unblank entry point must propagate the restore failure
+#     (run in a child process so `exit 1` cannot kill the test harness).
+reset_case
+write_state 7
+cli_rc=0
+cli_out="$(
+    XDG_RUNTIME_DIR="$D_STATE_DIR" \
+        C640_KBD_SYSFS_BRIGHTNESS="$TMP_DIR/no-sysfs-brightness" \
+        C640_KBD_SYSFS_MAX="$FAKE_MAX" \
+        C640_KBD_FORCE_LEGACY=0 \
+        STUB_GSD_FAIL=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1 STUB_GSD_NOOP=0 \
+        STUB_GDBUS_LOG="$GDBUS_LOG" STUB_SET_LOG="$SET_LOG" \
+        STUB_ECTOOL_LOG="$TMP_DIR/ectool.log" STUB_FLOCK_DIR="$FLOCK_DIR" \
+        STUB_RAW_FILE="$RAW_FILE" STUB_PCT_FILE="$PCT_FILE" \
+        STUB_KBD_RAW=42 STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false \
+        "$DAEMON" --test-unblank 2> "$DAEMON_ERR"
+)" || cli_rc=$?
+if [ "$cli_rc" -ne 0 ]; then
+    ok "CLI --test-unblank propagates restore failure (rc=$cli_rc)"
+else
+    bad "CLI --test-unblank returned 0 despite a failed restore: $cli_out"
+fi
+assert_file "CLI --test-unblank failure: state preserved" "$STATE_FILE" "7"
+assert_absent "CLI --test-unblank failure: pending rolled back" "$RESTORE_PENDING_FILE"
+if grep -q 'restore failed' "$DAEMON_ERR"; then
+    ok "CLI --test-unblank failure: logs 'restore failed'"
+else
+    bad "CLI --test-unblank failure: no 'restore failed' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# 16. recover_pending_state may only run at daemon startup, never from
+#     restore_state (it would mv a value another restore is mid-write on).
+reset_case
+write_state 7
+_orig_recover="$(declare -f recover_pending_state)"
+recover_pending_state() {
+    printf 'called\n' >> "$RECOVER_LOG"
+}
+run_fn restore_state
+eval "$_orig_recover"
+assert_eq "restore_state never calls recover_pending_state" "0" "$(grep -c . "$RECOVER_LOG" || true)"
+assert_file "restore_state (no recover) still wrote the saved value" "$RAW_FILE" "7"
+assert_absent "restore_state (no recover) still consumed the state" "$STATE_FILE"
+
+# 17. A second restore_state entering during A's slow write must not steal or
+#     delete A's staged PENDING value.  This is the concrete race that used to
+#     lose state permanently; the nested call is a real restore_state(), not a
+#     text/source comparison.
+reset_case
+write_state 7
+_orig_set_brightness_17="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_17 ()/' > "$TMP_DIR/real_set_brightness_17.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_17.def"
+nested_done_17=0
+staged_stolen_17=0
+set_brightness() {
+    if [ "$nested_done_17" -eq 0 ]; then
+        nested_done_17=1
+        # A has staged PENDING and released STATE_LOCK for the write.
+        local staged_before state_before staged_after state_after
+        staged_before="$(cat "$RESTORE_PENDING_FILE" 2> /dev/null || echo '<missing>')"
+        state_before="$(cat "$STATE_FILE" 2> /dev/null || echo '<missing>')"
+        run_fn restore_state
+        staged_after="$(cat "$RESTORE_PENDING_FILE" 2> /dev/null || echo '<missing>')"
+        state_after="$(cat "$STATE_FILE" 2> /dev/null || echo '<missing>')"
+        if [ "$staged_after" != "$staged_before" ] || [ "$state_after" != "$state_before" ]; then
+            staged_stolen_17=1
+        fi
+    fi
+    real_set_brightness_17 "$@"
+}
+run_fn restore_state
+eval "$_orig_set_brightness_17"
+assert_eq "concurrent restore leaves the staged PENDING untouched" "0" "$staged_stolen_17"
+assert_file "concurrent restore writes the saved brightness" "$RAW_FILE" "7"
+assert_absent "concurrent restore consumes state" "$STATE_FILE"
+assert_absent "concurrent restore consumes pending" "$RESTORE_PENDING_FILE"
+
+# 18. A transient state-lock failure in finalize_restore must NOT orphan
+#     PENDING.  The old `flock -n 203` returned 1 on contention while PENDING
+#     held the only copy of the saved value (STATE_FILE was already staged
+#     away); the "another restore is in progress" guard then blocked every
+#     later restore_state/cleanup until a daemon restart.
+reset_case
+write_state 7
+printf '9\n' > "$RAW_FILE"
+export STUB_FLOCK_FAIL_FD=203 STUB_FLOCK_FAIL_COUNT=1
+rc="$(run_fn_rc restore_state)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "finalize flock failure: restore still returns 0" "0" "$rc"
+assert_file "finalize flock failure: brightness still written" "$RAW_FILE" "7"
+assert_absent "finalize flock failure: PENDING consumed" "$RESTORE_PENDING_FILE"
+assert_absent "finalize flock failure: STATE consumed" "$STATE_FILE"
+if grep -q 'resolving PENDING without the lock' "$DAEMON_ERR"; then
+    ok "finalize flock failure: degraded path logged"
+else
+    bad "finalize flock failure: no degraded-path log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+# A later unblank with a fresh state must still be able to restore, i.e. must
+# not be skipped by the stale-PENDING guard.
+write_state 8
+rc="$(run_fn_rc restore_state)"
+assert_eq "finalize flock failure: later restore returns 0" "0" "$rc"
+assert_file "finalize flock failure: later restore writes its value" "$RAW_FILE" "8"
+assert_absent "finalize flock failure: later restore consumes PENDING" "$RESTORE_PENDING_FILE"
+if grep -q 'another restore is in progress' "$DAEMON_ERR"; then
+    bad "finalize flock failure: stale-PENDING guard blocked the later restore"
+else
+    ok "finalize flock failure: stale-PENDING guard not tripped"
+fi
+
+# 19. Same transient finalize failure on a FAILED write: PENDING must be
+#     rolled back to STATE_FILE instead of being orphaned, so a later
+#     unblank can still retry the write.
+reset_case
+write_state 7
+export STUB_GSD_FAIL=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1
+rm -f "$FAKE_SYSFS"
+export STUB_FLOCK_FAIL_FD=203 STUB_FLOCK_FAIL_COUNT=1
+rc="$(run_fn_rc restore_state)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+if [ "$rc" -ne 0 ]; then
+    ok "finalize flock failure (failed write): restore reports failure"
+else
+    bad "finalize flock failure (failed write): restore wrongly returned 0"
+fi
+assert_file "finalize flock failure (failed write): PENDING rolled back to STATE" "$STATE_FILE" "7"
+assert_absent "finalize flock failure (failed write): PENDING not orphaned" "$RESTORE_PENDING_FILE"
+export STUB_GSD_FAIL=0 STUB_UPOWER_FAIL=0 STUB_ECTOOL_FAIL=0
+printf '99\n' > "$FAKE_SYSFS"
+rc="$(run_fn_rc restore_state)"
+assert_eq "finalize flock failure (failed write): retry returns 0" "0" "$rc"
+assert_file "finalize flock failure (failed write): retry reaches LED" "$RAW_FILE" "7"
+assert_absent "finalize flock failure (failed write): retry consumes PENDING" "$RESTORE_PENDING_FILE"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

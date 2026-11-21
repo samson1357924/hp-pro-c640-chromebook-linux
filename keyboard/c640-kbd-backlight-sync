@@ -34,6 +34,11 @@ else
     chmod 700 "$STATE_DIR" 2> /dev/null || true
 fi
 STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
+# Staging file used while a restore write is in flight.  STATE_FILE is renamed
+# here just before the (potentially slow) write, so a blank arriving mid-write
+# can still store its new value in STATE_FILE; the staged value is consumed
+# only after the write has been verified.
+RESTORE_PENDING_FILE="${C640_KBD_RESTORE_PENDING_FILE:-$STATE_DIR/c640-kbd-backlight.restore-pending}"
 STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
 LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
 LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
@@ -249,25 +254,37 @@ ectool_get_raw() {
     fi
 }
 
+# Returns 0 when at least one ectool invocation (direct, sudo -n, or the
+# /usr/local/bin copy) accepted the write, 1 when all of them failed.
 ectool_set_pct() {
     local pct="$1"
     if command -v ectool > /dev/null 2>&1; then
-        if ! ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
-            if ! sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
-                log_warn_once "ectool-set" "ectool pwmsetkblight $pct failed even with sudo -n"
-            fi
+        if ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
         fi
+        if sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        log_warn_once "ectool-set" "ectool pwmsetkblight $pct failed even with sudo -n"
+        return 1
     elif [ -x /usr/local/bin/ectool ]; then
-        if ! /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
-            if ! sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
-                log_warn_once "ectool-local-set" "/usr/local/bin/ectool pwmsetkblight $pct failed even with sudo -n"
-            fi
+        if /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
         fi
-    else
-        log_warn_once "ectool-missing" "no ectool available for legacy fallback"
+        if sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        log_warn_once "ectool-local-set" "/usr/local/bin/ectool pwmsetkblight $pct failed even with sudo -n"
+        return 1
     fi
+    log_warn_once "ectool-missing" "no ectool available for legacy fallback"
+    return 1
 }
 
+# Returns 0 only when the write is confirmed.  A readable sysfs that does not
+# show the target value is NOT a success even when echo/tee returned 0: only a
+# successful ectool rescue can turn that into a success.  When sysfs cannot be
+# read back at all, the write syscall result is trusted.
 legacy_set_brightness() {
     local val="$1"
     local max="$2"
@@ -276,24 +293,43 @@ legacy_set_brightness() {
 
     if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
         log_warn_once "legacy-no-sysfs" "$SYSFS_BRIGHTNESS missing; using ectool only"
-        ectool_set_pct "$pct"
+        ectool_set_pct "$pct" || return 1
         return 0
     fi
+    local write_ok=0
     if [ -w "$SYSFS_BRIGHTNESS" ]; then
-        if ! echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null; then
+        if echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null; then
+            write_ok=1
+        else
             log_warn_once "sysfs-write" "direct write to $SYSFS_BRIGHTNESS failed"
         fi
     else
-        if ! echo "$val" | sudo -n tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1; then
+        if echo "$val" | sudo -n tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1; then
+            write_ok=1
+        else
             log_warn_once "sysfs-sudo" "sudo -n tee $SYSFS_BRIGHTNESS failed (user service may lack passwordless sudo)"
         fi
     fi
     local cur
     cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
-    if [ "$cur" != "$val" ]; then
+    if [[ "$cur" =~ ^[0-9]+$ ]]; then
+        if [ "$cur" -eq "$val" ]; then
+            return 0
+        fi
         log_warn_once "sysfs-verify" "sysfs verify mismatch ($cur != $val); falling back to ectool"
-        ectool_set_pct "$pct"
+        if ectool_set_pct "$pct"; then
+            return 0
+        fi
+        return 1
     fi
+    # No readback possible: trust the write syscall (or let ectool try).
+    if [ "$write_ok" -eq 1 ]; then
+        return 0
+    fi
+    if ectool_set_pct "$pct"; then
+        return 0
+    fi
+    return 1
 }
 
 # --- Read / write chain ---------------------------------------------------
@@ -323,10 +359,48 @@ get_brightness() {
     ectool_get_raw
 }
 
+# Verify a written value through any available readback path.  This
+# deliberately does NOT consult HAVE_GSD_KBD/HAVE_UPOWER_KBD: the Phase 1
+# backend re-probe caches those for write routing, while a verifier may still
+# be readable (or may have just disappeared) independently of that cache.
+# rc 0 = at least one verifier matches, 1 = every readable verifier disagrees,
+# 2 = no readback path at all.
+verify_brightness() {
+    local want="$1"
+    local found=0
+    local raw
+    if [ "$C640_KBD_FORCE_LEGACY" != "1" ]; then
+        raw="$(upower_get_raw 2> /dev/null || echo "")"
+        if [[ "$raw" =~ ^[0-9]+$ ]]; then
+            found=1
+            if [ "$raw" -eq "$want" ]; then
+                return 0
+            fi
+        fi
+    fi
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        raw="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "")"
+        if [[ "$raw" =~ ^[0-9]+$ ]]; then
+            found=1
+            if [ "$raw" -eq "$want" ]; then
+                return 0
+            fi
+        fi
+    fi
+    if [ "$found" -eq 1 ]; then
+        return 1
+    fi
+    return 2
+}
+
+# rc 0 = at least one backend accepted the write and a readback (where
+# available) confirmed the target; rc 1 = invalid value, every writer failed,
+# or every readback disagreed.  A write with no readback path at all is
+# accepted as authoritative, but emits a WARN.
 set_brightness() {
     local val="$1"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
-        return 0
+        return 1
     fi
     local max
     max="$(get_max)"
@@ -341,6 +415,7 @@ set_brightness() {
     fi
 
     ensure_backends
+    local vrc=0
 
     # 1) gsd-power property (pct) is the single writer: it updates its own
     #    cache and drives UPower -> LED.  Availability is proven by a
@@ -352,25 +427,42 @@ set_brightness() {
             local pct
             pct=$((val * 100 / max))
             if gsd_set_pct "$pct"; then
-                if [ "$HAVE_UPOWER_KBD" != "1" ]; then
-                    return 0
+                if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+                case "$vrc" in
+                    0) return 0 ;;
+                    2)
+                        log_warn_once "verify-unavailable" "gsd-power write accepted but no brightness readback available; treating as success (WARN)"
+                        return 0
+                        ;;
+                esac
+                # vrc == 1: the write did not reach the LED.  The common cause
+                # is kbd_brightness_now == value short-circuit: gsd-power
+                # skipped the hardware write because its cache was already at
+                # pct.  Re-setting the same property would short-circuit
+                # again, so force the hardware via UPower -- then VERIFY it,
+                # otherwise a "gsd fake success" would be mistaken for a
+                # completed restore.
+                if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+                    log_warn "gsd cache already at pct=$pct but brightness readback mismatch (expected $val); forcing hardware via UPower"
+                    if upower_set_raw "$val"; then
+                        if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+                        if [ "$vrc" -eq 0 ]; then
+                            return 0
+                        fi
+                        if [ "$vrc" -eq 2 ]; then
+                            log_warn_once "verify-unavailable" "UPower repair accepted but no brightness readback available; treating as success (WARN)"
+                            return 0
+                        fi
+                        log_warn "UPower repair for $val did not verify; continuing fallback"
+                    else
+                        log_warn "UPower SetBrightness $val failed during gsd-power repair"
+                    fi
                 fi
-                local cur
-                cur="$(upower_get_raw || echo "-1")"
-                if [ "$cur" = "$val" ]; then
-                    return 0
-                fi
-                # kbd_brightness_now == value short-circuit: the property was
-                # already at pct so gsd-power skipped the hardware write.
-                # Re-setting the property to the SAME pct would short-circuit
-                # again (gsd cache is already at target), so force the
-                # hardware only via UPower -- that is the missing write.
-                log_warn "gsd cache already at pct=$pct but UPower raw=$cur (expected $val); forcing hardware via UPower"
-                upower_set_raw "$val" || log_warn "UPower SetBrightness $val failed during gsd-power repair"
-                return 0
+                # Fall through to the direct UPower / legacy writers.
+            else
+                log_warn_once "gsd-set" "gsd-power Properties.Set failed; trying UPower directly"
+                backend_runtime_failed gsd "Properties.Set failure"
             fi
-            log_warn_once "gsd-set" "gsd-power Properties.Set failed; trying UPower directly"
-            backend_runtime_failed gsd "Properties.Set failure"
         else
             log_warn_once "gsd-get" "gsd-power Brightness Properties.Get failed; trying UPower directly"
             backend_runtime_failed gsd "Properties.Get failure"
@@ -378,21 +470,34 @@ set_brightness() {
     fi
 
     # 2) Direct UPower write.  gsd-power ignores UPower "external" signals,
-    #    so its cache may stay out of sync -> warn once.
+    #    so its cache may stay out of sync -> warn once.  The write itself is
+    #    not enough: read it back before declaring success.
     if [ "$HAVE_UPOWER_KBD" = "1" ]; then
         if upower_set_raw "$val"; then
             log_warn_once "upower-direct" "wrote UPower directly (raw=$val); gsd-power cache may be out of sync"
-            return 0
+            if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+            case "$vrc" in
+                0) return 0 ;;
+                2)
+                    log_warn_once "verify-unavailable" "UPower write accepted but no brightness readback available; treating as success (WARN)"
+                    return 0
+                    ;;
+            esac
+            log_warn "UPower SetBrightness $val succeeded but readback mismatch; trying legacy fallback"
+        else
+            log_warn_once "upower-set" "UPower SetBrightness $val failed; falling back to legacy path"
+            backend_runtime_failed upower "SetBrightness failure"
         fi
-        log_warn_once "upower-set" "UPower SetBrightness $val failed; falling back to legacy path"
-        backend_runtime_failed upower "SetBrightness failure"
     fi
 
-    # 3) Legacy sysfs / sudo tee / ectool fallback.
+    # 3) Legacy sysfs / sudo tee / ectool fallback.  It performs its own
+    #    readback for sysfs; ectool has no readback path and is authoritative
+    #    when its set command succeeds.
     if [ "$HAVE_GSD_KBD" != "1" ] && [ "$HAVE_UPOWER_KBD" != "1" ]; then
         log_warn_once "no-dbus-backend" "gsd-power and UPower keyboard backends unavailable; using legacy sysfs/ectool path"
     fi
-    legacy_set_brightness "$val" "$max"
+    legacy_set_brightness "$val" "$max" || return 1
+    return 0
 }
 
 # --- ScreenSaver state helpers -------------------------------------------
@@ -535,6 +640,88 @@ bump_restore_gen() {
     printf '%s\n' "$restore_gen" > "$RESTORE_GEN_FILE" 2> /dev/null || true
 }
 
+# Crash recovery for the staging window: the value in PENDING is a restore
+# that never reached finalize_restore().  If a new STATE_FILE exists it is
+# newer (a blank saved it) and wins; otherwise the staged value is moved back
+# so the next unblank can retry it.  Always returns 0 (safe to call in main).
+recover_pending_state() {
+    if [ ! -f "$RESTORE_PENDING_FILE" ]; then
+        return 0
+    fi
+    if ! exec 204> "$STATE_LOCK"; then
+        return 0
+    fi
+    if ! flock -n 204; then
+        exec 204>&-
+        return 0
+    fi
+    if [ -f "$STATE_FILE" ]; then
+        rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+        log "discarding interrupted restore (newer state already saved)"
+    else
+        if mv -f "$RESTORE_PENDING_FILE" "$STATE_FILE" 2> /dev/null; then
+            log "recovered interrupted restore from $RESTORE_PENDING_FILE"
+        else
+            log_warn "cannot recover $RESTORE_PENDING_FILE to $STATE_FILE"
+        fi
+    fi
+    flock -u 204
+    exec 204>&-
+    return 0
+}
+
+# Shared tail of every restore attempt.  PENDING is consumed only after the
+# write succeeded; on failure it is rolled back to STATE_FILE (unless a newer
+# blank already saved a replacement).  Returns the write's rc so the caller
+# can report failure and re-arm retries.
+#
+# The state lock is taken BLOCKING here.  Every holder is a short critical
+# section (save_state, a stage step, a retry's stage) and the slow brightness
+# write is already finished before finalize runs, so waiting cannot deadlock.
+# A non-blocking flock used to bail out on transient contention while PENDING
+# held the only copy of the saved value: STATE_FILE was already staged away,
+# so the PENDING guard made every later restore_state/cleanup skip forever
+# until a daemon restart.  If flock (or the open) still fails, resolve PENDING
+# anyway so it can never be orphaned.
+finalize_restore() {
+    local saved="$1" rc="$2" gen="$3"
+    local have_lock=1
+    if exec 203> "$STATE_LOCK"; then
+        if ! flock 203; then
+            log_warn "restore finalize (gen=$gen): flock failed; resolving PENDING without the lock"
+            have_lock=0
+        fi
+    else
+        log_warn "cannot open state lock $STATE_LOCK in finalize_restore; resolving PENDING without the lock"
+        have_lock=0
+    fi
+    local newer=""
+    if [ -f "$STATE_FILE" ]; then
+        newer="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    fi
+    if [ "$rc" -eq 0 ]; then
+        rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+        if [ -n "$newer" ] && [ "$newer" != "$saved" ]; then
+            log "restore (gen=$gen) succeeded; keeping newer blank-time state $newer"
+        fi
+    else
+        if [ -z "$newer" ]; then
+            if ! mv -f "$RESTORE_PENDING_FILE" "$STATE_FILE" 2> /dev/null; then
+                log_warn "restore failed (gen=$gen): could not roll staged value $saved back to $STATE_FILE"
+            fi
+        else
+            rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+            log "restore failed (gen=$gen): keeping newer blank-time state $newer"
+        fi
+        log_warn "restore failed (gen=$gen, rc=$rc): keeping brightness $saved for retry"
+    fi
+    if [ "$have_lock" -eq 1 ]; then
+        flock -u 203
+    fi
+    exec 203>&-
+    return "$rc"
+}
+
 schedule_restore_retries() {
     local gen="$1"
     shift
@@ -548,30 +735,54 @@ schedule_restore_retries() {
                 log_debug "restore retry +${delay}s gen=$gen superseded by $cur_gen"
                 exit 0
             fi
+            # Recovery is startup-only: a PENDING that still exists here can
+            # only belong to a restore that is mid-write, so never adopt it.
             if [ ! -f "$STATE_FILE" ]; then
                 exit 0
             fi
             if [ "$(screensaver_is_active)" = "true" ]; then
                 exit 0
             fi
-            local saved
-            saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-            if ! [[ "$saved" =~ ^[0-9]+$ ]] || [ "$saved" -eq 0 ]; then
-                rm -f "$STATE_FILE" 2> /dev/null || true
+            if ! exec 202> "$STATE_LOCK"; then
                 exit 0
             fi
-            if exec 202> "$STATE_LOCK"; then
-                if flock -n 202; then
-                    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-                    if [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
-                        rm -f "$STATE_FILE" 2> /dev/null || true
-                        log "restore retry +${delay}s (gen=$gen): restoring brightness $saved"
-                        set_brightness "$saved"
-                    fi
-                    flock -u 202
-                fi
+            if ! flock -n 202; then
                 exec 202>&-
+                exit 0
             fi
+            # Re-check the generation while holding the lock, so a restore
+            # that started after this retry was scheduled cannot be undone.
+            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ]; then
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            local saved
+            saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+            if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+                rm -f "$STATE_FILE" 2> /dev/null || true
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            # Stage before writing, exactly like the initial restore: a blank
+            # during the write can still save a newer value to STATE_FILE.
+            if ! mv -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null; then
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            flock -u 202
+            exec 202>&-
+            log "restore retry +${delay}s (gen=$gen): restoring brightness $saved"
+            local rc=0
+            if set_brightness "$saved"; then rc=0; else rc=$?; fi
+            # No recursive re-schedule: a failing backend would otherwise
+            # create a retry storm.  The state file is left in place for the
+            # next unblank event.
+            finalize_restore "$saved" "$rc" "$gen" || true
+            exit 0
         ) &
     done
 }
@@ -579,9 +790,21 @@ schedule_restore_retries() {
 restore_state() {
     if ! exec 201> "$STATE_LOCK"; then
         log_warn "cannot open state lock $STATE_LOCK"
-        return 0
+        return 1
     fi
     if ! flock -n 201; then
+        exec 201>&-
+        return 0
+    fi
+
+    # PENDING is the marker for a restore between stage and finalize.  Such a
+    # restore has released STATE_LOCK for the slow D-Bus write, so a second
+    # monitor source can reach this point while its value is staged.  Leave
+    # that value (and the generation) alone: its own finalize, or the daemon
+    # restart, owns it.  Crash recovery therefore runs only in main().
+    if [ -f "$RESTORE_PENDING_FILE" ]; then
+        log "restore skipped: another restore is in progress (staged value pending)"
+        flock -u 201
         exec 201>&-
         return 0
     fi
@@ -594,8 +817,9 @@ restore_state() {
 
     local saved
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-    if ! [[ "$saved" =~ ^[0-9]+$ ]] || [ "$saved" -eq 0 ]; then
-        rm -f "$STATE_FILE" 2> /dev/null || true
+    if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+        log_warn "discarding invalid saved brightness '$saved'"
+        rm -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null || true
         flock -u 201
         exec 201>&-
         return 0
@@ -603,8 +827,8 @@ restore_state() {
 
     # Defer while the screen is still active (re-blank race, TROUBLESHOOTING
     # §11), but converge via +0.5s/+1.5s/+3s retries.  Old retries are
-    # invalidated by the generation counter; removing the state makes them
-    # no-ops.
+    # invalidated by the generation counter; keeping the state makes the
+    # retries meaningful (and lets a later unblank restore it too).
     if [ "$(screensaver_is_active)" = "true" ]; then
         log "restore deferred: ScreenSaver still active (gen=$gen)"
         flock -u 201
@@ -613,16 +837,34 @@ restore_state() {
         return 0
     fi
 
-    rm -f "$STATE_FILE" 2> /dev/null || true
+    # A valid 0 goes through the exact same write path as any other value:
+    # "0" means the user explicitly switched the light off and MUST be
+    # written, otherwise a non-zero residual brightness survives the restore.
+    # Stage the value to PENDING so a blank arriving during the write can
+    # still save_state() its new value into STATE_FILE.
+    if ! mv -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null; then
+        log_warn "cannot stage saved brightness $saved; keeping $STATE_FILE"
+        flock -u 201
+        exec 201>&-
+        return 1
+    fi
     log "restoring brightness $saved"
     # Release the state lock BEFORE the D-Bus write. set_brightness can block
     # for several seconds (gdbus timeouts); a blank arriving in that window
-    # must still be able to save_state() the new value with flock -n. The
-    # restore write itself is already protected by consuming STATE_FILE and by
-    # the generation counter, so no write needs the lock held here.
+    # must still be able to save_state() the new value with flock -n.
     flock -u 201
     exec 201>&-
-    set_brightness "$saved"
+
+    local rc=0
+    if set_brightness "$saved"; then rc=0; else rc=$?; fi
+    if finalize_restore "$saved" "$rc" "$gen"; then :; else rc=$?; fi
+
+    if [ "$rc" -ne 0 ]; then
+        # Re-arm the same generation once; retries themselves do not recurse.
+        schedule_restore_retries "$gen" 0.5 1.5 3
+        return 1
+    fi
+    return 0
 }
 
 # --- Blank / unblank guards ----------------------------------------------
@@ -632,14 +874,22 @@ guard_blank() {
     for delay in 0.25 1.0; do
         (
             sleep "$delay"
-            if [ "$(screensaver_is_active)" != "true" ]; then
+            # Only an explicit "true" counts as active; every other value
+            # (including a future tristate "unknown") means inactive.
+            if [ "$(screensaver_is_active)" = "true" ]; then
+                : # active: verify the light is really off
+            else
                 exit 0
             fi
             local cur
             cur="$(get_brightness)"
             if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ne 0 ]; then
                 log_warn "blank guard +${delay}s: brightness=$cur while ScreenSaver active; forcing 0"
-                set_brightness 0
+                local grc=0
+                if set_brightness 0; then grc=0; else grc=$?; fi
+                if [ "$grc" -ne 0 ]; then
+                    log_warn "blank guard +${delay}s: failed to force 0 (rc=$grc)"
+                fi
             fi
         ) &
     done
@@ -679,7 +929,11 @@ guard_unblank() {
             fi
             if [ "$ok" -ne 1 ]; then
                 log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
-                set_brightness "$saved"
+                local grc=0
+                if set_brightness "$saved"; then grc=0; else grc=$?; fi
+                if [ "$grc" -ne 0 ]; then
+                    log_warn "unblank guard +${delay}s: re-set failed (rc=$grc)"
+                fi
             fi
         ) &
     done
@@ -687,7 +941,11 @@ guard_unblank() {
 
 handle_blank() {
     save_state
-    set_brightness 0
+    local rc=0
+    if set_brightness 0; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        log_warn "blank: failed to switch keyboard backlight off (rc=$rc)"
+    fi
     guard_blank
 }
 
@@ -696,8 +954,11 @@ handle_unblank() {
     if [ -f "$STATE_FILE" ]; then
         saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
     fi
-    restore_state
-    if [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
+    local rc=0
+    if restore_state; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        log_warn "unblank: restore failed (rc=$rc)"
+    elif [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
         guard_unblank "$saved"
     fi
 }
@@ -728,12 +989,12 @@ monitor_screensaver_dbus_monitor() {
         case "$line" in
             *boolean\ true*)
                 log "ScreenSaver active -> saving and turning off kbd backlight"
-                handle_blank
+                handle_blank || log_warn "dbus-monitor: blank handler failed"
                 ;;
             *boolean\ false*)
                 log "ScreenSaver inactive -> restoring kbd backlight"
                 sleep 0.5
-                handle_unblank
+                handle_unblank || log_warn "dbus-monitor: unblank handler failed"
                 ;;
         esac
     done
@@ -747,11 +1008,11 @@ monitor_screensaver_gdbus() {
             if echo "$line" | grep -q "org.gnome.ScreenSaver\|org.freedesktop.ScreenSaver"; then
                 if echo "$line" | grep -q "true"; then
                     log "ScreenSaver active (gdbus) -> off"
-                    handle_blank
+                    handle_blank || log_warn "gdbus monitor: blank handler failed"
                 elif echo "$line" | grep -q "false"; then
                     log "ScreenSaver inactive (gdbus) -> restore"
                     sleep 0.5
-                    handle_unblank
+                    handle_unblank || log_warn "gdbus monitor: unblank handler failed"
                 fi
             fi
         fi
@@ -769,7 +1030,7 @@ monitor_login1() {
             *boolean\ false*)
                 log "PrepareForSleep false -> restore after delay"
                 sleep 0.6
-                restore_state
+                restore_state || log_warn "login1: restore failed"
                 ;;
         esac
     done
@@ -805,14 +1066,14 @@ idle_poll_loop() {
         if [ "$idletime" -ge "$threshold" ]; then
             if [ "$was_idle" -eq 0 ]; then
                 log "idle threshold reached (${idletime}ms) -> off"
-                handle_blank
+                handle_blank || log_warn "idle poll: blank handler failed"
                 was_idle=1
             fi
         else
             if [ "$was_idle" -eq 1 ]; then
                 log "user active (idletime ${idletime}ms) -> restore"
                 sleep 0.5
-                handle_unblank
+                handle_unblank || log_warn "idle poll: unblank handler failed"
                 was_idle=0
             fi
         fi
@@ -872,13 +1133,20 @@ check_status() {
 
 cleanup() {
     log "cleanup: restoring if needed"
-    restore_state || true
+    local rc=0
+    if restore_state; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        log_warn "cleanup restore failed (rc=$rc); saved state was kept for retry"
+    fi
     # kill background jobs
     jobs -p | xargs -r kill 2> /dev/null || true
     exit 0
 }
 
 main() {
+    # Recover a value stranded by a crash between restore staging and finalize.
+    recover_pending_state
+
     # Handle CLI (semantics unchanged; --test-* do not touch ScreenSaver).
     if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
         print_help
@@ -886,12 +1154,22 @@ main() {
     fi
     if [ "${1:-}" = "--test-blank" ]; then
         save_state
-        set_brightness 0
+        local rc=0
+        if set_brightness 0; then rc=0; else rc=$?; fi
+        if [ "$rc" -ne 0 ]; then
+            echo "simulated blank: failed to set 0 (rc=$rc)" >&2
+            exit 1
+        fi
         echo "simulated blank: saved and set 0"
         exit 0
     fi
     if [ "${1:-}" = "--test-unblank" ]; then
-        restore_state
+        local rc=0
+        if restore_state; then rc=0; else rc=$?; fi
+        if [ "$rc" -ne 0 ]; then
+            echo "simulated unblank: restore failed (rc=$rc)" >&2
+            exit 1
+        fi
         echo "simulated unblank: restored"
         exit 0
     fi
@@ -994,10 +1272,10 @@ main() {
                 fi
                 if [ "$active" != "$prev" ]; then
                     if [ "$active" = "true" ]; then
-                        handle_blank
+                        handle_blank || log_warn "poll loop: blank handler failed"
                     else
                         sleep 0.5
-                        handle_unblank
+                        handle_unblank || log_warn "poll loop: unblank handler failed"
                     fi
                     prev="$active"
                 fi
