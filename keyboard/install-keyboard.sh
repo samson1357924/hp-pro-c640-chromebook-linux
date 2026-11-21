@@ -62,6 +62,40 @@ except Exception:
 PY
 }
 
+# Echo 1 when the manifest explicitly tracks a keyboard-scoped, system-scope
+# keyd service, otherwise 0. A user-scope record (the kbd backlight sync
+# service uses that scope) must never authorize disabling the system keyd.
+# This is the SOLE authority for deciding whether uninstall may
+# disable/stop keyd: manifest_add_service("keyd", "keyboard") writes that
+# record and lib/backup.sh's rollback reads it. A mere on-disk cros.conf is
+# NOT evidence of ownership (a user may have installed keyd and used the same
+# filename), so it is deliberately not consulted here. Read-only, DRY_RUN-safe
+# and fail-safe: any missing/unreadable/malformed manifest yields 0.
+_keyd_managed_by_us() {
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    [ -f "$MANIFEST_FILE" ] || {
+        echo 0
+        return 0
+    }
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    python3 - "$MANIFEST_FILE" << 'PY' 2> /dev/null || echo 0
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    for svc in data.get("services", []) or []:
+        if (svc.get("name") in ("keyd", "keyd.service")
+                and svc.get("component") == "keyboard"
+                and svc.get("scope", "system") != "user"):
+            print(1)
+            break
+    else:
+        print(0)
+except Exception:
+    print(0)
+PY
+}
+
 # Mirror lib/backup.sh rollback's lookup: the oldest backup matching
 # "$BACKUP_BASE_DIR/*/<target without leading slash>". Used before creating
 # any placeholder so we never leave behind a file that rollback cannot
@@ -76,9 +110,10 @@ _find_rollback_backup() {
 
 # True when $1 (default: $KEYD_LINK) is a symlink pointing at keyd's cros.conf.
 # Accepts relative spellings such as "cros.conf", "./cros.conf" and
-# "../keyd/cros.conf" as well as absolute paths. Used by status check,
-# uninstall service detection and install cleanup so the readlink comparison
-# lives in exactly one place.
+# "../keyd/cros.conf" as well as absolute paths. Used by status check and
+# install/upgrade cleanup so the readlink comparison lives in exactly one
+# place. It is deliberately NOT used to decide service ownership on uninstall
+# (see _keyd_managed_by_us).
 is_our_legacy_keyd_link() {
     local link="${1:-$KEYD_LINK}"
     [ -L "$link" ] || return 1
@@ -844,22 +879,35 @@ uninstall_keyboard() {
         sudo systemctl --global disable c640-kbd-backlight-sync.service 2> /dev/null || true
         # Also try system scope disable for backwards compat
         sudo systemctl disable c640-kbd-backlight-sync.service 2> /dev/null || true
-        # Disable keyd if we installed it (system service) - handle legacy symlink too
+        # Only disable keyd when the manifest explicitly records it as a
+        # keyboard service installed by this project. File/symlink existence
+        # is NOT ownership: a user-installed keyd with an identically named
+        # cros.conf must be left running. This check must stay BEFORE
+        # _prepare_keyd_link_for_rollback()/rollback_component("keyboard"):
+        # rollback_component("keyboard") is what consumes (and clears) the
+        # service record, while _prepare_keyd_link_for_rollback() only touches
+        # the file record / placeholder.
         if systemctl is-active --quiet keyd 2> /dev/null || systemctl is-enabled --quiet keyd 2> /dev/null; then
-            local keyd_ours=0
-            if [ -f "$KEYD_DST" ]; then
-                keyd_ours=1
-            elif is_our_legacy_keyd_link; then
-                keyd_ours=1
-            fi
-            if [ "$keyd_ours" = "1" ]; then
+            local keyd_managed
+            keyd_managed="$(_keyd_managed_by_us)"
+            if [ "$keyd_managed" = "1" ]; then
                 sudo systemctl disable --now keyd 2> /dev/null || true
-                log_info "Disabled keyd service (was managing Search dual-role)"
+                log_info "Disabled project-managed keyd service (rollback will restore its original state)"
+            else
+                log_info "keyd is active/enabled but has no keyboard service record in the manifest; leaving it untouched (not managed by this project)"
             fi
         fi
     else
         log_dryrun "Would disable user service: c640-kbd-backlight-sync.service (global + user)"
-        log_dryrun "Would disable keyd if active and config present"
+        # Keep DRY_RUN consistent with the real path without touching
+        # systemctl: the manifest service record is the only ownership proof.
+        local keyd_managed_dryrun
+        keyd_managed_dryrun="$(_keyd_managed_by_us)"
+        if [ "$keyd_managed_dryrun" = "1" ]; then
+            log_dryrun "Would disable project-managed keyd service (if active/enabled)"
+        else
+            log_dryrun "Would leave keyd service untouched (no keyboard service record in manifest)"
+        fi
     fi
 
     # The installer deletes our legacy default.conf symlink; prepare the

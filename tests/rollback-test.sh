@@ -556,8 +556,10 @@ case "$*" in
             exit 1
         fi
         ;;
-    *"is-enabled keyd"*) [ "${STUB_SVC_ENABLED:-1}" = "1" ] && exit 0 || exit 3 ;;
-    *"is-active keyd"*) [ "${STUB_SVC_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
+    # uninstall_keyboard() queries with --quiet; match both spellings so the
+    # ownership guard is actually exercised (default: keyd active/enabled).
+    *"is-enabled keyd"*|*"is-enabled --quiet keyd"*) [ "${STUB_SVC_ENABLED:-1}" = "1" ] && exit 0 || exit 3 ;;
+    *"is-active keyd"*|*"is-active --quiet keyd"*) [ "${STUB_SVC_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
 esac
 exit 0
 EOF
@@ -665,6 +667,46 @@ run_keyd_uninstall() {
         get_real_user() { echo ""; }
         uninstall_keyboard
     '
+}
+
+# Same as run_keyd_uninstall(), but with DRY_RUN=1 (no systemctl side effects).
+run_keyd_uninstall_dryrun() {
+    local sandbox="$1"
+    run_sandboxed "$sandbox" '
+        export DRY_RUN=1 PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        uninstall_keyboard
+    '
+}
+
+# Fresh sandbox for uninstall-ownership tests: a user-owned cros.conf and an
+# active/enabled keyd (stub default) with NO installer deployment performed.
+setup_keyd_uninstall_sandbox() {
+    local sandbox="$1"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'USER_OWN_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+}
+
+# Write a manifest with exact control over the services list. When
+# with_record=1 a keyboard record for cros.conf (was_existing=true) is included
+# so tests can prove that a file record alone does NOT grant service ownership.
+write_keyd_manifest() {
+    local sandbox="$1" services_json="$2" with_record="${3:-0}"
+    python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/cros.conf" \
+        "$services_json" "$with_record" << 'PY'
+import json, sys
+manifest, target, services, with_record = sys.argv[1:5]
+data = {"version": "2.0", "records": [], "services": json.loads(services), "groups": []}
+if with_record == "1":
+    data["records"].append({"target": target, "component": "keyboard",
+                            "was_existing": True, "installed_at": "2026-01-01 00:00:00"})
+with open(manifest, "w") as f:
+    json.dump(data, f, indent=2)
+PY
 }
 
 # Drive the REAL install_keyboard() in the sandbox, persisting its rc and keyd
@@ -2266,6 +2308,210 @@ test_uninstall_has_no_post_rollback_keyd_cleanup() {
     fi
 }
 
+# --- P1 blocker: uninstall must only manage keyd it actually installed -------
+# The stub reports keyd active/enabled, so before the fix every one of these
+# tests would have called `systemctl disable --now keyd` based solely on the
+# on-disk cros.conf. The manifest service record is now the sole authority.
+
+test_uninstall_leaves_foreign_keyd_alone() {
+    local sandbox="/tmp/rollback-test-uninstall-foreign-keyd"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    # No manifest at all: self-installed keyd with a same-named cros.conf.
+    : > "$sandbox/systemctl.log"
+
+    run_keyd_uninstall "$sandbox"
+
+    # Guard against a vacuous pass: the active/enabled query must have happened.
+    assert_contains "is-active --quiet keyd" "$(cat "$sandbox/systemctl.log")" \
+        "foreign-keyd: uninstall observed keyd as active"
+    local log
+    log="$(cat "$sandbox/systemctl.log")"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' <<< "$log"; then
+        fail "foreign-keyd: uninstall must not disable an unmanaged keyd service"
+    else
+        ok
+    fi
+    assert_eq "USER_OWN_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "foreign-keyd: user-owned cros.conf is unchanged"
+    assert_contains "leaving it untouched" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "foreign-keyd: log explains the service was left untouched"
+}
+
+test_uninstall_disables_managed_keyd_and_restores_state() {
+    local sandbox="/tmp/rollback-test-uninstall-managed-keyd"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    write_keyd_manifest "$sandbox" \
+        '[{"name":"keyd","component":"keyboard","was_enabled":true,"was_active":true,"scope":"system"}]'
+    : > "$sandbox/systemctl.log"
+
+    run_keyd_uninstall "$sandbox"
+
+    local log
+    log="$(cat "$sandbox/systemctl.log")"
+    assert_contains "disable --now keyd" "$log" \
+        "managed-keyd: project-managed keyd is disabled before rollback"
+    assert_contains "enable keyd" "$log" \
+        "managed-keyd: rollback re-enables keyd to its recorded state"
+    assert_contains "start keyd" "$log" \
+        "managed-keyd: rollback restarts keyd to its recorded state"
+    assert_eq "0" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' "$sandbox/manifest/install-manifest.json")" \
+        "managed-keyd: service record consumed by rollback"
+    assert_contains "Disabled project-managed keyd service" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "managed-keyd: log records the managed disable"
+}
+
+test_uninstall_keeps_keyd_without_service_record() {
+    local sandbox="/tmp/rollback-test-uninstall-no-svc-record"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    # A file record for cros.conf is NOT a service record.
+    write_keyd_manifest "$sandbox" '[]' 1
+    : > "$sandbox/systemctl.log"
+
+    run_keyd_uninstall "$sandbox"
+
+    local log
+    log="$(cat "$sandbox/systemctl.log")"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' <<< "$log"; then
+        fail "no-svc-record: file record alone must not authorize disabling keyd"
+    else
+        ok
+    fi
+    assert_eq "USER_OWN_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "no-svc-record: user-owned cros.conf is unchanged"
+    assert_contains "leaving it untouched" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "no-svc-record: log explains the service was left untouched"
+}
+
+test_uninstall_manifest_without_services_does_not_disable_keyd() {
+    local sandbox="/tmp/rollback-test-uninstall-no-services"
+    local manifest
+    setup_keyd_uninstall_sandbox "$sandbox"
+    manifest="$sandbox/manifest/install-manifest.json"
+    # Valid JSON with no services key: rollback itself handles this fine.
+    # (Corrupt JSON / services:null are covered by the probe unit test because
+    # the pre-existing rollback_component() aborts on those shapes.)
+    printf '{"version":"2.0","records":[]}' > "$manifest"
+    : > "$sandbox/systemctl.log"
+
+    if ! run_keyd_uninstall "$sandbox"; then
+        fail "uninstall must not crash on a manifest without services"
+        return 0
+    fi
+    local log
+    log="$(cat "$sandbox/systemctl.log")"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' <<< "$log"; then
+        fail "a manifest without services must not authorize disabling keyd"
+    else
+        ok
+    fi
+    assert_eq "USER_OWN_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "no-services-key: user-owned cros.conf is unchanged"
+}
+
+# Unit-test the ownership probe: read-only, fail-safe and free of side effects
+# even when the manifest is missing or corrupt. (A fully corrupt manifest makes
+# the pre-existing rollback_component() abort, so the probe is exercised
+# directly here rather than through the whole uninstall.)
+test_keyd_managed_by_us_fail_safe() {
+    local sandbox="/tmp/rollback-test-keyd-managed-probe"
+    local case_name expected manifest before after actual
+    for case_name in no_manifest corrupt no_services_key null_services \
+        wrong_component keyd_service_name user_scope managed; do
+        setup_keyd_uninstall_sandbox "$sandbox"
+        manifest="$sandbox/manifest/install-manifest.json"
+        case "$case_name" in
+            no_manifest) expected=0 ;;
+            corrupt)
+                printf 'this is not json' > "$manifest"
+                expected=0
+                ;;
+            no_services_key)
+                printf '{"version":"2.0","records":[]}' > "$manifest"
+                expected=0
+                ;;
+            null_services)
+                printf '{"version":"2.0","records":[],"services":null}' > "$manifest"
+                expected=0
+                ;;
+            wrong_component)
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"other"}]}' > "$manifest"
+                expected=0
+                ;;
+            keyd_service_name)
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd.service","component":"keyboard"}]}' > "$manifest"
+                expected=1
+                ;;
+            user_scope)
+                # A user-scope record must not authorize disabling system keyd
+                # (this is the scope the kbd backlight sync service uses).
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","scope":"user"}]}' > "$manifest"
+                expected=0
+                ;;
+            managed)
+                write_keyd_manifest "$sandbox" '[{"name":"keyd","component":"keyboard"}]'
+                expected=1
+                ;;
+        esac
+        if [ -f "$manifest" ]; then
+            before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        else
+            before=ABSENT
+        fi
+
+        if ! actual="$(run_sandboxed "$sandbox" '
+            source "$2/install-keyboard-sandbox.sh"
+            _keyd_managed_by_us
+        ')"; then
+            fail "[$case_name] _keyd_managed_by_us must not crash"
+            continue
+        fi
+        assert_eq "$expected" "$actual" "[$case_name] _keyd_managed_by_us result"
+        if [ -f "$manifest" ]; then
+            after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        else
+            after=ABSENT
+        fi
+        assert_eq "$before" "$after" "[$case_name] _keyd_managed_by_us is read-only"
+    done
+}
+
+test_uninstall_dryrun_keyd_ownership_messages() {
+    local sandbox="/tmp/rollback-test-uninstall-dryrun-keyd"
+    local case_name manifest before
+    for case_name in unmanaged managed; do
+        setup_keyd_uninstall_sandbox "$sandbox"
+        manifest="$sandbox/manifest/install-manifest.json"
+        if [ "$case_name" = "managed" ]; then
+            write_keyd_manifest "$sandbox" \
+                '[{"name":"keyd","component":"keyboard","was_enabled":true,"was_active":true,"scope":"system"}]'
+        fi
+        before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex() if __import__("os").path.exists(sys.argv[1]) else "ABSENT")' "$manifest")"
+        : > "$sandbox/systemctl.log"
+
+        if ! run_keyd_uninstall_dryrun "$sandbox"; then
+            fail "[$case_name] dry-run uninstall must not crash"
+            continue
+        fi
+        local log
+        log="$(cat "$sandbox/systemctl.log")"
+        if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' <<< "$log"; then
+            fail "[$case_name] dry-run must not actually disable keyd"
+        else
+            ok
+        fi
+        local after
+        after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex() if __import__("os").path.exists(sys.argv[1]) else "ABSENT")' "$manifest")"
+        assert_eq "$before" "$after" "[$case_name] dry-run leaves the manifest byte-identical"
+        if [ "$case_name" = "managed" ]; then
+            assert_contains "Would disable project-managed keyd service (if active/enabled)" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+                "[$case_name] dry-run logs the managed disable"
+        else
+            assert_contains "Would leave keyd service untouched (no keyboard service record in manifest)" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+                "[$case_name] dry-run logs that the service is left untouched"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
@@ -2318,6 +2564,12 @@ test_keyd_unsupported_path_type_fails_closed dir
 test_keyd_unsupported_path_type_fails_closed fifo
 test_keyd_restore_uses_sudo_nonroot
 test_uninstall_has_no_post_rollback_keyd_cleanup
+test_uninstall_leaves_foreign_keyd_alone
+test_uninstall_disables_managed_keyd_and_restores_state
+test_uninstall_keeps_keyd_without_service_record
+test_uninstall_manifest_without_services_does_not_disable_keyd
+test_keyd_managed_by_us_fail_safe
+test_uninstall_dryrun_keyd_ownership_messages
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
