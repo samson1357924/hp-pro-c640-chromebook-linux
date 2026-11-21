@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 """Check the AT keyboard scancode -> keycode map against the hwdb fixture.
 
-This script has three distinct capabilities. They are easy to confuse, so read
+This script has four distinct capabilities. They are easy to confuse, so read
 this carefully before drawing conclusions about what the firmware sends:
 
   1. (default) EVIOCGKEYCODE table check -- read-only ioctl. For every scancode
@@ -24,9 +24,15 @@ this carefully before drawing conclusions about what the firmware sends:
      This is the mode to use when you want to know whether a key press really
      sends 0xea or 0x3b.
 
+  4. ``--scan-only SECONDS`` -- the same raw capture as ``--scan`` but the
+     EVIOCGKEYCODE table check is skipped *entirely*. Use it on unknown models
+     or when the ioctl is unsupported: a table-check failure can no longer
+     block raw capture. It needs python3-evdev (it reads the event stream).
+     Cannot be combined with ``--scan`` or ``--listen``.
+
 None of the modes call EVIOCGRAB, so the desktop keeps working. However, keyd
 grabs the *physical* AT keyboard exclusively; while it holds that grab, no
-other reader (including --scan and plain evtest) can observe its MSC_SCAN
+other reader (including --scan/--scan-only and plain evtest) can observe MSC_SCAN
 events. To capture raw scancodes, stop keyd first, run the capture on a TTY or
 with the desktop input otherwise unused, then restore the service:
 
@@ -38,6 +44,7 @@ Usage:
   sudo python3 keyboard/tests/check-top-row-hwdb.py
   sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 15
   sudo python3 keyboard/tests/check-top-row-hwdb.py --scan 20
+  sudo python3 keyboard/tests/check-top-row-hwdb.py --scan-only 20   # no table check
   sudo python3 keyboard/tests/check-top-row-hwdb.py --device /dev/input/event2 --scan 20
   sudo python3 keyboard/tests/check-top-row-hwdb.py --device /dev/input/event2  # table only, no evdev needed
   python3 keyboard/tests/check-top-row-hwdb.py --self-test   # no device needed
@@ -48,16 +55,22 @@ Exit status: 0 all expected mappings present (and self-test passed), 1
 otherwise. Prints RESULT=PASS or RESULT=FAIL on stdout for the table check.
 A missing fixture or an unavailable EVIOCGKEYCODE ioctl prints FAIL with NO
 RESULT line, so callers (detect-hardware.sh) treat it as inconclusive.
+The two checks are also reported separately as MAPPING_CHECK=<status> and
+RAW_CAPTURE=PASS|FAIL (neither contains RESULT=, so they cannot be mistaken for
+a table verdict). --scan-only prints MAPPING_CHECK=SKIPPED and never RESULT=;
+its exit status is 0 when raw MSC_SCAN was observed, 1 otherwise.
 """
 import argparse
 import fcntl
 import glob
+import io
 import math
 import os
 import select
 import struct
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 
 try:
     import evdev
@@ -226,7 +239,8 @@ def scan(dev, seconds):
 
     Prints raw MSC_SCAN values and post-hwdb EV_KEY names, bounded by a
     monotonic deadline. If no MSC_SCAN is observed, print an explicit keyd
-    grab hint instead of failing silently.
+    grab hint instead of failing silently. Return whether any MSC_SCAN was
+    seen, so --scan-only can decide its exit status without a table check.
     """
     print(f"scanning {dev.path} (phys {dev.phys}) for {seconds:g}s "
           "(raw MSC_SCAN + post-hwdb EV_KEY, NO EVIOCGRAB)", flush=True)
@@ -261,6 +275,7 @@ def scan(dev, seconds):
         print(hint, flush=True)
     if not saw_scan and not saw_key:
         print("(no key events observed either — press a key during the window)", flush=True)
+    return saw_scan
 
 
 def run_self_test():
@@ -310,6 +325,66 @@ def run_self_test():
     if keyd_hint(False) != KEYD_HINT or keyd_hint(True) is not None:
         failures.append("keyd hint must appear only when no MSC_SCAN was observed")
 
+    # --scan-only: a stubbed ioctl failure must be reported, never raised, so
+    # raw capture can still run when the table check is unavailable.
+    def _stub_ioctl_failure(_fd, _scancode):
+        raise OSError("stub EVIOCGKEYCODE failure")
+
+    with redirect_stdout(io.StringIO()):
+        guarded_failures, guarded_status = run_table_check_guarded(
+            FIXTURE, FIXTURE, " (self-test)", keycode_fn=_stub_ioctl_failure,
+        )
+    if guarded_status != "UNAVAILABLE_IOCTL" or guarded_failures is not None:
+        failures.append("guarded table check must return (None, UNAVAILABLE_IOCTL) on ioctl OSError")
+
+    # --scan-only: exercise scan() itself (not just format_scan_event) with a
+    # pipe-backed fake device; it must return saw_scan=True and print 0xea.
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"x")  # make select() report the fake fd as readable
+    os.close(write_fd)
+
+    class _FakeDev:
+        path = "/dev/input/self-test"
+        phys = "self-test"
+
+        def __init__(self, fd, initial):
+            self.fd = fd
+            self._events = list(initial)
+
+        def read(self):
+            events, self._events = self._events, []
+            return events
+
+    with redirect_stdout(io.StringIO()) as captured_scan:
+        saw_scan = scan(_FakeDev(read_fd, events), 0.01)
+    os.close(read_fd)
+    if saw_scan is not True:
+        failures.append("scan() must return saw_scan=True after a synthetic MSC_SCAN")
+    if "MSC_SCAN=0xea" not in captured_scan.getvalue():
+        failures.append("scan() must print MSC_SCAN=0xea for --scan-only raw capture")
+
+    # --scan-only argument validation and mutual exclusion.
+    try:
+        parsed = parse_args(["--scan-only", "5"])
+        if parsed.scan_only != 5.0 or parsed.scan is not None or parsed.listen is not None:
+            failures.append("parse_args must accept --scan-only 5")
+    except SystemExit:
+        failures.append("parse_args must accept --scan-only 5")
+    for bad in ("-1", "nan"):
+        try:
+            with redirect_stderr(io.StringIO()):
+                parse_args(["--scan-only", bad])
+            failures.append(f"--scan-only {bad} must be rejected")
+        except SystemExit as exc:
+            if exc.code != 1:
+                failures.append(f"--scan-only {bad} must exit 1")
+    try:
+        with redirect_stderr(io.StringIO()):
+            parse_args(["--scan-only", "5", "--scan", "5"])
+        failures.append("--scan-only + --scan must be rejected")
+    except SystemExit:
+        pass
+
     print("self-test: synthetic 0xea press -> hwdb KEY_BACK")
     for line in scan_lines:
         print(f"  --scan   {line}")
@@ -320,7 +395,8 @@ def run_self_test():
             print(f"FAIL: {msg}")
         print("SELF-TEST=FAIL")
         return 1
-    print("SELF-TEST=PASS (scan shows raw 0xea; listen shows only KEY_BACK)")
+    print("SELF-TEST=PASS (scan shows raw 0xea; listen shows only KEY_BACK; "
+          "--scan-only survives ioctl failure)")
     return 0
 
 
@@ -333,6 +409,7 @@ def parse_args(argv=None):
             "  sudo ...py                         EVIOCGKEYCODE table check only\n"
             "  sudo ...py --listen 15             post-hwdb KEY_* state (NOT raw scancodes)\n"
             "  sudo ...py --scan 20               raw MSC_SCAN + EV_KEY (stop keyd first)\n"
+            "  sudo ...py --scan-only 20          raw capture only, no EVIOCGKEYCODE table check\n"
             "  ...py --self-test                  synthetic-event check, no device needed\n"
             "  ...py --device EVENT --fixture TSV table check with an explicit fixture\n"
         ),
@@ -345,7 +422,7 @@ def parse_args(argv=None):
         "--device", metavar="PATH",
         help=f"event node to check (default: auto-detect {AT_KEYBOARD_NAME!r}); "
              "a table-only check opens PATH directly (no python3-evdev needed); "
-             "with --listen/--scan, dev.path and dev.phys are printed for identification",
+             "with --listen/--scan/--scan-only, dev.path and dev.phys are printed for identification",
     )
     parser.add_argument(
         "--listen", type=float, metavar="SECONDS",
@@ -358,36 +435,89 @@ def parse_args(argv=None):
              "non-exclusively for SECONDS (stop keyd first: sudo systemctl stop keyd)",
     )
     parser.add_argument(
+        "--scan-only", type=float, metavar="SECONDS",
+        help="like --scan (raw EV_MSC/MSC_SCAN + EV_KEY, stop keyd first) but SKIP "
+             "the EVIOCGKEYCODE table check entirely: a fixture/ioctl failure can "
+             "no longer block raw capture. For unknown models or unsupported ioctl. "
+             "Requires python3-evdev (reads the event stream)",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="run a synthetic-event self-test (no real device needed) and exit",
     )
     args = parser.parse_args(argv)
-    for name in ("listen", "scan"):
+    if args.scan_only is not None and (args.scan is not None or args.listen is not None):
+        parser.error("--scan-only cannot be combined with --scan or --listen")
+    for name in ("listen", "scan", "scan_only"):
         value = getattr(args, name)
         if value is None:
             continue
         if value < 0:
-            print(f"FAIL: --{name} must be >= 0 (got {value})", file=sys.stderr)
+            print(f"FAIL: --{name.replace('_', '-')} must be >= 0 (got {value})", file=sys.stderr)
             raise SystemExit(1)
         if not math.isfinite(value):
-            print(f"FAIL: --{name} must be finite (got {value})", file=sys.stderr)
+            print(f"FAIL: --{name.replace('_', '-')} must be finite (got {value})", file=sys.stderr)
             raise SystemExit(1)
     return args
 
 
-def run_table_check(fd, path, fixture_path, ident):
-    """Print and run the read-only EVIOCGKEYCODE table check; return failures."""
+def run_table_check(fd, path, fixture_path, ident, keycode_fn=get_keycode):
+    """Print and run the read-only EVIOCGKEYCODE table check; return failures.
+
+    ``keycode_fn`` is injectable so --self-test can stub an ioctl failure
+    without owning an event node.
+    """
     print(f"{path}{ident}")
     print(f"{'scancode':8s} {'hwdb key':16s} {'expected':<20s} {'kernel':<20s} result")
     failures = 0
     for scancode, key, label in read_fixture(fixture_path):
         want = expected_keycode(key)
-        got = get_keycode(fd, scancode)
+        got = keycode_fn(fd, scancode)
         ok = got == want
         failures += 0 if ok else 1
         print(f"0x{scancode:02x}     {key:16s} {key_name(want):<20s} {key_name(got):<20s} "
               f"{'OK' if ok else 'MISMATCH'}  # {label}")
     return failures
+
+
+def run_table_check_guarded(path, fixture_path, ident, keycode_fn=get_keycode):
+    """Run the table check without letting fixture/ioctl problems escape.
+
+    Return ``(failures, status)`` where status is one of PASS, FAIL,
+    UNAVAILABLE_PERMISSION, UNAVAILABLE_FIXTURE or UNAVAILABLE_IOCTL.  The
+    UNAVAILABLE_* cases return ``failures=None`` and never raise, so a raw
+    capture can still run and report independently (--scan / --scan-only).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except PermissionError:
+        print(f"FAIL: cannot read {path} (EVIOCGKEYCODE needs root); re-run with sudo")
+        return None, "UNAVAILABLE_PERMISSION"
+    except OSError as exc:
+        print(f"FAIL: EVIOCGKEYCODE unavailable on {path}: {exc}")
+        return None, "UNAVAILABLE_IOCTL"
+    try:
+        failures = run_table_check(fd, path, fixture_path, ident, keycode_fn)
+    except FileNotFoundError as exc:
+        # A missing --fixture TSV is not an ioctl failure. Still no RESULT line
+        # is printed, so callers treat this as inconclusive rather than PASS.
+        print(f"FAIL: fixture unavailable ({fixture_path}): {exc}")
+        return None, "UNAVAILABLE_FIXTURE"
+    except OSError as exc:
+        # e.g. not an event node, or the ioctl is unavailable: no RESULT line
+        # is printed, so callers treat this as inconclusive rather than PASS.
+        print(f"FAIL: EVIOCGKEYCODE unavailable on {path}: {exc}")
+        return None, "UNAVAILABLE_IOCTL"
+    except SystemExit as exc:
+        # read_fixture()/expected_keycode() raise SystemExit (a BaseException,
+        # not an OSError) on malformed TSV or an unknown hwdb key name. Catch
+        # it here so no fixture problem escapes the guard: still no RESULT
+        # line, so callers treat this as inconclusive rather than PASS.
+        print(f"FAIL: fixture unavailable ({fixture_path}): {exc}")
+        return None, "UNAVAILABLE_FIXTURE"
+    finally:
+        os.close(fd)
+    return failures, ("FAIL" if failures else "PASS")
 
 
 def main(argv=None):
@@ -396,9 +526,13 @@ def main(argv=None):
         return run_self_test()
     print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Only --listen/--scan/auto-detect need InputDevice. A --device table check
-    # can open the event node directly, so it works without python3-evdev.
-    need_input_device = args.listen is not None or args.scan is not None or not args.device
+    # Only --listen/--scan/--scan-only/auto-detect need InputDevice (raw capture
+    # reads the event stream). A --device table check opens the node directly,
+    # so it still works without python3-evdev -- keep that delegation unchanged.
+    need_input_device = (
+        args.listen is not None or args.scan is not None or args.scan_only is not None
+        or not args.device
+    )
     if need_input_device and evdev is None:
         print("FAIL: python3-evdev is missing; install it with: sudo apt install python3-evdev")
         return 1
@@ -433,41 +567,45 @@ def main(argv=None):
         path = args.device
         ident = " (EVIOCGKEYCODE table check; python3-evdev not required)"
 
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except PermissionError:
-        print(f"FAIL: cannot read {path} (EVIOCGKEYCODE needs root); re-run with sudo")
-        return 1
-    failures = 0
-    try:
-        failures = run_table_check(fd, path, args.fixture, ident)
-    except FileNotFoundError as exc:
-        # A missing --fixture TSV is not an ioctl failure. Still no RESULT line
-        # is printed, so callers treat this as inconclusive rather than PASS.
-        print(f"FAIL: fixture unavailable ({args.fixture}): {exc}")
-        return 1
-    except OSError as exc:
-        # e.g. not an event node, or the ioctl is unavailable: no RESULT line
-        # is printed, so callers treat this as inconclusive rather than PASS.
-        print(f"FAIL: EVIOCGKEYCODE unavailable on {path}: {exc}")
-        return 1
-    finally:
-        os.close(fd)
+    # --- EVIOCGKEYCODE table check: skipped entirely by --scan-only ---
+    if args.scan_only is not None:
+        mapping_status = "SKIPPED"
+        print("MAPPING_CHECK=SKIPPED (--scan-only; EVIOCGKEYCODE not attempted)")
+    else:
+        failures, mapping_status = run_table_check_guarded(path, args.fixture, ident)
+        print(f"MAPPING_CHECK={mapping_status}")
 
+    # --- raw capture runs even when the table check is unavailable ---
+    raw_ok = None
     if dev is not None:
-        if args.listen:
-            listen(dev, args.listen)
-        if args.scan:
-            scan(dev, args.scan)
+        if args.scan_only is not None:
+            raw_ok = scan(dev, args.scan_only)
+            print(f"RAW_CAPTURE={'PASS' if raw_ok else 'FAIL'} "
+                  f"(MSC_SCAN {'observed' if raw_ok else 'not observed'})")
+        else:
+            if args.listen:
+                listen(dev, args.listen)
+            if args.scan:
+                raw_ok = scan(dev, args.scan)
+                print(f"RAW_CAPTURE={'PASS' if raw_ok else 'FAIL'} "
+                      f"(MSC_SCAN {'observed' if raw_ok else 'not observed'})")
         dev.close()
 
-    if failures:
+    # --- separate verdicts: only a genuine table verdict emits RESULT= ---
+    if args.scan_only is not None:
+        # detect-hardware.sh greps RESULT=/MISMATCH; never emit them here.
+        return 0 if raw_ok else 1
+    if mapping_status == "PASS":
+        print("RESULT=PASS")
+        return 0
+    if mapping_status == "FAIL":
         print(f"RESULT=FAIL ({failures} scancode(s) not mapped as expected)")
         print("Reinstall with: sudo ./keyboard/install-keyboard.sh --with-keyd")
         print(f"then check:     udevadm info {path} | grep KEYBOARD_KEY")
         return 1
-    print("RESULT=PASS")
-    return 0
+    # UNAVAILABLE_*: inconclusive contract, no RESULT line. Any requested raw
+    # capture has already run and been reported above; overall status is still 1.
+    return 1
 
 
 if __name__ == "__main__":

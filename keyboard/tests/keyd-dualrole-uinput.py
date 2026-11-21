@@ -59,8 +59,16 @@ Run:
   sudo python3 keyboard/tests/keyd-dualrole-uinput.py        # live test
   python3 keyboard/tests/keyd-dualrole-uinput.py --self-test # synthetic, no root
 
-Exit code 0 = all checks passed. NOTE: restarting keyd briefly drops the real
-keyboard remapping, so run this from a TTY/SSH or accept a ~1s interruption.
+Exit codes:
+  0 = all assertions passed AND keyd was restored afterwards.
+  1 = a check or setup failed (RESULT=FAIL / ASSERTIONS=FAIL or setup error).
+  2 = all assertions passed but the cleanup `systemctl restart keyd` failed;
+      RESULT= still reflects the assertions only, while SERVICE_RESTORE= is the
+      independent keyboard-service health signal. Restore keyd manually with
+      `sudo systemctl restart keyd` in that case.
+
+NOTE: restarting keyd briefly drops the real keyboard remapping, so run this
+from a TTY/SSH or accept a ~1s interruption.
 """
 import argparse
 import os
@@ -258,6 +266,57 @@ def close_quietly(dev):
         pass
 
 
+def keyd_restore_ok(returncode):
+    """True iff a `systemctl restart keyd` returned success."""
+    return returncode == 0
+
+
+def restore_keyd():
+    """Best-effort restart of keyd at the end of a live run.
+
+    Assertions and service recovery are reported separately: a failed restore
+    must never be silently folded into a successful verdict. Returns True only
+    when `systemctl restart keyd` actually succeeded.
+    """
+    try:
+        res = subprocess.run(["systemctl", "restart", "keyd"], check=False)
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"FAIL: could not restart keyd ({exc}); run `sudo systemctl restart keyd` manually")
+        return False
+    if not keyd_restore_ok(res.returncode):
+        print(f"FAIL: keyd restart exited {res.returncode}; run `sudo systemctl restart keyd` manually")
+        return False
+    return True
+
+
+def final_verdict(failures, restore_ok):
+    """Return ``(lines, exit_code)`` separating assertions from keyd restore.
+
+    ``RESULT=`` only reflects the assertion failures; ``SERVICE_RESTORE=`` is an
+    independent keyboard-service health signal. This keeps a run that passed
+    every assertion but left keyd stopped from claiming full success.
+    """
+    if failures:
+        return (
+            [
+                f"ASSERTIONS=FAIL ({', '.join(failures)})",
+                f"RESULT=FAIL {failures}",
+                f"SERVICE_RESTORE={'PASS' if restore_ok else 'FAIL'}",
+            ],
+            1,
+        )
+    if restore_ok:
+        return (["ASSERTIONS=PASS", "SERVICE_RESTORE=PASS", "RESULT=PASS"], 0)
+    return (
+        [
+            "ASSERTIONS=PASS",
+            "SERVICE_RESTORE=FAIL",
+            "RESULT=PASS (assertions only; keyd restore FAILED — run sudo systemctl restart keyd manually)",
+        ],
+        2,
+    )
+
+
 def find_keyd():
     for path in list_devices():
         try:
@@ -391,13 +450,35 @@ def run_self_test():
            seq("KEY_LEFTMETA", [1, 2, 0]) + seq("KEY_RIGHTCTRL", [1, 0]), False)
     expect("lone [1,2,0]", check_lone, seq("KEY_LEFTMETA", [1, 2, 0]), True)
 
-    # Direct helper checks (repeat filtering / leading-reset tolerance).
+    # 5. Composite verdict: assertion health (RESULT=) and keyd restore health
+    #    (SERVICE_RESTORE=) are independent, with distinct exit codes.
+    for label, assertions, restore_in, want_code, want_lines in (
+        ("verdict pass + restore pass", [], True, 0, ("SERVICE_RESTORE=PASS", "RESULT=PASS")),
+        ("verdict pass + restore fail", [], False, 2, ("SERVICE_RESTORE=FAIL", "RESULT=PASS")),
+        ("verdict assertions fail", ["tap"], True, 1, ("ASSERTIONS=FAIL", "RESULT=FAIL")),
+    ):
+        lines, code = final_verdict(assertions, restore_in)
+        joined = "\n".join(lines)
+        ok = code == want_code and all(s in joined for s in want_lines)
+        detail = f"exit={code}, lines={lines}"
+        results.append((label, ok, detail))
+        if not ok:
+            failures.append(f"{label}: expected exit {want_code} with {want_lines}, got {detail}")
+
+    # Direct helper checks (repeat filtering / leading-reset tolerance /
+    # restore detection). These are not part of the pairing case count.
     if values_for(seq("KEY_A", [1, 2, 2, 0]), "KEY_A") != [1, 0]:
         failures.append("values_for() must drop autorepeat (value 2)")
     if not clean_press([0, 0, 1, 2, 0, 0]):
         failures.append("clean_press() must tolerate leading/trailing resets and repeat")
+    if not keyd_restore_ok(0) or keyd_restore_ok(1):
+        failures.append("keyd_restore_ok() must be True only for returncode 0")
+    # An assertion failure stays exit 1 even when restore also fails.
+    lines, code = final_verdict(["tap"], False)
+    if code != 1 or not any("RESULT=FAIL" in line for line in lines):
+        failures.append(f"final_verdict(['tap'], False) must still exit 1: {lines} / {code}")
 
-    print("self-test: synthetic EV_KEY value 1/0 pairing (no device needed)")
+    print("self-test: synthetic EV_KEY value 1/0 pairing and verdict (no device needed)")
     for label, ok, detail in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}: {detail}")
     if failures:
@@ -405,7 +486,7 @@ def run_self_test():
             print(f"FAIL: {msg}")
         print("SELF-TEST=FAIL")
         return 1
-    print(f"SELF-TEST=PASS ({len(results)} pairing cases)")
+    print(f"SELF-TEST=PASS ({len(results)} cases)")
     return 0
 
 
@@ -426,6 +507,94 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def run_checks(ui, kd, failures):
+    """Run the assertion body against the live keyd virtual keyboard.
+
+    ``failures`` is the single source of truth for assertion failures. This
+    function never prints a verdict, so every path (including a missing keyd
+    device) flows to main()'s unified final_verdict().
+    """
+    top_row = build_top_row()
+    print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if kd is None:
+        print("FAIL: keyd virtual keyboard not found (is keyd running?)")
+        failures.append("keyd-not-found")
+        return
+    print(f"keyd output device: {kd.path}")
+
+    res = subprocess.run(
+        ["journalctl", "-u", "keyd", "--since", "20 seconds ago", "--no-pager"],
+        capture_output=True,
+        text=True,
+    )
+    log = res.stdout
+    if res.returncode != 0 or TEST_DEVICE_NAME not in log:
+        log = subprocess.run(
+            ["journalctl", "-u", "keyd", "-n", "100", "--no-pager"],
+            capture_output=True,
+            text=True,
+        ).stdout
+    attached = TEST_DEVICE_NAME in log
+    print("keyd attached to test device:", attached)
+    if not attached:
+        print("FAIL: keyd did not grab the test device (check [ids] in /etc/keyd/cros.conf)")
+        failures.append("attach")
+
+    # 1. tap Search -> CAPSLOCK only. A plain overload() would also emit
+    # META plus the LEFTCTRL guard here, so check the raw names AND require
+    # a clean CAPSLOCK down/up pair.
+    press(ui, e.KEY_LEFTMETA, hold=0.05)
+    ok, detail = check_tap(collect_checked(kd, 0.6, "tap Search", failures))
+    if ok:
+        print(f"PASS: tap Search -> CAPSLOCK only (no META, no guard) {detail}")
+    else:
+        print(f"FAIL: tap Search expected CAPSLOCK only (one down/up), got {detail}")
+        failures.append("tap")
+
+    # 2. hold Search + each top-row key -> F1 ... F10.
+    for label, code, expected in top_row:
+        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
+        ui.syn()
+        time.sleep(0.6)  # exceed the tap timeout and enter the meta layer
+        press(ui, code)
+        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
+        ui.syn()
+        ok, detail = check_hold(
+            collect_checked(kd, 0.7, f"hold Search + {label}", failures), expected
+        )
+        if ok:
+            print(f"PASS: hold Search + {label} -> {expected} {detail}")
+        else:
+            print(f"FAIL: hold Search + {label} expected only {expected} (one down/up), got {detail}")
+            failures.append(f"hold-{expected.lower()}")
+
+    # 3. each top-row key alone -> its own media key (pass-through).
+    for label, code, _expected in top_row:
+        press(ui, code)
+        own = key_name(code)
+        ok, detail = check_media(collect_checked(kd, 0.6, f"{label} alone", failures), own)
+        if ok:
+            print(f"PASS: {label} alone -> {own} {detail}")
+        else:
+            print(f"FAIL: {label} alone expected {own} (one down/up, no stray down), got {detail}")
+            failures.append(f"media-{label.lower().split()[0]}")
+
+    # 4. hold Search and release it alone -> clean lone META, no LEFTCTRL.
+    # keyd's clear_mod() guard would otherwise turn this into Meta+Ctrl and
+    # Mutter would not treat it as the overlay key (no GNOME overview).
+    ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
+    ui.syn()
+    time.sleep(0.6)
+    ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
+    ui.syn()
+    ok, detail = check_lone(collect_checked(kd, 0.8, "hold Search alone, release", failures))
+    if ok:
+        print(f"PASS: hold Search alone -> bare META release (no guard) {detail}")
+    else:
+        print(f"FAIL: hold Search alone expected a META release without LEFTCTRL guard, got {detail}")
+        failures.append("hold-meta-clean")
+
+
 def main(argv=None):
     args = parse_args(argv)
     # --self-test returns before the root / evdev / device checks so CI (and a
@@ -441,7 +610,6 @@ def main(argv=None):
         return 1
 
     keys = build_keys()
-    top_row = build_top_row()
 
     ui = None
     try:
@@ -459,115 +627,32 @@ def main(argv=None):
     except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"FAIL: setup error (creating /dev/uinput device or restarting keyd): {exc}")
         # A failed `systemctl restart keyd` may have stopped keyd already. Try
-        # to restore it, and say so explicitly if that best effort also fails.
-        try:
-            subprocess.run(["systemctl", "restart", "keyd"], check=True)
-        except (OSError, subprocess.CalledProcessError, FileNotFoundError) as restore_exc:
-            print(f"WARN: keyd may not be restored (restart failed: {restore_exc}); run `sudo systemctl restart keyd` manually")
+        # to restore it, and report that health signal separately from the
+        # failed setup (which always returns 1).
+        restore_ok = restore_keyd()
+        print(f"SERVICE_RESTORE={'PASS' if restore_ok else 'FAIL'}")
         close_quietly(ui)
         return 1
 
     failures = []
     kd = None
+    restore_ok = False
     try:
-        print(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
         kd = find_keyd()
-        if kd is None:
-            print("FAIL: keyd virtual keyboard not found (is keyd running?)")
-            return 1
-        print(f"keyd output device: {kd.path}")
-
-        res = subprocess.run(
-            ["journalctl", "-u", "keyd", "--since", "20 seconds ago", "--no-pager"],
-            capture_output=True,
-            text=True,
-        )
-        log = res.stdout
-        if res.returncode != 0 or TEST_DEVICE_NAME not in log:
-            log = subprocess.run(
-                ["journalctl", "-u", "keyd", "-n", "100", "--no-pager"],
-                capture_output=True,
-                text=True,
-            ).stdout
-        attached = TEST_DEVICE_NAME in log
-        print("keyd attached to test device:", attached)
-        if not attached:
-            print("FAIL: keyd did not grab the test device (check [ids] in /etc/keyd/cros.conf)")
-            failures.append("attach")
-
-        # 1. tap Search -> CAPSLOCK only. A plain overload() would also emit
-        # META plus the LEFTCTRL guard here, so check the raw names AND require
-        # a clean CAPSLOCK down/up pair.
-        press(ui, e.KEY_LEFTMETA, hold=0.05)
-        ok, detail = check_tap(collect_checked(kd, 0.6, "tap Search", failures))
-        if ok:
-            print(f"PASS: tap Search -> CAPSLOCK only (no META, no guard) {detail}")
-        else:
-            print(f"FAIL: tap Search expected CAPSLOCK only (one down/up), got {detail}")
-            failures.append("tap")
-
-        # 2. hold Search + each top-row key -> F1 ... F10.
-        for label, code, expected in top_row:
-            ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
-            ui.syn()
-            time.sleep(0.6)  # exceed the tap timeout and enter the meta layer
-            press(ui, code)
-            ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
-            ui.syn()
-            ok, detail = check_hold(
-                collect_checked(kd, 0.7, f"hold Search + {label}", failures), expected
-            )
-            if ok:
-                print(f"PASS: hold Search + {label} -> {expected} {detail}")
-            else:
-                print(f"FAIL: hold Search + {label} expected only {expected} (one down/up), got {detail}")
-                failures.append(f"hold-{expected.lower()}")
-
-        # 3. each top-row key alone -> its own media key (pass-through).
-        for label, code, _expected in top_row:
-            press(ui, code)
-            own = key_name(code)
-            ok, detail = check_media(collect_checked(kd, 0.6, f"{label} alone", failures), own)
-            if ok:
-                print(f"PASS: {label} alone -> {own} {detail}")
-            else:
-                print(f"FAIL: {label} alone expected {own} (one down/up, no stray down), got {detail}")
-                failures.append(f"media-{label.lower().split()[0]}")
-
-        # 4. hold Search and release it alone -> clean lone META, no LEFTCTRL.
-        # keyd's clear_mod() guard would otherwise turn this into Meta+Ctrl and
-        # Mutter would not treat it as the overlay key (no GNOME overview).
-        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 1)
-        ui.syn()
-        time.sleep(0.6)
-        ui.write(e.EV_KEY, e.KEY_LEFTMETA, 0)
-        ui.syn()
-        ok, detail = check_lone(collect_checked(kd, 0.8, "hold Search alone, release", failures))
-        if ok:
-            print(f"PASS: hold Search alone -> bare META release (no guard) {detail}")
-        else:
-            print(f"FAIL: hold Search alone expected a META release without LEFTCTRL guard, got {detail}")
-            failures.append("hold-meta-clean")
-
+        run_checks(ui, kd, failures)
     finally:
-        # Close devices on every path (including early returns / exceptions),
-        # using a quiet close so cleanup errors cannot mask the real result.
+        # Close devices on every path (including exceptions), using a quiet
+        # close so cleanup errors cannot mask the real result. Close order is
+        # kd -> ui -> restart: the virtual device must be gone before keyd
+        # re-scans. Restore is a separate health signal from the assertions.
         close_quietly(kd)
         close_quietly(ui)
-        # Drop the virtual device and let keyd re-scan without it. Do not fail
-        # silently: leave a clear warning if the cleanup restart did not work.
-        try:
-            res = subprocess.run(["systemctl", "restart", "keyd"], check=False)
-            if res.returncode != 0:
-                print(f"WARN: keyd restart after test exited {res.returncode}; restart keyd manually")
-        except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
-            print(f"WARN: could not restart keyd after test ({exc}); restart keyd manually")
+        restore_ok = restore_keyd()
 
-    if failures:
-        print("RESULT=FAIL", failures)
-        return 1
-    print("RESULT=PASS")
-    return 0
+    lines, code = final_verdict(failures, restore_ok)
+    for line in lines:
+        print(line)
+    return code
 
 
 if __name__ == "__main__":

@@ -148,7 +148,10 @@
   > 請先停掉 keyd（`sudo systemctl stop keyd`），用
   > `check-top-row-hwdb.py --scan 60` 或不加 `--grab` 的 `evtest` 讀
   > `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論掃描碼並建立自己的 hwdb 條目
-  > （見 `CONTRIBUTING.md` → §2 的「New Chromebook model?」）。完成後請執行
+  > （見 `CONTRIBUTING.md` → §2 的「New Chromebook model?」）。未知機型或
+  > `EVIOCGKEYCODE` 不支援時，改用 `check-top-row-hwdb.py --scan-only 60`：
+  > 它完全跳過表格檢查，fixture 不符或 ioctl 失敗都不會擋住原始擷取。
+  > 完成後請執行
   > `sudo systemctl start keyd` 恢復服務，否則 Search 輕點/長按與亮度重映射會持續失效。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」

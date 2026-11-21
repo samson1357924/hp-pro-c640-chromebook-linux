@@ -37,7 +37,9 @@ AT `F1`-`F10`）。在標準 Linux 下，這些按鍵可透過核心/硬體層�
 > 掃描碼，需要建立自己的 hwdb 條目。沿用這張表前，請先停掉 keyd
 > （`sudo systemctl stop keyd`），用 `check-top-row-hwdb.py --scan 60` 或
 > 不加 `--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論
-> 掃描碼並建立自己的 hwdb 條目。**擷取完成後請執行
+> 掃描碼並建立自己的 hwdb 條目。未知機型或 `EVIOCGKEYCODE` 不支援時，改用
+> `check-top-row-hwdb.py --scan-only 60`：它完全跳過表格檢查，因此 Dratini
+> fixture 不符也不會擋住原始擷取。**擷取完成後請執行
 > `sudo systemctl start keyd` 恢復服務**，否則 Search 輕點/長按與亮度重映射
 > 會持續失效。`--listen` 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件，不是原始
 > 掃描碼。

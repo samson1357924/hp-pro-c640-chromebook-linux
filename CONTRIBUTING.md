@@ -52,7 +52,10 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   Dratini block. Stop keyd (`sudo systemctl stop keyd`) and read
   `EV_MSC/MSC_SCAN` for each top-row press with either
   `sudo python3 keyboard/tests/check-top-row-hwdb.py --scan 60` or plain
-  `sudo evtest` (no `--grab`). **After capturing, run
+  `sudo evtest` (no `--grab`). On an unknown model or when `EVIOCGKEYCODE` is
+  unsupported, use `sudo python3 keyboard/tests/check-top-row-hwdb.py --scan-only 60`:
+  it skips the table check entirely, so a Dratini fixture mismatch cannot block
+  raw capture. **After capturing, run
   `sudo systemctl start keyd` to restore the service**; otherwise Search
   tap/hold and brightness remapping stay disabled. `--listen` is **not** for
   this: it only observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`, not

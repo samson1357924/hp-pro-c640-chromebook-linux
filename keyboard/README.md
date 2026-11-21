@@ -42,7 +42,10 @@ kernel/hardware level using `systemd-hwdb` or at the input daemon level using
 > (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN` with
 > `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then infer
 > the scancode against the standard AT table and create your own hwdb entry.
-> **After capturing, run `sudo systemctl start keyd` to restore the service** —
+> On an unknown model or when `EVIOCGKEYCODE` is unsupported, use
+> `check-top-row-hwdb.py --scan-only 60`: it skips the table check entirely, so
+> a Dratini fixture mismatch cannot block raw capture. **After capturing, run
+> `sudo systemctl start keyd` to restore the service** —
 > otherwise Search tap/hold and brightness remapping stay disabled. `--listen`
 > only shows the post-hwdb `KEY_*` events, not raw scancodes.
 

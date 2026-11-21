@@ -175,7 +175,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > stop keyd (`sudo systemctl stop keyd`) and read `EV_MSC/MSC_SCAN` with
   > `check-top-row-hwdb.py --scan 60` or plain `evtest` (no `--grab`), then infer
   > the scancode against the standard AT table and create your own hwdb entry
-  > (see `CONTRIBUTING.md` → "New Chromebook model?" in §2). When done, run
+  > (see `CONTRIBUTING.md` → "New Chromebook model?" in §2). On an unknown model
+  > or when `EVIOCGKEYCODE` is unsupported, use
+  > `check-top-row-hwdb.py --scan-only 60`: it skips the table check entirely, so
+  > a fixture mismatch or ioctl failure cannot block raw capture. When done, run
   > `sudo systemctl start keyd` to restore the service; otherwise Search
   > tap/hold and brightness remapping stay disabled.
 
