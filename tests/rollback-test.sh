@@ -2067,6 +2067,197 @@ test_keyd_unsupported_path_type_fails_closed() {
     assert_eq "0" "$backup_count" "unsupported path ($kind): no backup created before refusal"
 }
 
+# ---------------------------------------------------------------------------
+# 34. P2 regression: a non-root user with passwordless sudo must be able to
+#     restore a snapshot of root-owned keyd paths. The simulation enforces the
+#     privilege boundary without needing a second real uid: the sudo stub logs
+#     each call and sets a marker, and shadowing rm/mkdir/ln/install wrappers
+#     deny mutations of the (simulated root-owned) keyd dir unless that marker
+#     is present. Before the fix the restore mutations were unprivileged, so
+#     V1 was lost and a misleading success line was printed.
+# ---------------------------------------------------------------------------
+setup_keyd_privilege_stubs() {
+    local sandbox="$1"
+    mkdir -p "$sandbox/privbin"
+
+    # sudo: record the exact command, then "elevate" via a marker that the
+    # privilege wrappers check (analogous to passwordless sudo for uid 1000).
+    cat > "$sandbox/stub/sudo" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_SUDO_LOG:?}"
+export STUB_SUDO_ELEVATED=1
+exec "$@"
+EOF
+
+    # Shadow the four mutation commands. Non-sudo calls aimed at the keyd dir
+    # are denied like EACCES for a non-root user; every other path passes
+    # through so snapshot/backup bookkeeping still works.
+    cat > "$sandbox/privbin/priv-wrapper" << EOF
+#!/usr/bin/env bash
+name="\$(basename "\$0")"
+real=""
+for d in /usr/bin /bin /usr/sbin /sbin; do
+    if [ -x "\$d/\$name" ]; then real="\$d/\$name"; break; fi
+done
+[ -n "\$real" ] || exit 1
+if [ "\${STUB_SUDO_ELEVATED:-0}" = "1" ]; then
+    exec "\$real" "\$@"
+fi
+for arg in "\$@"; do
+    case "\$arg" in
+        $sandbox/etc/keyd | $sandbox/etc/keyd/*)
+            printf 'DENIED:%s %s\n' "\$name" "\$*" >> "\${STUB_PRIV_LOG:?}"
+            exit 1
+            ;;
+    esac
+done
+exec "\$real" "\$@"
+EOF
+    chmod +x "$sandbox/stub/sudo" "$sandbox/privbin/priv-wrapper"
+    local cmd
+    for cmd in rm mkdir ln install; do
+        ln -s priv-wrapper "$sandbox/privbin/$cmd"
+    done
+}
+
+test_keyd_restore_uses_sudo_nonroot() {
+    # (a) Unit level: cover the sudo rm -rf branch directly with a crafted
+    #     snapshot (a directory at KEYD_DST plus a symlink at KEYD_LINK).
+    local unit="/tmp/rollback-test-keyd-restore-sudo-unit"
+    rm -rf "$unit"
+    mkdir -p "$unit/backups" "$unit/manifest" "$unit/etc/keyd" "$unit/snapshots/crafted"
+    prepare_keyd_sandbox_script "$unit"
+    setup_keyd_stubs "$unit" valid
+    setup_keyd_privilege_stubs "$unit"
+    printf 'file\n' > "$unit/snapshots/crafted/cros.kind"
+    printf '644\n' > "$unit/snapshots/crafted/cros.mode"
+    printf 'V1_DATA\n' > "$unit/snapshots/crafted/cros.data"
+    printf 'symlink\n' > "$unit/snapshots/crafted/link.kind"
+    printf 'cros.conf\n' > "$unit/snapshots/crafted/link.target"
+    mkdir -p "$unit/etc/keyd/cros.conf"
+    ln -s stale "$unit/etc/keyd/default.conf"
+    : > "$unit/sudo.log"
+    : > "$unit/priv.log"
+
+    local unit_rc=0
+    run_sandboxed "$unit" '
+        export PATH="$2/privbin:$2/stub:$PATH" STUB_SUDO_LOG="$2/sudo.log" STUB_PRIV_LOG="$2/priv.log"
+        source "$2/install-keyboard-sandbox.sh"
+        KEYD_SNAPSHOT_DIR="$3"
+        _keyd_restore_one "$KEYD_DST" "cros" && _keyd_restore_one "$KEYD_LINK" "link"
+    ' "$unit/snapshots/crafted" || unit_rc=$?
+    assert_eq "0" "$unit_rc" "restore-sudo (unit): restore helper succeeded under simulated non-root"
+    assert_eq "V1_DATA" "$(cat "$unit/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "restore-sudo (unit): directory at keyd path removed via sudo rm -rf, file restored"
+    if [ -L "$unit/etc/keyd/default.conf" ] && [ "$(readlink "$unit/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "restore-sudo (unit): symlink rebuilt via sudo rm -f + sudo ln -s"
+    fi
+    local unit_sudo_log unit_denied
+    unit_sudo_log="$(cat "$unit/sudo.log" 2> /dev/null || echo "")"
+    unit_denied="$(grep -c 'DENIED:' "$unit/priv.log" 2> /dev/null || true)"
+    assert_eq "0" "${unit_denied:-0}" "restore-sudo (unit): no unprivileged keyd-path mutation"
+    assert_contains "rm -rf -- $unit/etc/keyd/cros.conf" "$unit_sudo_log" \
+        "restore-sudo (unit): sudo rm -rf used for a directory"
+    assert_contains "rm -f -- $unit/etc/keyd/default.conf" "$unit_sudo_log" \
+        "restore-sudo (unit): sudo rm -f used for a stale symlink"
+    assert_contains "mkdir -p -- $unit/etc/keyd" "$unit_sudo_log" \
+        "restore-sudo (unit): sudo mkdir -p used for the parent directory"
+    assert_contains "ln -s -- cros.conf $unit/etc/keyd/default.conf" "$unit_sudo_log" \
+        "restore-sudo (unit): sudo ln -s used to rebuild the symlink"
+    assert_contains "install -D -m 644" "$unit_sudo_log" \
+        "restore-sudo (unit): sudo install used to restore file content"
+    assert_eq "5" "$(printf '%s\n' "$unit_sudo_log" | grep -cE '^(rm -f|rm -rf|mkdir -p|ln -s|install) --|^install -D' || true)" \
+        "restore-sudo (unit): all five mutation kinds logged through sudo"
+
+    # (b) End-to-end reviewer scenario: V1 -> V2 deploy with a failing first
+    #     restart. Only a sudo-routed restore can bring V1 back from the
+    #     simulated root-owned keyd dir.
+    local sandbox="/tmp/rollback-test-keyd-restore-sudo"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/keyd" "$sandbox/keyd-src"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    printf 'V1_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    printf 'V1_CONFIG\n' > "$sandbox/etc/keyd/cros.conf"
+    if ! run_keyd_install_step "$sandbox"; then
+        fail "restore-sudo: V1 deploy failed"
+        return 0
+    fi
+
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    setup_keyd_privilege_stubs "$sandbox"
+    : > "$sandbox/sudo.log"
+    : > "$sandbox/priv.log"
+    : > "$sandbox/systemctl.log"
+
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/privbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SUDO_LOG="$2/sudo.log" STUB_PRIV_LOG="$2/priv.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        install_keyd_step
+    ' 2> "$sandbox/step.log"; then
+        fail "restore-sudo: V2 failure with a safe revert must return 1"
+        return 0
+    fi
+    assert_eq "V1_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "restore-sudo: V1 config restored, not the broken V2"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "restore-sudo: legacy default.conf symlink restored"
+    fi
+    local denied sudo_log step_log
+    denied="$(grep -c 'DENIED:' "$sandbox/priv.log" 2> /dev/null || true)"
+    assert_eq "0" "${denied:-0}" "restore-sudo: no unprivileged keyd-path mutation"
+    sudo_log="$(cat "$sandbox/sudo.log" 2> /dev/null || echo "")"
+    assert_contains "rm -f -- $sandbox/etc/keyd/cros.conf" "$sudo_log" \
+        "restore-sudo: sudo rm -f used to clear the current config"
+    assert_contains "mkdir -p -- $sandbox/etc/keyd" "$sudo_log" \
+        "restore-sudo: sudo mkdir -p used for the parent directory"
+    assert_contains "ln -s -- cros.conf $sandbox/etc/keyd/default.conf" "$sudo_log" \
+        "restore-sudo: sudo ln -s used to rebuild the symlink"
+    assert_contains "install -D -m 644" "$sudo_log" \
+        "restore-sudo: sudo install used to restore the file from the snapshot"
+    step_log="$(cat "$sandbox/step.log" 2> /dev/null || echo "")"
+    assert_contains "keyd restart succeeded after restoring previous config" "$step_log" \
+        "restore-sudo: success line printed when restored=1"
+    if grep -qF "snapshot restore FAILED" "$sandbox/step.log"; then
+        fail "restore-sudo: failure warning must be absent when restored=1"
+    else
+        ok
+    fi
+
+    # (c) Forcing snapshot restoration to fail must produce the explicit
+    #     warning instead of the misleading success line (restored=0).
+    printf 'V2_CONFIG\n' > "$sandbox/keyd-src/cros.conf"
+    rm -f "$sandbox/retried"
+    : > "$sandbox/sudo.log"
+    : > "$sandbox/priv.log"
+    : > "$sandbox/systemctl.log"
+    : > "$sandbox/step2.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/privbin:$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SUDO_LOG="$2/sudo.log" STUB_PRIV_LOG="$2/priv.log" \
+            STUB_RESTART_FAIL_FIRST=1 STUB_RESTART_RETRY_FLAG="$2/retried"
+        source "$2/install-keyboard-sandbox.sh"
+        _keyd_snapshot_restore() { return 1; }
+        install_keyd_step
+    ' 2> "$sandbox/step2.log" && fail "restore-sudo: forced restore failure must still return 1"
+    local step2_log
+    step2_log="$(cat "$sandbox/step2.log" 2> /dev/null || echo "")"
+    assert_contains "snapshot restore FAILED" "$step2_log" \
+        "restore-sudo: explicit warning printed when restored=0"
+    if grep -qF "keyd restart succeeded after restoring previous config" "$sandbox/step2.log"; then
+        fail "restore-sudo: success line must NOT be printed when restored=0"
+    else
+        ok
+    fi
+}
+
 test_uninstall_has_no_post_rollback_keyd_cleanup() {
     if grep -q 'Clean up legacy default.conf symlink' "$REPO_ROOT/keyboard/install-keyboard.sh"; then
         fail "uninstall must not delete default.conf after rollback_component"
@@ -2125,6 +2316,7 @@ test_keyd_snapshot_cleanup_on_success
 test_keyd_snapshot_create_failure_fails_closed
 test_keyd_unsupported_path_type_fails_closed dir
 test_keyd_unsupported_path_type_fails_closed fifo
+test_keyd_restore_uses_sudo_nonroot
 test_uninstall_has_no_post_rollback_keyd_cleanup
 
 echo ""

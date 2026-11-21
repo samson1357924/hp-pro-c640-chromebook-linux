@@ -275,19 +275,21 @@ _keyd_restore_one() {
     esac
 
     # Clear the current state first, symlink flag first (a dangling link is
-    # still a link), then directories, then everything else.
+    # still a link), then directories, then everything else. The keyd paths
+    # are root-owned, so every mutation must go through sudo just like the
+    # deployment and service operations do. Reads (cat/-f/readlink) do not.
     if [ -L "$dst" ]; then
-        if ! rm -f -- "$dst" 2> /dev/null; then
+        if ! sudo rm -f -- "$dst" 2> /dev/null; then
             log_warn "Could not remove $dst symlink while restoring keyd snapshot"
             return 1
         fi
     elif [ -d "$dst" ]; then
-        if ! rm -rf -- "$dst" 2> /dev/null; then
+        if ! sudo rm -rf -- "$dst" 2> /dev/null; then
             log_warn "Could not remove $dst directory while restoring keyd snapshot"
             return 1
         fi
     elif [ -e "$dst" ]; then
-        if ! rm -f -- "$dst" 2> /dev/null; then
+        if ! sudo rm -f -- "$dst" 2> /dev/null; then
             log_warn "Could not remove $dst while restoring keyd snapshot"
             return 1
         fi
@@ -302,11 +304,11 @@ _keyd_restore_one() {
                 log_warn "Could not read $d/$prefix.target; cannot restore $dst"
                 return 1
             fi
-            if ! mkdir -p -- "$(dirname "$dst")" 2> /dev/null; then
+            if ! sudo mkdir -p -- "$(dirname "$dst")" 2> /dev/null; then
                 log_warn "Could not create parent directory for $dst"
                 return 1
             fi
-            if ! ln -s -- "$target" "$dst" 2> /dev/null; then
+            if ! sudo ln -s -- "$target" "$dst" 2> /dev/null; then
                 log_warn "Could not recreate $dst as a symlink to $target"
                 return 1
             fi
@@ -320,7 +322,7 @@ _keyd_restore_one() {
                 log_warn "Keyd snapshot has no $prefix.data; cannot restore $dst"
                 return 1
             fi
-            if ! install -D -m "$mode" "$d/$prefix.data" "$dst" 2> /dev/null; then
+            if ! sudo install -D -m "$mode" "$d/$prefix.data" "$dst" 2> /dev/null; then
                 log_warn "Could not restore $dst from keyd snapshot"
                 return 1
             fi
@@ -386,10 +388,13 @@ _keyd_snapshot_restore() {
 # again afterwards: the brief health-check start is acceptable, the final
 # state is not.
 # Returns 2 when the snapshot was fully restored AND the final restart
-# succeeded (safe revert: the new dual-role config is NOT active), 1 when
-# recovery could not be completed, and 0 when no revert was needed (the new
-# config is running normally). Callers MUST treat 2 like a failure: dual-role
-# must never be reported as active after a revert.
+# succeeded (safe revert: the new dual-role config is NOT active), and 1 when
+# recovery (or the final stop of a previously inactive service) could not be
+# completed. This helper is only called after a restart has already failed, so
+# there is no "no revert needed" case in practice: 0 is reserved purely as a
+# defensive/future-compatible value and is never returned on the current paths.
+# Callers MUST treat 2 like a failure: dual-role must never be reported as
+# active after a revert.
 _restore_keyd_after_failed_restart() {
     local restored=0 wanted_active=""
     if _keyd_snapshot_restore; then
@@ -403,7 +408,13 @@ _restore_keyd_after_failed_restart() {
         log_warn "keyd still failed to restart after restoring previous config; check 'journalctl -u keyd' manually"
         return 1
     fi
-    log_success "keyd restart succeeded after restoring previous config"
+    if [ "$restored" -eq 1 ]; then
+        log_success "keyd restart succeeded after restoring previous config"
+    else
+        # Never claim a successful restore here: the running config may still
+        # be the new (broken) one that failed the health-check restart.
+        log_warn "keyd restarted, but snapshot restore FAILED — the active config may be the new (broken) one"
+    fi
 
     if [ "$restored" -eq 1 ] && [ -f "$KEYD_SNAPSHOT_DIR/.active_wanted" ]; then
         if ! wanted_active="$(cat "$KEYD_SNAPSHOT_DIR/.active_wanted" 2> /dev/null)"; then
