@@ -189,6 +189,20 @@
   不會到 `0` 或不會恢復；`journalctl --user -u c640-kbd-backlight-sync` 空白或 `Daemon running: no`。
   另一相關症狀是**閃爍/震盪**：LED 在熄滅/點亮前後於已存值與最大亮度間反覆跳動，
   通常是 gsd-power 快取與 UPower 不一致，或 ScreenSaver 複查競態。
+
+  > [!IMPORTANT]
+  > 真實 S3 週期中，systemd 會在 sleep hook 的 `post` 階段前**凍結 `user.slice`**
+  > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)、
+  > [systemd sleep 設計](https://systemd.io/SLEEP/)）。因此從 root hook 查詢 session
+  > bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
+  > `c640-kbd-backlight.suspend`（單一整數，`0` 有效），`post` 發佈
+  > `c640-kbd-backlight.resume`（`<epoch> <action>`），兩者皆 `0600` + chown 給
+  > session user + 原子 `mv` 進 `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。
+  > 它絕不寫 LED、不刪 state、不查 D-Bus。唯一寫入者是 thaw 後的**使用者 daemon**：
+  > 它在 **system** bus（未被凍結）收到 `PrepareForSleep(false)` 時 adopt handoff，
+  > 再經 gsd-power → UPower → legacy 還原。請勿把舊的 root 端 session bus 探測
+  > 加回 hook——那就是當年第二寫入者的 bug。
+
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
@@ -200,6 +214,9 @@
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # 唯讀 handoff 檔（僅在休眠/喚醒週期間存在）：
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # 已存值，0 有效
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<epoch> <action>"
   # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -209,6 +226,7 @@
   # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
   # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin
   # ectool 回退：ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  # 三態：只有 ScreenSaver "inactive" 允許還原寫入（active/unknown 皆延後）
   ```
 
   **日誌驗證**：unit 設了 `StandardError=journal`，下列訊息應該可見；若沒有，
@@ -216,13 +234,14 @@
 
   ```bash
   journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
-    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
+    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore deferred|resume deferred|ignoring blank-side|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **常見修復**：
   * 安裝後**重新登入**（`plugdev`/`uaccess` ACL），或 `systemctl --user start c640-kbd-backlight-sync.service`。
   * 若未 enable：`sudo systemctl --global enable c640-kbd-backlight-sync.service && systemctl --user daemon-reload`。
-  * KDE/Sway 上 `ScreenSaver available: no` 時，仍由 `system-sleep` 處理盒蓋 `suspend`，
+  * KDE/Sway 上 `ScreenSaver available: no` 時，`system-sleep` 仍會在盒蓋
+    `suspend` 時發佈 handoff 檔，但還原由 thaw 後的使用者 daemon 負責，請保持啟用；
     閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
   * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
   * Ubuntu 26.04 上，LED 屬性只有在 udev 規則的 `RUN+=chgrp plugdev` +
@@ -234,12 +253,23 @@
   * 根因判斷：使用者 service 無法互動輸入 sudo 密碼。若
     `journalctl --user -u c640-kbd-backlight-sync` 出現 `sudo: a password is required`，
     表示問題在上述權限路徑，而非 D-Bus 事件。
-  * 閃爍/震盪：檢查上面兩條唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
+  * 閃爍/震盪：檢查上面的唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
     UPower raw 值不一致，daemon 會記錄
     `[WARN] gsd-power set ... forcing UPower + property refresh`；請確認部署的
     daemon/unit 與 repo 完全一致（smoke 測試會檢查），並避免其他工具直接寫 LED。
-    若還原時 ScreenSaver 仍為 `true`，延後是預期行為——等待
-    `+0.5s/+1.5s/+3s` 重試，或檢查 sleep hook 的 fail-open bus 探測。
+    若還原時 ScreenSaver 為 `true` 或 `unknown`，延後是預期行為——等待
+    `+0.5s/+1.5s/+3s` 重試或解鎖工作階段。hook 已完全不再探測 session bus。
+  * `resume deferred: ScreenSaver still active`／`... unknown ... deferring restore`
+    代表三態防護正常運作；請保留 state 並等待解鎖。
+    `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 是明確的**風險接受**（可能在仍鎖定的螢幕下
+    點亮鍵盤），預設關閉；`C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後的輪詢（預設 10 秒）。
+  * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` 代表
+    休眠開始時螢幕已熄滅：hook 讀到的硬體 0 被正確忽略，解鎖後會還原使用者的亮度 N
+    （已於真實 S3 週期驗證——見 [verification.md §3](verification.md)）。
+  * `restore failed (... rc=1): keeping brightness N for retry` 或 `another restore is
+    in progress` 代表 `c640-kbd-backlight.restore-pending` 中的暫存值會保留供重試；
+    當機則在 daemon 啟動時復原。`RECOVERED (0 -> 1)` 代表先前缺失的 gsd-power/UPower
+    D-Bus name 回來了，daemon 重新探測後切回 gsd 單一寫入者。
 
 ---
 
@@ -354,6 +384,13 @@
 
 * **症狀**：盒蓋休眠（S3 `deep`）後打開，系統已喚醒（`PM: suspend exit`）
   但面板**全黑**，直到按鍵或點擊才亮。不是當機——輸入一到鎖定畫面即正常。
+
+  > [!NOTE]
+  > 開蓋後**鍵盤**背光偏暗也是預期行為：thaw 後的 daemon 會等到 ScreenSaver 明確為
+  > `inactive` 才還原（`resume deferred: ScreenSaver still active`）。解鎖工作階段
+  > 即會還原（例如 `restoring brightness 30`）。這是 §11 所述的 fail-closed 三態
+  > 防護，不是上面的顯示面板問題。
+
 * **根因（2026-08-18 兩個候選機制）**：
   1. **GNOME 使用者層再次黑屏**（最可能，符合「按鍵即恢復」特徵）：
      `gsd-power` 在休眠時關閉面板；螢幕護盾的鎖定動畫在顯示器關閉期間停滯，

@@ -222,6 +222,21 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   repeatedly jumps between the saved value and full brightness around blank/unblank,
   usually meaning gsd-power's cache and UPower disagree or the ScreenSaver re-check
   lost a race.
+
+  > [!IMPORTANT]
+  > On a real S3 cycle systemd **freezes `user.slice`** before the sleep hook's
+  > `post` phase ([systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html),
+  > [systemd sleep design](https://systemd.io/SLEEP/)). A session-bus probe from the
+  > root hook therefore always fails or times out; the hook is now a **pure handoff
+  > writer**: `pre` publishes `c640-kbd-backlight.suspend` (one integer, `0` valid),
+  > `post` publishes `c640-kbd-backlight.resume` (`<epoch> <action>`), both `0600` +
+  > chowned to the session user + atomically `mv`-ed into `$XDG_RUNTIME_DIR`
+  > (`C640_KBD_HANDOFF_DIR` overrides it). It never writes the LED, deletes state or
+  > queries D-Bus. The thawed **user daemon** is the only writer: it adopts the handoff
+  > on `PrepareForSleep(false)` from the **system** bus (not frozen) and restores via
+  > gsd-power → UPower → legacy. Do not reintroduce root-side session-bus probing
+  > in the hook — that was the old second-writer bug.
+
 * **Triage** (all gdbus queries below are read-only):
 
   ```bash
@@ -233,6 +248,9 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # check TAG+="uaccess" rule
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # read-only handoff files (only present across a suspend/resume cycle):
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # saved value, 0 valid
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<epoch> <action>"
   # read-only D-Bus probes (no writes, safe while the daemon runs):
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -242,6 +260,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   # non-GNOME (Sway/KDE): org.gnome.ScreenSaver not available -> daemon falls back to org.freedesktop.ScreenSaver + system-sleep hook only
   # minimal image missing gdbus/dbus-monitor: sudo apt install dbus-x11 libglib2.0-bin
   # ectool fallback: ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  # tristate: only ScreenSaver "inactive" permits a restore write (active/unknown defer)
   ```
 
   **Log verification:** the unit sets `StandardError=journal`, so these lines must
@@ -249,15 +268,16 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
-    | grep -E 'backends probed|saved brightness|restoring brightness|\[WARN\]'
+    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore deferred|resume deferred|ignoring blank-side|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **Common fixes**:
   * After install, **re-login** (for `plugdev` / `uaccess` ACL), or `systemctl --user start c640-kbd-backlight-sync.service`.
   * If service not enabled: `sudo systemctl --global enable c640-kbd-backlight-sync.service && systemctl --user daemon-reload`.
-  * If `ScreenSaver available: no` on KDE/Sway, backlight still works via `system-sleep` hook
-    for lid close (`suspend`), but not for idle blank - enable IdleMonitor:
-    see `keyboard/README.md` `C640_KBD_ENABLE_IDLEMONITOR=1`.
+  * If `ScreenSaver available: no` on KDE/Sway, the `system-sleep` hook still publishes
+    handoff files for lid close (`suspend`), but the thawed user daemon owns the restore,
+    so keep it enabled; idle blank needs IdleMonitor: see `keyboard/README.md`
+    `C640_KBD_ENABLE_IDLEMONITOR=1`.
   * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
   * On Ubuntu 26.04 the LED attribute is only writable if the udev rule applied its
     `RUN+=chgrp plugdev` + `RUN+=chmod 0660` (verified: `-rw-rw---- root plugdev`).
@@ -268,13 +288,27 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * Root cause check: the user unit cannot prompt for sudo. `journalctl --user -u
     c640-kbd-backlight-sync` showing `sudo: a password is required` confirms the
     permission path above is the problem, not the D-Bus events.
-  * Flicker/oscillation: check the two read-only queries above. If gsd-power's
+  * Flicker/oscillation: check the read-only queries above. If gsd-power's
     `Brightness` percent and UPower's raw value disagree, the daemon logs
     `[WARN] gsd-power set ... forcing UPower + property refresh`; keep the
     deployed daemon/unit byte-identical to the repo (the smoke test asserts this)
-    and avoid other tools writing the LED directly. If ScreenSaver is still
-    `true` during restore, deferral is expected — wait for the `+0.5s/+1.5s/+3s`
-    retries or check the sleep hook's fail-open bus probe.
+    and avoid other tools writing the LED directly. If ScreenSaver is `true` or
+    `unknown` during restore, deferral is expected — wait for the `+0.5s/+1.5s/+3s`
+    retries or unlock the session. The hook no longer probes the session bus at all.
+  * `resume deferred: ScreenSaver still active` / `... unknown ... deferring restore`
+    means the tristate guard is doing its job; keep the state and wait for unlock.
+    `C640_KBD_RESUME_ALLOW_UNKNOWN=1` is an explicit **risk acceptance** (may light the
+    keyboard under a still-locked screen) and is off by default;
+    `C640_KBD_RESUME_PROBE_MAX` caps the post-thaw poll (default 10s).
+  * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` means the
+    suspend started while the screen was blank: the hook's hardware 0 was correctly
+    ignored so unlocking restores the user's brightness N (verified in a real S3 cycle —
+    see [verification.md §3](verification.md)).
+  * `restore failed (... rc=1): keeping brightness N for retry` or `another restore is
+    in progress` means the staged value in `c640-kbd-backlight.restore-pending` is kept
+    for a later retry; a crash is recovered at daemon startup. `RECOVERED (0 -> 1)` means
+    a previously missing gsd-power/UPower D-Bus name came back and the daemon switched
+    back to the gsd single writer after re-probing.
 
 ---
 
@@ -403,6 +437,14 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 * **Symptoms**: after lid close (S3 `deep`) and reopen, the system resumes
   (`PM: suspend exit`) but the panel stays **dark** until a key press or
   click. Not a hang — the lock screen works once any input arrives.
+
+  > [!NOTE]
+  > A dark **keyboard** backlight right after lid-open is also expected: the thawed
+  > daemon defers the restore until ScreenSaver is explicitly `inactive`
+  > (`resume deferred: ScreenSaver still active`). Unlock the session and it restores
+  > (e.g. `restoring brightness 30`). This is the fail-closed tristate guard described
+  > in §11, not the display-panel issue above.
+
 * **Root cause (two candidate mechanisms, 2026-08-18)**:
   1. **GNOME userspace re-blank** (most likely, matches the keypress-cure
      signature): `gsd-power` blanks the panel on suspend; the screen-shield
