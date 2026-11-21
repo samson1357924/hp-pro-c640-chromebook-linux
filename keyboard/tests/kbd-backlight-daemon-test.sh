@@ -295,6 +295,7 @@ reset_case() {
     : > "$PCT_FILE"
     export HAVE_GSD_KBD=""
     export HAVE_UPOWER_KBD=""
+    _BACKENDS_LOGGED=0
     export STUB_KBD_RAW="42"
     export STUB_GSD_FAIL="0"
     export STUB_UPOWER_FAIL="0"
@@ -365,6 +366,11 @@ run_fn set_brightness 33
 export C640_KBD_FORCE_LEGACY=0
 set_count="$(grep -c . "$SET_LOG" || true)"
 assert_eq "forced legacy mode makes no D-Bus write" "0" "$set_count"
+if grep -q 'introspect' "$GDBUS_LOG"; then
+    bad "forced legacy mode must not probe D-Bus: $(cat "$GDBUS_LOG")"
+else
+    ok "forced legacy mode performs no D-Bus introspection (early return preserved)"
+fi
 assert_file "forced legacy mode writes sysfs" "$FAKE_SYSFS" "33"
 
 # 5. save_state stores 0 as a valid value (not "no saved state").
@@ -483,6 +489,69 @@ printf '55\n' > "$RAW_FILE"
 printf '3\n' > "$LAST_USER_FILE"
 run_fn seed_last_user_from_current
 assert_file "startup re-seeds last-user from current brightness" "$LAST_USER_FILE" "55"
+
+# 14. Backend recovery in the SAME process: a gsd-power name that was absent
+#     at startup must be re-probed on a later call, not cached as dead forever.
+#     Phase 1: gsd unavailable -> UPower direct writer.
+reset_case
+export STUB_GSD_FAIL=1
+run_fn set_brightness 30
+export STUB_GSD_FAIL=0
+set_count="$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_eq "gsd-absent phase makes no Properties.Set" "0" "$set_count"
+if grep -q 'UPower.SetBrightness' "$SET_LOG"; then
+    ok "gsd-absent phase falls back to a direct UPower write"
+else
+    bad "gsd-absent phase did not write UPower directly: $(cat "$SET_LOG")"
+fi
+assert_eq "gsd-absent phase caches HAVE_GSD_KBD=0" "0" "$HAVE_GSD_KBD"
+if grep -qiE 'warn|fallback|degrad' "$DAEMON_ERR"; then
+    ok "gsd-absent phase emits a WARN on stderr"
+else
+    bad "gsd-absent phase did not log a WARN (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# Phase 2: same process, HAVE_* deliberately NOT cleared, gsd back on D-Bus.
+: > "$SET_LOG"
+run_fn set_brightness 40
+set_count="$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_eq "recovered phase writes exactly one Properties.Set" "1" "$set_count"
+direct_count="$(grep -c 'UPower.SetBrightness' "$SET_LOG" || true)"
+assert_eq "recovered phase makes no direct UPower write" "0" "$direct_count"
+assert_file "recovered phase reaches the LED via gsd-power" "$RAW_FILE" "40"
+assert_eq "recovered phase caches HAVE_GSD_KBD=1" "1" "$HAVE_GSD_KBD"
+probes="$(grep -c 'introspect.*SettingsDaemon.Power' "$GDBUS_LOG" || true)"
+assert_eq "gsd was introspected once per set_brightness call" "2" "$probes"
+if grep -q 'RECOVERED' "$DAEMON_ERR"; then
+    ok "recovery is logged as a transition to single writer"
+else
+    bad "recovery transition not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# 15. A backend that was available, failed at runtime, then comes back must
+#     return to the single-writer path within one long-lived process.
+reset_case
+run_fn set_brightness 20
+assert_eq "backend starts available" "1" "$HAVE_GSD_KBD"
+assert_file "initial write uses gsd-power" "$RAW_FILE" "20"
+
+export STUB_GSD_FAIL=1
+run_fn set_brightness 21
+export STUB_GSD_FAIL=0
+assert_eq "runtime gsd failure invalidates the cached 1" "0" "$HAVE_GSD_KBD"
+assert_file "runtime failure falls back to direct UPower" "$RAW_FILE" "21"
+if grep -q 'UPower.SetBrightness' "$SET_LOG"; then
+    ok "runtime failure writes UPower directly"
+else
+    bad "runtime failure did not write UPower directly: $(cat "$SET_LOG")"
+fi
+
+: > "$SET_LOG"
+run_fn set_brightness 22
+set_count="$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_eq "runtime recovery restores exactly one Properties.Set" "1" "$set_count"
+assert_eq "runtime recovery re-caches HAVE_GSD_KBD=1" "1" "$HAVE_GSD_KBD"
+assert_file "runtime recovery reaches the LED via gsd-power" "$RAW_FILE" "22"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

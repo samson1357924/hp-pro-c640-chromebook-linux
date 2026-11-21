@@ -53,9 +53,14 @@ GSD_PATH="/org/gnome/SettingsDaemon/Power"
 GSD_IFACE="org.gnome.SettingsDaemon.Power.Keyboard"
 DBUS_PROPS="org.freedesktop.DBus.Properties"
 
-# Backend availability, probed once at daemon start (empty = not probed yet).
+# Backend availability.  Only the value "1" is cached: 0/empty are re-probed
+# on every use so a long-running daemon can adopt gsd-power / UPower after
+# their D-Bus names appear (and drop them when they disappear).
 HAVE_GSD_KBD=""
 HAVE_UPOWER_KBD=""
+# Emit "backends probed: ..." once per process; later changes are transition
+# logs so the journal stays readable while re-probing on every use.
+_BACKENDS_LOGGED=0
 restore_gen=0
 # In-process mirror of the last user-visible brightness.  The value is also
 # persisted to LAST_USER_FILE so save_state (which runs in a subshell) can read
@@ -116,31 +121,72 @@ upower_kbd_present() {
     grep -q "SetBrightness" <<< "$intro"
 }
 
-ensure_backends() {
-    if [ -n "$HAVE_GSD_KBD" ] && [ -n "$HAVE_UPOWER_KBD" ]; then
+# Log a backend availability change (only when it actually changed).
+log_backend_transition() {
+    local name="$1" old="$2" new="$3"
+    if [ "$old" = "$new" ]; then
         return 0
     fi
+    if [ "$new" = "1" ]; then
+        log "$name RECOVERED ($old -> 1); switching back to single writer"
+    else
+        log_warn "$name lost ($old -> 0); falling back"
+    fi
+}
+
+ensure_backends() {
+    # FORCE_LEGACY must be checked first: no gdbus call and no re-probe at all.
     if [ "$C640_KBD_FORCE_LEGACY" = "1" ]; then
         HAVE_GSD_KBD=0
         HAVE_UPOWER_KBD=0
         log "C640_KBD_FORCE_LEGACY=1: D-Bus backends disabled"
         return 0
     fi
-    if [ -z "$HAVE_GSD_KBD" ]; then
+
+    local old_gsd="$HAVE_GSD_KBD" old_upower="$HAVE_UPOWER_KBD"
+
+    # TTL=0: only "1" is cached.  Re-probe on every use while a backend is
+    # unavailable so a name that shows up later is picked up by this daemon.
+    if [ "$HAVE_GSD_KBD" != "1" ]; then
         if command -v gdbus > /dev/null 2>&1 && gsd_kbd_present; then
             HAVE_GSD_KBD=1
         else
             HAVE_GSD_KBD=0
         fi
     fi
-    if [ -z "$HAVE_UPOWER_KBD" ]; then
+    if [ "$HAVE_UPOWER_KBD" != "1" ]; then
         if command -v gdbus > /dev/null 2>&1 && upower_kbd_present; then
             HAVE_UPOWER_KBD=1
         else
             HAVE_UPOWER_KBD=0
         fi
     fi
-    log "backends probed: gsd=$HAVE_GSD_KBD upower=$HAVE_UPOWER_KBD"
+
+    if [ "$_BACKENDS_LOGGED" != "1" ]; then
+        _BACKENDS_LOGGED=1
+        log "backends probed: gsd=$HAVE_GSD_KBD upower=$HAVE_UPOWER_KBD"
+        return 0
+    fi
+    log_backend_transition "gsd-power" "$old_gsd" "$HAVE_GSD_KBD"
+    log_backend_transition "UPower" "$old_upower" "$HAVE_UPOWER_KBD"
+}
+
+# A failed runtime D-Bus call invalidates a cached "1": drop it so the next
+# ensure_backends() re-probes instead of writing into a dead backend forever.
+backend_runtime_failed() {
+    local backend="$1" detail="$2" var name old
+    if [ "$backend" = "gsd" ]; then
+        var=HAVE_GSD_KBD
+        name="gsd-power"
+    else
+        var=HAVE_UPOWER_KBD
+        name="UPower"
+    fi
+    old="${!var}"
+    if [ "$old" = "1" ]; then
+        printf -v "$var" '%s' "0"
+        log_warn "$name lost (1 -> 0) after $detail; falling back (re-probe on next use)"
+    fi
 }
 
 # --- D-Bus helpers --------------------------------------------------------
@@ -263,6 +309,7 @@ get_brightness() {
                 return 0
             fi
             log_warn_once "upower-get" "UPower GetBrightness failed; falling back to sysfs/ectool"
+            backend_runtime_failed upower "GetBrightness failure"
         fi
     fi
     if [ -f "$SYSFS_BRIGHTNESS" ]; then
@@ -323,8 +370,10 @@ set_brightness() {
                 return 0
             fi
             log_warn_once "gsd-set" "gsd-power Properties.Set failed; trying UPower directly"
+            backend_runtime_failed gsd "Properties.Set failure"
         else
             log_warn_once "gsd-get" "gsd-power Brightness Properties.Get failed; trying UPower directly"
+            backend_runtime_failed gsd "Properties.Get failure"
         fi
     fi
 
@@ -336,6 +385,7 @@ set_brightness() {
             return 0
         fi
         log_warn_once "upower-set" "UPower SetBrightness $val failed; falling back to legacy path"
+        backend_runtime_failed upower "SetBrightness failure"
     fi
 
     # 3) Legacy sysfs / sudo tee / ectool fallback.
@@ -607,6 +657,9 @@ guard_unblank() {
     local delay
     for delay in 0.3 0.9; do
         (
+            # This runs in a subshell: it cannot write HAVE_* back to the
+            # parent, but it does give this guard the freshest backend state.
+            ensure_backends
             sleep "$delay"
             if [ "$(screensaver_is_active)" = "true" ]; then
                 exit 0
