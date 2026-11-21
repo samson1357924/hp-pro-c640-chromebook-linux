@@ -284,6 +284,7 @@ export STATE_FILE="$D_STATE_DIR/c640-kbd-backlight.state"
 export STATE_LOCK="$D_STATE_DIR/c640-kbd-backlight.state.lock"
 export LOCK_FILE="$D_STATE_DIR/c640-kbd-backlight.lock"
 export LAST_USER_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user"
+export LAST_USER_META_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user.meta"
 export RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
 export RESTORE_PENDING_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-pending"
 export HAVE_GSD_KBD=""
@@ -311,9 +312,9 @@ reset_case() {
     : > "$DAEMON_ERR"
     : > "$RECOVER_LOG"
     : > "$TMP_DIR/ectool.log"
-    rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$RESTORE_GEN_FILE" \
-        "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending "$D_STATE_DIR"/*.meta \
-        "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE"
+    rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$LAST_USER_META_FILE" \
+        "$RESTORE_GEN_FILE" "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending \
+        "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE"
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
@@ -839,6 +840,91 @@ rc="$(run_fn_rc restore_state)"
 assert_eq "finalize flock failure (failed write): retry returns 0" "0" "$rc"
 assert_file "finalize flock failure (failed write): retry reaches LED" "$RAW_FILE" "7"
 assert_absent "finalize flock failure (failed write): retry consumes PENDING" "$RESTORE_PENDING_FILE"
+
+# (b) A user brightness change made after the last sampler tick must not be
+#     lost to the 5s-old cache: a valid non-zero live reading wins.
+reset_case
+write_last_user 8 nonzero
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "live non-zero wins over a stale sampler cache" "$STATE_FILE" "30"
+
+# (b2) TTL expiry: a manual0 cache suppresses a non-zero live reading only
+#      while it is fresh.  The age comes from the sidecar's ts=, NOT the file
+#      mtime, so the meta content must be rewritten to really cross the TTL.
+reset_case
+write_last_user 0 manual0
+printf 'source=manual0\nts=%s\n' "$(($(date +%s) - 60))" > "$LAST_USER_META_FILE"
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "expired manual0 cache no longer suppresses a live reading" "$STATE_FILE" "30"
+
+# (b3) Stage 3 preserved: an explicit manual off (two on-screen zeros) is
+#      still saved while gsd-power reports off, even though live is non-zero.
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "fresh manual off beats a non-zero firmware residue" "$STATE_FILE" "0"
+
+# (b4) Once gsd-power reports non-zero the user brightened again, so the
+#      manual-off cache must not suppress the live reading.
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "manual off is overridden when gsd reports non-zero" "$STATE_FILE" "30"
+
+# (b5) Blank-side zero: firmware already switched the LED off, so the cached
+#      user brightness is saved regardless of the cache's age/source.
+reset_case
+write_last_user 8 nonzero
+printf '0\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "blank-side zero falls back to the cached brightness" "$STATE_FILE" "8"
+
+# (b6) A failing gsd pct query is treated as "empty", not as 0: with a
+#      non-zero sampler cache the live reading still wins.
+reset_case
+write_last_user 8 nonzero
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+export STUB_GSD_FAIL=1
+run_fn save_state
+export STUB_GSD_FAIL=0
+assert_file "failed gsd pct query does not suppress the live reading" "$STATE_FILE" "30"
+
+# (b6b) A manual0 cache with a FAILING gsd pct query: the result is "empty",
+#       which still counts as "off", so the explicit off is saved.  The old
+#       (b6) used src=nonzero and never queried gsd, so STUB_GSD_FAIL was inert
+#       there; this case exercises the real empty-pct path.
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+export STUB_GSD_FAIL=1
+run_fn save_state
+export STUB_GSD_FAIL=0
+assert_file "manual off survives a failed gsd pct query (empty pct)" "$STATE_FILE" "0"
+
+# (b7) Regression: a restart seed from an already-off light must record an
+#      explicit off (manual0), not a plain non-zero source.  Otherwise a later
+#      blank with a non-zero firmware residue loses the user's "off" intent.
+reset_case
+printf '0\n' > "$RAW_FILE"
+run_fn seed_last_user_from_current
+assert_file "restart seed at 0 writes the cached value 0" "$LAST_USER_FILE" "0"
+assert_eq "restart seed at 0 writes manual0 source" "manual0" "$(last_user_cache_source)"
+# Blank arrives before the sampler can record a fresh manual off: live shows a
+# non-zero firmware residue while gsd still reports off.
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "restart-seeded off survives a non-zero firmware residue" "$STATE_FILE" "0"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

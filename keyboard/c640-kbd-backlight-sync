@@ -42,6 +42,14 @@ RESTORE_PENDING_FILE="${C640_KBD_RESTORE_PENDING_FILE:-$STATE_DIR/c640-kbd-backl
 STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
 LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
 LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
+# Sidecar metadata for LAST_USER_FILE: how the value was recorded and when.
+# A "manual0" record means the sampler saw two consecutive on-screen zeros,
+# i.e. the user explicitly switched the light off.  It is only honoured for
+# C640_KBD_LAST_USER_TTL seconds while gsd-power still reports 0, so a live
+# non-zero reading after the user brightens again is not mistaken for a
+# firmware residue.
+LAST_USER_META_FILE="${C640_KBD_LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+C640_KBD_LAST_USER_TTL="${C640_KBD_LAST_USER_TTL:-15}"
 RESTORE_GEN_FILE="$STATE_DIR/c640-kbd-backlight.restore-gen"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
@@ -540,6 +548,70 @@ read_last_user_brightness() {
     fi
 }
 
+# Atomically persist both the last-user value and its metadata.  The value
+# file's format is unchanged (a bare number); the sidecar records the source
+# and a timestamp so save_state can tell an explicit manual off from a stale
+# sampler reading.  Failures are non-fatal: the cache is best-effort.
+write_last_user() {
+    local v="$1" src="$2"
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local tmp ts
+
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lu-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lu-XXXXXX" 2> /dev/null || echo "")"
+    if [ -n "$tmp" ]; then
+        printf '%s\n' "$v" > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$LAST_USER_FILE" 2> /dev/null || cp "$tmp" "$LAST_USER_FILE" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+    fi
+
+    ts="$(date +%s 2> /dev/null || echo 0)"
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lum-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lum-XXXXXX" 2> /dev/null || echo "")"
+    if [ -n "$tmp" ]; then
+        {
+            printf 'source=%s\n' "$src"
+            printf 'ts=%s\n' "$ts"
+        } > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$meta" 2> /dev/null || cp "$tmp" "$meta" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+    fi
+}
+
+# Source recorded in LAST_USER_META_FILE ("nonzero" or "manual0"), empty when
+# the sidecar is missing or malformed (e.g. a cache left by an older daemon).
+last_user_cache_source() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line src=""
+    while IFS= read -r line; do
+        case "$line" in
+            source=*) src="${line#source=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    printf '%s' "$src"
+}
+
+# Age of the cached value in seconds.  Prefer the sidecar's ts; fall back to
+# LAST_USER_FILE's mtime when ts is absent (older cache / manual file write).
+last_user_cache_age() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line ts="" now mtime
+    while IFS= read -r line; do
+        case "$line" in
+            ts=*) ts="${line#ts=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    now="$(date +%s 2> /dev/null || echo 0)"
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$((now - ts))"
+    elif [ -f "$LAST_USER_FILE" ]; then
+        mtime="$(stat -c %Y "$LAST_USER_FILE" 2> /dev/null || echo "")"
+        if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$((now - mtime))"
+        fi
+    fi
+}
+
 # One sampler tick, kept separate from the infinite loop so it is unit
 # testable. Only observations made while the screen is ON count as user
 # intent; a blank-side transient 0 is ignored.
@@ -553,7 +625,7 @@ sample_brightness_once() {
     if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -ne 0 ]; then
         _C640_ZERO_STREAK=0
         last_user_brightness="$b"
-        printf '%s\n' "$b" > "$LAST_USER_FILE" 2> /dev/null || true
+        write_last_user "$b" nonzero
         return 0
     fi
     if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -eq 0 ]; then
@@ -567,7 +639,7 @@ sample_brightness_once() {
         _C640_ZERO_STREAK=$((_C640_ZERO_STREAK + 1))
         if [ "$_C640_ZERO_STREAK" -ge 2 ]; then
             last_user_brightness=0
-            printf '0\n' > "$LAST_USER_FILE" 2> /dev/null || true
+            write_last_user 0 manual0
             log "sampler: two consecutive on-screen zeros (gsd pct=0) -> recording explicit off"
         fi
     fi
@@ -593,28 +665,85 @@ seed_last_user_from_current() {
     cur="$(get_brightness)"
     if [[ "$cur" =~ ^[0-9]+$ ]]; then
         last_user_brightness="$cur"
-        printf '%s\n' "$cur" > "$LAST_USER_FILE" 2> /dev/null || true
+        # A restart seed normally records what the user currently sees.  When
+        # the light is already off, record it as an explicit off so a later
+        # blank with a non-zero firmware residue cannot re-light the keyboard
+        # before the sampler has observed a fresh manual off (~5-10s).
+        if [ "$cur" -eq 0 ]; then
+            write_last_user "$cur" manual0
+        else
+            write_last_user "$cur" nonzero
+        fi
     fi
 }
 
 # --- State save / restore -------------------------------------------------
 
 save_state() {
-    # Atomic first-wins with flock on STATE_LOCK.  A numeric reading is
-    # always saved (including 0); the sampler's last non-zero value is
-    # preferred so a firmware-side blank does not lose user intent.
+    # Atomic first-wins with flock on STATE_LOCK.  A current valid non-zero
+    # reading wins: the sampler only runs every 5s, so a brightness change
+    # made just before a blank must not be lost to a stale cache.  The cache
+    # is used for blank-side zeros (firmware already off) and unreadable
+    # hardware.  An explicit manual off stays in force only while it is fresh
+    # and gsd-power still reports off; once gsd reports non-zero the user has
+    # brightened again and the live reading is authoritative.
     (
         flock -n 200 || return 0
         if [ -f "$STATE_FILE" ]; then
             return 0
         fi
-        local curr
-        curr="$(read_last_user_brightness)"
+        local live cache curr src age pct
+        # get_brightness() runs in a command substitution (its own subshell),
+        # so its backend probe would not be visible here.  Probe once in this
+        # shell so HAVE_GSD_KBD is accurate for the gsd pct check below.
+        ensure_backends
+        live="$(get_brightness 2> /dev/null || echo "")"
+        cache="$(read_last_user_brightness)"
+        src="$(last_user_cache_source)"
+        curr=""
+        if [[ "$live" =~ ^[0-9]+$ ]] && [ "$live" -ne 0 ]; then
+            if [ "$cache" = "0" ] && [ "$src" = "manual0" ]; then
+                age="$(last_user_cache_age)"
+                if [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ]; then
+                    pct=""
+                    # gsd_get_pct failure/timeout means "empty", not 0, and is
+                    # only queried when a gsd keyboard backend is present.
+                    if [ "$HAVE_GSD_KBD" = "1" ]; then
+                        pct="$(gsd_get_pct 2> /dev/null || echo "")"
+                    fi
+                    if [ -z "$pct" ] || [ "$pct" = "0" ]; then
+                        curr=0
+                    fi
+                fi
+            fi
+            if [ -z "$curr" ] && [ -n "$cache" ] && [ -z "$src" ]; then
+                # A cache without metadata has no provenance (older daemon or
+                # a direct file write, e.g. a blank simulated mid-restore):
+                # retain the historical cache-wins behaviour for it.
+                curr="$cache"
+            fi
+            if [ -z "$curr" ]; then
+                curr="$live"
+            fi
+        elif [ "$live" = "0" ]; then
+            # Blank-side zero: the firmware already turned the LED off, so the
+            # live reading carries no user intent.  Use the cache regardless
+            # of age; an old value still beats a dark keyboard on unblank.
+            if [ -n "$cache" ]; then
+                curr="$cache"
+            else
+                curr=0
+            fi
+        else
+            # Unreadable hardware: use the cache when available.
+            curr="$cache"
+        fi
+        # Final fallbacks when the live reading and the cache were unusable.
         if [ -z "$curr" ]; then
             curr="$last_user_brightness"
         fi
         if [ -z "$curr" ]; then
-            curr="$(get_brightness)"
+            curr="$(get_brightness 2> /dev/null || echo "")"
         fi
         if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
             return 0
