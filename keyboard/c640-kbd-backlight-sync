@@ -34,6 +34,13 @@ else
     chmod 700 "$STATE_DIR" 2> /dev/null || true
 fi
 STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
+# Phase 4b handoff files.  The root sleep hook publishes the pre-suspend
+# brightness and the post-thaw flag into the user's runtime dir; the daemon
+# adopts them after thaw and is the ONLY writer of the restored brightness.
+# Both env overrides are for the unit test; production uses the same dir as
+# STATE_FILE (i.e. $XDG_RUNTIME_DIR).
+HANDOFF_SUSPEND_FILE="${C640_KBD_HANDOFF_SUSPEND:-$STATE_DIR/c640-kbd-backlight.suspend}"
+HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.resume}"
 # Staging file used while a restore write is in flight.  STATE_FILE is renamed
 # here just before the (potentially slow) write, so a blank arriving mid-write
 # can still store its new value in STATE_FILE; the staged value is consumed
@@ -41,6 +48,9 @@ STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
 RESTORE_PENDING_FILE="${C640_KBD_RESTORE_PENDING_FILE:-$STATE_DIR/c640-kbd-backlight.restore-pending}"
 STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
 LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
+# Separate lock so the login1 monitor, the 5s sampler and the startup handler
+# cannot all enter handle_resume() at once (which would issue two gsd writes).
+RESUME_LOCK="${C640_KBD_RESUME_LOCK:-$STATE_DIR/c640-kbd-backlight.resume.lock}"
 LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
 # Sidecar metadata for LAST_USER_FILE: how the value was recorded and when.
 # A "manual0" record means the sampler saw two consecutive on-screen zeros,
@@ -58,6 +68,12 @@ C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
 C640_KBD_FORCE_LEGACY="${C640_KBD_FORCE_LEGACY:-0}"
 # Verbose monitor/debug logging (0=off default).
 C640_KBD_DEBUG="${C640_KBD_DEBUG:-0}"
+# Resume convergence: poll ScreenSaver for up to ~6s (0.2+0.4+0.8+1.6+3.2)
+# after thaw, capped by C640_KBD_RESUME_PROBE_MAX seconds.  Set to 0 in tests
+# to make "unknown" converge immediately.  An explicit opt-in is required to
+# restore while the ScreenSaver answer is still unknown.
+C640_KBD_RESUME_PROBE_MAX="${C640_KBD_RESUME_PROBE_MAX:-10}"
+C640_KBD_RESUME_ALLOW_UNKNOWN="${C640_KBD_RESUME_ALLOW_UNKNOWN:-0}"
 
 # D-Bus well-known paths / interfaces.
 UP_PATH="/org/freedesktop/UPower/KbdBacklight"
@@ -510,28 +526,66 @@ set_brightness() {
 
 # --- ScreenSaver state helpers -------------------------------------------
 
-screensaver_is_active() {
-    local active=""
+# Tristate ScreenSaver probe.  Only an explicit "true"/"false" reply is
+# trusted.  A missing tool, a timeout, a missing service or an unrecognisable
+# reply is "unknown" -- it must NOT be read as "false" on a restore path.
+# Every gdbus/busctl call is bounded by `timeout 3`.
+screensaver_tristate() {
+    local out
     if command -v gdbus > /dev/null 2>&1; then
-        active="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
-        if ! grep -q "true" <<< "$active"; then
-            active="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+        out="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
         fi
-        if grep -q "true" <<< "$active"; then
-            echo "true"
-        else
-            echo "false"
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
         fi
-    elif command -v busctl > /dev/null 2>&1; then
-        active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
-        if ! grep -q "true" <<< "$active"; then
-            active="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+        out="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
         fi
-        if grep -q "true" <<< "$active"; then
-            echo "true"
-        else
-            echo "false"
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
         fi
+        echo "unknown"
+        return 0
+    fi
+    if command -v busctl > /dev/null 2>&1; then
+        out="$(timeout 3 busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        out="$(timeout 3 busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        echo "unknown"
+        return 0
+    fi
+    echo "unknown"
+}
+
+# Backwards-compatible boolean wrapper for NON-writing callers only (the
+# sampler and guard_blank).  There a fail-open answer merely skips a sample or
+# a forced-off guard; it never writes a restored brightness.  Restore paths
+# must call screensaver_tristate() and fail closed instead.
+screensaver_is_active() {
+    if [ "$(screensaver_tristate)" = "active" ]; then
+        echo "true"
     else
         echo "false"
     fi
@@ -616,6 +670,13 @@ last_user_cache_age() {
 # testable. Only observations made while the screen is ON count as user
 # intent; a blank-side transient 0 is ignored.
 sample_brightness_once() {
+    # Convergence path for systems without a working dbus-monitor: a stray
+    # resume flag left by the sleep hook is picked up by the sampler too.
+    # handle_resume serialises itself with RESUME_LOCK, so racing with the
+    # login1 monitor cannot issue two writes.
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        handle_resume
+    fi
     if [ "$(screensaver_is_active)" = "true" ]; then
         _C640_ZERO_STREAK=0
         return 0
@@ -869,7 +930,9 @@ schedule_restore_retries() {
             if [ ! -f "$STATE_FILE" ]; then
                 exit 0
             fi
-            if [ "$(screensaver_is_active)" = "true" ]; then
+            # Fail closed: only an explicit "inactive" permits a restore
+            # write.  "active" and "unknown" both defer to a later unblank.
+            if [ "$(screensaver_tristate)" != "inactive" ]; then
                 exit 0
             fi
             if ! exec 202> "$STATE_LOCK"; then
@@ -917,6 +980,11 @@ schedule_restore_retries() {
 }
 
 restore_state() {
+    # Normal callers never pass an argument: the ScreenSaver check below is
+    # fail-closed for every restore path.  The ONLY bypass is the explicit
+    # C640_KBD_RESUME_ALLOW_UNKNOWN=1 resume opt-in (force=1), which must also
+    # set that env var -- a stray `restore_state 1` cannot open the bypass.
+    local force="${1:-0}"
     if ! exec 201> "$STATE_LOCK"; then
         log_warn "cannot open state lock $STATE_LOCK"
         return 1
@@ -958,12 +1026,17 @@ restore_state() {
     # §11), but converge via +0.5s/+1.5s/+3s retries.  Old retries are
     # invalidated by the generation counter; keeping the state makes the
     # retries meaningful (and lets a later unblank restore it too).
-    if [ "$(screensaver_is_active)" = "true" ]; then
-        log "restore deferred: ScreenSaver still active (gen=$gen)"
+    local ss
+    ss="$(screensaver_tristate)"
+    if [ "$ss" != "inactive" ] && ! { [ "$force" = "1" ] && [ "$C640_KBD_RESUME_ALLOW_UNKNOWN" = "1" ]; }; then
+        log "restore deferred: ScreenSaver $ss (gen=$gen); only inactive permits a write"
         flock -u 201
         exec 201>&-
         schedule_restore_retries "$gen" 0.5 1.5 3
         return 0
+    fi
+    if [ "$ss" != "inactive" ]; then
+        log_warn "restore: explicit C640_KBD_RESUME_ALLOW_UNKNOWN=1 overrides ScreenSaver=$ss"
     fi
 
     # A valid 0 goes through the exact same write path as any other value:
@@ -994,6 +1067,267 @@ restore_state() {
         return 1
     fi
     return 0
+}
+
+# --- Phase 4b: resume handoff ---------------------------------------------
+
+# Body of adopt_suspend_handoff(), called with STATE_LOCK held.  No brightness
+# write: publishing the value into STATE_FILE is all this does.  The hook
+# never deletes the handoff; consuming it here (only after a successful
+# adoption) is what stops a later cycle reusing a stale value.
+_adopt_suspend_handoff_locked() {
+    # A staged restore owns STATE_FILE until its finalize; do not overwrite it.
+    # Return a distinct "deferred" code (2): the caller must NOT treat the
+    # missing STATE_FILE as "no saved state" and clear the resume flag while
+    # the staged restore is still in flight (P2-1).  The handoff is kept and
+    # the sampler/startup handler will adopt it once PENDING disappears.
+    if [ -f "$RESTORE_PENDING_FILE" ]; then
+        log "suspend handoff adoption deferred: restore in progress (staged value pending)"
+        return 2
+    fi
+    local raw val existing tmp
+    # Command substitution strips the hook's trailing newline; validate what
+    # remains strictly.  A bare "0" is a real value, not "no state".
+    raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    raw="${raw%$'\n'}"
+    if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
+        log_warn "suspend handoff invalid ('$raw'); daemon state left unchanged"
+        return 1
+    fi
+    val=$((10#$raw))
+    existing="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    if [ -n "$existing" ] && [ "$existing" != "$val" ]; then
+        log "suspend handoff $val overrides differing daemon state $existing"
+    fi
+    mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX" 2> /dev/null || echo "")"
+    if [ -z "$tmp" ]; then
+        log_warn "cannot create temp file for suspend handoff adoption"
+        return 1
+    fi
+    if ! printf '%s\n' "$val" > "$tmp" 2> /dev/null; then
+        rm -f "$tmp" 2> /dev/null || true
+        log_warn "cannot write suspend handoff value to temp file"
+        return 1
+    fi
+    chmod 600 "$tmp" 2> /dev/null || true
+    if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
+        cp "$tmp" "$STATE_FILE" 2> /dev/null || true
+    fi
+    rm -f "$tmp" 2> /dev/null || true
+    if [ "$(cat "$STATE_FILE" 2> /dev/null || echo "")" != "$val" ]; then
+        log_warn "could not publish adopted brightness $val to $STATE_FILE"
+        return 1
+    fi
+    log "adopted suspend handoff brightness $val"
+    # Only the daemon consumes the handoff, and only after the value is ours.
+    rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+    return 0
+}
+
+adopt_suspend_handoff() {
+    if [ ! -f "$HANDOFF_SUSPEND_FILE" ]; then
+        log_warn "suspend handoff $HANDOFF_SUSPEND_FILE missing; nothing to adopt"
+        return 0
+    fi
+    (
+        local arc=0
+        if ! exec 205> "$STATE_LOCK"; then
+            log_warn "cannot open state lock in adopt_suspend_handoff"
+            exit 0
+        fi
+        if ! flock -n 205; then
+            exec 205>&-
+            exit 0
+        fi
+        # Propagate the locked body's rc: 2 means "deferred while a staged
+        # restore owns STATE_FILE", which handle_resume() must honour by
+        # returning immediately instead of clearing the resume flag (P2-1).
+        _adopt_suspend_handoff_locked || arc=$?
+        # Release explicitly: the stub flock keys on the open fd and a real
+        # flock would release on fd close, but leaving a lock file behind would
+        # make the immediately following restore_state() skip its write.
+        flock -u 205 2> /dev/null || true
+        exec 205>&-
+        exit "$arc"
+    )
+}
+
+# The only implementation of "restore after thaw".  RESUME_LOCK makes the
+# login1 monitor, the 5s sampler and the startup handler mutually exclusive,
+# so gsd Properties.Set is issued at most once per resume cycle.  ALL writes
+# go through restore_state() -> set_brightness(); this function never writes
+# sysfs/ectool directly.
+_handle_resume_locked() {
+    # Thaw invalidates any D-Bus cache taken before suspend: drop it and
+    # re-probe (Phase 1 semantics; FORCE_LEGACY still short-circuits in
+    # ensure_backends).  A stale HAVE_*=1 must not write into a dead backend.
+    HAVE_GSD_KBD=""
+    HAVE_UPOWER_KBD=""
+    ensure_backends
+
+    local adopt_rc=0
+    adopt_suspend_handoff || adopt_rc=$?
+    if [ "$adopt_rc" -eq 2 ]; then
+        # P2-1: adoption was deferred because a staged restore owns STATE_FILE.
+        # Do NOT clear the resume flag, do NOT adopt again and do NOT restore:
+        # the in-flight restore (or its PENDING recovery) still owns this cycle.
+        # The sampler/startup handler retries after PENDING disappears.
+        log "resume: handoff adoption deferred (restore in flight); keeping flag and handoff"
+        return 0
+    fi
+
+    if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+        log_debug "resume: no resume flag present; continuing from saved state"
+    fi
+
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+        # Nothing to restore: LED_CORE_SUSPENDRESUME normally kept the value.
+        rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+        log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
+        return 0
+    fi
+    saved=$((10#$saved))
+
+    # Poll for an explicit answer.  Only "inactive" is a write permit;
+    # "active" and "unknown" both defer.  Total budget ~6s, capped by
+    # C640_KBD_RESUME_PROBE_MAX (0 makes "unknown" converge immediately).
+    local ss="unknown"
+    local -a delays=(0.2 0.4 0.8 1.6 3.2)
+    local i d next elapsed=0 probe_max="$C640_KBD_RESUME_PROBE_MAX"
+    case "$probe_max" in
+        '' | *[!0-9.]*) probe_max=10 ;;
+    esac
+    for i in 0 1 2 3 4 5; do
+        ss="$(screensaver_tristate)"
+        if [ "$ss" != "unknown" ]; then
+            break
+        fi
+        if [ "$i" -eq 5 ]; then
+            break
+        fi
+        d="${delays[$i]}"
+        next="$(awk -v a="$elapsed" -v b="$d" 'BEGIN { printf "%.1f", a+b }')"
+        if ! awk -v t="$next" -v m="$probe_max" 'BEGIN { exit !(t <= m) }'; then
+            break
+        fi
+        sleep "$d"
+        elapsed="$next"
+    done
+    log "resume: ScreenSaver=$ss after ${elapsed}s (saved=$saved)"
+
+    local rc cur
+    case "$ss" in
+        active)
+            log "resume deferred: ScreenSaver still active (saved=$saved)"
+            bump_restore_gen
+            schedule_restore_retries "$restore_gen" 0.5 1.5 3
+            return 0
+            ;;
+        inactive)
+            rc=0
+            if restore_state; then rc=0; else rc=$?; fi
+            if [ "$rc" -eq 0 ]; then
+                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                log "resume: restore complete; resume flag consumed"
+            else
+                log_warn "resume: restore failed (rc=$rc); keeping resume flag and state for retry"
+            fi
+            return "$rc"
+            ;;
+        unknown)
+            cur="$(get_brightness 2> /dev/null || echo "")"
+            # P2-2: re-read + compare + consume must be one STATE_LOCK critical
+            # section.  Without the lock a blank arriving between the probe and
+            # `rm` could save a newer STATE_FILE that we then delete; re-reading
+            # under the lock also protects against a non-cooperative writer.
+            if ! exec 207> "$STATE_LOCK"; then
+                log_warn "resume: cannot open state lock for convergence check; keeping state"
+                return 0
+            fi
+            if ! flock -n 207; then
+                exec 207>&-
+                log "resume: state lock busy during convergence check; keeping state"
+                return 0
+            fi
+            local latest=""
+            latest="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+            if [ -f "$RESTORE_PENDING_FILE" ]; then
+                log "resume: unknown but a restore is in flight; not consuming state"
+                flock -u 207 2> /dev/null || true
+                exec 207>&-
+                return 0
+            fi
+            if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$((10#$cur))" -eq "$saved" ]; then
+                if [ "$latest" != "$saved" ]; then
+                    # A blank replaced the state while we were probing; its
+                    # newer value must survive (and the flag stays for retry).
+                    log "resume: state changed to $latest during probe; keeping it"
+                    flock -u 207 2> /dev/null || true
+                    exec 207>&-
+                    return 0
+                fi
+                # Safe convergence: firmware already shows the saved value and
+                # STATE_FILE is unchanged, so consume it WITHOUT any write.
+                rm -f "$STATE_FILE" 2> /dev/null || true
+                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                log "resume: ScreenSaver unknown but brightness already $saved; state consumed without writing"
+                flock -u 207 2> /dev/null || true
+                exec 207>&-
+                return 0
+            fi
+            flock -u 207 2> /dev/null || true
+            exec 207>&-
+            if [ "$C640_KBD_RESUME_ALLOW_UNKNOWN" = "1" ]; then
+                log_warn "resume: ScreenSaver unknown and brightness $cur != $saved; C640_KBD_RESUME_ALLOW_UNKNOWN=1 -> restoring"
+                rc=0
+                # Explicit opt-in is the only allowed bypass of the
+                # fail-closed tristate guard inside restore_state.
+                if restore_state 1; then rc=0; else rc=$?; fi
+                if [ "$rc" -eq 0 ]; then
+                    rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                else
+                    log_warn "resume: opt-in unknown restore failed (rc=$rc); keeping resume flag"
+                fi
+                return "$rc"
+            fi
+            log_warn "resume: ScreenSaver unknown (current=$cur saved=$saved); deferring restore, handoff kept"
+            return 0
+            ;;
+    esac
+    return 0
+}
+
+handle_resume() {
+    (
+        if ! exec 206> "$RESUME_LOCK"; then
+            log_warn "cannot open resume lock $RESUME_LOCK"
+            exit 0
+        fi
+        if ! flock -n 206; then
+            log_debug "resume: another handler already active; skipping duplicate"
+            exec 206>&-
+            exit 0
+        fi
+        local rc=0
+        _handle_resume_locked || rc=$?
+        flock -u 206 2> /dev/null || true
+        exec 206>&-
+        exit "$rc"
+    )
+}
+
+# Startup recovery for a daemon restarted while the machine was suspended, or
+# for a dead dbus-monitor that missed PrepareForSleep(false).  main() calls
+# this in the background so startup latency is unaffected.
+startup_resume_handoff() {
+    if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+        return 0
+    fi
+    log "startup: resume handoff found; adopting after thaw"
+    handle_resume
 }
 
 # --- Blank / unblank guards ----------------------------------------------
@@ -1040,7 +1374,9 @@ guard_unblank() {
             # parent, but it does give this guard the freshest backend state.
             ensure_backends
             sleep "$delay"
-            if [ "$(screensaver_is_active)" = "true" ]; then
+            # This guard can write a restored brightness, so it follows the
+            # same fail-closed rule as restore_state: only inactive proceeds.
+            if [ "$(screensaver_tristate)" != "inactive" ]; then
                 exit 0
             fi
             local ok=0
@@ -1079,6 +1415,17 @@ handle_blank() {
 }
 
 handle_unblank() {
+    # P1: when the sleep hook has published a resume flag, this restore belongs
+    # to handle_resume(), which serialises every resume writer with RESUME_LOCK
+    # and consumes the handoff exactly once.  Going straight to restore_state()
+    # here races with the login1 monitor / sampler and lets a later
+    # handle_resume() re-adopt a stale handoff value (double gsd write, or
+    # overwriting a brightness the user changed in between).
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        log "unblank: resume flag present; routing through handle_resume"
+        handle_resume
+        return $?
+    fi
     local saved=""
     if [ -f "$STATE_FILE" ]; then
         saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
@@ -1155,11 +1502,16 @@ monitor_login1() {
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
                 save_state
+                # Drop a stale flag from any previous cycle; the hook's post
+                # phase will publish a fresh one after this resume.
+                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
                 ;;
             *boolean\ false*)
-                log "PrepareForSleep false -> restore after delay"
-                sleep 0.6
-                restore_state || log_warn "login1: restore failed"
+                log "PrepareForSleep false -> daemon adopts handoff and restores"
+                # The hook no longer probes D-Bus or writes brightness while
+                # user.slice is frozen.  It only published handoff files; the
+                # thawed daemon owns the single restore path now.
+                handle_resume || log_warn "login1: resume handler failed"
                 ;;
         esac
     done
@@ -1224,6 +1576,10 @@ print_help() {
     echo "  C640_KBD_DEBUG=1               Verbose monitor/debug logging"
     echo "  C640_KBD_SYSFS_BRIGHTNESS=PATH Override sysfs brightness path"
     echo "  C640_KBD_SYSFS_MAX=PATH        Override sysfs max_brightness path"
+    echo "  C640_KBD_HANDOFF_SUSPEND=PATH  Override suspend handoff file (tests)"
+    echo "  C640_KBD_HANDOFF_RESUME=PATH   Override resume handoff flag (tests)"
+    echo "  C640_KBD_RESUME_PROBE_MAX=N    Cap ScreenSaver polling after thaw (default 10s)"
+    echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
 }
 
 check_status() {
@@ -1334,6 +1690,11 @@ main() {
     trap cleanup TERM INT EXIT HUP
 
     log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR Legacy=$C640_KBD_FORCE_LEGACY"
+
+    # If the daemon was restarted during suspend (or dbus-monitor died), the
+    # hook's resume flag is still on disk.  Pick it up in the background so a
+    # missed PrepareForSleep(false) still converges (Phase 4b).
+    startup_resume_handoff &
 
     # Discard any last-user value persisted by a previous daemon run.
     seed_last_user_from_current

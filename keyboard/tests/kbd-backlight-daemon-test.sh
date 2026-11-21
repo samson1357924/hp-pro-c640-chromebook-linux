@@ -22,8 +22,13 @@ RAW_FILE="$TMP_DIR/upower-raw"
 PCT_FILE="$TMP_DIR/gsd-pct"
 DAEMON_ERR="$TMP_DIR/daemon.err"
 FLOCK_DIR="$TMP_DIR/flock"
+FLOCK_LOG="$TMP_DIR/flock.log"
 RECOVER_LOG="$TMP_DIR/recover.log"
-mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR"
+HANDOFF_DIR="$TMP_DIR/handoff"
+HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
+HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
+LEGACY_LOG="$TMP_DIR/legacy.log"
+mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR" "$HANDOFF_DIR"
 
 passed=0
 failed=0
@@ -53,6 +58,14 @@ assert_absent() {
         bad "$label (file still exists)"
     else
         ok "$label"
+    fi
+}
+assert_present() {
+    local label="$1" file="$2"
+    if [ -e "$file" ]; then
+        ok "$label"
+    else
+        bad "$label (file missing)"
     fi
 }
 
@@ -90,20 +103,16 @@ esac
 case "$*" in
     *GetActive*)
         case "$*" in
-            *org.gnome.ScreenSaver*)
-                if [ "${STUB_GNOME_ACTIVE:-false}" = "true" ]; then
-                    printf '(true,)\n'
-                else
-                    printf '(false,)\n'
-                fi
-                ;;
-            *)
-                if [ "${STUB_FDO_ACTIVE:-false}" = "true" ]; then
-                    printf '(true,)\n'
-                else
-                    printf '(false,)\n'
-                fi
-                ;;
+            *org.gnome.ScreenSaver*) _ans="${STUB_GNOME_ACTIVE:-false}" ;;
+            *) _ans="${STUB_FDO_ACTIVE:-false}" ;;
+        esac
+        # true/false are explicit answers; fail (timeout/service missing) and
+        # anything unrecognisable must drive screensaver_tristate() to unknown.
+        case "$_ans" in
+            true) printf '(true,)\n' ;;
+            false) printf '(false,)\n' ;;
+            fail) exit 1 ;;
+            *) printf '(garbled,)\n' ;;
         esac
         exit 0
         ;;
@@ -225,6 +234,10 @@ if [ -n "$fail_fd" ] && [ "$fd" = "$fail_fd" ] && [ "$fail_n" -gt 0 ]; then
 fi
 target="$(readlink "/proc/self/fd/$fd" 2> /dev/null || true)"
 [ -n "$target" ] || target="fd$fd"
+# Optional audit trail (off by default): lets a test assert that a specific
+# critical section really took STATE_LOCK (e.g. fd 207 in the resume unknown
+# convergence path).
+printf 'flock fd=%s target=%s op=%s\n' "$fd" "$target" "$op" >> "${STUB_FLOCK_LOG:-/dev/null}" 2> /dev/null || true
 key="$(printf '%s\n' "$target" | cksum | cut -d' ' -f1)"
 lockfile="$lock_dir/flock.$key"
 case "$op" in
@@ -255,6 +268,14 @@ chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/flock"
 # The stub directory MUST win before any daemon function runs: otherwise the
 # real session/system bus would be queried (and the real LED could be written).
 export PATH="$STUB_DIR:$PATH"
+
+# Phase 4b: the daemon resolves handoff paths at source time, so these must be
+# exported BEFORE sourcing it.  Probe cap 0 makes an unknown ScreenSaver answer
+# converge immediately (no real sleeping in unit tests).
+export C640_KBD_HANDOFF_SUSPEND="$HANDOFF_SUSPEND_FILE"
+export C640_KBD_HANDOFF_RESUME="$HANDOFF_RESUME_FILE"
+export C640_KBD_RESUME_PROBE_MAX=0
+export C640_KBD_RESUME_ALLOW_UNKNOWN=0
 
 # --- load the daemon --------------------------------------------------------
 if [ ! -f "$DAEMON" ]; then
@@ -287,6 +308,9 @@ export LAST_USER_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user"
 export LAST_USER_META_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user.meta"
 export RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
 export RESTORE_PENDING_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-pending"
+export HANDOFF_SUSPEND_FILE="$HANDOFF_SUSPEND_FILE"
+export HANDOFF_RESUME_FILE="$HANDOFF_RESUME_FILE"
+export RESUME_LOCK="$D_STATE_DIR/c640-kbd-backlight.resume.lock"
 export HAVE_GSD_KBD=""
 export HAVE_UPOWER_KBD=""
 
@@ -294,6 +318,7 @@ export STUB_GDBUS_LOG="$GDBUS_LOG"
 export STUB_SET_LOG="$SET_LOG"
 export STUB_ECTOOL_LOG="$TMP_DIR/ectool.log"
 export STUB_FLOCK_DIR="$FLOCK_DIR"
+export STUB_FLOCK_LOG=/dev/null
 export STUB_RAW_FILE="$RAW_FILE"
 export STUB_PCT_FILE="$PCT_FILE"
 export STUB_KBD_RAW="42"
@@ -312,9 +337,11 @@ reset_case() {
     : > "$DAEMON_ERR"
     : > "$RECOVER_LOG"
     : > "$TMP_DIR/ectool.log"
+    : > "$LEGACY_LOG"
     rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$LAST_USER_META_FILE" \
         "$RESTORE_GEN_FILE" "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending \
-        "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE"
+        "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE" \
+        "$HANDOFF_SUSPEND_FILE" "$HANDOFF_RESUME_FILE" "$D_STATE_DIR"/*.resume.lock
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
@@ -331,6 +358,8 @@ reset_case() {
     export C640_KBD_FORCE_LEGACY=0
     export STUB_GSD_NOOP=0
     export STUB_ECTOOL_FAIL=0
+    export C640_KBD_RESUME_PROBE_MAX=0
+    export C640_KBD_RESUME_ALLOW_UNKNOWN=0
     _C640_WARNED=()
     _C640_ZERO_STREAK=0
     last_user_brightness=""
@@ -339,6 +368,18 @@ reset_case() {
 write_state() {
     mkdir -p "$D_STATE_DIR"
     printf '%s\n' "$1" > "$STATE_FILE"
+}
+
+# Phase 4b helpers: the hook writes these with a trailing newline and never
+# deletes them; only a successful daemon adoption/restore consumes them.
+write_handoff_suspend() {
+    mkdir -p "$HANDOFF_DIR"
+    printf '%s\n' "$1" > "$HANDOFF_SUSPEND_FILE"
+}
+
+write_handoff_resume() {
+    mkdir -p "$HANDOFF_DIR"
+    printf '%s suspend\n' "$(date +%s)" > "$HANDOFF_RESUME_FILE"
 }
 
 run_fn() {
@@ -925,6 +966,391 @@ printf '30\n' > "$RAW_FILE"
 printf '0\n' > "$PCT_FILE"
 run_fn save_state
 assert_file "restart-seeded off survives a non-zero firmware residue" "$STATE_FILE" "0"
+
+# ==========================================================================
+# Phase 4b: tristate ScreenSaver + handoff-driven, daemon-owned restore
+# ==========================================================================
+
+# P4b-1. Tristate probe: only explicit answers are trusted; everything else is
+#        "unknown" (never "false"), including a missing gdbus/busctl tool.
+reset_case
+export STUB_GNOME_ACTIVE=true
+assert_eq "tristate: explicit true -> active" "active" "$(screensaver_tristate)"
+export STUB_GNOME_ACTIVE=false
+assert_eq "tristate: explicit false -> inactive" "inactive" "$(screensaver_tristate)"
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+assert_eq "tristate: GetActive failures -> unknown" "unknown" "$(screensaver_tristate)"
+assert_eq "tristate wrapper keeps unknown->false for sampler" "false" "$(screensaver_is_active)"
+export STUB_GNOME_ACTIVE=garbled STUB_FDO_ACTIVE=garbled
+assert_eq "tristate: unrecognisable replies -> unknown" "unknown" "$(screensaver_tristate)"
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "tristate: no gdbus/busctl tool -> unknown" "unknown" "$(
+    command() {
+        if [ "$1" = "-v" ] && { [ "${2:-}" = "gdbus" ] || [ "${2:-}" = "busctl" ]; }; then
+            return 1
+        fi
+        builtin command "$@"
+    }
+    screensaver_tristate
+)"
+
+# P4b-2. adopt_suspend_handoff: trailing newline is trimmed, the handoff wins
+#        over a differing daemon state, and it is consumed only on success.
+reset_case
+write_state 9
+write_handoff_suspend 7
+run_fn adopt_suspend_handoff
+assert_file "adopt: handoff overrides differing daemon state" "$STATE_FILE" "7"
+assert_absent "adopt: handoff consumed after successful adoption" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'overrides differing daemon state' "$DAEMON_ERR"; then
+    ok "adopt: difference from daemon state is logged"
+else
+    bad "adopt: difference not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+# A staged restore owns STATE_FILE: adoption must skip, not overwrite it.
+reset_case
+write_state 9
+printf '7\n' > "$RESTORE_PENDING_FILE"
+write_handoff_suspend 7
+run_fn adopt_suspend_handoff
+assert_file "adopt(pending): staged value untouched" "$RESTORE_PENDING_FILE" "7"
+assert_file "adopt(pending): daemon state untouched" "$STATE_FILE" "9"
+assert_present "adopt(pending): handoff retained" "$HANDOFF_SUSPEND_FILE"
+# Invalid content: warn, do not write state, do not consume the handoff.
+reset_case
+write_handoff_suspend "not-a-number"
+run_fn adopt_suspend_handoff
+assert_absent "adopt(invalid): no state written" "$STATE_FILE"
+assert_present "adopt(invalid): handoff not consumed" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'suspend handoff invalid' "$DAEMON_ERR"; then
+    ok "adopt(invalid): warns about invalid handoff"
+else
+    bad "adopt(invalid): no warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-3. resume + active: adopt 7, defer, keep state + flag; no LED write.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GNOME_ACTIVE=true
+run_fn handle_resume
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false
+assert_file "resume(active): handoff adopted into STATE_FILE" "$STATE_FILE" "7"
+assert_file "resume(active): RAW_FILE unchanged" "$RAW_FILE" "42"
+assert_eq "resume(active): no gsd Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "resume(active): handoff.suspend consumed by adoption" "$HANDOFF_SUSPEND_FILE"
+assert_present "resume(active): resume flag retained" "$HANDOFF_RESUME_FILE"
+if grep -q 'resume deferred: ScreenSaver still active' "$DAEMON_ERR"; then
+    ok "resume(active): logs 'resume deferred'"
+else
+    bad "resume(active): missing 'resume deferred' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-4. resume + inactive: exactly one gsd write; all three handoff files
+#        consumed; no UPower/legacy/sysfs fallback write.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+run_fn handle_resume
+assert_eq "resume(inactive): exactly one gsd Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "resume(inactive): RAW_FILE reaches saved value" "$RAW_FILE" "7"
+assert_file "resume(inactive): no direct sysfs write" "$FAKE_SYSFS" "99"
+assert_absent "resume(inactive): daemon state consumed" "$STATE_FILE"
+assert_absent "resume(inactive): handoff.suspend consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "resume(inactive): handoff.resume consumed" "$HANDOFF_RESUME_FILE"
+assert_eq "resume(inactive): no UPower direct write" "0" "$(grep -c 'UPower.SetBrightness' "$SET_LOG" || true)"
+assert_eq "resume(inactive): no ectool write" "0" "$(grep -c 'pwmsetkblight' "$TMP_DIR/ectool.log" || true)"
+
+# P4b-5. resume + unknown, saved != current: no write, state + flag kept, WARN.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+run_fn handle_resume
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "resume(unknown): no Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "resume(unknown): state retained" "$STATE_FILE" "7"
+assert_file "resume(unknown): RAW_FILE unchanged" "$RAW_FILE" "42"
+assert_absent "resume(unknown): handoff.suspend consumed by adoption" "$HANDOFF_SUSPEND_FILE"
+assert_present "resume(unknown): resume flag retained" "$HANDOFF_RESUME_FILE"
+if grep -q '\[WARN\]' "$DAEMON_ERR"; then
+    ok "resume(unknown): emits a WARN"
+else
+    bad "resume(unknown): no WARN (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-6. resume + unknown, saved == current: converge WITHOUT any write.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+printf '7\n' > "$RAW_FILE"
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+run_fn handle_resume
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "resume(unknown,same): SET_LOG empty" "0" "$(grep -c . "$SET_LOG" || true)"
+assert_file "resume(unknown,same): RAW_FILE unchanged" "$RAW_FILE" "7"
+assert_file "resume(unknown,same): FAKE_SYSFS unchanged" "$FAKE_SYSFS" "99"
+assert_absent "resume(unknown,same): state consumed without writing" "$STATE_FILE"
+assert_absent "resume(unknown,same): resume flag consumed" "$HANDOFF_RESUME_FILE"
+
+# P4b-7. Explicit opt-in restores even when ScreenSaver is unknown.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export C640_KBD_RESUME_ALLOW_UNKNOWN=1
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+run_fn handle_resume
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+export C640_KBD_RESUME_ALLOW_UNKNOWN=0
+assert_eq "resume(allow-unknown): one gsd Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "resume(allow-unknown): RAW_FILE reaches saved value" "$RAW_FILE" "7"
+assert_absent "resume(allow-unknown): state consumed" "$STATE_FILE"
+assert_absent "resume(allow-unknown): resume flag consumed" "$HANDOFF_RESUME_FILE"
+if grep -q 'C640_KBD_RESUME_ALLOW_UNKNOWN=1' "$DAEMON_ERR"; then
+    ok "resume(allow-unknown): opt-in is logged"
+else
+    bad "resume(allow-unknown): opt-in not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+if grep -q '\[WARN\]' "$DAEMON_ERR"; then
+    ok "resume(allow-unknown): emits a WARN"
+else
+    bad "resume(allow-unknown): no WARN (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-8. A handoff value of 0 is real state, not "no state": it is adopted and
+#        written through gsd, and consumed like any other value.
+reset_case
+write_handoff_suspend 0
+write_handoff_resume
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn handle_resume
+assert_file "handoff 0: LED written off" "$RAW_FILE" "0"
+assert_absent "handoff 0: state consumed" "$STATE_FILE"
+assert_absent "handoff 0: handoff.suspend consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "handoff 0: resume flag consumed" "$HANDOFF_RESUME_FILE"
+if grep -q 'Properties.Set' "$SET_LOG"; then
+    ok "handoff 0: performed a real writer call"
+else
+    bad "handoff 0: no writer call (SET_LOG: $(cat "$SET_LOG"))"
+fi
+# With an active screen the adopted 0 must be visible in STATE_FILE.
+reset_case
+write_handoff_suspend 0
+write_handoff_resume
+export STUB_GNOME_ACTIVE=true
+run_fn handle_resume
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false
+assert_file "handoff 0 active: adopted state is 0" "$STATE_FILE" "0"
+assert_file "handoff 0 active: LED untouched" "$RAW_FILE" "42"
+
+# P4b-9. Legacy/sysfs/ectool writers must never be called by the resume path.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+_orig_legacy="$(declare -f legacy_set_brightness)"
+legacy_set_brightness() {
+    printf 'legacy %s\n' "$*" >> "$LEGACY_LOG"
+    return 0
+}
+run_fn handle_resume
+eval "$_orig_legacy"
+assert_eq "resume: legacy_set_brightness never called" "0" "$(grep -c . "$LEGACY_LOG" || true)"
+assert_file "resume: gsd wrote the saved value" "$RAW_FILE" "7"
+assert_file "resume: no direct sysfs write" "$FAKE_SYSFS" "99"
+
+# P4b-10. Retry path is fail-closed too: valid generation + active/unknown ->
+#         no write; inactive -> one gsd write (state consumed after staging).
+reset_case
+write_state 7
+bump_restore_gen
+export STUB_GNOME_ACTIVE=true
+# shellcheck disable=SC2154  # restore_gen is a global set by bump_restore_gen
+schedule_restore_retries "$restore_gen" 0.5 1.5 3
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false
+assert_eq "retry(active): no Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "retry(active): state retained" "$STATE_FILE" "7"
+assert_file "retry(active): RAW_FILE unchanged" "$RAW_FILE" "42"
+reset_case
+write_state 7
+bump_restore_gen
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+# shellcheck disable=SC2154  # restore_gen is a global set by bump_restore_gen
+schedule_restore_retries "$restore_gen" 0.5 1.5 3
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "retry(unknown): no Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "retry(unknown): state retained" "$STATE_FILE" "7"
+assert_file "retry(unknown): RAW_FILE unchanged" "$RAW_FILE" "42"
+reset_case
+write_state 7
+bump_restore_gen
+# shellcheck disable=SC2154  # restore_gen is a global set by bump_restore_gen
+schedule_restore_retries "$restore_gen" 0.5 1.5 3
+wait 2> /dev/null || true
+assert_eq "retry(inactive): exactly one gsd Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "retry(inactive): RAW_FILE reaches saved value" "$RAW_FILE" "7"
+assert_absent "retry(inactive): state consumed" "$STATE_FILE"
+
+# P4b-11. Startup recovery catches a resume flag left behind by a daemon
+#         restart / dead dbus-monitor; without a flag it is a no-op.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+run_fn startup_resume_handoff
+assert_eq "startup handoff: one gsd Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "startup handoff: RAW_FILE reaches saved value" "$RAW_FILE" "7"
+assert_absent "startup handoff: handoff.suspend consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "startup handoff: resume flag consumed" "$HANDOFF_RESUME_FILE"
+assert_absent "startup handoff: state consumed" "$STATE_FILE"
+reset_case
+write_state 7
+run_fn startup_resume_handoff
+assert_eq "startup without flag: no restore write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "startup without flag: state untouched" "$STATE_FILE" "7"
+
+# P4b-12. gsd Set failure in the resume scenario: state + flag kept, WARN.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GSD_FAIL=1 STUB_UPOWER_FAIL=1 STUB_ECTOOL_FAIL=1
+rm -f "$FAKE_SYSFS"
+run_fn handle_resume
+wait 2> /dev/null || true
+export STUB_GSD_FAIL=0 STUB_UPOWER_FAIL=0 STUB_ECTOOL_FAIL=0
+assert_file "resume(gsd fail): state preserved" "$STATE_FILE" "7"
+assert_present "resume(gsd fail): resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_file "resume(gsd fail): RAW_FILE unchanged" "$RAW_FILE" "42"
+if grep -q 'restore failed' "$DAEMON_ERR"; then
+    ok "resume(gsd fail): logs 'restore failed'"
+else
+    bad "resume(gsd fail): no 'restore failed' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+if grep -q '\[WARN\]' "$DAEMON_ERR"; then
+    ok "resume(gsd fail): emits a WARN"
+else
+    bad "resume(gsd fail): no WARN (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P4b-13. No state and no handoff: clear the flag, write nothing.
+reset_case
+write_handoff_resume
+run_fn handle_resume
+assert_absent "resume(no state): resume flag cleared" "$HANDOFF_RESUME_FILE"
+assert_eq "resume(no state): no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "resume(no state): RAW_FILE unchanged" "$RAW_FILE" "42"
+
+# P4b-14 (P1 reentry).  An unblank that arrives before login1's resume signal
+# must not race handle_resume: with a resume flag present it is routed through
+# handle_resume (RESUME_LOCK), which writes once and consumes the handoff.  A
+# later handle_resume (login1 false) then sees no state/flag and is a no-op.
+reset_case
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+run_fn handle_unblank
+assert_eq "P1 reentry: handle_unblank issues exactly one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "P1 reentry: handoff value written once" "$RAW_FILE" "7"
+assert_absent "P1 reentry: state consumed" "$STATE_FILE"
+assert_absent "P1 reentry: handoff.suspend consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "P1 reentry: resume flag consumed" "$HANDOFF_RESUME_FILE"
+if grep -q 'routing through handle_resume' "$DAEMON_ERR"; then
+    ok "P1 reentry: unblank logged the resume routing"
+else
+    bad "P1 reentry: unblank did not log resume routing (stderr: $(cat "$DAEMON_ERR"))"
+fi
+: > "$SET_LOG"
+run_fn handle_resume
+assert_eq "P1 reentry: late handle_resume issues no gsd Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "P1 reentry: late handle_resume leaves brightness alone" "$RAW_FILE" "7"
+
+# P4b-15 (P1 stale handoff).  If the user changes the brightness to 9 between
+# the unblank and the late handle_resume, the stale handoff 7 must not be
+# adopted/written a second time.
+reset_case
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+run_fn handle_unblank
+assert_eq "P1 stale: routed unblank issued exactly one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+printf '9\n' > "$RAW_FILE"
+: > "$SET_LOG"
+run_fn handle_resume
+assert_eq "P1 stale: late handle_resume issues no gsd Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "P1 stale: user brightness 9 not overwritten by old handoff 7" "$RAW_FILE" "9"
+assert_absent "P1 stale: state consumed" "$STATE_FILE"
+assert_absent "P1 stale: handoff.suspend consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "P1 stale: resume flag consumed" "$HANDOFF_RESUME_FILE"
+
+# P4b-16 (P2-1 deferred handoff).  While a staged restore owns STATE_FILE the
+# adoption must defer loudly: flag + handoff + staged value all stay, no write.
+# Once PENDING disappears the next handle_resume adopts and restores normally.
+reset_case
+# STATE_FILE was staged into PENDING by an in-flight restore: only PENDING
+# holds the staged value.  A naive handle_resume would see "no saved state"
+# and clear the flag while the restore is still flying (P2-1).
+printf '9\n' > "$RESTORE_PENDING_FILE"
+write_handoff_suspend 7
+write_handoff_resume
+run_fn handle_resume
+assert_present "P2-1: resume flag retained while PENDING exists" "$HANDOFF_RESUME_FILE"
+assert_present "P2-1: handoff.suspend retained while PENDING exists" "$HANDOFF_SUSPEND_FILE"
+assert_file "P2-1: staged value untouched" "$RESTORE_PENDING_FILE" "9"
+assert_absent "P2-1: no daemon state written while staged" "$STATE_FILE"
+assert_eq "P2-1: no gsd Set while deferred" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'handoff adoption deferred' "$DAEMON_ERR"; then
+    ok "P2-1: deferral is logged"
+else
+    bad "P2-1: deferral not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+rm -f "$RESTORE_PENDING_FILE"
+: > "$SET_LOG"
+run_fn handle_resume
+assert_eq "P2-1: retry after PENDING vanished issues one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "P2-1: retry writes adopted handoff 7" "$RAW_FILE" "7"
+assert_absent "P2-1: retry consumes state" "$STATE_FILE"
+assert_absent "P2-1: retry consumes handoff.suspend" "$HANDOFF_SUSPEND_FILE"
+assert_absent "P2-1: retry consumes resume flag" "$HANDOFF_RESUME_FILE"
+
+# P4b-17 (P2-2 locked convergence).  Simulate a blank arriving while the
+# unknown-brightness probe is in flight: it writes a NEW state (9) to
+# STATE_FILE.  The daemon must re-read under STATE_LOCK and keep that value
+# instead of deleting it.  The flock stub audit also proves the critical
+# section really acquired STATE_LOCK (fd 207).
+reset_case
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+printf '7\n' > "$RAW_FILE"
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+export STUB_FLOCK_LOG="$FLOCK_LOG"
+: > "$FLOCK_LOG"
+_orig_get_brightness="$(declare -f get_brightness)"
+get_brightness() {
+    printf '9\n' > "$STATE_FILE" # a concurrent blank saves a newer value
+    printf '7\n'                 # hardware still shows the saved 7
+}
+run_fn handle_resume
+eval "$_orig_get_brightness"
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+export STUB_FLOCK_LOG=/dev/null
+assert_eq "P2-2: no gsd Set on unknown convergence" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "P2-2: concurrent blank state 9 survives" "$STATE_FILE" "9"
+assert_file "P2-2: raw unchanged" "$RAW_FILE" "7"
+assert_present "P2-2: resume flag retained (no convergence)" "$HANDOFF_RESUME_FILE"
+if grep -q 'state changed to 9 during probe' "$DAEMON_ERR"; then
+    ok "P2-2: changed state is detected and logged"
+else
+    bad "P2-2: changed state not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+if grep -q 'flock fd=207 .* op=n' "$FLOCK_LOG"; then
+    ok "P2-2: STATE_LOCK acquired around the convergence critical section"
+else
+    bad "P2-2: STATE_LOCK not acquired (flock log: $(cat "$FLOCK_LOG"))"
+fi
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
