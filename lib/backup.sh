@@ -40,8 +40,15 @@ backup_file_manifest_aware() {
     fi
     local existed=0
     [ -e "$target" ] || [ -L "$target" ] && existed=1
-    backup_file "$target"
-    manifest_add_entry "$target" "$component" "$existed"
+    if ! backup_file "$target"; then
+        log_error "Backup of $target failed; NOT recording a manifest entry (rollback coverage must never be claimed without a real backup)"
+        return 1
+    fi
+    if ! manifest_add_entry "$target" "$component" "$existed"; then
+        log_error "Manifest write failed for $target: a backup exists but is NOT claimed in the manifest; refusing to continue"
+        return 1
+    fi
+    return 0
 }
 
 backup_meson_install_plan() {
@@ -274,10 +281,23 @@ backup_file() {
         local timestamp
         timestamp="$(date '+%Y%m%d_%H%M%S%N')"
         local backup_path="$BACKUP_BASE_DIR/$timestamp$target"
-        sudo mkdir -p "$(dirname "$backup_path")"
-        sudo cp -a "$target" "$backup_path"
+        if ! sudo mkdir -p "$(dirname "$backup_path")"; then
+            log_error "Could not create backup directory for $target; refusing to continue"
+            return 1
+        fi
+        if ! sudo cp -a "$target" "$backup_path"; then
+            log_error "Could not back up $target -> $backup_path; refusing to continue"
+            # Remove a possible partial copy so a failed backup is never
+            # mistaken for a complete one by rollback. Keep the guard: only
+            # ever delete paths under our own backup base.
+            case "$backup_path" in
+                "$BACKUP_BASE_DIR"/*) sudo rm -rf -- "$backup_path" ;;
+            esac
+            return 1
+        fi
         log_info "Backed up existing file: $target -> $backup_path"
     fi
+    return 0
 }
 
 manifest_add_entry() {

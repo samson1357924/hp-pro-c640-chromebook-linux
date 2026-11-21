@@ -2142,6 +2142,220 @@ test_keyd_unsupported_path_type_fails_closed() {
 }
 
 # ---------------------------------------------------------------------------
+# 32a/32b. P1: a failed backup copy or manifest write must fail closed. The
+# pre-deploy cros.conf and legacy symlink stay untouched, no service is
+# mutated, no keyd record is claimed in the manifest and the snapshot is
+# retained with a .failed marker. $3 = expected number of backup files,
+# $4 = expected number of manifest records for the two keyd paths (default 0).
+# ---------------------------------------------------------------------------
+assert_keyd_backup_failure_fails_closed() {
+    local sandbox="$1" label="$2" expected_backups="$3" expected_keyd_records="${4:-0}"
+    assert_eq "1" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
+        "$label: CLI returns 1"
+    assert_eq "failed" "$(cat "$sandbox/keyd-state.txt" 2> /dev/null || echo MISSING)" \
+        "$label: KEYD_STATE=failed"
+    assert_eq "0" "$(cat "$sandbox/keyd-deployed.txt" 2> /dev/null || echo MISSING)" \
+        "$label: KEYD_DEPLOYED=0"
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "$label: original cros.conf untouched"
+    if [ -L "$sandbox/etc/keyd/default.conf" ] && [ "$(readlink "$sandbox/etc/keyd/default.conf")" = "cros.conf" ]; then
+        ok
+    else
+        fail "$label: legacy default.conf symlink must be preserved"
+    fi
+    if grep -qE 'enable keyd|restart keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "$label: keyd service must not be enabled or restarted"
+    else
+        ok
+    fi
+    local retained
+    retained="$(snapshot_dir "$sandbox")"
+    if [ -n "$retained" ] && sudo test -d "$retained"; then
+        ok
+    else
+        fail "$label: pre-deploy snapshot must be retained"
+        retained=""
+    fi
+    if [ -n "$retained" ] && sudo test -f "$retained/.failed"; then
+        ok
+    else
+        fail "$label: retained snapshot must carry a .failed marker"
+    fi
+    assert_contains "backup failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "$label: retain log names the backup failure"
+    assert_contains "refusing to deploy keyd config" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "$label: fail-closed error logged"
+    local keyd_records
+    keyd_records="$(python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print(0)
+    raise SystemExit
+targets = set(sys.argv[2:])
+print(sum(1 for r in data.get("records", []) if r.get("target") in targets))
+' "$sandbox/manifest/install-manifest.json" \
+        "$sandbox/etc/keyd/cros.conf" "$sandbox/etc/keyd/default.conf" 2> /dev/null || echo MISSING)"
+    assert_eq "$expected_keyd_records" "$keyd_records" "$label: keyd manifest record count"
+    assert_eq "$expected_backups" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "$label: backup file count"
+}
+
+test_keyd_backup_copy_failure_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-backup-copy-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    # Fail only the backup copy under .../backups/*keyd/*, never the snapshot
+    # copy -a into .../snapshots/keyd.XXXX/.
+    cat > "$sandbox/stub/cp" << 'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    case "$arg" in
+        */backups/*keyd/*)
+            printf 'STUB: backup cp refused: %s\n' "$*" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /bin/cp "$@"
+EOF
+    chmod +x "$sandbox/stub/cp"
+
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "backup copy failure: CLI must return 1"
+    fi
+    assert_keyd_backup_failure_fails_closed "$sandbox" "backup copy failure" 0
+}
+
+test_keyd_manifest_write_failure_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-manifest-write-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    # manifest_add_entry() calls python3 -c with 7 args; allow the 4/5-arg
+    # readers (manifest_has_target, _manifest_was_existing, normalize).
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ]; then
+    printf 'STUB: manifest write refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "manifest write failure: CLI must return 1"
+    fi
+    assert_keyd_backup_failure_fails_closed "$sandbox" "manifest write failure" 1
+}
+
+# Fail ONLY the legacy symlink backup (cros.conf was already backed up). This
+# proves the symlink removal was moved after its own backup guard.
+test_keyd_link_backup_failure_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-link-backup-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+
+    cat > "$sandbox/stub/cp" << 'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    case "$arg" in
+        */backups/*keyd/*default.conf)
+            printf 'STUB: link backup cp refused: %s\n' "$*" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /bin/cp "$@"
+EOF
+    chmod +x "$sandbox/stub/cp"
+
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "link backup failure: CLI must return 1"
+    fi
+    # cros.conf already had a valid backup/record before the link backup
+    # failed; only the legacy link must stay unclaimed.
+    assert_keyd_backup_failure_fails_closed "$sandbox" "link backup failure" 1 1
+    local link_records
+    link_records="$(python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print(0)
+    raise SystemExit
+print(sum(1 for r in data.get("records", []) if r.get("target") == sys.argv[2]))
+' "$sandbox/manifest/install-manifest.json" "$sandbox/etc/keyd/default.conf" 2> /dev/null || echo MISSING)"
+    assert_eq "0" "$link_records" "link backup failure: no manifest record for the legacy link"
+    assert_contains "failed for $sandbox/etc/keyd/default.conf" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "link backup failure: refusal names the legacy link"
+}
+
+# Direct helper-level checks: both primitives must propagate a real failure.
+test_backup_helper_copy_failure_returns_nonzero() {
+    local sandbox="/tmp/rollback-test-backup-helper-copy-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc" "$sandbox/stub"
+    setup_keyd_stubs "$sandbox" none
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    printf '#!/usr/bin/env bash\nprintf "STUB: cp refused\\n" >&2\nexit 1\n' > "$sandbox/stub/cp"
+    chmod +x "$sandbox/stub/cp"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        backup_file "$2/etc/demo.conf"
+        printf "%s\n" "$?" > "$2/helper-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "backup_file: copy failure returns 1"
+    assert_eq "ORIGINAL" "$(cat "$sandbox/etc/demo.conf")" "backup_file: source untouched"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "backup_file: no partial backup left"
+}
+
+test_backup_helper_manifest_failure_returns_nonzero() {
+    local sandbox="/tmp/rollback-test-backup-helper-manifest-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc" "$sandbox/stub"
+    setup_keyd_stubs "$sandbox" none
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ]; then
+    printf 'STUB: manifest write refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        backup_file_manifest_aware "$2/etc/demo.conf" "demo"
+        printf "%s\n" "$?" > "$2/helper-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "backup_file_manifest_aware: manifest write failure returns 1"
+    assert_eq "1" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "backup_file_manifest_aware: backup kept when manifest write fails"
+    local records
+    records="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("records", [])))' \
+        "$sandbox/manifest/install-manifest.json" 2> /dev/null || echo MISSING)"
+    assert_eq "0" "$records" "backup_file_manifest_aware: no unclaimed manifest record"
+}
+
+# ---------------------------------------------------------------------------
 # 33a. P1 SECURITY: a pre-created world-writable snapshot base must never be
 #      accepted (no chown/chmod "repair", no deploy, no backup).
 # ---------------------------------------------------------------------------
@@ -2891,6 +3105,11 @@ test_keyd_snapshot_cleanup_on_success
 test_keyd_snapshot_create_failure_fails_closed
 test_keyd_unsupported_path_type_fails_closed dir
 test_keyd_unsupported_path_type_fails_closed fifo
+test_keyd_backup_copy_failure_fails_closed
+test_keyd_manifest_write_failure_fails_closed
+test_keyd_link_backup_failure_fails_closed
+test_backup_helper_copy_failure_returns_nonzero
+test_backup_helper_manifest_failure_returns_nonzero
 test_keyd_snapshot_base_world_writable_fails_closed
 test_keyd_snapshot_base_symlink_rejected
 test_keyd_restore_failure_keeps_snapshot

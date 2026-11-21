@@ -518,6 +518,7 @@ _keyd_snapshot_restore() {
 # of the pre-deploy (V1) keyd state. Mark it so pruning keeps it, and print an
 # absolute path so an operator can still recover manually.
 _keyd_snapshot_retain_notice() {
+    local reason="${1:-restore failed}"
     local d="${KEYD_SNAPSHOT_DIR:-}"
     case "$d" in
         "" | "/" | "$KEYD_SNAPSHOT_BASE") return 0 ;;
@@ -526,7 +527,7 @@ _keyd_snapshot_retain_notice() {
         return 0
     fi
     printf 'failed\n' | sudo tee "$d/.failed" > /dev/null 2>&1 || true
-    log_warn "Keyd snapshot RETAINED at $d (restore failed); manual recovery preserved"
+    log_warn "Keyd snapshot RETAINED at $d ($reason); manual recovery preserved"
 }
 
 # Undo a failed keyd deployment by restoring the PER-DEPLOY snapshot (V1,
@@ -738,12 +739,28 @@ install_keyd_step() {
     fi
 
     # Backups must be taken before the symlink is removed or cros.conf replaced.
-    backup_file_manifest_aware "$KEYD_DST" "keyboard"
+    # A failed backup or manifest write must abort BEFORE either original is
+    # touched: without a claimed backup, rollback cannot restore it. The
+    # snapshot is kept (and marked) because it is the only V1 evidence left.
+    if ! backup_file_manifest_aware "$KEYD_DST" "keyboard"; then
+        log_error "Keyd pre-deploy backup/manifest failed for $KEYD_DST; refusing to deploy keyd config"
+        _keyd_snapshot_retain_notice "backup failed"
+        KEYD_STATE="failed"
+        return 1
+    fi
     if is_our_legacy_keyd_link; then
         local link_target
         link_target="$(readlink "$KEYD_LINK" 2> /dev/null || echo "")"
         _normalize_keyd_link_manifest_component
-        backup_file_manifest_aware "$KEYD_LINK" "keyboard"
+        # Keep the snapshot and the symlink intact on any backup failure: the
+        # cros.conf backup above may already exist, but removing the link now
+        # would make the original unrecoverable.
+        if ! backup_file_manifest_aware "$KEYD_LINK" "keyboard"; then
+            log_error "Keyd pre-deploy backup/manifest failed for $KEYD_LINK; refusing to deploy keyd config"
+            _keyd_snapshot_retain_notice "backup failed"
+            KEYD_STATE="failed"
+            return 1
+        fi
         sudo rm -f "$KEYD_LINK" 2> /dev/null || true
         log_info "Removed redundant symlink $KEYD_LINK -> $link_target"
     fi
