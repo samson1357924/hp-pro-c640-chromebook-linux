@@ -3712,6 +3712,69 @@ test_corrupt_manifest_uninstall_does_not_touch_manifest() {
         "corrupt uninstall: cros.conf left untouched"
 }
 
+test_missing_manifest_without_python3_is_untracked() {
+    # Regression: minimal/CI containers may have no python3.  With no manifest
+    # on disk there is nothing to validate, so manifest_has_target() must return
+    # 1 (untracked) without invoking python3.  Previously the probe exited 127
+    # and was misread as a corrupt manifest (rc 2), which broke
+    # `./setup.sh --all --dry-run` at the very first backup gate.
+    local sandbox="/tmp/rollback-test-no-python3-no-manifest"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc" "$sandbox/failbin"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    # Mimic a container without python3: any interpreter call exits 127.
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$sandbox/failbin/python3"
+    chmod +x "$sandbox/failbin/python3"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$PATH"
+        export DRY_RUN=1
+        source "$1/lib/backup.sh"
+        rc=0; manifest_has_target "$2/etc/demo.conf" || rc=$?
+        printf "%s\n" "$rc" > "$2/has-rc.txt"
+        printf "%s\n" "$MANIFEST_CREATED" > "$2/created.txt"
+        rc=0; backup_file_manifest_aware "$2/etc/demo.conf" "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/aware-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/has-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/no-manifest: manifest_has_target returns 1 (untracked)"
+    assert_eq "1" "$(cat "$sandbox/created.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/no-manifest: manifest_load reports CREATED=1"
+    assert_eq "0" "$(cat "$sandbox/aware-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/no-manifest: dry-run backup gate succeeds"
+    local log
+    log="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
+    if grep -q 'corrupt/invalid' <<< "$log"; then
+        fail "no-python3/no-manifest: no false corrupt/invalid diagnostic"
+    else
+        ok
+    fi
+    if [ -e "$sandbox/manifest/install-manifest.json" ]; then
+        fail "no-python3/no-manifest: dry-run must not create a manifest"
+    else
+        ok
+    fi
+
+    # Fail-closed must be preserved: an EXISTING manifest still needs python3
+    # for validation, so a failing interpreter must not be treated as "empty".
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' > "$manifest"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_has_target "$2/etc/demo.conf" || rc=$?
+        printf "%s\n" "$rc" > "$2/present-has-rc.txt"
+        rc=0; backup_file_manifest_aware "$2/etc/demo.conf" "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/present-aware-rc.txt"
+    '
+    assert_eq "2" "$(cat "$sandbox/present-has-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/present-manifest: manifest_has_target still fails closed with rc 2"
+    assert_eq "1" "$(cat "$sandbox/present-aware-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/present-manifest: backup gate refuses with rc 1"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "no-python3/present-manifest: no backup created"
+}
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
@@ -3795,6 +3858,7 @@ test_backup_manifest_aware_corrupt_fails_closed
 test_missing_manifest_still_creates_data
 test_legacy_manifest_missing_optional_fields_is_accepted
 test_corrupt_manifest_uninstall_does_not_touch_manifest
+test_missing_manifest_without_python3_is_untracked
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

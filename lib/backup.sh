@@ -88,6 +88,12 @@ manifest_has_target() {
     if ! manifest_load; then
         return 2
     fi
+    if [ "$MANIFEST_CREATED" = "1" ]; then
+        # No manifest exists yet: there are no records to check, so the target is
+        # untracked.  Avoid depending on python3 here (minimal/dry-run containers
+        # may not have it); an existing manifest still goes through the validator.
+        return 1
+    fi
     local rc=0
     printf '%s' "$MANIFEST_JSON" | python3 -c '
 import json, sys
