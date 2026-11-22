@@ -60,7 +60,12 @@ check_power_status() {
 
 uninstall_power() {
     log_section "Uninstalling Power Optimization Profiles"
-    rollback_component "power"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # remaining uninstall steps. Capture the rc, finish the cleanup below, and
+    # propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "power" || rollback_rc=$?
 
     # NOTE: do NOT restart systemd-logind here — with an active desktop session
     # it logs everyone out (session leader is lost on deserialization), which
@@ -70,6 +75,8 @@ uninstall_power() {
         log_info "Reboot (or log out and back in) for the lid-switch change to take effect."
     fi
     log_success "Power optimization profiles removed."
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
 install_power() {

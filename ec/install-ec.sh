@@ -151,13 +151,20 @@ uninstall_ec_tools() {
         sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
     fi
 
-    rollback_component "ec"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # group removal and the daemon-reload below. Capture the rc, finish every
+    # cleanup step, and propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "ec" || rollback_rc=$?
     remove_group_membership "plugdev" "$(get_real_user)" "ec"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemctl daemon-reload
     fi
     log_success "EC utilities removed."
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
 ACTION="install"

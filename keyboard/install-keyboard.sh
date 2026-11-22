@@ -1081,7 +1081,13 @@ uninstall_keyboard() {
     # manifest target so rollback can restore the original symlink. There is
     # deliberately no post-rollback deletion of default.conf here.
     _prepare_keyd_link_for_rollback
-    rollback_component "keyboard"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored (its record is retained for a later retry). With `set -e` an
+    # unguarded call would abort here and SKIP the group removal and the
+    # udev/brightness/state cleanup below. Capture the rc, finish every
+    # cleanup step, and propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "keyboard" || rollback_rc=$?
     remove_group_membership "plugdev" "$(get_real_user)" "keyboard"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
@@ -1154,6 +1160,8 @@ uninstall_keyboard() {
         log_dryrun "Would clean: /run/c640-kbd-backlight/state, /run/user/\$UID/c640-kbd-backlight.state*, TMPDIR fallback"
     fi
     log_success "Keyboard mapping uninstallation completed."
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
 install_keyboard() {

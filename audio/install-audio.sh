@@ -78,13 +78,20 @@ check_audio_status() {
 
 uninstall_audio() {
     log_section "Uninstalling ALSA UCM2 Profiles"
-    rollback_component "audio"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # empty-dir cleanup below. Capture the rc, finish the cleanup, and
+    # propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "audio" || rollback_rc=$?
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         # Clean up empty dirs
         sudo rmdir "$UCM_DST/conf.d/sof-rt5682" 2> /dev/null || true
     fi
     log_success "Audio UCM profiles removed successfully."
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
 install_audio() {

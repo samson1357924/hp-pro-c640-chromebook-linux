@@ -43,6 +43,27 @@ assert_contains() {
     fi
 }
 
+# Small helpers shared by the re-review #1/#2/#3 regression tests.
+file_hex() { python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$1"; }
+manifest_count() {
+    # $1=manifest path, $2=top-level array key
+    python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get(sys.argv[2], [])))' "$1" "$2"
+}
+manifest_names() {
+    # $1=manifest path, $2=array key, $3=name key
+    python3 -c 'import json,sys; print(" ".join(str(x[sys.argv[3]]) for x in json.load(open(sys.argv[1])).get(sys.argv[2], [])))' "$1" "$2" "$3"
+}
+write_demo_services_manifest() {
+    # $1=sandbox $2=services JSON $3=records JSON (default [])
+    python3 - "$1/manifest/install-manifest.json" "$2" "${3:-[]}" << 'PY'
+import json, sys
+mp, services, records = sys.argv[1:4]
+json.dump({"version": "2.0", "records": json.loads(records),
+           "services": json.loads(services), "groups": []},
+          open(mp, "w"), indent=2)
+PY
+}
+
 # Sandbox helper: run a backup.sh snippet with sandboxed dirs and an
 # extended ALLOWED_PREFIXES so targets under the sandbox stay in scope.
 run_sandboxed() {
@@ -251,7 +272,15 @@ EOF
 test_service_manifest() {
     local sandbox="/tmp/rollback-test-service"
     rm -rf "$sandbox"
-    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc" "$sandbox/stub"
+    # rollback now checks every systemctl returncode. Without a stub the real
+    # systemctl would return non-zero for the fake unit and make rollback rc 1
+    # (which would abort this test under `set -e`). The sudo stub keeps PATH
+    # pointing at our systemctl stub inside `sudo python3`, too.
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$sandbox/stub/sudo"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${STUB_SYSTEMCTL_LOG:?}"\nexit 0\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/sudo" "$sandbox/stub/systemctl"
+    : > "$sandbox/systemctl.log"
 
     run_sandboxed "$sandbox" '
         source "$1/lib/backup.sh"
@@ -270,9 +299,13 @@ json.dump(d, open(mp, "w"), indent=2)
 EOF
 
     run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
         source "$1/lib/backup.sh"
-        rollback_component "demo"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
     '
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "service manifest rollback: rc 0 with a working systemctl stub"
 
     local services
     services="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("services", [])))' "$sandbox/manifest/install-manifest.json")"
@@ -409,7 +442,10 @@ test_kbd_backlight_sync_install() {
 
     # Stub systemctl to handle --global and --user queries (user service: --global cat succeeds)
     printf '#!/usr/bin/env bash\ncase "$*" in\n  *"--global cat"*) exit 0 ;;\n  *" cat "*) exit 1 ;;\n  *"--global is-enabled"*|*"--global is-active"*) exit 1 ;;\n  *"is-enabled"*|*"is-active"*) exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
-    chmod +x "$sandbox/stub/systemctl"
+    # The rollback python runs under `sudo python3`; a sudo stub is required
+    # so its PATH still resolves to this systemctl stub (real sudo resets PATH).
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$sandbox/stub/sudo"
+    chmod +x "$sandbox/stub/systemctl" "$sandbox/stub/sudo"
     # Also stub udevadm and systemd-hwdb for completeness
     printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/udevadm"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/systemd-hwdb"
@@ -478,7 +514,10 @@ test_kbd_backlight_double_install() {
     mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
     mkdir -p "$sandbox/etc/systemd/user"
     printf '#!/usr/bin/env bash\ncase "$*" in\n  *"--global cat"*) exit 0 ;;\n  *" cat "*) exit 1 ;;\n  *"is-enabled"*|*"is-active"*) [ -e "${STUB_UNIT_STATE_FILE:-}" ] && exit 0 || exit 1 ;;\n  *) exit 0 ;;\nesac\n' > "$sandbox/stub/systemctl"
-    chmod +x "$sandbox/stub/systemctl"
+    # Keep PATH inside `sudo python3` so rollback's systemctl calls hit the
+    # stub instead of the host's real systemd.
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$sandbox/stub/sudo"
+    chmod +x "$sandbox/stub/systemctl" "$sandbox/stub/sudo"
     # first install with file not existing
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH"
@@ -547,7 +586,7 @@ setup_keyd_stubs() {
     mkdir -p "$sandbox/stub"
 
     # sudo just runs the command: every destination is inside the sandbox.
-    printf '#!/usr/bin/env bash\nexec "$@"\n' > "$sandbox/stub/sudo"
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$sandbox/stub/sudo"
 
     # systemctl records every call and can fail the first (or every) restart
     # on demand.
@@ -569,6 +608,12 @@ case "$*" in
     *"is-enabled keyd"*|*"is-enabled --quiet keyd"*) [ "${STUB_SVC_ENABLED:-1}" = "1" ] && exit 0 || exit 3 ;;
     *"is-active keyd"*|*"is-active --quiet keyd"*) [ "${STUB_SVC_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
 esac
+# Opt-in fault injection for rollback state restoration. Checked AFTER the
+# cases above so is-enabled/is-active/restart semantics stay unchanged.
+if [ -n "${STUB_SYSTEMCTL_FAIL_CMD:-}" ] && [[ "$*" == *"$STUB_SYSTEMCTL_FAIL_CMD"* ]]; then
+    printf 'stub: refusing %s\n' "$*" >&2
+    exit "${STUB_SYSTEMCTL_FAIL_RC:-1}"
+fi
 exit 0
 EOF
 
@@ -3790,7 +3835,9 @@ test_manifest_field_type_payloads_fail_closed() {
         installed_at_not_string version_not_string service_name_not_string \
         service_component_not_string service_was_enabled_not_bool \
         service_scope_not_string group_name_not_string \
-        group_was_member_not_bool; do
+        group_was_member_not_bool record_missing_was_existing \
+        service_missing_was_enabled service_missing_was_active \
+        service_missing_both_was_flags group_missing_was_member; do
         rm -rf "$sandbox"
         mkdir -p "$sandbox/backups" "$sandbox/manifest"
         case "$case_name" in
@@ -3824,22 +3871,39 @@ test_manifest_field_type_payloads_fail_closed() {
                 payload='{"version":2.0,"records":[],"services":[],"groups":[]}'
                 ;;
             service_name_not_string)
-                payload='{"version":"2.0","records":[],"services":[{"name":12,"component":"keyboard","was_enabled":true}],"groups":[]}'
+                payload='{"version":"2.0","records":[],"services":[{"name":12,"component":"keyboard","was_enabled":true,"was_active":true}],"groups":[]}'
                 ;;
             service_component_not_string)
-                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":[],"was_enabled":true}],"groups":[]}'
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":[],"was_enabled":true,"was_active":true}],"groups":[]}'
                 ;;
             service_was_enabled_not_bool)
-                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","was_enabled":"true"}],"groups":[]}'
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","was_enabled":"true","was_active":true}],"groups":[]}'
                 ;;
             service_scope_not_string)
-                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","scope":7}],"groups":[]}'
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","was_enabled":true,"was_active":true,"scope":7}],"groups":[]}'
                 ;;
             group_name_not_string)
-                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":12,"user":"u","component":"demo"}]}'
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":12,"user":"u","component":"demo","was_member":true}]}'
                 ;;
             group_was_member_not_bool)
                 payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo","was_member":"false"}]}'
+                ;;
+            # Safety-decision fields are REQUIRED: omitting one is "unknown",
+            # not false. All real writers (v1.0 and v2.0) always emit them.
+            record_missing_was_existing)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","component":"keyboard"}],"services":[],"groups":[]}'
+                ;;
+            service_missing_was_enabled)
+                payload='{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_active":true}],"groups":[]}'
+                ;;
+            service_missing_was_active)
+                payload='{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":true}],"groups":[]}'
+                ;;
+            service_missing_both_was_flags)
+                payload='{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard"}],"groups":[]}'
+                ;;
+            group_missing_was_member)
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo"}]}'
                 ;;
         esac
         printf '%s' "$payload" > "$manifest"
@@ -3927,18 +3991,25 @@ PY
 test_schema_optional_fields_and_roundtrip_accepted() {
     local sandbox="/tmp/rollback-test-schema-optional"
     local case_name payload
-    for case_name in legacy_service legacy_record_no_component group_no_was_member; do
+    for case_name in legacy_service legacy_record_no_component group_all_required_fields; do
         rm -rf "$sandbox"
         mkdir -p "$sandbox/backups" "$sandbox/manifest"
         case "$case_name" in
             legacy_service)
-                payload='{"version":"1.0","records":[],"services":[{"name":"keyd","component":"keyboard"}]}'
+                # Real v1/v2 writers ALWAYS emit the was_* safety flags; the
+                # only genuinely optional service field is `scope` (added
+                # later for user-scope services). A service record without
+                # was_enabled/was_active is UNKNOWN, not legacy.
+                payload='{"version":"1.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":true,"was_active":false}]}'
                 ;;
             legacy_record_no_component)
                 payload='{"version":"2.0","records":[{"target":"/tmp/x","was_existing":true}],"services":[],"groups":[]}'
                 ;;
-            group_no_was_member)
-                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo"}]}'
+            group_all_required_fields)
+                # Groups have no optional fields; was_member is a safety flag
+                # and must be present. The legacy tolerance here is for the
+                # missing top-level arrays, not for missing was_member.
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo","was_member":true}]}'
                 ;;
         esac
         printf '%s' "$payload" > "$sandbox/manifest/install-manifest.json"
@@ -3999,7 +4070,7 @@ test_uninstall_schema_invalid_manifest_does_not_touch_services() {
     # was_enabled as a string is truthy in Python: without the uninstall gate,
     # _keyd_managed_by_us() would still claim ownership and disable keyd before
     # rollback ever sees the invalid manifest.
-    printf '%s' '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":"false","scope":"system"}],"groups":[]}' > "$manifest"
+    printf '%s' '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":"false","was_active":true,"scope":"system"}],"groups":[]}' > "$manifest"
     local before
     before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
     : > "$sandbox/systemctl.log"
@@ -4229,6 +4300,768 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# 41. Finding #1: a missing safety-decision field is UNKNOWN, never false.
+#     The validator rejects it before any side effect; the rollback python
+#     repeats the check as defence in depth (test 41c).
+# ---------------------------------------------------------------------------
+
+test_missing_was_existing_record_never_deletes_file() {
+    local sandbox="/tmp/rollback-test-missing-was-existing"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc/udev/hwdb.d"
+    local file="$sandbox/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'USER_ORIGINAL\n' > "$file"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"keyboard\"}],\"services\":[],\"groups\":[]}" > "$manifest"
+    local before
+    before="$(file_hex "$file")"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "keyboard" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "missing was_existing: rollback rc 1"
+    assert_eq "$before" "$(file_hex "$file")" "missing was_existing: file bytes unchanged"
+    assert_eq "1" "$(manifest_count "$manifest" records)" "missing was_existing: record retained"
+    if [ -f "$file" ]; then ok; else fail "missing was_existing: file must still exist"; fi
+    assert_contains "MANIFEST_INVALID" "$(cat "$sandbox/rollback.log")" \
+        "missing was_existing: MANIFEST_INVALID logged"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "missing was_existing: no .tmp"
+}
+
+test_missing_service_flags_never_disables_or_stops() {
+    local sandbox="/tmp/rollback-test-missing-svc-flags"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    : > "$sandbox/systemctl.log"
+    write_keyd_manifest "$sandbox" '[{"name":"keyd","component":"keyboard"}]'
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local before
+    before="$(file_hex "$manifest")"
+
+    # Full uninstall path: the gate at uninstall_keyboard() must fire BEFORE
+    # _keyd_managed_by_us()/systemctl disable --now keyd (reviewer example B).
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        rc=0; uninstall_keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/uninstall-rc.txt"
+    ' 2> "$sandbox/uninstall.log"
+    assert_eq "1" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
+        "missing service flags: uninstall rc 1"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "missing service flags: uninstall must not disable keyd"
+    else
+        ok
+    fi
+    if grep -qE '(^|[[:space:]])stop([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "missing service flags: uninstall must not stop keyd"
+    else
+        ok
+    fi
+    assert_eq "$before" "$(file_hex "$manifest")" \
+        "missing service flags: uninstall leaves manifest bytes unchanged"
+
+    # Direct rollback path: the validator gate must fire here too.
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "keyboard" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "missing service flags: direct rollback rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "missing service flags: service record retained"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "missing service flags: direct rollback must not disable keyd"
+    else
+        ok
+    fi
+    if grep -qE '(^|[[:space:]])stop([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "missing service flags: direct rollback must not stop keyd"
+    else
+        ok
+    fi
+}
+
+test_rollback_python_unknown_state_is_fail_closed_without_validator() {
+    local sandbox="/tmp/rollback-test-unknown-state-injected"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    mkdir -p "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local injected="$sandbox/injected.json"
+    printf 'USER_ORIGINAL\n' > "$file"
+    # The on-disk manifest passes the validator gate; the python3 stub feeds
+    # the rollback python a DIFFERENT document with missing safety fields.
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' > "$manifest"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\"}],\"services\":[{\"name\":\"keyd\",\"component\":\"demo\"}],\"groups\":[]}" > "$injected"
+    : > "$sandbox/systemctl.log"
+    local before
+    before="$(file_hex "$file")"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+# validator: 3 args; rollback pipeline: 6 args. Only substitute stdin for the
+# latter so the fail-closed gate still runs against the real on-disk manifest.
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ]; then
+    exec /usr/bin/python3 "$@" < "${STUB_INJECT_MANIFEST:?}"
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_INJECT_MANIFEST="$2/injected.json"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "injected unknown state: rollback rc 1"
+    assert_eq "$before" "$(file_hex "$file")" \
+        "injected unknown state: file bytes unchanged (no delete/restore)"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "injected unknown state: must not disable keyd"
+    else
+        ok
+    fi
+    if grep -qE '(^|[[:space:]])stop([[:space:]]|$).*keyd' "$sandbox/systemctl.log"; then
+        fail "injected unknown state: must not stop keyd"
+    else
+        ok
+    fi
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "injected unknown state: record retained in written-back manifest"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "injected unknown state: service record retained in written-back manifest"
+    assert_contains "UNKNOWN ORIGINAL STATE" "$(cat "$sandbox/rollback.log")" \
+        "injected unknown state: UNKNOWN ORIGINAL STATE warning"
+    assert_contains "RECORD_STATE_UNKNOWN" "$(cat "$sandbox/rollback.log")" \
+        "injected unknown state: RECORD_STATE_UNKNOWN marker"
+    assert_contains "SERVICE_STATE_UNKNOWN" "$(cat "$sandbox/rollback.log")" \
+        "injected unknown state: SERVICE_STATE_UNKNOWN marker"
+    if grep -qF "finished!" "$sandbox/log.txt"; then
+        fail "injected unknown state: no success line may be printed"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 42. Finding #2: restore the original from the FIRST backup even when the
+#     installed target has disappeared. Only a confirmed success consumes a
+#     record; a missing backup keeps it (but is not an error, as before).
+# ---------------------------------------------------------------------------
+
+test_rollback_absent_target_restores_first_backup_file() {
+    local sandbox="/tmp/rollback-test-absent-restore"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'ORIGINAL\n' > "$file"
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        backup_file_manifest_aware "$2/etc/demo.conf" "demo"
+    '
+    printf 'CUSTOM\n' > "$file"
+    rm -f "$file"
+    if [ -e "$file" ] || [ -L "$file" ]; then
+        fail "absent target setup: installed file must be gone before rollback"
+    else
+        ok
+    fi
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "absent target + backup: rollback rc 0"
+    assert_eq "ORIGINAL" "$(cat "$file" 2> /dev/null || echo MISSING)" \
+        "absent target + backup: ORIGINAL restored"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "absent target + backup: record consumed after successful restore"
+    assert_contains "[RESTORED PREVIOUS BACKUP]" "$(cat "$sandbox/rollback.log")" \
+        "absent target + backup: restore log emitted"
+}
+
+test_rollback_absent_target_restores_first_backup_symlink() {
+    local sandbox="/tmp/rollback-test-absent-symlink"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local link="$sandbox/etc/liblink"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'TARGET-BODY\n' > "$sandbox/etc/real-file"
+    ln -s real-file "$link"
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        backup_file_manifest_aware "$2/etc/liblink" "demo"
+    '
+    rm -f "$link"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        fail "absent symlink setup: link must be gone before rollback"
+    else
+        ok
+    fi
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "absent symlink + backup: rollback rc 0"
+    if [ -L "$link" ]; then ok; else fail "absent symlink + backup: link restored"; fi
+    assert_eq "real-file" "$(readlink "$link" 2> /dev/null || echo MISSING)" \
+        "absent symlink + backup: islink checked before isdir/copy"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "absent symlink + backup: record consumed"
+}
+
+test_rollback_absent_target_no_backup_keeps_record() {
+    local sandbox="/tmp/rollback-test-absent-no-backup"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "absent target + no backup: rollback rc 0 (historical semantics)"
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        ok
+    else
+        fail "absent target + no backup: must not invent a file"
+    fi
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "absent target + no backup: record retained"
+    assert_contains "[WARN NO BACKUP]" "$(cat "$sandbox/rollback.log")" \
+        "absent target + no backup: warning emitted"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "absent target + no backup: no .tmp"
+}
+
+test_rollback_absent_target_was_existing_false_is_safe_noop() {
+    local sandbox="/tmp/rollback-test-absent-was-false"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":false}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "absent target + was_existing=false: rollback rc 0"
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        ok
+    else
+        fail "absent target + was_existing=false: no file should be created"
+    fi
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "absent target + was_existing=false: safe no-op consumes record"
+}
+
+test_rollback_absent_target_restore_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-absent-restore-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    local file="$sandbox/blocker/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'blocker\n' > "$sandbox/blocker"
+    # Place a valid first backup at the exact path rollback will glob.
+    local ts="20260101_000000000000"
+    mkdir -p "$sandbox/backups/$ts${file%/*}"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$file"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "restore failure: rollback rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "restore failure: record kept for retry"
+    assert_contains "RECORD_RESTORE_FAILED" "$(cat "$sandbox/rollback.log")" \
+        "restore failure: warning marker emitted"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "restore failure: no staged copy left behind"
+}
+
+# ---------------------------------------------------------------------------
+# 43. Finding #3: every systemctl action is checked. A failed service keeps
+#     its record (and is retryable), other services/files still roll back,
+#     and the python reports non-zero only AFTER the atomic write-back.
+# ---------------------------------------------------------------------------
+
+test_rollback_systemctl_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    mkdir -p "$sandbox/etc"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'NEW\n' > "$sandbox/etc/demo.conf"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"ok.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"},{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}]' \
+        "[{\"target\":\"$sandbox/etc/demo.conf\",\"component\":\"demo\",\"was_existing\":false}]"
+    : > "$sandbox/systemctl.log"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="start fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "systemctl failure: rollback rc 1"
+    assert_eq "fail.service" "$(manifest_names "$manifest" services name)" \
+        "systemctl failure: only the failed service record is retained"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "systemctl failure: file records are still processed and consumed"
+    if [ ! -e "$sandbox/etc/demo.conf" ]; then ok; else fail "systemctl failure: file still rolled back"; fi
+    local calls
+    calls="$(cat "$sandbox/systemctl.log")"
+    assert_contains "enable ok.service" "$calls" "systemctl failure: ok.service enabled"
+    assert_contains "start ok.service" "$calls" "systemctl failure: ok.service started"
+    assert_contains "enable fail.service" "$calls" "systemctl failure: fail.service enabled"
+    assert_contains "start fail.service" "$calls" "systemctl failure: fail.service start attempted"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=start rc=1" \
+        "$(cat "$sandbox/rollback.log")" "systemctl failure: structured warning marker"
+    assert_contains "rollback of demo failed" "$(cat "$sandbox/log.txt")" \
+        "systemctl failure: error logged"
+    if grep -qF "finished!" "$sandbox/log.txt"; then
+        fail "systemctl failure: no success line may be printed"
+    else
+        ok
+    fi
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "systemctl failure: no .tmp residue"
+}
+
+test_rollback_systemctl_failure_retry_consumes_record() {
+    local sandbox="/tmp/rollback-test-systemctl-retry"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}]'
+    : > "$sandbox/systemctl.log"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="start fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "systemctl retry: first run fails"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "systemctl retry: record retained after first run"
+
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback2.log"
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "systemctl retry: second run succeeds"
+    assert_eq "0" "$(manifest_count "$manifest" services)" \
+        "systemctl retry: retained record consumed on success"
+    assert_contains "start fail.service" "$(cat "$sandbox/systemctl.log")" \
+        "systemctl retry: retained record actually retried"
+}
+
+test_rollback_enable_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-enable-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="enable fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "enable failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" "enable failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=enable rc=1" \
+        "$(cat "$sandbox/rollback.log")" "enable failure: marker"
+    if grep -qE '(^|[[:space:]])start([[:space:]]|$).*fail.service' "$sandbox/systemctl.log"; then
+        fail "enable failure: start must be short-circuited"
+    else
+        ok
+    fi
+}
+
+test_rollback_disable_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-disable-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":false,"was_active":false,"scope":"system"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="disable fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "disable failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" "disable failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=disable rc=1" \
+        "$(cat "$sandbox/rollback.log")" "disable failure: marker"
+}
+
+test_rollback_stop_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-stop-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":false,"was_active":false,"scope":"system"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="stop fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "stop failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" "stop failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=stop rc=1" \
+        "$(cat "$sandbox/rollback.log")" "stop failure: marker"
+}
+
+test_rollback_user_scope_global_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-global-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":false,"scope":"user"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="--global enable fail.service"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "user scope global failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "user scope global failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=--global enable rc=1" \
+        "$(cat "$sandbox/rollback.log")" "user scope global failure: marker"
+}
+
+test_rollback_user_scope_no_manager_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-no-manager"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"user"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        unset SUDO_USER
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no user manager with was_active=true: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "no user manager with was_active=true: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=--user start rc=unavailable" \
+        "$(cat "$sandbox/rollback.log")" "no user manager: marker"
+    if grep -qF -- "--user start" "$sandbox/systemctl.log"; then
+        fail "no user manager: no --user start should be attempted"
+    else
+        ok
+    fi
+}
+
+test_rollback_user_scope_start_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-user-start-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local uid user
+    # The suite runs under sudo: SUDO_USER is the real non-root caller, while
+    # `id -un` would report root (which the production gate rejects).
+    user="${SUDO_USER:-}"
+    if [ -z "$user" ] || [ "$user" = "root" ]; then
+        user="$(id -un)"
+    fi
+    uid="$(id -u "$user" 2> /dev/null || echo 0)"
+    mkdir -p "$sandbox/run-user/$uid"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"user"}]'
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_SYSTEMCTL_FAIL_CMD="--user start" \
+            SUDO_USER="$4" CROS_ENABLEMENT_TEST_XDG_ROOT="$2/run-user"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' "$uid" "$user" 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "user scope start failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "user scope start failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=--user start rc=1" \
+        "$(cat "$sandbox/rollback.log")" "user scope start failure: marker"
+    assert_contains "--user start fail.service" "$(cat "$sandbox/systemctl.log")" \
+        "user scope start failure: --user start was attempted"
+}
+
+test_rollback_systemctl_spawn_failure_keeps_record() {
+    local sandbox="/tmp/rollback-test-systemctl-spawn-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"fail.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}]'
+    # No systemctl anywhere on this PATH: subprocess.run raises FileNotFoundError.
+    mkdir -p "$sandbox/spawnbin"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ] && [ -n "${STUB_NO_SYSTEMCTL_PATH:-}" ]; then
+    PATH="$STUB_NO_SYSTEMCTL_PATH" exec /usr/bin/python3 "$@"
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_NO_SYSTEMCTL_PATH="$2/spawnbin"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "systemctl spawn failure: rc 1"
+    assert_eq "1" "$(manifest_count "$manifest" services)" \
+        "systemctl spawn failure: record retained"
+    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=enable rc=spawn-error" \
+        "$(cat "$sandbox/rollback.log")" "systemctl spawn failure: marker"
+}
+
+test_rollback_all_success_consumes_services_and_records() {
+    local sandbox="/tmp/rollback-test-systemctl-all-ok"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    mkdir -p "$sandbox/etc"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'NEW\n' > "$sandbox/etc/demo.conf"
+    write_demo_services_manifest "$sandbox" \
+        '[{"name":"ok.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"},{"name":"ok2.service","component":"demo","was_enabled":false,"was_active":false,"scope":"system"}]' \
+        "[{\"target\":\"$sandbox/etc/demo.conf\",\"component\":\"demo\",\"was_existing\":false}]"
+    : > "$sandbox/systemctl.log"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "all success: rollback rc 0"
+    assert_eq "0" "$(manifest_count "$manifest" services)" "all success: services consumed"
+    assert_eq "0" "$(manifest_count "$manifest" records)" "all success: records consumed"
+    assert_contains "finished!" "$(cat "$sandbox/log.txt")" "all success: finished line printed"
+    assert_contains "enable ok.service" "$(cat "$sandbox/systemctl.log")" "all success: ok.service enabled"
+    assert_contains "disable ok2.service" "$(cat "$sandbox/systemctl.log")" "all success: ok2.service disabled"
+    assert_contains "stop ok2.service" "$(cat "$sandbox/systemctl.log")" "all success: ok2.service stopped"
+}
+
+# ---------------------------------------------------------------------------
+# 44. Non-keyboard uninstall callers must not abort on a failed rollback.
+#     rollback_component now returns 1 for failed/unknown items; with `set -e`
+#     an unguarded call skips the caller's remaining cleanup. These tests run
+#     the REAL uninstall functions under `set -e` and prove BOTH that the rc
+#     propagates and that post-rollback cleanup still ran.
+# ---------------------------------------------------------------------------
+
+# Generate a sandbox copy of an installer: real uninstall function, no CLI
+# dispatcher, host-side paths redirected into the sandbox. $3 may point at a
+# modified source (used by the pre-fix negative-control test).
+prepare_caller_sandbox_script() {
+    local sandbox="$1" comp="$2" src
+    src="${3:-$REPO_ROOT/$comp/install-$comp.sh}"
+    sed \
+        -e "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"$sandbox/$comp\"|" \
+        -e "s|^ROOT_DIR=.*|ROOT_DIR=\"$REPO_ROOT\"|" \
+        -e "s|/var/lib/fprint/crfpmoc.key|$sandbox/fp/crfpmoc.key|g" \
+        -e "s|/usr/local/bin/c640-ec-control|$sandbox/ec/c640-ec-control|g" \
+        -e '/^ACTION=/,$d' \
+        "$src" > "$sandbox/install-caller-sandbox.sh"
+}
+
+setup_caller_uninstall_sandbox() {
+    local sandbox="$1" comp="$2"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+
+    # sudo logs each command and only execs commands that have a sandbox stub
+    # (python3/udevadm/ldconfig/gpasswd/systemctl), so no host command can be
+    # reached through it.
+    cat > "$sandbox/stub/sudo" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    python3) ;;
+    *) printf '%s\n' "$*" >> "${STUB_CALL_LOG:?}" ;;
+esac
+[ "${1:-}" = "-u" ] && shift 2
+cmd="${1:-}"
+if [ -x "${STUB_DIR:?}/$cmd" ]; then
+    exec "$@"
+fi
+exit 0
+EOF
+    # Fail ONLY the rollback python (its script contains this marker), so the
+    # validator/gate and the group-record lookups still run for real.
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -eq 6 ] && [[ "$2" == *"ROLLBACK_INCOMPLETE"* ]] && [ "${STUB_FAIL_ROLLBACK_PY:-0}" = "1" ]; then
+    printf 'stub: forced rollback failure\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    local stub
+    for stub in udevadm ldconfig gpasswd; do
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/$stub"
+    done
+    # Direct package probes must report "not installed" so the uninstalls
+    # never reach a package-removal branch.
+    for stub in dpkg rpm pacman zypper; do
+        printf '#!/usr/bin/env bash\nexit 1\n' > "$sandbox/stub/$stub"
+    done
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${STUB_CALL_LOG:?}"\nexit 0\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/"*
+
+    prepare_caller_sandbox_script "$sandbox" "$comp"
+
+    python3 - "$sandbox/manifest/install-manifest.json" "$comp" << 'PY'
+import json, sys
+mp, comp = sys.argv[1:3]
+json.dump({"version": "2.0", "records": [], "services": [], "groups": [
+    {"group": "plugdev", "user": "testuser", "component": comp,
+     "was_member": False}]}, open(mp, "w"), indent=2)
+PY
+    : > "$sandbox/caller.log"
+    : > "$sandbox/log.txt"
+}
+
+run_caller_uninstall() {
+    # $1=sandbox $2=component $3=uninstall function $4=1 to force rollback rc 1
+    local sandbox="$1" fn="$3" rc=0
+    # Call the function as a plain command: wrapping it in `|| ...` would
+    # disable `set -e` inside it and hide the very bug under test.
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_CALL_LOG="$2/caller.log" \
+            STUB_DIR="$2/stub" STUB_FAIL_ROLLBACK_PY="$5"
+        source "$2/install-caller-sandbox.sh"
+        get_real_user() { echo "testuser"; }
+        "$4"
+    ' "$2" "$fn" "$4"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf '%s\n' "$rc" > "$sandbox/uninstall-rc.txt"
+}
+
+test_caller_uninstall_rollback_failure() {
+    # $1=component $2=uninstall function $3=post-rollback marker
+    # $4=log file holding the marker (caller.log or log.txt)
+    local comp="$1" fn="$2" marker="$3" logfile="$4"
+    local sandbox="/tmp/rollback-test-caller-$comp-fail"
+    setup_caller_uninstall_sandbox "$sandbox" "$comp"
+    run_caller_uninstall "$sandbox" "$comp" "$fn" 1
+
+    assert_eq "1" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
+        "[$comp] uninstall propagates rollback rc 1"
+    assert_contains "$marker" "$(cat "$sandbox/$logfile" 2> /dev/null || echo "")" \
+        "[$comp] post-rollback cleanup still ran"
+    if [ "$comp" = "fingerprint" ] || [ "$comp" = "ec" ]; then
+        assert_contains "group 'plugdev'" "$(cat "$sandbox/log.txt")" \
+            "[$comp] post-rollback group-membership step ran"
+    fi
+    assert_contains "rollback of $comp failed" "$(cat "$sandbox/log.txt")" \
+        "[$comp] rollback failure logged"
+}
+
+test_caller_uninstall_rollback_success() {
+    # Same parameters: a successful rollback must keep rc 0 and still clean up.
+    local comp="$1" fn="$2" marker="$3" logfile="$4"
+    local sandbox="/tmp/rollback-test-caller-$comp-ok"
+    setup_caller_uninstall_sandbox "$sandbox" "$comp"
+    run_caller_uninstall "$sandbox" "$comp" "$fn" 0
+
+    assert_eq "0" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
+        "[$comp] successful rollback keeps uninstall rc 0"
+    assert_contains "$marker" "$(cat "$sandbox/$logfile" 2> /dev/null || echo "")" \
+        "[$comp] cleanup still runs after successful rollback"
+    assert_contains "Rollback for component [$comp] finished!" "$(cat "$sandbox/log.txt")" \
+        "[$comp] rollback success logged"
+}
+
+test_caller_uninstall_regression_detects_unguarded_rollback() {
+    # Negative control: the pre-fix fingerprint caller (unguarded rollback)
+    # must show the exact failure mode this regression guards against.
+    local sandbox="/tmp/rollback-test-caller-unguarded"
+    setup_caller_uninstall_sandbox "$sandbox" fingerprint
+    python3 - "$REPO_ROOT/fingerprint/install-fingerprint.sh" "$sandbox/unfixed-source.sh" << 'PY'
+import sys
+src = open(sys.argv[1]).read()
+src = src.replace('rollback_component "fingerprint" || rollback_rc=$?',
+                  'rollback_component "fingerprint"')
+src = src.replace('    # Propagate a rollback failure only after ALL cleanup above has run.\n'
+                  '    return "$rollback_rc"\n', '')
+open(sys.argv[2], "w").write(src)
+PY
+    prepare_caller_sandbox_script "$sandbox" fingerprint "$sandbox/unfixed-source.sh"
+    run_caller_uninstall "$sandbox" fingerprint uninstall_fp 1
+
+    assert_eq "1" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
+        "unguarded control: uninstall rc 1"
+    if grep -qF 'udevadm control --reload-rules' "$sandbox/caller.log"; then
+        fail "unguarded control: cleanup unexpectedly ran (test cannot detect the regression)"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -4320,6 +5153,37 @@ test_non_absolute_manifest_entries_are_skipped
 test_nul_target_rollback_has_no_service_side_effects
 test_missing_python3_existing_manifest_dryrun_rollback_fails_closed
 test_rollback_python_failure_returns_nonzero
+# Finding #1: missing safety fields are unknown (fail closed)
+test_missing_was_existing_record_never_deletes_file
+test_missing_service_flags_never_disables_or_stops
+test_rollback_python_unknown_state_is_fail_closed_without_validator
+# Finding #2: restore the original even when the target is absent
+test_rollback_absent_target_restores_first_backup_file
+test_rollback_absent_target_restores_first_backup_symlink
+test_rollback_absent_target_no_backup_keeps_record
+test_rollback_absent_target_was_existing_false_is_safe_noop
+test_rollback_absent_target_restore_failure_keeps_record
+# Finding #3: systemctl failures keep records and report non-zero
+test_rollback_systemctl_failure_keeps_record
+test_rollback_systemctl_failure_retry_consumes_record
+test_rollback_enable_failure_keeps_record
+test_rollback_disable_failure_keeps_record
+test_rollback_stop_failure_keeps_record
+test_rollback_user_scope_global_failure_keeps_record
+test_rollback_user_scope_no_manager_keeps_record
+test_rollback_user_scope_start_failure_keeps_record
+test_rollback_systemctl_spawn_failure_keeps_record
+test_rollback_all_success_consumes_services_and_records
+# Non-keyboard uninstall callers: propagate rollback rc without skipping cleanup
+test_caller_uninstall_rollback_failure fingerprint uninstall_fp "udevadm control --reload-rules" caller.log
+test_caller_uninstall_rollback_failure ec uninstall_ec_tools "systemctl daemon-reload" caller.log
+test_caller_uninstall_rollback_failure audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log
+test_caller_uninstall_rollback_failure power uninstall_power "Reboot (or log out and back in)" log.txt
+test_caller_uninstall_rollback_success fingerprint uninstall_fp "udevadm control --reload-rules" caller.log
+test_caller_uninstall_rollback_success ec uninstall_ec_tools "systemctl daemon-reload" caller.log
+test_caller_uninstall_rollback_success audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log
+test_caller_uninstall_rollback_success power uninstall_power "Reboot (or log out and back in)" log.txt
+test_caller_uninstall_regression_detects_unguarded_rollback
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

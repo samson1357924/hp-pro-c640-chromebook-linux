@@ -83,7 +83,12 @@ uninstall_fp() {
         manifest_add_entry /var/lib/fprint/crfpmoc.key "fingerprint" "0"
         log_warn "Will remove /var/lib/fprint/crfpmoc.key (enrolled prints must be re-enrolled after reinstall)"
     fi
-    rollback_component "fingerprint"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # group removal and the udev/PAM cleanup below. Capture the rc, finish
+    # every cleanup step, and propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "fingerprint" || rollback_rc=$?
     remove_group_membership "plugdev" "$(get_real_user)" "fingerprint"
 
     # Remove prebuilt package if installed via package manager
@@ -140,6 +145,8 @@ uninstall_fp() {
         log_dryrun "Reinstall stock libfprint package via your distribution's package manager"
     fi
     log_success "Fingerprint driver uninstallation finished."
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
 configure_udev_and_sleep_hook() {

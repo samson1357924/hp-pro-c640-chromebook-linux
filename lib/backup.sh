@@ -27,9 +27,15 @@ MANIFEST_CREATED=0
 # from argv[1]; malformed input exits 2 with a MANIFEST_INVALID diagnostic on
 # stderr, valid input prints one canonical JSON document on stdout.
 # Validate only (never repair/coerce): a field that is present with the wrong
-# type is an invalid manifest, not a value to normalise. Optional fields may
-# be absent (legacy v1 records/services/groups), but present ones must have
-# the expected type so readers (realpath/truthiness) cannot crash or misbehave.
+# type is an invalid manifest, not a value to normalise.
+# Safety-decision fields (records[*].was_existing, services[*].was_enabled /
+# was_active, groups[*].was_member) are REQUIRED: every real writer, v1.0 and
+# v2.0, has always emitted them (verified against git history). A missing one
+# means "original state unknown", NEVER "false" — treating it as false would
+# let rollback delete a user's file / disable a user's service / drop a group
+# membership without evidence. Truly optional legacy fields (component, scope,
+# installed_at, top-level services/groups arrays) stay optional and are
+# normalised/defaulted.
 _MANIFEST_VALIDATE_PY='
 import json, sys, os
 
@@ -91,24 +97,24 @@ if "version" in data:
 for i, rec in enumerate(data["records"]):
     where = "records[%d]" % i
     check(rec, "target",       "abspath", where, required=True)
-    check(rec, "component",    "str",     where)
-    check(rec, "was_existing", "bool",    where)
-    check(rec, "installed_at", "str",     where)
+    check(rec, "component",    "str",     where)   # optional: legacy v1 backfill
+    check(rec, "was_existing", "bool",    where, required=True)
+    check(rec, "installed_at", "str",     where)   # optional: no safety impact
 
 for i, svc in enumerate(data.get("services", [])):
     where = "services[%d]" % i
     check(svc, "name",        "str",  where, required=True)
     check(svc, "component",   "str",  where, required=True)
-    check(svc, "was_enabled", "bool", where)
-    check(svc, "was_active",  "bool", where)
-    check(svc, "scope",       "str",  where)
+    check(svc, "was_enabled", "bool", where, required=True)
+    check(svc, "was_active",  "bool", where, required=True)
+    check(svc, "scope",       "str",  where)       # optional: user scope added later
 
 for i, grp in enumerate(data.get("groups", [])):
     where = "groups[%d]" % i
     check(grp, "group",      "str",  where, required=True)
     check(grp, "user",       "str",  where, required=True)
     check(grp, "component",  "str",  where, required=True)
-    check(grp, "was_member", "bool", where)
+    check(grp, "was_member", "bool", where, required=True)
 
 # Canonical output (unchanged): defaults are only added at the top level;
 # record-level fields are never injected/reordered, preserving first-wins.
@@ -401,7 +407,13 @@ if not os.path.exists(mp):
 d = json.load(open(mp))
 for g in d.get("groups", []):
     if g.get("group") == group and g.get("user") == user and g.get("component") == comp:
-        sys.exit(0 if not g.get("was_member") else 1)
+        # was_member is a safety-decision field: only an explicit bool false
+        # proves that WE added the membership. Missing/wrong type is unknown,
+        # never "false" — keep the membership (fail closed). The validator
+        # gate above already rejects such manifests; this is defence in depth
+        # for this direct json.load path.
+        was_member = g.get("was_member")
+        sys.exit(0 if isinstance(was_member, bool) and not was_member else 1)
 sys.exit(1)
 ' "$MANIFEST_FILE" "$1" "$2" "$3" 2> /dev/null) && ours="1" || ours="0"
     if [ "$ours" != "1" ]; then
@@ -564,21 +576,72 @@ rollback_component() {
     if command -v python3 > /dev/null 2>&1; then
         local allowed_prefixes
         allowed_prefixes="${CROS_ENABLEMENT_ALLOWED_PREFIXES:-/etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/}"
-        # Capture the python rc: a crash (e.g. an unexpectedly unvalidatable
-        # target) must NOT be reported as a successful rollback. Services are
-        # restored before files, so a mid-script failure can leave partial
-        # state behind and the caller has to know.
+        # Capture the python rc: a failed/unknown item must NOT be reported as
+        # a successful rollback. Services are restored before files, so a
+        # partial failure can leave state behind; the retained manifest
+        # records (written back atomically before the python exits non-zero)
+        # are what make a later retry possible.
+        #
+        # Three findings share one invariant here: a record is consumed ONLY
+        # after its whole action has been confirmed successful. Every
+        # failure/unknown goes into problems[], the whitelists
+        # remaining_services / remaining_records keep everything else, and a
+        # SINGLE atomic write-back happens BEFORE the single sys.exit(1).
         if ! printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
-import json, os, sys, shutil, glob, fnmatch
+import json, os, sys, shutil, glob, fnmatch, subprocess
 
 manifest_path = sys.argv[1]
 target_comp = sys.argv[2]
 backup_base = sys.argv[3]
 allowed_prefixes = tuple(sys.argv[4].split())
 
+# Unknown original state is NOT false. A missing/wrong-typed was_* field must
+# never authorize a destructive action (delete / disable / stop / gpasswd).
+UNKNOWN = object()
+problems = []   # single source of truth for the final rc
+
 def in_scope(path):
     # Literal prefix (system defaults like /etc/) or glob pattern (tests)
     return any(path.startswith(p) or fnmatch.fnmatch(path, p) for p in allowed_prefixes)
+
+def problem(kind, detail):
+    problems.append("%s %s" % (kind, detail))
+    print("  [WARN] %s %s" % (kind, detail), file=sys.stderr)
+
+def run_cmd(argv, name, action):
+    """True only when the command exits 0; spawn errors count as failures."""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True,
+                           errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        problem("SERVICE_RESTORE_FAILED",
+                "name=%s action=%s rc=spawn-error stderr=%s" %
+                (name, action, repr(str(e))[:200]))
+        return False
+    if p.returncode != 0:
+        problem("SERVICE_RESTORE_FAILED",
+                "name=%s action=%s rc=%d stderr=%s" %
+                (name, action, p.returncode,
+                 repr((p.stderr or "").strip())[:200]))
+        return False
+    return True
+
+def user_manager():
+    """(user, uid, xdg); xdg == "" means no reachable per-user manager."""
+    user = os.environ.get("SUDO_USER", "")
+    if not user or user == "root":
+        return user, "", ""
+    try:
+        import pwd
+        uid = pwd.getpwnam(user).pw_uid
+    except (KeyError, OSError):
+        return user, "", ""
+    # Test seam: redirect the /run/user lookup into a sandbox. Production
+    # uses the real /run/user; tests never write to the host /run.
+    xdg_root = os.environ.get("CROS_ENABLEMENT_TEST_XDG_ROOT", "/run/user")
+    xdg = os.path.join(xdg_root, str(uid))
+    return user, str(uid), xdg if os.path.isdir(xdg) else ""
 
 # Consume the EXACT document that the fail-closed manifest_load gate above
 # validated (no second, unvalidated parse; no TOCTOU window). manifest_path
@@ -590,112 +653,219 @@ data = json.load(sys.stdin)
 # Supports both system and user scopes (scope field added for kbd backlight user service).
 data.setdefault("services", [])
 services = data["services"]
-restored_services = []
+remaining_services = []
+consumed_service_ids = set()   # id(), not dict equality: duplicate records must not be co-consumed
+
 for svc in services:
     if target_comp != "all" and svc.get("component") != target_comp:
+        remaining_services.append(svc)
         continue
     name = svc.get("name")
     if not name:
+        remaining_services.append(svc)
         continue
+
+    was_enabled = svc.get("was_enabled", UNKNOWN)
+    was_active = svc.get("was_active", UNKNOWN)
+    if not isinstance(was_enabled, bool) or not isinstance(was_active, bool):
+        missing = ",".join(k for k, v in (("was_enabled", was_enabled),
+                                          ("was_active", was_active))
+                           if not isinstance(v, bool))
+        problem("SERVICE_STATE_UNKNOWN",
+                "UNKNOWN ORIGINAL STATE name=%s missing_or_invalid=%s; "
+                "skipping ALL state changes, record kept" % (name, missing))
+        remaining_services.append(svc)
+        continue
+
     scope = svc.get("scope", "system")
-    print(f"Restoring service state: {name} (scope={scope})")
-    import subprocess
+    print("Restoring service state: %s (scope=%s)" % (name, scope))
+    ok = True
     if scope == "user":
-        if svc.get("was_enabled"):
-            subprocess.run(["systemctl", "--global", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["systemctl", "--global", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # --global only supports enable/disable; start/stop must be per-user
-        # Attempt per-user stop/start for the real user if XDG_RUNTIME_DIR exists
-        try:
-            import pwd, os
-            # attempt to find real user from SUDO_USER or fallback
-            real_user = os.environ.get("SUDO_USER", "")
-            if real_user and real_user != "root":
-                uid = pwd.getpwnam(real_user).pw_uid
-                xdg = f"/run/user/{uid}"
-                if os.path.isdir(xdg):
-                    env = os.environ.copy()
-                    env["XDG_RUNTIME_DIR"] = xdg
-                    if svc.get("was_active"):
-                        subprocess.run(["sudo", "-u", real_user, "env", f"XDG_RUNTIME_DIR={xdg}", "systemctl", "--user", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.run(["sudo", "-u", real_user, "env", f"XDG_RUNTIME_DIR={xdg}", "systemctl", "--user", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        verb = "enable" if was_enabled else "disable"
+        ok = run_cmd(["systemctl", "--global", verb, name],
+                     name, "--global " + verb)
+        if ok:
+            user, uid, xdg = user_manager()
+            if xdg:
+                verb2 = "start" if was_active else "stop"
+                ok = run_cmd(["sudo", "-u", user, "env", "XDG_RUNTIME_DIR=" + xdg,
+                              "systemctl", "--user", verb2, name],
+                             name, "--user " + verb2)
+            elif was_active:
+                # was_active=true but no per-user bus: the original active
+                # state cannot be reached, so this record is NOT restorable.
+                problem("SERVICE_RESTORE_FAILED",
+                        "name=%s action=--user start rc=unavailable stderr=%s" %
+                        (name, repr("no user manager (SUDO_USER=%s, uid=%s)" %
+                                    (user or "<unset>", uid or "<unknown>"))[:200]))
+                ok = False
+            # was_active=false + no bus: target already stopped; --global
+            # disable above prevents auto-start, so the goal is achieved.
     else:
-        if svc.get("was_enabled"):
-            subprocess.run(["systemctl", "enable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["systemctl", "disable", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if svc.get("was_active"):
-            subprocess.run(["systemctl", "start", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["systemctl", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    restored_services.append(svc)
-data["services"] = [s for s in services if s not in restored_services]
+        verb = "enable" if was_enabled else "disable"
+        ok = run_cmd(["systemctl", verb, name], name, verb)
+        if ok:
+            verb = "start" if was_active else "stop"
+            ok = run_cmd(["systemctl", verb, name], name, verb)
+
+    if ok:
+        consumed_service_ids.add(id(svc))
+        print("  [RESTORED SERVICE] %s" % name)
+    else:
+        print("  [SERVICE RESTORE INCOMPLETE] %s; record kept for retry" % name,
+              file=sys.stderr)
+        remaining_services.append(svc)
+
+data["services"] = [s for s in services if id(s) not in consumed_service_ids]
 
 records = data.get("records", [])
 remaining_records = []
 PROTECTED_DIRS = {"/", "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/lib64", "/home", "/root"}
 
+def find_first_backup(target):
+    # Mirror the "$BACKUP_BASE_DIR/$timestamp$target" layout of backup_file()
+    # and the _find_rollback_backup() lookup in install-keyboard.sh. Timestamp prefixes are
+    # YYYYMMDD_HHMMSS%N, so sorted()[0] is the FIRST (original) backup.
+    # glob.escape keeps []*? in a path literal instead of a pattern.
+    pattern = os.path.join(backup_base, "*", glob.escape(target.lstrip("/")))
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else None
+
+def remove_path(path):
+    """Return None on success, an error string on failure; never raise."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        return None
+    except OSError as exc:
+        return str(exc)
+
+def restore_original(target, backup):
+    """Stage next to the target, then swap atomically. Return None on success."""
+    stage = target + ".cros-rollback-tmp-%d" % os.getpid()
+    try:
+        parent = os.path.dirname(target)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        # islink FIRST: os.path.isdir() is also true for a symlink to a dir.
+        if os.path.islink(backup):
+            os.symlink(os.readlink(backup), stage)
+        elif os.path.isdir(backup):
+            shutil.copytree(backup, stage, symlinks=True, dirs_exist_ok=True)
+            shutil.copystat(backup, stage, follow_symlinks=False)
+        else:
+            shutil.copy2(backup, stage, follow_symlinks=False)
+
+        # cp -a preserved ownership; copy2/copytree do not. Best effort only:
+        # some filesystems reject chown on symlinks, owner is not safety data.
+        st = os.lstat(backup)
+        try:
+            os.chown(stage, st.st_uid, st.st_gid, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+
+        if os.path.isdir(target) and not os.path.islink(target):
+            # os.replace() cannot overwrite a non-empty directory: move the
+            # old one aside first and put it back if the swap fails.
+            old = target + ".cros-rollback-old-%d" % os.getpid()
+            os.rename(target, old)
+            try:
+                os.replace(stage, target)
+            except OSError:
+                os.rename(old, target)
+                raise
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            if os.path.lexists(target):
+                os.remove(target)
+            os.replace(stage, target)
+        return None
+    except OSError as exc:
+        try:
+            if os.path.isdir(stage) and not os.path.islink(stage):
+                shutil.rmtree(stage)
+            elif os.path.lexists(stage):
+                os.remove(stage)
+        except OSError:
+            pass
+        return str(exc)
+
 for rec in records:
     comp = rec.get("component", "")
     target = rec.get("target", "")
-    was_existing = rec.get("was_existing", False)
-    
+
     if target_comp != "all" and comp != target_comp:
         remaining_records.append(rec)
         continue
-    
-    real = os.path.realpath(target) if target else ""
-    if not target or real in PROTECTED_DIRS or not in_scope(real):
-        print(f"  [SKIPPED OUT-OF-SCOPE TARGET] {target}", file=sys.stderr)
+
+    was_existing = rec.get("was_existing", UNKNOWN)
+    if not isinstance(was_existing, bool):
+        problem("RECORD_STATE_UNKNOWN",
+                "UNKNOWN ORIGINAL STATE target=%s field=was_existing; "
+                "no delete and no restore, record kept" % target)
         remaining_records.append(rec)
         continue
 
-    print(f"Processing rollback for: {target} (component: {comp})")
-    if os.path.lexists(target):
-        if not was_existing:
-            if os.path.isdir(target) and not os.path.islink(target):
-                shutil.rmtree(target, ignore_errors=True)
-                print(f"  [REMOVED DIR] {target}")
-            else:
-                os.remove(target)
-                print(f"  [REMOVED FILE] {target}")
-        else:
-            # Restore the OLDEST backup (matches[0]): for legacy manifests
-            # that may hold multiple backups of the same target, the first
-            # one is the pre-customization original.
-            pattern = os.path.join(backup_base, "*", target.lstrip("/"))
-            matches = sorted(glob.glob(pattern))
-            if matches:
-                original_backup = matches[0]
-                print(f"  [RESTORING PREVIOUS BACKUP] {original_backup} -> {target}")
-                if os.path.lexists(target):
-                    if os.path.islink(target) or os.path.isfile(target):
-                        os.remove(target)
-                    else:
-                        shutil.rmtree(target, ignore_errors=True)
-                if os.path.islink(original_backup):
-                    os.symlink(os.readlink(original_backup), target)
-                elif os.path.isdir(original_backup):
-                    shutil.copytree(original_backup, target, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(original_backup, target)
-            else:
-                print(f"  [NOTE] {target} existed prior to install. Left intact.")
-                # Keep the record so a later rollback run can still restore
-                # the original once the backup becomes available.
-                remaining_records.append(rec)
+    real = os.path.realpath(target) if target else ""
+    if not target or real in PROTECTED_DIRS or not in_scope(real):
+        print("  [SKIPPED OUT-OF-SCOPE TARGET] %s" % target, file=sys.stderr)
+        remaining_records.append(rec)
+        continue
 
+    print("Processing rollback for: %s (component: %s)" % (target, comp))
+    if was_existing:
+        # Find the first backup REGARDLESS of whether the target still exists.
+        # A user or another tool may have removed our installed file; the
+        # original must still be restored from the first backup (finding #2).
+        backup = find_first_backup(target)
+        if backup is None:
+            # Keep the record for a later retry, but do NOT invent a file and
+            # do NOT fail the whole rollback (matches the historical rc=0).
+            print("  [WARN NO BACKUP] %s: original unavailable; record kept" %
+                  target, file=sys.stderr)
+            remaining_records.append(rec)
+            continue
+        err = restore_original(target, backup)
+        if err is not None:
+            problem("RECORD_RESTORE_FAILED",
+                    "target=%s backup=%s stderr=%s; record kept" %
+                    (target, backup, repr(err)[:200]))
+            remaining_records.append(rec)
+            continue
+        print("  [RESTORED PREVIOUS BACKUP] %s -> %s" % (backup, target))
+    else:
+        # We created this target: only delete it when it is still present.
+        # Absence is a safe no-op (goal already reached) and consumes the record.
+        if not os.path.lexists(target):
+            print("  [NOTE] %s already absent; nothing to remove" % target)
+            continue
+        kind = "DIR" if os.path.isdir(target) and not os.path.islink(target) else "FILE"
+        err = remove_path(target)
+        if err is not None:
+            problem("RECORD_REMOVE_FAILED",
+                    "target=%s stderr=%s; record kept" % (target, repr(err)[:200]))
+            remaining_records.append(rec)
+            continue
+        print("  [REMOVED %s] %s" % (kind, target))
+
+# SINGLE atomic write-back of the retained records. This MUST happen before
+# any non-zero exit, otherwise a failure would erase the records needed for
+# the next retry (and erase untouched records of other components as well).
 tmp_manifest = manifest_path + ".tmp"
 data["records"] = remaining_records
 with open(tmp_manifest, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
+
+if problems:
+    print("ROLLBACK_INCOMPLETE: %d item(s) retained (see WARN lines above)" %
+          len(problems), file=sys.stderr)
+    sys.exit(1)
 ' "$MANIFEST_FILE" "$target_comp" "$BACKUP_BASE_DIR" "$allowed_prefixes"; then
-            log_error "rollback of $target_comp failed; service/file state may be partial"
+            log_error "rollback of $target_comp failed; service/file state may be partial (retained records remain for retry)"
             return 1
         fi
     else
