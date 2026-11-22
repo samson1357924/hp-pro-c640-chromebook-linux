@@ -69,6 +69,11 @@ LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
 # firmware residue.
 LAST_USER_META_FILE="${C640_KBD_LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
 C640_KBD_LAST_USER_TTL="${C640_KBD_LAST_USER_TTL:-15}"
+# Bounded wait (seconds) for the state lock in save_state().  A restore can
+# hold STATE_LOCK for a few seconds while probing ScreenSaver; waiting for it
+# (instead of silently skipping the save) prevents a blank from turning the
+# LED off with no persisted copy of the new brightness.  0 = no wait.
+C640_KBD_SAVE_LOCK_WAIT="${C640_KBD_SAVE_LOCK_WAIT:-2}"
 RESTORE_GEN_FILE="$STATE_DIR/c640-kbd-backlight.restore-gen"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
@@ -756,84 +761,114 @@ seed_last_user_from_current() {
 
 # --- State save / restore -------------------------------------------------
 
-save_state() {
-    # Atomic first-wins with flock on STATE_LOCK.  A current valid non-zero
-    # reading wins: the sampler only runs every 5s, so a brightness change
-    # made just before a blank must not be lost to a stale cache.  The cache
-    # is used for blank-side zeros (firmware already off) and unreadable
-    # hardware.  An explicit manual off stays in force only while it is fresh
-    # and gsd-power still reports off; once gsd reports non-zero the user has
-    # brightened again and the live reading is authoritative.
-    (
-        flock -n 200 || return 0
-        if [ -f "$STATE_FILE" ]; then
-            return 0
-        fi
-        local live cache curr src age pct
-        # get_brightness() runs in a command substitution (its own subshell),
-        # so its backend probe would not be visible here.  Probe once in this
-        # shell so HAVE_GSD_KBD is accurate for the gsd pct check below.
-        ensure_backends
-        live="$(get_brightness 2> /dev/null || echo "")"
-        cache="$(read_last_user_brightness)"
-        src="$(last_user_cache_source)"
-        curr=""
-        if [[ "$live" =~ ^[0-9]+$ ]] && [ "$live" -ne 0 ]; then
-            if [ "$cache" = "0" ] && [ "$src" = "manual0" ]; then
-                age="$(last_user_cache_age)"
-                if [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ]; then
-                    pct=""
-                    # gsd_get_pct failure/timeout means "empty", not 0, and is
-                    # only queried when a gsd keyboard backend is present.
-                    if [ "$HAVE_GSD_KBD" = "1" ]; then
-                        pct="$(gsd_get_pct 2> /dev/null || echo "")"
-                    fi
-                    if [ -z "$pct" ] || [ "$pct" = "0" ]; then
-                        curr=0
-                    fi
+# Pure value-selection helper: print the brightness that save_state should
+# persist and return 1 when no usable value exists.  The selection logic is
+# copied verbatim from the old save_state (including the gsd-pct empty-value
+# semantics) but kept separate from the lock/write path so handle_blank can
+# sample the user-visible brightness BEFORE writing 0.  Writing 0 changes the
+# live reading, so recomputing after the write would lose the real value.
+compute_save_brightness() {
+    local live cache curr src age pct
+    # A current valid non-zero reading wins: the sampler only runs every 5s,
+    # so a brightness change made just before a blank must not be lost to a
+    # stale cache.  The cache is used for blank-side zeros (firmware already
+    # off) and unreadable hardware.  An explicit manual off stays in force
+    # only while it is fresh and gsd-power still reports off; once gsd reports
+    # non-zero the user has brightened again and the live reading wins.
+    # get_brightness() runs in a command substitution (its own subshell), so
+    # its backend probe would not be visible here.  Probe once in this shell
+    # so HAVE_GSD_KBD is accurate for the gsd pct check below.
+    ensure_backends
+    live="$(get_brightness 2> /dev/null || echo "")"
+    cache="$(read_last_user_brightness)"
+    src="$(last_user_cache_source)"
+    curr=""
+    if [[ "$live" =~ ^[0-9]+$ ]] && [ "$live" -ne 0 ]; then
+        if [ "$cache" = "0" ] && [ "$src" = "manual0" ]; then
+            age="$(last_user_cache_age)"
+            if [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ]; then
+                pct=""
+                # gsd_get_pct failure/timeout means "empty", not 0, and is
+                # only queried when a gsd keyboard backend is present.
+                if [ "$HAVE_GSD_KBD" = "1" ]; then
+                    pct="$(gsd_get_pct 2> /dev/null || echo "")"
+                fi
+                if [ -z "$pct" ] || [ "$pct" = "0" ]; then
+                    curr=0
                 fi
             fi
-            if [ -z "$curr" ] && [ -n "$cache" ] && [ -z "$src" ]; then
-                # A cache without metadata has no provenance (older daemon or
-                # a direct file write, e.g. a blank simulated mid-restore):
-                # retain the historical cache-wins behaviour for it.
-                curr="$cache"
-            fi
-            if [ -z "$curr" ]; then
-                curr="$live"
-            fi
-        elif [ "$live" = "0" ]; then
-            # Blank-side zero: the firmware already turned the LED off, so the
-            # live reading carries no user intent.  Use the cache regardless
-            # of age; an old value still beats a dark keyboard on unblank.
-            if [ -n "$cache" ]; then
-                curr="$cache"
-            else
-                curr=0
-            fi
-        else
-            # Unreadable hardware: use the cache when available.
+        fi
+        if [ -z "$curr" ] && [ -n "$cache" ] && [ -z "$src" ]; then
+            # A cache without metadata has no provenance (older daemon or a
+            # direct file write, e.g. a blank simulated mid-restore): retain
+            # the historical cache-wins behaviour for it.
             curr="$cache"
         fi
-        # Final fallbacks when the live reading and the cache were unusable.
         if [ -z "$curr" ]; then
-            curr="$last_user_brightness"
+            curr="$live"
         fi
-        if [ -z "$curr" ]; then
-            curr="$(get_brightness 2> /dev/null || echo "")"
+    elif [ "$live" = "0" ]; then
+        # Blank-side zero: the firmware already turned the LED off, so the
+        # live reading carries no user intent.  Use the cache regardless of
+        # age; an old value still beats a dark keyboard on unblank.
+        if [ -n "$cache" ]; then
+            curr="$cache"
+        else
+            curr=0
         fi
-        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
-            return 0
-        fi
+    else
+        # Unreadable hardware: use the cache when available.
+        curr="$cache"
+    fi
+    # Final fallbacks when the live reading and the cache were unusable.
+    if [ -z "$curr" ]; then
+        curr="$last_user_brightness"
+    fi
+    if [ -z "$curr" ]; then
+        curr="$(get_brightness 2> /dev/null || echo "")"
+    fi
+    if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$curr"
+}
+
+# Persist the brightness to STATE_FILE (atomic, first-wins).
+# rc: 0 = a valid copy exists (already present or written now),
+#     1 = the bounded lock wait failed / flock errored,
+#     2 = value selection or the state write failed.
+# Optional $1 is an already-sampled value (skips selection); this is what
+# handle_blank uses so a blank's new value cannot be lost to a lock timeout.
+save_state() {
+    local val="${1:-}"
+    if [ -z "$val" ]; then
+        val="$(compute_save_brightness)" || return 2
+    fi
+    [[ "$val" =~ ^[0-9]+$ ]] || return 2
+    (
+        flock -w "$C640_KBD_SAVE_LOCK_WAIT" 200 || exit 1
+        # First-wins: an existing valid copy must not be overwritten, even by
+        # a later (newer) blank.  The restore staging logic owns that case.
+        [ -f "$STATE_FILE" ] && exit 0
         mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
         local tmp
-        tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
-        echo "$curr" > "$tmp" 2> /dev/null || true
+        tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")" || exit 2
+        printf '%s\n' "$val" > "$tmp" || exit 2
         chmod 600 "$tmp" 2> /dev/null || true
-        mv -f "$tmp" "$STATE_FILE" 2> /dev/null || cp "$tmp" "$STATE_FILE" 2> /dev/null || true
+        if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
+            cp "$tmp" "$STATE_FILE" 2> /dev/null || {
+                rm -f "$tmp"
+                exit 2
+            }
+        fi
         rm -f "$tmp" 2> /dev/null || true
-        log "saved brightness $curr"
-    ) 200> "$STATE_LOCK" || true
+        # Verify the value really landed before reporting success: a silent
+        # write failure here would let handle_blank turn the LED off with no
+        # persisted copy of the new brightness.
+        [ "$(cat "$STATE_FILE" 2> /dev/null || echo '')" = "$val" ] || exit 2
+        log "saved brightness $val"
+        exit 0
+    ) 200> "$STATE_LOCK"
 }
 
 bump_restore_gen() {
@@ -1118,7 +1153,8 @@ restore_state() {
     log "restoring brightness $saved"
     # Release the state lock BEFORE the D-Bus write. set_brightness can block
     # for several seconds (gdbus timeouts); a blank arriving in that window
-    # must still be able to save_state() the new value with flock -n.
+    # must still be able to save_state() the new value with a bounded
+    # flock -w wait (C640_KBD_SAVE_LOCK_WAIT).
     flock -u 201
     exec 201>&-
 
@@ -1526,7 +1562,35 @@ guard_unblank() {
 }
 
 handle_blank() {
-    save_state
+    local captured="" src=0 attempt
+    # Sample BEFORE writing 0: the write changes the live reading, so a
+    # recomputation afterwards could capture the (meaningless) blank-side 0
+    # or nothing at all.  The captured value is reused for every retry.
+    captured="$(compute_save_brightness 2> /dev/null || true)"
+    if save_state; then src=0; else src=$?; fi
+    if [ "$src" -ne 0 ] && [ -n "$captured" ]; then
+        for attempt in 1 2; do
+            if save_state "$captured"; then
+                src=0
+                break
+            else src=$?; fi
+            log_warn "blank: deferred save attempt $attempt failed (rc=$src)"
+        done
+    fi
+    if [ "$src" -ne 0 ]; then
+        # No copy of the new brightness exists.  Keep the LED ON rather than
+        # going dark with nothing to restore on unblank, and leave the value
+        # in the last-user cache so a later blank/save can still pick it up.
+        log_warn "blank: brightness NOT saved (rc=$src); leaving LED on, keeping captured=$captured in cache"
+        if [ -n "$captured" ]; then
+            if [ "$captured" = "0" ]; then
+                write_last_user 0 manual0
+            else
+                write_last_user "$captured" nonzero
+            fi
+        fi
+        return "$src"
+    fi
     local rc=0
     if set_brightness 0; then rc=0; else rc=$?; fi
     if [ "$rc" -ne 0 ]; then
@@ -1634,7 +1698,7 @@ monitor_login1() {
         case "$line" in
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
-                save_state
+                save_state || log_warn "prepare-for-sleep: save_state failed (rc=$?)"
                 # Drop a stale flag from any previous cycle; the hook's post
                 # phase will publish a fresh one after this resume.
                 rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
@@ -1718,6 +1782,7 @@ print_help() {
     echo "  C640_KBD_HANDOFF_RESUME=PATH   Override resume handoff flag (tests)"
     echo "  C640_KBD_RESUME_PROBE_MAX=N    Cap ScreenSaver polling after thaw (default 10s)"
     echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
+    echo "  C640_KBD_SAVE_LOCK_WAIT=N      Bounded wait for the state lock on save (default 2s)"
 }
 
 check_status() {
@@ -1776,7 +1841,10 @@ main() {
         exit 0
     fi
     if [ "${1:-}" = "--test-blank" ]; then
-        save_state
+        if ! save_state; then
+            echo "simulated blank: save failed" >&2
+            exit 1
+        fi
         local rc=0
         if set_brightness 0; then rc=0; else rc=$?; fi
         if [ "$rc" -ne 0 ]; then

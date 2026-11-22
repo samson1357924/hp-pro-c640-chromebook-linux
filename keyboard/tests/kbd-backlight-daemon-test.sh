@@ -24,6 +24,9 @@ DAEMON_ERR="$TMP_DIR/daemon.err"
 FLOCK_DIR="$TMP_DIR/flock"
 FLOCK_LOG="$TMP_DIR/flock.log"
 RECOVER_LOG="$TMP_DIR/recover.log"
+# P6-7/P6-8: records STATE_FILE's content at the moment set_brightness 0 runs,
+# proving the save happened before the LED was switched off.
+ORDER_FILE="$TMP_DIR/blank-order"
 # One-shot gate for ordered ScreenSaver answers (N2).  A file is required:
 # screensaver_tristate() is called from command substitutions, so an in-process
 # counter would be lost in each subshell.
@@ -204,25 +207,43 @@ STUB
 # Minimal real-ish flock: lock identity is the file opened on the fd (read
 # from /proc/self/fd), so fd 200/201/202 all contend on the same state lock.
 # The recorded PID lets a dead subshell's stale lock be reclaimed, so a no-op
-# `sleep` cannot wedge later cases.
+# `sleep` cannot wedge later cases.  `-w N` really polls the lockfile with
+# /bin/sleep 0.02 (the no-op stub in STUB_DIR must NOT be used here) and exits
+# 1 on timeout, so save_state's bounded wait is exercised end to end.
 cat > "$STUB_DIR/flock" << 'STUB'
 #!/bin/sh
 lock_dir="${STUB_FLOCK_DIR:-/tmp}"
 fd=""
 op=""
-for arg in "$@"; do
+wait_secs=0
+while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
     case "$arg" in
         -n) op=n ;;
         -u) op=u ;;
-        -w*) op=w ;;
+        -w)
+            op=w
+            if [ "$#" -gt 0 ]; then
+                wait_secs="$1"
+                shift
+            fi
+            ;;
+        -w*) op=w; wait_secs="${arg#-w}" ;;
         -x | -s) ;;
         [0-9]*) fd="$arg" ;;
     esac
 done
+case "$wait_secs" in
+    '' | *[!0-9]*) wait_secs=0 ;;
+esac
+# 50 polls per second (0.02s each).
+polls=$((wait_secs * 50))
 [ -n "$fd" ] || exit 0
 # Fault injection: fail the first N flock calls for one fd, modelling a
 # transient flock error even in blocking mode.  The counter lives next to the
-# lock files so reset_case's `rm -f "$FLOCK_DIR"/flock.*` clears it.
+# lock files so reset_case's `rm -f "$FLOCK_DIR"/flock.*` clears it.  It stays
+# BEFORE the lockfile check, so an injected failure never waits.
 fail_fd="${STUB_FLOCK_FAIL_FD:-}"
 fail_n="${STUB_FLOCK_FAIL_COUNT:-0}"
 if [ -n "$fail_fd" ] && [ "$fd" = "$fail_fd" ] && [ "$fail_n" -gt 0 ]; then
@@ -240,7 +261,7 @@ target="$(readlink "/proc/self/fd/$fd" 2> /dev/null || true)"
 [ -n "$target" ] || target="fd$fd"
 # Optional audit trail (off by default): lets a test assert that a specific
 # critical section really took STATE_LOCK (e.g. fd 207 in the resume unknown
-# convergence path).
+# convergence path, or fd 200 with op=w in save_state's bounded wait).
 printf 'flock fd=%s target=%s op=%s\n' "$fd" "$target" "$op" >> "${STUB_FLOCK_LOG:-/dev/null}" 2> /dev/null || true
 key="$(printf '%s\n' "$target" | cksum | cut -d' ' -f1)"
 lockfile="$lock_dir/flock.$key"
@@ -256,6 +277,22 @@ case "$op" in
                 exit 1
             fi
         fi
+        printf '%s\n' "$PPID" > "$lockfile" 2> /dev/null || true
+        exit 0
+        ;;
+    w)
+        tries=0
+        while [ -f "$lockfile" ]; do
+            old="$(cat "$lockfile" 2> /dev/null || echo "")"
+            if [ -z "$old" ] || ! kill -0 "$old" 2> /dev/null; then
+                break
+            fi
+            if [ "$tries" -ge "$polls" ]; then
+                exit 1
+            fi
+            /bin/sleep 0.02
+            tries=$((tries + 1))
+        done
         printf '%s\n' "$PPID" > "$lockfile" 2> /dev/null || true
         exit 0
         ;;
@@ -1773,6 +1810,313 @@ assert_eq "N10: first invalid-handoff poll returns FAIL" "1" "$rc1"
 assert_eq "N10: second invalid-handoff poll returns FAIL" "1" "$rc2"
 assert_eq "N10: invalid-handoff warning emitted exactly once across subshells" "1" "$(grep -c 'suspend handoff invalid' "$TMP_DIR/n10-first.err" || true)"
 assert_eq "N10: no repeat warning on the next poll" "0" "$(grep -c 'suspend handoff invalid' "$DAEMON_ERR" || true)"
+
+# ==========================================================================
+# Phase 3 (6th re-review #3).  save_state now has an explicit rc and a bounded
+# lock wait; handle_blank must not switch the LED off unless a copy of the new
+# brightness was persisted.  These cases exercise both the rc contract and the
+# two-process contention that used to be silently skipped.
+# ==========================================================================
+
+# P6-1. Successful save: rc=0 and the value is on disk.
+reset_case
+printf '30\n' > "$RAW_FILE"
+rc="$(run_fn_rc save_state)"
+assert_eq "P6-1: save_state success rc=0" "0" "$rc"
+assert_file "P6-1: saved value is 30" "$STATE_FILE" "30"
+
+# P6-2. flock failure: rc=1 (NOT a silent success) and no state is written.
+reset_case
+printf '30\n' > "$RAW_FILE"
+export STUB_FLOCK_FAIL_FD=200 STUB_FLOCK_FAIL_COUNT=1
+rc="$(run_fn_rc save_state)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "P6-2: lock failure rc=1" "1" "$rc"
+assert_absent "P6-2: no state written on lock failure" "$STATE_FILE"
+
+# P6-3. Value selection failure: rc=2 (distinct from lock failure).
+reset_case
+_orig_get_brightness_p63="$(declare -f get_brightness)"
+get_brightness() { printf 'garbage\n'; }
+rc="$(run_fn_rc save_state)"
+eval "$_orig_get_brightness_p63"
+assert_eq "P6-3: selection failure rc=2" "2" "$rc"
+assert_absent "P6-3: no state written on selection failure" "$STATE_FILE"
+
+# P6-4. Bounded wait really waits: a background holder owns STATE_LOCK for
+# 0.3s; save_state must use flock -w on fd 200 and succeed after it leaves.
+reset_case
+printf '30\n' > "$RAW_FILE"
+export STUB_FLOCK_LOG="$FLOCK_LOG"
+: > "$FLOCK_LOG"
+P64_HOLDER_MARKER="$TMP_DIR/p64-holder"
+rm -f "$P64_HOLDER_MARKER"
+(
+    exec 200> "$STATE_LOCK" || exit 1
+    flock -n 200 || exit 1
+    : > "$P64_HOLDER_MARKER"
+    /bin/sleep 0.3
+) &
+holder=$!
+for ((i = 0; i < 100; i++)); do
+    [ -f "$P64_HOLDER_MARKER" ] && break
+    /bin/sleep 0.01
+done
+assert_present "P6-4: background holder owns the lock" "$P64_HOLDER_MARKER"
+rc="$(run_fn_rc save_state)"
+wait "$holder" 2> /dev/null || true
+assert_eq "P6-4: save_state waited and succeeded" "0" "$rc"
+assert_file "P6-4: value saved after wait" "$STATE_FILE" "30"
+if grep -q 'flock fd=200 .* op=w' "$FLOCK_LOG"; then
+    ok "P6-4: save_state used flock -w on fd 200"
+else
+    bad "P6-4: no bounded-wait flock record: $(cat "$FLOCK_LOG")"
+fi
+export STUB_FLOCK_LOG=/dev/null
+
+# P6-5. Bounded wait timeout: lock stays busy past the limit -> rc=1, no write.
+reset_case
+printf '30\n' > "$RAW_FILE"
+export C640_KBD_SAVE_LOCK_WAIT=1
+P65_HOLDER_MARKER="$TMP_DIR/p65-holder"
+rm -f "$P65_HOLDER_MARKER"
+(
+    exec 200> "$STATE_LOCK" || exit 1
+    flock -n 200 || exit 1
+    : > "$P65_HOLDER_MARKER"
+    /bin/sleep 3
+) &
+holder=$!
+for ((i = 0; i < 100; i++)); do
+    [ -f "$P65_HOLDER_MARKER" ] && break
+    /bin/sleep 0.01
+done
+assert_present "P6-5: background holder owns the lock" "$P65_HOLDER_MARKER"
+rc="$(run_fn_rc save_state)"
+export C640_KBD_SAVE_LOCK_WAIT=2
+wait "$holder" 2> /dev/null || true
+assert_eq "P6-5: lock timeout rc=1" "1" "$rc"
+assert_absent "P6-5: no state written on timeout" "$STATE_FILE"
+
+# P6-6. The core regression: when EVERY save attempt fails, handle_blank must
+# leave the LED on (RAW unchanged), write no state, emit no gsd Set 0, and WARN.
+reset_case
+printf '30\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_FLOCK_FAIL_FD=200 STUB_FLOCK_FAIL_COUNT=9
+rc="$(run_fn_rc handle_blank)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "P6-6: handle_blank propagates save failure" "1" "$rc"
+assert_file "P6-6: LED left ON (raw still 30)" "$RAW_FILE" "30"
+assert_absent "P6-6: no state file" "$STATE_FILE"
+assert_eq "P6-6: no gsd Set 0" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'brightness NOT saved' "$DAEMON_ERR"; then
+    ok "P6-6: WARN explains why the LED stayed on"
+else
+    bad "P6-6: missing NOT-saved WARN (stderr: $(cat "$DAEMON_ERR"))"
+fi
+assert_file "P6-6: captured value kept in last-user cache" "$LAST_USER_FILE" "30"
+
+# P6-7. Positive timing proof: the first save fails, the retry with the
+# pre-blank snapshot succeeds, and only then is set_brightness 0 called.
+reset_case
+printf '30\n' > "$RAW_FILE"
+: > "$ORDER_FILE"
+export STUB_FLOCK_FAIL_FD=200 STUB_FLOCK_FAIL_COUNT=1
+_orig_set_p67="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_p67 ()/' > "$TMP_DIR/real_set_brightness_p67.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_p67.def"
+set_brightness() {
+    if [ "${1:-}" = "0" ]; then
+        cat "$STATE_FILE" > "$ORDER_FILE" 2> /dev/null || true
+    fi
+    real_set_brightness_p67 "$@"
+}
+run_fn handle_blank
+eval "$_orig_set_p67"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_file "P6-7: state held 30 when LED went off" "$ORDER_FILE" "30"
+assert_file "P6-7: saved value is 30" "$STATE_FILE" "30"
+assert_file "P6-7: LED finally off" "$RAW_FILE" "0"
+
+# P6-8. Two processes: a restore holds STATE_LOCK while probing ScreenSaver;
+# a blank arrives and must wait for the lock, save its new value, and only
+# then switch the LED off.  PENDING must be consumed by the restore's finalize.
+reset_case
+write_state 7
+printf '30\n' > "$RAW_FILE"
+: > "$ORDER_FILE"
+: > "$SET_LOG"
+isolate_retry_generation
+P68_PROBE_MARKER="$TMP_DIR/p68-in-probe"
+P68_RESTORE_WRITTEN_MARKER="$TMP_DIR/p68-restore-written"
+rm -f "$P68_PROBE_MARKER" "$P68_RESTORE_WRITTEN_MARKER"
+_orig_sched_p68="$(declare -f schedule_restore_retries)"
+schedule_restore_retries() { :; }
+_orig_tristate_p68="$(declare -f screensaver_tristate)"
+screensaver_tristate() {
+    : > "$P68_PROBE_MARKER"
+    /bin/sleep 0.3
+    printf 'inactive\n'
+}
+_orig_set_p68="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_p68 ()/' > "$TMP_DIR/real_set_brightness_p68.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_p68.def"
+set_brightness() {
+    if [ "${1:-}" = "0" ]; then
+        # Deterministic gate: the blank's off must be the last writer, as in a
+        # real re-blank race.  Wait for the in-flight restore's write of 7 to
+        # actually land instead of a fixed sleep that a loaded CI can outrun.
+        local waited=0
+        while [ ! -e "$P68_RESTORE_WRITTEN_MARKER" ]; do
+            if [ "$waited" -ge 100 ]; then
+                bad "P6-8: restore write of 7 never landed within 1s; blank off would race"
+                break
+            fi
+            /bin/sleep 0.01
+            waited=$((waited + 1))
+        done
+        cat "$STATE_FILE" > "$ORDER_FILE" 2> /dev/null || true
+    fi
+    real_set_brightness_p68 "$@"
+    if [ "${1:-}" = "7" ]; then
+        # The restore's write completed; release the blank's gate only after
+        # the real writer has returned (not merely after it was called).
+        : > "$P68_RESTORE_WRITTEN_MARKER"
+    fi
+}
+(
+    restore_state
+) 2> "$TMP_DIR/p68-restore.err" &
+restore_pid=$!
+for ((i = 0; i < 100; i++)); do
+    [ -f "$P68_PROBE_MARKER" ] && break
+    /bin/sleep 0.01
+done
+assert_present "P6-8: restore entered its slow ScreenSaver probe" "$P68_PROBE_MARKER"
+rc="$(run_fn_rc handle_blank)"
+wait "$restore_pid" 2> /dev/null || true
+eval "$_orig_set_p68"
+eval "$_orig_tristate_p68"
+eval "$_orig_sched_p68"
+assert_eq "P6-8: blank's save succeeded" "0" "$rc"
+assert_file "P6-8: new value 30 persisted" "$STATE_FILE" "30"
+assert_absent "P6-8: PENDING consumed by restore finalize" "$RESTORE_PENDING_FILE"
+assert_file "P6-8: LED finally off (raw 0)" "$RAW_FILE" "0"
+assert_file "P6-8: save happened before off" "$ORDER_FILE" "30"
+if grep -q 'keeping newer blank-time state 30' "$TMP_DIR/p68-restore.err"; then
+    ok "P6-8: restore kept the newer blank-time state"
+else
+    bad "P6-8: restore did not report keeping newer state ($(cat "$TMP_DIR/p68-restore.err"))"
+fi
+
+# P6-9. Pure contention variant: the lock is held on fd 201 (restore's fd),
+# and save_state's fd 200 must still wait for it and persist the value.
+reset_case
+printf '22\n' > "$RAW_FILE"
+export STUB_FLOCK_LOG="$FLOCK_LOG"
+: > "$FLOCK_LOG"
+P69_HOLDER_MARKER="$TMP_DIR/p69-holder"
+rm -f "$P69_HOLDER_MARKER"
+(
+    exec 201> "$STATE_LOCK" || exit 1
+    flock -n 201 || exit 1
+    : > "$P69_HOLDER_MARKER"
+    /bin/sleep 0.25
+) &
+holder=$!
+for ((i = 0; i < 100; i++)); do
+    [ -f "$P69_HOLDER_MARKER" ] && break
+    /bin/sleep 0.01
+done
+assert_present "P6-9: background holder owns the lock" "$P69_HOLDER_MARKER"
+rc="$(run_fn_rc save_state)"
+wait "$holder" 2> /dev/null || true
+assert_eq "P6-9: save under fd201 contention rc=0" "0" "$rc"
+assert_file "P6-9: value saved after waiting" "$STATE_FILE" "22"
+if grep -q 'flock fd=200 .* op=w' "$FLOCK_LOG"; then
+    ok "P6-9: contending save used bounded wait on fd 200"
+else
+    bad "P6-9: no fd200 bounded-wait record: $(cat "$FLOCK_LOG")"
+fi
+export STUB_FLOCK_LOG=/dev/null
+
+# P6-10. All retries failed, but the last-user cache (with metadata) keeps the
+# captured value usable: a later blank with the lock free saves it correctly.
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+export STUB_FLOCK_FAIL_FD=200 STUB_FLOCK_FAIL_COUNT=9
+rc="$(run_fn_rc handle_blank)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "P6-10: first blank cannot save" "1" "$rc"
+assert_file "P6-10: LED left on after failed save" "$RAW_FILE" "30"
+assert_absent "P6-10: no state after failed save" "$STATE_FILE"
+assert_file "P6-10: captured 0 kept in cache" "$LAST_USER_FILE" "0"
+if grep -q 'source=manual0' "$LAST_USER_META_FILE"; then
+    ok "P6-10: cache metadata records manual0"
+else
+    bad "P6-10: cache metadata lost source: $(cat "$LAST_USER_META_FILE")"
+fi
+rc="$(run_fn_rc handle_blank)"
+assert_eq "P6-10: later blank saves from cache" "0" "$rc"
+assert_file "P6-10: rescued value 0 persisted" "$STATE_FILE" "0"
+assert_file "P6-10: LED finally off" "$RAW_FILE" "0"
+
+# P6-11. The CLI --test-blank entry point must propagate a save failure.
+reset_case
+printf '30\n' > "$RAW_FILE"
+cli_rc=0
+cli_out="$(
+    XDG_RUNTIME_DIR="$D_STATE_DIR" \
+        C640_KBD_SYSFS_BRIGHTNESS="$FAKE_SYSFS" \
+        C640_KBD_SYSFS_MAX="$FAKE_MAX" \
+        STUB_FLOCK_DIR="$FLOCK_DIR" STUB_FLOCK_FAIL_FD=200 STUB_FLOCK_FAIL_COUNT=1 \
+        STUB_FLOCK_LOG=/dev/null \
+        STUB_GDBUS_LOG="$GDBUS_LOG" STUB_SET_LOG="$SET_LOG" \
+        STUB_ECTOOL_LOG="$TMP_DIR/ectool.log" \
+        STUB_RAW_FILE="$RAW_FILE" STUB_PCT_FILE="$PCT_FILE" \
+        STUB_KBD_RAW=42 STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false \
+        "$DAEMON" --test-blank 2> "$DAEMON_ERR"
+)" || cli_rc=$?
+assert_eq "P6-11: CLI --test-blank propagates save failure" "1" "$cli_rc"
+assert_file "P6-11: LED unchanged on CLI failure" "$RAW_FILE" "30"
+assert_absent "P6-11: no state on CLI failure" "$STATE_FILE"
+if grep -q 'simulated blank: save failed' "$DAEMON_ERR"; then
+    ok "P6-11: CLI reports the save failure"
+else
+    bad "P6-11: CLI error message missing: $(cat "$DAEMON_ERR")"
+fi
+
+# P6-12. Regression: the existing mid-restore blank (test #12) and the
+# PENDING guard still behave identically with the rc-bearing save_state.
+reset_case
+write_state 7
+isolate_retry_generation
+_orig_set_p612="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_p612 ()/' > "$TMP_DIR/real_set_brightness_p612.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_p612.def"
+set_brightness() {
+    printf '5\n' > "$LAST_USER_FILE"
+    save_state
+    real_set_brightness_p612 "$@"
+}
+run_fn restore_state
+eval "$_orig_set_p612"
+assert_file "P6-12: mid-restore blank still saved 5" "$STATE_FILE" "5"
+assert_file "P6-12: restore still wrote 7" "$RAW_FILE" "7"
+
+reset_case
+write_state 7
+printf '9\n' > "$RESTORE_PENDING_FILE"
+rc="$(run_fn_rc restore_state)"
+assert_eq "P6-12: PENDING guard still defers restore" "2" "$rc"
+assert_file "P6-12: staged PENDING value preserved" "$RESTORE_PENDING_FILE" "9"
+assert_file "P6-12: guarded restore writes nothing" "$RAW_FILE" "42"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
