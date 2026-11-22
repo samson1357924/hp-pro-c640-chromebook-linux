@@ -214,8 +214,8 @@ cat /sys/power/mem_sleep
   unresolved, user accepted), 2026-08-23 (EC 90% battery daemon + `c640-ec-sleep.sh`
   zero-window resume hook + standalone `ectool` LPC handshake verified; packaging
   iteration 2 `1.94.10-2` metadata prepared, driver source unchanged),
-  2026-08-29 (keyboard backlight sync installed — config-only at the time;
-  superseded by the 2026-10-31 entry below),
+  2026-08-29 (keyboard backlight sync installed — config-only at the time,
+  CI smoke passed; superseded by the 2026-10-31 entry below),
   2026-10-31 (keyboard top row re-measured: hwdb now maps the real AT scancodes
   `0x3b`-`0x44`; keyd `overloadt2` dual-role Search verified with the uinput
   test and with real-key passive capture; backlight sync installed and
