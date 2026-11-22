@@ -271,7 +271,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
-    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
+    | grep -E 'backends probed|RECOVERED|saved brightness|replacing invalid saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **Common fixes**:
@@ -317,7 +317,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     keeps the LED **on** (rather than going dark with nothing to restore) and leaves the
     captured value in the last-user cache. Check `C640_KBD_SAVE_LOCK_WAIT` (default 2s):
     a slow restore can hold `STATE_LOCK` until `save_state` times out. `save_state` rc is
-    `0` = saved, `1` = lock wait failed, `2` = value selection/write failed.
+    `0` = saved, `1` = lock wait failed, `2` = value selection/write failed. The blank
+    samples brightness **once** and the first `save_state "$captured"` uses that value
+    directly (no second sample that could see a blank-side `0` and save a stale cache
+    value); only an empty capture lets `save_state` sample on its own.
+  * `replacing invalid saved brightness with N` means the state file held an empty,
+    non-numeric, multi-line or binary value. First-wins protects only a **valid** saved
+    integer: under `STATE_LOCK` the bad file was atomically replaced with the brightness
+    captured before blanking. A genuine write failure still returns rc `2` and keeps the
+    LED on; nothing here changes the rc or retry contract above.
   * The resume path uses result codes `0 = RC_DONE` (write verified; `STATE` /
     `restore-pending` consumed), `1 = RC_FAIL` (bad input / I/O error) and `2 = RC_DEFER`
     (lock contention, a staged restore in flight or ScreenSaver active/unknown). Only
@@ -332,9 +340,24 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     signals, not failures — wait for the next poll or unlock the session.
   * `MANIFEST_INVALID ... original bytes left untouched` comes from the **installer**,
     not the daemon: `/var/lib/cros-enablement/install-manifest.json` is corrupt, so the
-    backup/writer paths fail closed and leave the file byte-for-byte unchanged. Repair
-    or deliberately remove it before reinstalling; never treat a corrupt manifest as an
-    empty one.
+    backup/writer paths fail closed and leave the file byte-for-byte unchanged. A wrong
+    **field type** is now also an invalid-manifest reason, not only malformed JSON: a
+    record `target` must be an absolute path string without NUL, `component`/
+    `installed_at`/`version`/`scope` must be strings when present, and
+    `was_existing`/`was_enabled`/`was_active`/`was_member` must be booleans (the string
+    `"false"` and the number `1` are rejected, not coerced); service `name`/`component`
+    and group `group`/`user`/`component` are required, while absent optional fields are
+    accepted (legacy v1). Repair or deliberately remove it before reinstalling; never
+    treat an invalid manifest as an empty one.
+  * `skipping manifest entry with non-absolute target` means the installer skipped a
+    pseudo-target (such as the fingerprint `package:libfprint-crfpmoc`) that cannot be a
+    record `target`; it is not an error.
+    `rollback of <component> failed; service/file state may be partial` means the restore
+    script crashed mid-run (services are restored before files) and rollback returned rc 1
+    — check service and file state manually.
+    Rollback, uninstall and group-membership removal all validate the manifest **before**
+    any `systemctl disable keyd` / `gpasswd -d` / file side effect and fail closed on an
+    invalid one.
 
 ---
 

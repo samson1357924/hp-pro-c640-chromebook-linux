@@ -79,6 +79,24 @@ untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續
 也不宣稱任何目標已受追蹤）。重裝前請修復或明確移除損毀的 manifest，以免 rollback
 覆蓋範圍被悄悄放棄。
 
+紀錄**按欄位型別驗證，絕不修補**（所有 reader/writer 共用同一驗證器）。record 的
+`target` 必須是無 NUL 的絕對路徑字串；`component`、`installed_at`、`version`、`scope`
+若存在必須是字串；`was_existing`、`was_enabled`、`was_active`、`was_member` 必須是布林
+——字串 `"false"` 與數字 `1` 會被拒絕，不會被轉換。service 的 `name`/`component`、
+group 的 `group`/`user`/`component` 為必填；選用欄位缺席仍接受（legacy v1 manifest），
+未知 key 忽略。型別錯誤是新的 `MANIFEST_INVALID` 原因（不只是 JSON 損毀），原檔位元組
+保持不變。非絕對的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`）在寫入紀錄前
+會被略過並記錄 `skipping manifest entry with non-absolute target`（Meson install plan
+的目的路徑也必須是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
+
+**rollback 在任何副作用前先做 gate：** `rollback_component()`、`uninstall_keyboard()` 與
+`remove_group_membership()` 會先驗證 manifest——在 `systemctl disable keyd` / `gpasswd -d`
+以及任何服務/檔案變更之前——驗證失敗即 fail closed（rc 1、不 log_success）。rollback
+將驗證過的文件經 stdin 餵給還原腳本（不再二次解析、沒有 TOCTOU 窗口）。由於服務先於檔案
+還原，腳本執行到一半失敗可能留下部分狀態：此時會記錄
+`rollback of <component> failed; service/file state may be partial` 並回傳 rc 1，
+而不是謊稱成功。
+
 ---
 
 ### 選項 2：`keyd` 常駐程式（進階多層與雙重角色）
@@ -210,20 +228,28 @@ UPower `KbdBacklight.SetBrightness`（raw），再降級到 `sysfs`/`ectool`。�
   `user.slice` 下只當純 handoff 寫入者：不寫 LED、不查 D-Bus、不刪 state、不延遲）
 
 **儲存/還原語意**：亮度 `0` 也是有效的已存值，且與其他數值走完全相同的寫入/驗證路徑。
-`save_state()` 是原子且 first-wins：熄滅時優先用當下非零讀數，所以熄滅前剛調整的亮度
-不會被 5 秒取樣的快取覆蓋。快取只用於 blank-side 的 0（韌體已關閉）、無法讀取的硬體，
-以及*新鮮*的手動關閉（`source=manual0` 附 `ts`，僅在 gsd-power 仍回報 0 時，於
-`C640_KBD_LAST_USER_TTL=15` 秒內有效）。sidecar `LAST_USER_META_FILE`
-（`c640-kbd-backlight.last-user.meta`）記錄 `source=nonzero|manual0` + `ts`；daemon
-重啟時會以當下讀數重新 seed（`cur=0` → `manual0`）。沒有 state 檔時完全不寫入，
-因此使用者手動調整會被保留。
+選值時優先用當下非零讀數，所以熄滅前剛調整的亮度不會被 5 秒取樣的快取覆蓋。快取只用於
+blank-side 的 0（韌體已關閉）、無法讀取的硬體，以及*新鮮*的手動關閉（`source=manual0`
+附 `ts`，僅在 gsd-power 仍回報 0 時，於 `C640_KBD_LAST_USER_TTL=15` 秒內有效）。sidecar
+`LAST_USER_META_FILE`（`c640-kbd-backlight.last-user.meta`）記錄
+`source=nonzero|manual0` + `ts`；daemon 重啟時會以當下讀數重新 seed（`cur=0` → `manual0`）。
+沒有 state 檔時完全不寫入，因此使用者手動調整會被保留。
 
-`save_state()` 有明確的 rc：`0` = 已有有效副本（原本就存在或剛寫入）、
+`save_state()` 是原子且**first-wins 只保護有效副本**：持鎖（`STATE_LOCK`）時會檢查已存值是
+單行、無 NUL 的純非負十進位整數。有效的既有副本絕不被覆寫，即使之後又熄滅一次；空白、
+非數字、多列或二進位的 state 檔不算副本——會在鎖內驗證後，以本次熄滅擷取到的值原子取代，
+並記錄 `replacing invalid saved brightness with N`。選值在取鎖前完成；只有真正的
+mktemp/寫入/驗證失敗才回 rc `2` 並保持 LED 亮著。
+
+`save_state()` 有明確的 rc：`0` = 已有有效副本（原本就存在或剛自我修復）、
 `1` = state lock 的 `flock -w` 逾時或出錯、`2` = 選值或寫入 state 失敗。
 `C640_KBD_SAVE_LOCK_WAIT` 限制該等待時間（預設 `2s`；`0` = 不等待）。熄滅時 daemon
-先取樣目前亮度、予以保存（首次失敗時以擷取到的值再重試兩次），**保存成功才關閉 LED**；
-若全部失敗，會記錄 `blank: brightness NOT saved (...)`、`blank: deferred save attempt N
-failed`、保持 LED 亮著，並把擷取值留在 last-user cache，讓下次熄滅仍有機會保存。
+**在關閉 LED 前只取樣一次**，而**第一次 `save_state "$captured"` 就直接使用該擷取值——
+不會再取樣第二次**。取樣兩次可能讓 blank-side 的硬體 `0` 回退到過期的 last-user cache
+（把真實的 `30` 存成 `8`），而這個錯誤值之後的重試永遠不會修正。只有當擷取結果本身為空時，
+`save_state` 才會自行取樣；重試則一律重用同一個擷取值。**保存成功才關閉 LED**；若全部失敗，
+會記錄 `blank: brightness NOT saved (...)`、`blank: deferred save attempt N failed`、
+保持 LED 亮著，並把擷取值留在 last-user cache，讓下次熄滅仍有機會保存。
 `--test-blank` 在保存失敗時回傳 1。
 
 `set_brightness()` 在至少一個後端接受寫入且讀回（`verify_brightness()`）確認後回傳 0
@@ -319,7 +345,8 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 
 **日誌：** daemon 訊息全部寫到 stderr；unit 設了 `StandardError=journal`，因此
 （含 `backends probed: gsd=... upower=...`、`RECOVERED (0 -> 1)`、
-`saved brightness`、`restoring brightness`、`restore verify (gen=...): ... not completed`、
+`saved brightness`、`replacing invalid saved brightness with N`、
+`restoring brightness`、`restore verify (gen=...): ... not completed`、
 `suspend handoff adoption deferred`、`restore deferred: ScreenSaver ...`、
 `resume deferred:`、`unblank: restore deferred`、`ignoring blank-side suspend handoff 0`、
 `blank: brightness NOT saved`、`blank: deferred save attempt N failed`、
@@ -347,15 +374,16 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 374 個案例（寫入鏈、重新探測、暫存/驗證、
-三態、喚醒結果碼/重試、熄滅前保存）；sleep hook 測試有 73 個案例（純 handoff、
-`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、不寫 LED）。rollback 測試
-（`tests/rollback-test.sh`，需 root）有 493 個案例，包含損毀 manifest fail-closed。
+所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
+三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
+測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 700 個案例，包含損毀
+與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate 與 pseudo-target 略過。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 374 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 493 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 700 個案例（需 root）
 ```
 
 ---

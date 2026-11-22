@@ -235,7 +235,7 @@
 
   ```bash
   journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
-    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
+    | grep -E 'backends probed|RECOVERED|saved brightness|replacing invalid saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **常見修復**：
@@ -275,7 +275,12 @@
     (rc=...)` 代表熄滅時無法保存新亮度。daemon 會**保持 LED 亮著**（不讓畫面全暗卻無值
     可還原），並把擷取值留在 last-user cache。請檢查 `C640_KBD_SAVE_LOCK_WAIT`
     （預設 2 秒）：緩慢的還原可能佔住 `STATE_LOCK` 導致 `save_state` 逾時。
-    `save_state` 的 rc：`0` = 已保存、`1` = 鎖等待失敗、`2` = 選值/寫入失敗。
+    `save_state` 的 rc：`0` = 已保存、`1` = 鎖等待失敗、`2` = 選值/寫入失敗。熄滅時
+    **只取樣一次**，第一次 `save_state "$captured"` 就直接使用該值（不會再取樣第二次而
+    讀到 blank-side 的 `0`、存進過期快取值）；只有擷取值為空時才會讓 `save_state` 自行取樣。
+  * `replacing invalid saved brightness with N` 代表 state 檔內容為空白、非數字、多列或
+    二進位。first-wins 只保護**有效的**已存整數：在 `STATE_LOCK` 內，損毀的檔案已被以熄滅前
+    擷取的亮度原子取代。真正寫入失敗仍回 rc `2` 並保持 LED 亮著；上述的 rc 與重試語意不變。
   * 喚醒路徑使用結果碼 `0 = RC_DONE`（寫入已驗證，`STATE`/`restore-pending` 已消耗）、
     `1 = RC_FAIL`（輸入無效／I/O 錯誤）、`2 = RC_DEFER`（鎖競爭、暫存還原仍在進行，
     或 ScreenSaver active/unknown）。只有 `RC_DONE` 會消耗 resume flag 與 handoff 檔；
@@ -286,8 +291,19 @@
     重試訊號而非失敗——等待下一次輪詢或解鎖工作階段即可。
   * `MANIFEST_INVALID ... original bytes left untouched` 來自**安裝器**而非 daemon：
     `/var/lib/cros-enablement/install-manifest.json` 已損毀，因此備份/寫入路徑 fail
-    closed，原檔保持位元組不變。重裝前請修復或明確移除它；切勿把損毀的 manifest
-    當成空 manifest。
+    closed，原檔保持位元組不變。**欄位型別錯誤**現在也是 manifest 無效的原因，不只是
+    JSON 格式錯誤：record 的 `target` 必須是無 NUL 的絕對路徑字串，`component`/
+    `installed_at`/`version`/`scope` 若存在必須是字串，
+    `was_existing`/`was_enabled`/`was_active`/`was_member` 必須是布林（字串 `"false"`
+    與數字 `1` 會被拒絕，不轉換）；service 的 `name`/`component` 與 group 的
+    `group`/`user`/`component` 為必填，選用欄位缺席仍接受（legacy v1）。重裝前請修復或
+    明確移除它；切勿把無效的 manifest 當成空 manifest。
+  * `skipping manifest entry with non-absolute target` 代表安裝器略過了無法作為 record
+    `target` 的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`），這不是錯誤。
+    `rollback of <component> failed; service/file state may be partial` 代表還原腳本執行到
+    一半崩潰（服務先於檔案還原）且 rollback 回傳 rc 1——請手動檢查服務與檔案狀態。
+    rollback、uninstall 與移除群組組成員都會在任何 `systemctl disable keyd` / `gpasswd -d`
+    / 檔案副作用**之前**先驗證 manifest，無效即 fail closed。
 
 ---
 

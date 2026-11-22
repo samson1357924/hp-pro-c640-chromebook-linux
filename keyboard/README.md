@@ -90,6 +90,29 @@ backup/writer paths refuse to continue (no target is backed up or claimed as tra
 while the manifest cannot be parsed). Repair or deliberately remove the corrupt manifest
 before reinstalling, so rollback coverage is never silently lost.
 
+Records are **validated by field type, never repaired** (one validator shared by all
+readers/writers). A record `target` must be an absolute path string with no NUL;
+`component`, `installed_at`, `version` and `scope` must be strings when present;
+`was_existing`, `was_enabled`, `was_active` and `was_member` must be booleans — the
+string `"false"` and the number `1` are rejected, not coerced. Service `name`/
+`component` and group `group`/`user`/`component` are required; an absent optional
+field is still accepted (legacy v1 manifests) and unknown keys are ignored. A wrong
+type is a new `MANIFEST_INVALID` reason (not only corrupt JSON) and leaves the original
+bytes untouched. Non-absolute pseudo-targets such as the fingerprint
+`package:libfprint-crfpmoc` are skipped before a record is written, logging
+`skipping manifest entry with non-absolute target` (Meson install-plan destinations must
+be absolute too), so the installer never writes a record its own validator would reject.
+
+**Rollback is gated before any side effect:** `rollback_component()`,
+`uninstall_keyboard()` and `remove_group_membership()` validate the manifest first —
+before `systemctl disable keyd` / `gpasswd -d` and before any service or file change —
+and fail closed (rc 1, no log_success) if it is invalid. Rollback feeds the exact
+validated document to the restore script over stdin (no second unvalidated parse, no
+TOCTOU window). Because services are restored before files, a mid-run script failure can
+leave partial state: it logs
+`rollback of <component> failed; service/file state may be partial` and returns rc 1
+instead of claiming success.
+
 ---
 
 ### Option 2: `keyd` Daemon (Advanced Multi-Layer & Dual-Role)
@@ -236,25 +259,38 @@ Installed automatically via `./keyboard/install-keyboard.sh`:
   under frozen `user.slice`; no LED write, no D-Bus, no state deletion, no delay)
 
 **Save/restore semantics:** a brightness of `0` is a valid saved value and uses the
-exact same write-and-verify path as any other value. `save_state()` is atomic and
-first-wins: on blank it prefers the current live non-zero reading, so a change made
-just before the blank is not lost to the 5s sampler cache. The cache is used for
-blank-side zeros (firmware already off), unreadable hardware and a *fresh* explicit
-manual-off (`source=manual0` with `ts`, honoured for `C640_KBD_LAST_USER_TTL=15`s only
-while gsd-power still reports 0). Its sidecar `LAST_USER_META_FILE`
-(`c640-kbd-backlight.last-user.meta`) records `source=nonzero|manual0` + `ts`; a daemon
-restart re-seeds the cache from the current reading (`cur=0` → `manual0`). With no
-state file nothing is written, so manual adjustments are preserved.
+exact same write-and-verify path as any other value. Brightness selection prefers the
+current live non-zero reading, so a change made just before the blank is not lost to the
+5s sampler cache. The cache is used for blank-side zeros (firmware already off),
+unreadable hardware and a *fresh* explicit manual-off (`source=manual0` with `ts`,
+honoured for `C640_KBD_LAST_USER_TTL=15`s only while gsd-power still reports 0). Its
+sidecar `LAST_USER_META_FILE` (`c640-kbd-backlight.last-user.meta`) records
+`source=nonzero|manual0` + `ts`; a daemon restart re-seeds the cache from the current
+reading (`cur=0` → `manual0`). With no state file nothing is written, so manual
+adjustments are preserved.
 
-`save_state()` has an explicit rc: `0` = a valid copy exists (already present or written
-now), `1` = the bounded `flock -w` on the state lock timed out or errored, `2` = value
-selection or the state write failed. `C640_KBD_SAVE_LOCK_WAIT` bounds that wait (default
-`2s`; `0` = no wait). On blank the daemon samples the current value first, saves it
-(retrying twice with the captured value if the first save fails), and **only turns the
-LED off after the save succeeds**; if every attempt fails it logs
-`blank: brightness NOT saved (...)`, `blank: deferred save attempt N failed`, leaves the
-LED on and keeps the captured value in the last-user cache so a later blank can still
-persist it. `--test-blank` exits 1 on a save failure.
+`save_state()` is atomic and **first-wins only for a valid copy**: while holding
+`STATE_LOCK` it checks that the saved value is a bare non-negative decimal integer on a
+single line. A valid existing copy is never overwritten, even by a later blank. An
+empty, non-numeric, multi-line or binary state file is not a copy — it is validated
+inside the lock and atomically replaced with this blank's captured value, logging
+`replacing invalid saved brightness with N`. Value selection happens before the lock;
+only a real mktemp/write/verify failure returns rc `2` and leaves the LED on.
+
+`save_state()` has an explicit rc: `0` = a valid copy exists (already present, or
+self-healed now), `1` = the bounded `flock -w` on the state lock timed out or errored,
+`2` = value selection or the state write failed. `C640_KBD_SAVE_LOCK_WAIT` bounds that
+wait (default `2s`; `0` = no wait). On blank the daemon samples the brightness **once,
+before switching the LED off**, and the first `save_state "$captured"` uses that captured
+value directly — it does **not** sample a second time. Sampling twice could let a
+blank-side hardware `0` fall back to a stale last-user cache (saving `8` instead of the
+real `30`), and that wrong value would never be corrected by a later retry. Only when
+the capture itself is empty does `save_state` sample on its own; retry attempts reuse
+the same captured value. The daemon **only turns the LED off after the save succeeds**;
+if every attempt fails it logs `blank: brightness NOT saved (...)`,
+`blank: deferred save attempt N failed`, leaves the LED on and keeps the captured value
+in the last-user cache so a later blank can still persist it. `--test-blank` exits 1 on
+a save failure.
 
 `set_brightness()` returns 0 (success) when at least one backend accepted the write and a
 readback (`verify_brightness()`) confirmed it; with no readable path at all the accepted
@@ -364,6 +400,7 @@ restore, so the user service must be running.
 **Logs:** all daemon messages go to stderr; the unit sets
 `StandardError=journal`, so they are visible in the user journal (including
 `backends probed: gsd=... upower=...`, `RECOVERED (0 -> 1)`, `saved brightness`,
+`replacing invalid saved brightness with N`,
 `restoring brightness`, `restore verify (gen=...): ... not completed`,
 `suspend handoff adoption deferred`, `restore deferred: ScreenSaver ...`,
 `resume deferred:`, `unblank: restore deferred`, `ignoring blank-side suspend handoff 0`,
@@ -394,16 +431,18 @@ accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node a
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 374 cases (write chain, re-probe,
-staging/verify, tristate, resume result codes/retry, save-before-blank) and the
-sleep-hook suite has 73 cases (pure handoff, `0600`/`chown`/atomic `mv`,
-`C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite (`tests/rollback-test.sh`,
-run as root) has 493 cases, including corrupt-manifest fail-closed.
+all state is in a temp dir. The daemon suite has 406 cases (write chain, re-probe,
+staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
+blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
+`0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
+(`tests/rollback-test.sh`, run as root) has 700 cases, including corrupt and
+field-type-invalid manifest fail-closed, the pre-mutation rollback gate and
+pseudo-target skipping.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 374 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 493 cases (root)
+sudo bash tests/rollback-test.sh                       # 700 cases (root)
 ```
 
 ---
