@@ -81,21 +81,46 @@ untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續
 
 紀錄**按欄位型別驗證，絕不修補**（所有 reader/writer 共用同一驗證器）。record 的
 `target` 必須是無 NUL 的絕對路徑字串；`component`、`installed_at`、`version`、`scope`
-若存在必須是字串；`was_existing`、`was_enabled`、`was_active`、`was_member` 必須是布林
-——字串 `"false"` 與數字 `1` 會被拒絕，不會被轉換。service 的 `name`/`component`、
-group 的 `group`/`user`/`component` 為必填；選用欄位缺席仍接受（legacy v1 manifest），
-未知 key 忽略。型別錯誤是新的 `MANIFEST_INVALID` 原因（不只是 JSON 損毀），原檔位元組
-保持不變。非絕對的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`）在寫入紀錄前
-會被略過並記錄 `skipping manifest entry with non-absolute target`（Meson install plan
-的目的路徑也必須是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
+若存在必須是字串。安全決策欄位 `was_existing`、`was_enabled`、`was_active`、
+`was_member` 為**必填布林**——所有真實 writer（v1.0 與 v2.0）一直都會寫出這些欄位，
+因此真正向後相容的只有頂層陣列缺席、keyd record 缺 `component`（回填）或缺 `scope`。
+字串 `"false"` 與數字 `1` 會被拒絕，不會被轉換；service 的 `name`/`component`、group 的
+`group`/`user`/`component` 為必填，其他選用欄位可缺席，未知 key 忽略。型別錯誤是新的
+`MANIFEST_INVALID` 原因（不只是 JSON 損毀），原檔位元組保持不變。非絕對的 pseudo-target
+（例如指紋的 `package:libfprint-crfpmoc`）在寫入紀錄前會被略過並記錄
+`skipping manifest entry with non-absolute target`（Meson install plan 的目的路徑也必須
+是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
 **rollback 在任何副作用前先做 gate：** `rollback_component()`、`uninstall_keyboard()` 與
 `remove_group_membership()` 會先驗證 manifest——在 `systemctl disable keyd` / `gpasswd -d`
 以及任何服務/檔案變更之前——驗證失敗即 fail closed（rc 1、不 log_success）。rollback
 將驗證過的文件經 stdin 餵給還原腳本（不再二次解析、沒有 TOCTOU 窗口）。由於服務先於檔案
 還原，腳本執行到一半失敗可能留下部分狀態：此時會記錄
-`rollback of <component> failed; service/file state may be partial` 並回傳 rc 1，
-而不是謊稱成功。
+`rollback of <component> failed; service/file state may be partial (retained records
+remain for retry)` 並回傳 rc 1，而不是謊稱成功。
+
+**rollback 安全語意：**
+
+* **原始狀態未知即 fail closed。** `was_existing` / `was_enabled` / `was_active` /
+  `was_member` 欄位缺失或型別錯誤代表「原始狀態未知」，絕非 `false`。此類紀錄不刪檔、
+  不停服務、不移除成員資格；保留紀錄、警告（`RECORD_STATE_UNKNOWN` /
+  `SERVICE_STATE_UNKNOWN`）並回 rc 1。`_keyd_managed_by_us()` 同樣在沒有有效布林快照時
+  拒絕停用/停止 keyd。
+* **目標缺席時仍會還原。** 對 `was_existing` 紀錄，rollback 不論目標是否還存在，一律找出
+  最早且符合的備份，先暫存再原子取代原始檔案/symlink（還原 owner、mode 與 symlink
+  目標）。只有確認成功才消耗紀錄；找不到備份時保留紀錄並警告（`[WARN NO BACKUP]`），
+  不會憑空建立檔案。
+* **還原失敗就保留紀錄。** 每一次 `systemctl` enable/disable/start/stop 都會檢查回傳碼
+  （含 timeout、stderr 與 spawn error）。失敗的服務會記錄 `SERVICE_RESTORE_FAILED` /
+  `ROLLBACK_INCOMPLETE`、保留紀錄供日後重試，並讓 rollback 回傳非 0；成功的則記錄
+  `[RESTORED SERVICE]`。
+* **先記錄群組 membership 再變更。** 對 `plugdev`，安裝器先把原始成員資格寫入 manifest，
+  再明確檢查 `sudo usermod -aG` 的 rc（移除 `|| true`）；若 `usermod` 失敗且先前沒有紀錄，
+  就移除剛寫入的紀錄。keyboard、fingerprint 與 EC 程式共用 `manifest_has_group` /
+  `manifest_remove_group` / `ensure_group_membership` helper。
+
+所有安裝 caller 會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e` 在
+rollback 失敗時提前中止收尾。
 
 ---
 
@@ -377,13 +402,15 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 700 個案例，包含損毀
-與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate 與 pseudo-target 略過。
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 927 個案例，包含損毀
+與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
+unknown 狀態 fail closed、目標缺席時從第一份備份還原、systemctl 還原檢查 rc 與
+先記錄後變更的群組 membership。
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 700 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 927 個案例（需 root）
 ```
 
 ---

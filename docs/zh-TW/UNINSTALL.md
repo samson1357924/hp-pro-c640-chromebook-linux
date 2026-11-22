@@ -38,6 +38,30 @@
 8. 移除指紋加密種子 `/var/lib/fprint/crfpmoc.key`，並提示發行版重裝原生
    `libfprint` 套件的指令。
 
+### Rollback 安全保證
+
+rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它。若下列保證無法達成，紀錄會
+**保留**在 `/var/lib/cros-enablement/install-manifest.json`（附警告；除找不到原始備份外
+並回 rc 1），供日後再次執行 `./setup.sh --uninstall` 重試——絕不會被當成已完成而悄悄
+略過：
+
+* **原始狀態未知絕不當成 false。** 安全欄位 `was_existing`、`was_enabled`、`was_active`、
+  `was_member` 為必填。若快照缺失或不是布林，rollback 拒絕自動還原該筆紀錄：檔案、
+  服務狀態與群組 membership 都保持原樣，記錄警告（`RECORD_STATE_UNKNOWN` /
+  `SERVICE_STATE_UNKNOWN`）並回 rc 1。同樣地，沒有有效的布林服務快照時，安裝器也不會
+  停用/停止 `keyd`。
+* **目標被移走時仍會還原。** 對安裝前就存在的檔案，rollback 一律從**第一份（最早）
+  備份**還原——即使期間安裝的檔案/symlink 已被移除——先暫存再原子取代原檔，並保留
+  owner、mode 與 symlink 目標。找不到備份時會保留紀錄並警告（`[WARN NO BACKUP]`），
+  不會憑空建立檔案。
+* **服務還原失敗就保留紀錄。** 每一次 `systemctl` enable/disable/start/stop 都會檢查
+  回傳碼（含 timeout、stderr 與 spawn error）。還原失敗時會記錄
+  `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE`、保留服務紀錄供重試，並回傳非 0，
+  而不是謊稱成功。
+* **先記錄群組 membership 再變更。** 安裝器先把原始 `plugdev` 成員資格寫入 manifest，
+  之後才明確檢查 `usermod` 的 rc。若變更失敗，就移除剛寫入的紀錄（除非已有較早的
+  紀錄），以免日後 uninstall 移除使用者自行取得的成員資格。
+
 ---
 
 ## 🛠️ 單一模組獨立解除安裝

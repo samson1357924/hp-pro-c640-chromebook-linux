@@ -343,21 +343,41 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     backup/writer paths fail closed and leave the file byte-for-byte unchanged. A wrong
     **field type** is now also an invalid-manifest reason, not only malformed JSON: a
     record `target` must be an absolute path string without NUL, `component`/
-    `installed_at`/`version`/`scope` must be strings when present, and
-    `was_existing`/`was_enabled`/`was_active`/`was_member` must be booleans (the string
-    `"false"` and the number `1` are rejected, not coerced); service `name`/`component`
-    and group `group`/`user`/`component` are required, while absent optional fields are
-    accepted (legacy v1). Repair or deliberately remove it before reinstalling; never
-    treat an invalid manifest as an empty one.
+    `installed_at`/`version`/`scope` must be strings when present, and the safety fields
+    `was_existing`/`was_enabled`/`was_active`/`was_member` are **required booleans** (a
+    missing one means unknown, never `false`; the string `"false"` and number `1` are
+    rejected, not coerced). Service `name`/`component` and group `group`/`user`/
+    `component` are required; other optional fields may be absent (legacy v1) and unknown
+    keys ignored. Repair or deliberately remove it before reinstalling; never treat an
+    invalid manifest as an empty one.
   * `skipping manifest entry with non-absolute target` means the installer skipped a
     pseudo-target (such as the fingerprint `package:libfprint-crfpmoc`) that cannot be a
     record `target`; it is not an error.
-    `rollback of <component> failed; service/file state may be partial` means the restore
-    script crashed mid-run (services are restored before files) and rollback returned rc 1
-    — check service and file state manually.
+    `rollback of <component> failed; service/file state may be partial (retained records
+    remain for retry)` means the restore script failed mid-run (services are restored
+    before files) and rollback returned rc 1 — the retained records let a later run retry.
     Rollback, uninstall and group-membership removal all validate the manifest **before**
     any `systemctl disable keyd` / `gpasswd -d` / file side effect and fail closed on an
     invalid one.
+  * `RECORD_STATE_UNKNOWN` / `SERVICE_STATE_UNKNOWN` means an original-state snapshot is
+    missing or not a boolean. Rollback treats it as **unknown, never false**: that file is
+    not deleted/restored, that service is not enabled/disabled/started/stopped, and the
+    record is kept with rc 1. No keyd disable either — `_keyd_managed_by_us()` needs a
+    valid bool service snapshot before it will disable/stop keyd.
+  * `[WARN NO BACKUP]` means a `was_existing` target has no first backup available; the
+    record is kept (no fake file is created) so a later retry can restore it.
+    `[RESTORED PREVIOUS BACKUP] <backup> -> <target>` means the original was rebuilt from
+    the oldest matching backup even though the installed file was already absent.
+    `RECORD_RESTORE_FAILED` / `RECORD_REMOVE_FAILED` means the file operation failed; the
+    record is kept for retry.
+  * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` means at least one `systemctl`
+    enable/disable/start/stop returned non-zero (or timed out / failed to spawn); those
+    service records are kept for retry and rollback returns rc 1. Re-run uninstall after
+    fixing the service manager — successful restores log `[RESTORED SERVICE]`.
+  * Group membership is now recorded **before** `usermod` runs: the installer persists the
+    original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
+    the change fails with no earlier record, removes the record it just wrote. Uninstall
+    consumes the group record only after `gpasswd -d` succeeds (`manifest_remove_group`).
 
 ---
 

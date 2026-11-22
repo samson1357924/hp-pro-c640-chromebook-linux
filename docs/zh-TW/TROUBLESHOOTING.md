@@ -293,17 +293,35 @@
     `/var/lib/cros-enablement/install-manifest.json` 已損毀，因此備份/寫入路徑 fail
     closed，原檔保持位元組不變。**欄位型別錯誤**現在也是 manifest 無效的原因，不只是
     JSON 格式錯誤：record 的 `target` 必須是無 NUL 的絕對路徑字串，`component`/
-    `installed_at`/`version`/`scope` 若存在必須是字串，
-    `was_existing`/`was_enabled`/`was_active`/`was_member` 必須是布林（字串 `"false"`
-    與數字 `1` 會被拒絕，不轉換）；service 的 `name`/`component` 與 group 的
-    `group`/`user`/`component` 為必填，選用欄位缺席仍接受（legacy v1）。重裝前請修復或
-    明確移除它；切勿把無效的 manifest 當成空 manifest。
+    `installed_at`/`version`/`scope` 若存在必須是字串；安全欄位
+    `was_existing`/`was_enabled`/`was_active`/`was_member` 為**必填布林**（缺失代表
+    未知，絕非 `false`；字串 `"false"` 與數字 `1` 會被拒絕，不轉換）。service 的
+    `name`/`component` 與 group 的 `group`/`user`/`component` 為必填，其他選用欄位可
+    缺席（legacy v1），未知 key 忽略。重裝前請修復或明確移除它；切勿把無效的 manifest
+    當成空 manifest。
   * `skipping manifest entry with non-absolute target` 代表安裝器略過了無法作為 record
     `target` 的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`），這不是錯誤。
-    `rollback of <component> failed; service/file state may be partial` 代表還原腳本執行到
-    一半崩潰（服務先於檔案還原）且 rollback 回傳 rc 1——請手動檢查服務與檔案狀態。
-    rollback、uninstall 與移除群組組成員都會在任何 `systemctl disable keyd` / `gpasswd -d`
-    / 檔案副作用**之前**先驗證 manifest，無效即 fail closed。
+    `rollback of <component> failed; service/file state may be partial (retained records
+    remain for retry)` 代表還原腳本執行到一半失敗（服務先於檔案還原）且 rollback 回傳
+    rc 1——保留的紀錄可供下次重試。rollback、uninstall 與移除群組組成員都會在任何
+    `systemctl disable keyd` / `gpasswd -d` / 檔案副作用**之前**先驗證 manifest，無效即
+    fail closed。
+  * `RECORD_STATE_UNKNOWN` / `SERVICE_STATE_UNKNOWN` 代表原始狀態快照缺失或不是布林。
+    rollback 視之為**未知，絕非 false**：不刪除/不還原該檔、不啟用/停用/啟動/停止該服務，
+    並保留紀錄且回 rc 1。keyd 也不會被停用——`_keyd_managed_by_us()` 需要有效的布林服務
+    快照才會停用/停止 keyd。
+  * `[WARN NO BACKUP]` 代表 `was_existing` 目標找不到第一份備份；紀錄會保留（不會憑空
+    建立檔案），供日後重試還原。`[RESTORED PREVIOUS BACKUP] <backup> -> <target>` 代表
+    即使安裝的檔案已不存在，仍從最早符合的備份重建原檔。`RECORD_RESTORE_FAILED` /
+    `RECORD_REMOVE_FAILED` 代表檔案操作失敗，紀錄保留供重試。
+  * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` 代表至少一個 `systemctl`
+    enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗）；這些服務紀錄會保留供
+    重試，rollback 回傳 rc 1。修好 service manager 後重跑 uninstall 即可——成功的還原會
+    記錄 `[RESTORED SERVICE]`。
+  * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
+    寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
+    紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗群組紀錄
+    (`manifest_remove_group`)。
 
 ---
 
