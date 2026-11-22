@@ -1012,6 +1012,17 @@ check_keyboard_status() {
 uninstall_keyboard() {
     log_section "Uninstalling Keyboard Top-Row hwdb Mapping & Backlight Sync"
 
+    # Fail closed before any service/group side effect. _keyd_managed_by_us()
+    # (below) calls `systemctl disable --now keyd` BEFORE rollback_component(),
+    # and both it and _normalize_keyd_link_manifest_component() would otherwise
+    # trust a schema-invalid manifest (e.g. was_enabled="false" is truthy in
+    # Python). A missing manifest keeps the previous no-op behaviour.
+    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
+    if [ -f "$MANIFEST_FILE" ] && ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to change service/group state during uninstall"
+        return 1
+    fi
+
     # Backfill the component on legacy (v1.0) KEYD_LINK records BEFORE any
     # rollback/placeholder decision. install_keyd_step() only normalizes while
     # the symlink is still present; an earlier install may already have removed

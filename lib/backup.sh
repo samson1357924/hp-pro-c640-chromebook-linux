@@ -26,8 +26,12 @@ MANIFEST_CREATED=0
 # Single validation source for all manifest readers/writers. Reads the path
 # from argv[1]; malformed input exits 2 with a MANIFEST_INVALID diagnostic on
 # stderr, valid input prints one canonical JSON document on stdout.
+# Validate only (never repair/coerce): a field that is present with the wrong
+# type is an invalid manifest, not a value to normalise. Optional fields may
+# be absent (legacy v1 records/services/groups), but present ones must have
+# the expected type so readers (realpath/truthiness) cannot crash or misbehave.
 _MANIFEST_VALIDATE_PY='
-import json, sys
+import json, sys, os
 
 mp = sys.argv[1]
 
@@ -35,12 +39,39 @@ def invalid(reason):
     print("MANIFEST_INVALID: %s: %s" % (mp, reason), file=sys.stderr)
     sys.exit(2)
 
+def check(obj, key, kind, where, required=False):
+    if key not in obj:
+        if required:
+            invalid("%s is missing required field %s" % (where, key))
+        return
+    value = obj[key]
+    if kind == "str":
+        ok = isinstance(value, str)
+    elif kind == "bool":
+        ok = isinstance(value, bool)
+    elif kind == "abspath":
+        # isinstance first: os.path.isabs(12) raises TypeError (traceback
+        # instead of a MANIFEST_INVALID diagnostic). Reject embedded NULs
+        # explicitly: os.path.isabs("/tmp/x\x00evil") is True, but
+        # os.path.realpath() in rollback raises ValueError and crashes the
+        # python after services have already been restored.
+        ok = isinstance(value, str) and os.path.isabs(value) and "\x00" not in value
+    else:
+        ok = False
+    if not ok:
+        invalid("%s.%s must be %s (got %s)" %
+                (where, key,
+                 {"str": "a string", "bool": "a boolean",
+                  "abspath": "an absolute path string"}[kind],
+                 repr(value)[:80]))
+
 try:
     with open(mp, "r") as f:
         data = json.load(f)
 except Exception as e:
     invalid("cannot parse manifest: %s" % e)
 
+# Container checks (unchanged semantics).
 if not isinstance(data, dict):
     invalid("top-level JSON value is not an object")
 if not isinstance(data.get("records"), list):
@@ -52,6 +83,35 @@ for key in ("records", "services", "groups"):
     for i, item in enumerate(data.get(key, [])):
         if not isinstance(item, dict):
             invalid("%s[%d] is not an object" % (key, i))
+
+# Field-level type checks. Unknown keys are ignored (forward compatibility).
+if "version" in data:
+    check(data, "version", "str", "manifest")
+
+for i, rec in enumerate(data["records"]):
+    where = "records[%d]" % i
+    check(rec, "target",       "abspath", where, required=True)
+    check(rec, "component",    "str",     where)
+    check(rec, "was_existing", "bool",    where)
+    check(rec, "installed_at", "str",     where)
+
+for i, svc in enumerate(data.get("services", [])):
+    where = "services[%d]" % i
+    check(svc, "name",        "str",  where, required=True)
+    check(svc, "component",   "str",  where, required=True)
+    check(svc, "was_enabled", "bool", where)
+    check(svc, "was_active",  "bool", where)
+    check(svc, "scope",       "str",  where)
+
+for i, grp in enumerate(data.get("groups", [])):
+    where = "groups[%d]" % i
+    check(grp, "group",      "str",  where, required=True)
+    check(grp, "user",       "str",  where, required=True)
+    check(grp, "component",  "str",  where, required=True)
+    check(grp, "was_member", "bool", where)
+
+# Canonical output (unchanged): defaults are only added at the top level;
+# record-level fields are never injected/reordered, preserving first-wins.
 data.setdefault("version", "2.0")
 data.setdefault("services", [])
 data.setdefault("groups", [])
@@ -172,11 +232,15 @@ backup_meson_install_plan() {
         [ -z "$dest" ] && continue
         backup_file_manifest_aware "$dest" "$component"
     done < <(python3 -c '
-import json, sys
+import json, sys, os
 plan = json.load(open(sys.argv[1]))
 skip = tuple(sys.argv[2].split())
 for dest in plan.values():
-    if isinstance(dest, str) and not dest.startswith(skip):
+    # Only absolute destinations can be tracked: manifest_add_entry stores
+    # this verbatim as a record target, which the validator requires to be
+    # an absolute path. A relative path from the install plan must not make
+    # our own manifest invalid on the next load.
+    if isinstance(dest, str) and os.path.isabs(dest) and not dest.startswith(skip):
         print(dest)
 ' "$plan" "$skip_prefixes")
 }
@@ -318,6 +382,14 @@ remove_group_membership() {
         return 0
     fi
     [ -f "$MANIFEST_FILE" ] || return 0
+    # Fail closed BEFORE gpasswd -d (a real side effect): a schema-invalid
+    # group record (e.g. was_member="false", truthy in Python) must never be
+    # accepted as evidence that we should delete a membership. This also
+    # protects the fingerprint/EC uninstall callers of this helper.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group membership for $2@$1"
+        return 1
+    fi
     # Only remove membership if WE recorded adding it (user was not already
     # a member before our install).
     local ours
@@ -405,6 +477,17 @@ manifest_add_entry() {
         return 0
     fi
 
+    # Pseudo-targets are not filesystem paths: fingerprint records
+    # "package:libfprint-crfpmoc" after installing a prebuilt package, and the
+    # validator requires every record target to be absolute. Writing such a
+    # record would make OUR OWN manifest invalid on the next load and fail
+    # closed for every component. No caller consumes these pseudo-records, so
+    # skip them (successfully) instead of poisoning the manifest.
+    if [ -z "${target:-}" ] || [[ "$target" != /* ]]; then
+        log_warn "skipping manifest entry with non-absolute target: ${target:-<empty>}"
+        return 0
+    fi
+
     # Load (and validate) BEFORE any mkdir/tee/write: a corrupt manifest must
     # never be replaced with an empty skeleton.
     if ! manifest_load; then
@@ -462,6 +545,17 @@ rollback_component() {
         return 0
     fi
 
+    # FAIL CLOSED before any mutation. This function used to read the manifest
+    # itself (without the validator) and restored services BEFORE files, so a
+    # schema-invalid record (e.g. target=12) would mutate services and then
+    # throw TypeError at os.path.realpath() — a partial rollback. Validating
+    # here, before DRY_RUN and before any service/file side effect, prevents
+    # that. The python below consumes this exact validated MANIFEST_JSON.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to roll back $target_comp"
+        return 1
+    fi
+
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Rollback would process records in $MANIFEST_FILE for component: $target_comp"
         return 0
@@ -470,7 +564,11 @@ rollback_component() {
     if command -v python3 > /dev/null 2>&1; then
         local allowed_prefixes
         allowed_prefixes="${CROS_ENABLEMENT_ALLOWED_PREFIXES:-/etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/}"
-        sudo python3 -c '
+        # Capture the python rc: a crash (e.g. an unexpectedly unvalidatable
+        # target) must NOT be reported as a successful rollback. Services are
+        # restored before files, so a mid-script failure can leave partial
+        # state behind and the caller has to know.
+        if ! printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
 import json, os, sys, shutil, glob, fnmatch
 
 manifest_path = sys.argv[1]
@@ -482,15 +580,10 @@ def in_scope(path):
     # Literal prefix (system defaults like /etc/) or glob pattern (tests)
     return any(path.startswith(p) or fnmatch.fnmatch(path, p) for p in allowed_prefixes)
 
-if not os.path.exists(manifest_path):
-    sys.exit(0)
-
-try:
-    with open(manifest_path, "r") as f:
-        data = json.load(f)
-except Exception as e:
-    print(f"Error reading manifest: {e}", file=sys.stderr)
-    sys.exit(1)
+# Consume the EXACT document that the fail-closed manifest_load gate above
+# validated (no second, unvalidated parse; no TOCTOU window). manifest_path
+# is still argv[1] for the final atomic write-back.
+data = json.load(sys.stdin)
 
 # Restore systemd service states BEFORE touching files, so units are still
 # present when systemctl disable/start is called.
@@ -601,7 +694,10 @@ data["records"] = remaining_records
 with open(tmp_manifest, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
-' "$MANIFEST_FILE" "$target_comp" "$BACKUP_BASE_DIR" "$allowed_prefixes"
+' "$MANIFEST_FILE" "$target_comp" "$BACKUP_BASE_DIR" "$allowed_prefixes"; then
+            log_error "rollback of $target_comp failed; service/file state may be partial"
+            return 1
+        fi
     else
         log_warn "python3 not found; automatic rollback unavailable. Files may need manual restoration."
     fi

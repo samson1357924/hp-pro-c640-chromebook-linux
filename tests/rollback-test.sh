@@ -3776,6 +3776,459 @@ test_missing_manifest_without_python3_is_untracked() {
 }
 
 # ---------------------------------------------------------------------------
+# 36. Field-level manifest schema validation: well-formed JSON with a field of
+#     the wrong type must fail closed everywhere (never repaired, never
+#     treated as empty). Regression for re-review finding #3.
+# ---------------------------------------------------------------------------
+
+test_manifest_field_type_payloads_fail_closed() {
+    local sandbox="/tmp/rollback-test-field-type-payloads"
+    local case_name payload before after manifest
+    manifest="$sandbox/manifest/install-manifest.json"
+    for case_name in numeric_target relative_target empty_target nul_target \
+        string_false_was_existing int_was_existing component_not_string \
+        installed_at_not_string version_not_string service_name_not_string \
+        service_component_not_string service_was_enabled_not_bool \
+        service_scope_not_string group_name_not_string \
+        group_was_member_not_bool; do
+        rm -rf "$sandbox"
+        mkdir -p "$sandbox/backups" "$sandbox/manifest"
+        case "$case_name" in
+            numeric_target)
+                payload='{"version":"2.0","records":[{"target":12,"component":"keyboard","was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            relative_target)
+                payload='{"version":"2.0","records":[{"target":"etc/demo.conf","component":"keyboard","was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            empty_target)
+                payload='{"version":"2.0","records":[{"target":"","component":"keyboard","was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            nul_target)
+                # os.path.isabs("/tmp/x\x00evil") is True, but the rollback's
+                # os.path.realpath() raises ValueError -> mid-rollback crash.
+                payload='{"version":"2.0","records":[{"target":"/tmp/x\u0000evil","component":"keyboard","was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            string_false_was_existing)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","component":"keyboard","was_existing":"false"}],"services":[],"groups":[]}'
+                ;;
+            int_was_existing)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","component":"keyboard","was_existing":1}],"services":[],"groups":[]}'
+                ;;
+            component_not_string)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","component":12,"was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            installed_at_not_string)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","component":"keyboard","was_existing":true,"installed_at":99}],"services":[],"groups":[]}'
+                ;;
+            version_not_string)
+                payload='{"version":2.0,"records":[],"services":[],"groups":[]}'
+                ;;
+            service_name_not_string)
+                payload='{"version":"2.0","records":[],"services":[{"name":12,"component":"keyboard","was_enabled":true}],"groups":[]}'
+                ;;
+            service_component_not_string)
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":[],"was_enabled":true}],"groups":[]}'
+                ;;
+            service_was_enabled_not_bool)
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","was_enabled":"true"}],"groups":[]}'
+                ;;
+            service_scope_not_string)
+                payload='{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"keyboard","scope":7}],"groups":[]}'
+                ;;
+            group_name_not_string)
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":12,"user":"u","component":"demo"}]}'
+                ;;
+            group_was_member_not_bool)
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo","was_member":"false"}]}'
+                ;;
+        esac
+        printf '%s' "$payload" > "$manifest"
+        before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+
+        run_sandboxed "$sandbox" '
+            source "$1/lib/backup.sh"
+            rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+            printf "%s\n" "$MANIFEST_CREATED" > "$2/created.txt"
+            printf "%s\n" "$MANIFEST_JSON" > "$2/json.txt"
+            rc=0; manifest_has_target "/tmp/probe" || rc=$?; printf "%s\n" "$rc" > "$2/has-rc.txt"
+            rc=0; manifest_add_entry "/tmp/probe" "demo" 0 || rc=$?; printf "%s\n" "$rc" > "$2/entry-rc.txt"
+            rc=0; manifest_add_service "probe.service" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/svc-rc.txt"
+            rc=0; manifest_add_group "plugdev" "testuser" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/grp-rc.txt"
+        '
+        assert_eq "1" "$(cat "$sandbox/load-rc.txt")" "[$case_name] manifest_load rc 1"
+        assert_eq "0" "$(cat "$sandbox/created.txt")" "[$case_name] CREATED=0"
+        assert_eq "" "$(cat "$sandbox/json.txt")" "[$case_name] MANIFEST_JSON empty"
+        assert_eq "2" "$(cat "$sandbox/has-rc.txt")" "[$case_name] has_target rc 2"
+        assert_eq "1" "$(cat "$sandbox/entry-rc.txt")" "[$case_name] add_entry rc 1"
+        assert_eq "1" "$(cat "$sandbox/svc-rc.txt")" "[$case_name] add_service rc 1"
+        assert_eq "1" "$(cat "$sandbox/grp-rc.txt")" "[$case_name] add_group rc 1"
+        after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        assert_eq "$before" "$after" "[$case_name] manifest bytes unchanged"
+        assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+            "[$case_name] no .tmp"
+        assert_contains "MANIFEST_INVALID" "$(tr -d '\000' < "$sandbox/log.txt")" \
+            "[$case_name] MANIFEST_INVALID logged"
+    done
+}
+
+test_schema_invalid_manifest_rollback_has_no_side_effects() {
+    local sandbox="/tmp/rollback-test-schema-invalid-rollback"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    mkdir -p "$sandbox/etc"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    : > "$sandbox/systemctl.log"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    # A well-formed service record is listed FIRST: the old rollback restored
+    # services before files, so without the fail-closed gate it would modify
+    # probe.service and then throw TypeError on target=12. Several fields are
+    # invalid at once here; the validator rejects target=12 first, so the
+    # was_member="false" trap is not exercised independently.
+    python3 - "$manifest" << 'PY'
+import json, sys
+d = {"version": "2.0",
+     "services": [{"name": "probe.service", "component": "demo",
+                   "was_enabled": True, "was_active": False, "scope": "system"}],
+     "records": [{"target": 12, "component": "demo", "was_existing": True}],
+     "groups": [{"group": "plugdev", "user": "testuser", "component": "demo",
+                 "was_member": "false"}]}
+with open(sys.argv[1], "w") as f:
+    json.dump(d, f, indent=2)
+PY
+    local before before_file
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    before_file="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$sandbox/etc/demo.conf")"
+
+    local rc=0
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    rc="$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)"
+    assert_eq "1" "$rc" "schema-invalid rollback: rc 1"
+    if grep -q 'probe.service' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "schema-invalid rollback: service must NOT be touched before failing"
+    else
+        ok
+    fi
+    assert_eq "$before_file" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$sandbox/etc/demo.conf")" \
+        "schema-invalid rollback: file bytes unchanged"
+    assert_eq "$before" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")" \
+        "schema-invalid rollback: manifest bytes unchanged (no rewrite)"
+    assert_contains "MANIFEST_INVALID" "$(cat "$sandbox/rollback.log")" \
+        "schema-invalid rollback: MANIFEST_INVALID logged"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "schema-invalid rollback: no .tmp"
+}
+
+test_schema_optional_fields_and_roundtrip_accepted() {
+    local sandbox="/tmp/rollback-test-schema-optional"
+    local case_name payload
+    for case_name in legacy_service legacy_record_no_component group_no_was_member; do
+        rm -rf "$sandbox"
+        mkdir -p "$sandbox/backups" "$sandbox/manifest"
+        case "$case_name" in
+            legacy_service)
+                payload='{"version":"1.0","records":[],"services":[{"name":"keyd","component":"keyboard"}]}'
+                ;;
+            legacy_record_no_component)
+                payload='{"version":"2.0","records":[{"target":"/tmp/x","was_existing":true}],"services":[],"groups":[]}'
+                ;;
+            group_no_was_member)
+                payload='{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"u","component":"demo"}]}'
+                ;;
+        esac
+        printf '%s' "$payload" > "$sandbox/manifest/install-manifest.json"
+        run_sandboxed "$sandbox" '
+            source "$1/lib/backup.sh"
+            rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+        '
+        assert_eq "0" "$(cat "$sandbox/load-rc.txt")" \
+            "[$case_name] optional/absent fields accepted"
+    done
+
+    # Round trip: a manifest written by our own writers must pass the very
+    # same validator (no "self-invalidating" manifest).
+    rm -rf "$sandbox"
+    setup_keyd_stubs "$sandbox" none
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; backup_file_manifest_aware "$2/etc/demo.conf" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/aware-rc.txt"
+        rc=0; manifest_add_service "probe.service" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/svc-rc.txt"
+        rc=0; manifest_add_group "plugdev" "testuser" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/grp-rc.txt"
+        rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+        printf "%s\n" "$MANIFEST_JSON" > "$2/json.txt"
+    '
+    assert_eq "0" "$(cat "$sandbox/aware-rc.txt" 2> /dev/null || echo MISSING)" \
+        "round-trip: backup_file_manifest_aware succeeds"
+    assert_eq "0" "$(cat "$sandbox/svc-rc.txt" 2> /dev/null || echo MISSING)" \
+        "round-trip: manifest_add_service succeeds"
+    assert_eq "0" "$(cat "$sandbox/grp-rc.txt" 2> /dev/null || echo MISSING)" \
+        "round-trip: manifest_add_group succeeds"
+    assert_eq "0" "$(cat "$sandbox/load-rc.txt" 2> /dev/null || echo MISSING)" \
+        "round-trip: our own manifest validates"
+    local canonical
+    canonical="$(cat "$sandbox/json.txt" 2> /dev/null || echo "")"
+    assert_contains '"version":"2.0"' "$canonical" "round-trip: canonical JSON keeps version"
+    local result
+    result="$(
+        python3 - "$sandbox/manifest/install-manifest.json" "$sandbox/etc/demo.conf" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+target = sys.argv[2]
+print(len(d.get("records", [])), len(d.get("services", [])), len(d.get("groups", [])),
+      int(any(r.get("target") == target for r in d.get("records", []))),
+      int(any(s.get("name") == "probe.service" for s in d.get("services", []))),
+      int(any(g.get("group") == "plugdev" for g in d.get("groups", []))))
+PY
+    )"
+    assert_eq "1 1 1 1 1 1" "$result" \
+        "round-trip: file/service/group records all present and accepted"
+}
+
+test_uninstall_schema_invalid_manifest_does_not_touch_services() {
+    local sandbox="/tmp/rollback-test-uninstall-schema-invalid"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    # was_enabled as a string is truthy in Python: without the uninstall gate,
+    # _keyd_managed_by_us() would still claim ownership and disable keyd before
+    # rollback ever sees the invalid manifest.
+    printf '%s' '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":"false","scope":"system"}],"groups":[]}' > "$manifest"
+    local before
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    : > "$sandbox/systemctl.log"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        rc=0; uninstall_keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/uninstall-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
+        "schema-invalid uninstall: rc 1"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "schema-invalid uninstall: must not disable keyd"
+    else
+        ok
+    fi
+    assert_eq "$before" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")" \
+        "schema-invalid uninstall: manifest bytes unchanged"
+}
+
+# ---------------------------------------------------------------------------
+# 37. P0: pseudo-targets (fingerprint's "package:libfprint-crfpmoc" record) must
+#     never poison our own manifest. manifest_add_entry skips non-absolute
+#     targets so the next load / backup gate / rollback still works.
+# ---------------------------------------------------------------------------
+
+test_non_absolute_manifest_entries_are_skipped() {
+    local sandbox="/tmp/rollback-test-nonabsolute-entry"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local target before after
+
+    # (a) Exact reviewer reproduction: no manifest yet, then fingerprint's
+    # prebuilt-package pseudo-target. add_entry succeeds (no consumer depends
+    # on the record), writes nothing, and load + backup gate still return 0.
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; manifest_add_entry "package:libfprint-crfpmoc" "fingerprint" "0" || rc=$?; printf "%s\n" "$rc" > "$2/entry-rc.txt"
+        rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+        rc=0; DRY_RUN=1 backup_file_manifest_aware "$2/etc/demo.conf" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/aware-rc.txt"
+    '
+    assert_eq "0" "$(cat "$sandbox/entry-rc.txt" 2> /dev/null || echo MISSING)" \
+        "pseudo-target: add_entry still returns 0"
+    assert_eq "0" "$(cat "$sandbox/load-rc.txt" 2> /dev/null || echo MISSING)" \
+        "pseudo-target: next manifest_load returns 0"
+    assert_eq "0" "$(cat "$sandbox/aware-rc.txt" 2> /dev/null || echo MISSING)" \
+        "pseudo-target: backup gate returns 0"
+    if [ ! -e "$manifest" ] && [ ! -L "$manifest" ]; then
+        ok
+    else
+        fail "pseudo-target: no manifest should be written for a skipped entry"
+    fi
+    assert_contains "skipping manifest entry with non-absolute target: package:libfprint-crfpmoc" \
+        "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "pseudo-target: skip is logged"
+
+    # (b) An existing valid manifest must stay byte-identical for every kind
+    # of non-absolute target (pseudo-target, empty, relative).
+    for case_name in pseudo_target empty_target relative_target; do
+        rm -rf "$sandbox"
+        mkdir -p "$sandbox/backups" "$sandbox/manifest"
+        printf '%s' '{"version":"2.0","records":[{"target":"/tmp/keep","component":"demo","was_existing":true}],"services":[],"groups":[]}' > "$manifest"
+        before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        case "$case_name" in
+            pseudo_target) target="package:libfprint-crfpmoc" ;;
+            empty_target) target="" ;;
+            relative_target) target="etc/demo.conf" ;;
+        esac
+        run_sandboxed "$sandbox" '
+            source "$1/lib/backup.sh"
+            rc=0; manifest_add_entry "$3" "fingerprint" "0" || rc=$?; printf "%s\n" "$rc" > "$2/entry-rc.txt"
+            rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+        ' "$target"
+        assert_eq "0" "$(cat "$sandbox/entry-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] add_entry returns 0"
+        assert_eq "0" "$(cat "$sandbox/load-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest still validates"
+        after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        assert_eq "$before" "$after" "[$case_name] manifest bytes unchanged"
+        assert_contains "skipping manifest entry with non-absolute target" \
+            "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+            "[$case_name] skip is logged"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 38. P1: a target with an embedded NUL passes os.path.isabs() but crashes
+#     os.path.realpath() in rollback. It must be rejected at the gate, before
+#     any service/file mutation.
+# ---------------------------------------------------------------------------
+
+test_nul_target_rollback_has_no_service_side_effects() {
+    local sandbox="/tmp/rollback-test-nul-rollback"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    mkdir -p "$sandbox/etc"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    : > "$sandbox/systemctl.log"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    python3 - "$manifest" << 'PY'
+import json, sys
+d = {"version": "2.0",
+     "records": [{"target": "/tmp/x\u0000evil", "component": "demo", "was_existing": True}],
+     "services": [{"name": "probe.service", "component": "demo",
+                   "was_enabled": True, "was_active": True, "scope": "system"}],
+     "groups": []}
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+    local before before_file
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    before_file="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$sandbox/etc/demo.conf")"
+
+    local rc=0
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "nul rollback: rc 1"
+    if grep -q 'probe.service' "$sandbox/systemctl.log" 2> /dev/null; then
+        fail "nul rollback: service must NOT be touched before failing"
+    else
+        ok
+    fi
+    assert_eq "$before_file" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$sandbox/etc/demo.conf")" \
+        "nul rollback: file bytes unchanged"
+    assert_eq "$before" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")" \
+        "nul rollback: manifest bytes unchanged"
+    assert_contains "MANIFEST_INVALID" "$(tr -d '\000' < "$sandbox/rollback.log")" \
+        "nul rollback: MANIFEST_INVALID logged"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "nul rollback: no .tmp"
+}
+
+# ---------------------------------------------------------------------------
+# 39. P2: the fail-closed manifest gate sits BEFORE the DRY_RUN early exit.
+#     With an existing manifest and no python3, rollback must still return 1
+#     (never a misleading "would rollback" success).
+# ---------------------------------------------------------------------------
+
+test_missing_python3_existing_manifest_dryrun_rollback_fails_closed() {
+    local sandbox="/tmp/rollback-test-no-python3-dryrun-rollback"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc" \
+        "$sandbox/failbin" "$sandbox/stub"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$sandbox/failbin/python3"
+    chmod +x "$sandbox/failbin/python3"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${STUB_SYSTEMCTL_LOG:?}"\nexit 0\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/systemctl"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}],"groups":[]}' > "$manifest"
+    local before
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    : > "$sandbox/systemctl.log"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$PATH" DRY_RUN=1 STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "no-python3/dry-run rollback: rc 1 (gate before DRY_RUN)"
+    if grep -q 'probe.service' "$sandbox/systemctl.log"; then
+        fail "no-python3/dry-run rollback: service must not be touched"
+    else
+        ok
+    fi
+    assert_eq "$before" \
+        "$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")" \
+        "no-python3/dry-run rollback: manifest bytes unchanged"
+    assert_contains "MANIFEST_INVALID" "$(cat "$sandbox/rollback.log")" \
+        "no-python3/dry-run rollback: MANIFEST_INVALID logged"
+}
+
+# ---------------------------------------------------------------------------
+# 40. The rollback python pipeline's rc must be propagated: a crash must not
+#     be reported as a successful rollback. The validator uses 3 args and the
+#     rollback pipeline 6 (stub contract); only the latter is refused here.
+# ---------------------------------------------------------------------------
+
+test_rollback_python_failure_returns_nonzero() {
+    local sandbox="/tmp/rollback-test-rollback-python-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[{"name":"probe.service","component":"demo","was_enabled":true,"was_active":true,"scope":"system"}],"groups":[]}' > "$manifest"
+    : > "$sandbox/systemctl.log"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ]; then
+    printf 'STUB: rollback python refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' 2> "$sandbox/rollback.log"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "rollback python failure: rc 1"
+    assert_contains "rollback of demo failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "rollback python failure: error logged"
+    if grep -qF "finished!" "$sandbox/log.txt"; then
+        fail "rollback python failure: no success line may be printed"
+    else
+        ok
+    fi
+    if grep -q 'probe.service' "$sandbox/systemctl.log"; then
+        fail "rollback python failure: service must not be touched"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -3859,6 +4312,14 @@ test_missing_manifest_still_creates_data
 test_legacy_manifest_missing_optional_fields_is_accepted
 test_corrupt_manifest_uninstall_does_not_touch_manifest
 test_missing_manifest_without_python3_is_untracked
+test_manifest_field_type_payloads_fail_closed
+test_schema_invalid_manifest_rollback_has_no_side_effects
+test_schema_optional_fields_and_roundtrip_accepted
+test_uninstall_schema_invalid_manifest_does_not_touch_services
+test_non_absolute_manifest_entries_are_skipped
+test_nul_target_rollback_has_no_service_side_effects
+test_missing_python3_existing_manifest_dryrun_rollback_fails_closed
+test_rollback_python_failure_returns_nonzero
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
