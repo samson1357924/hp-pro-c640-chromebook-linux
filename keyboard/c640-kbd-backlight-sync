@@ -18,6 +18,15 @@
 # turned off by firmware.
 set -euo pipefail
 
+# Restore / handoff result-code contract.  Only RC_DONE means "work actually
+# completed and was verified", and is therefore the only code allowed to
+# consume HANDOFF_RESUME_FILE / STATE_FILE.  RC_DEFER is retryable contention
+# or an active/unknown screen (keep flag, handoff and state); RC_FAIL is an
+# invalid input or an I/O failure (keep everything and warn).
+RC_DONE=0
+RC_FAIL=1
+RC_DEFER=2
+
 # Optional sysfs overrides (mainly for testing / non-standard kernels).
 SYSFS_BRIGHTNESS="${C640_KBD_SYSFS_BRIGHTNESS:-/sys/class/leds/chromeos::kbd_backlight/brightness}"
 SYSFS_MAX="${C640_KBD_SYSFS_MAX:-/sys/class/leds/chromeos::kbd_backlight/max_brightness}"
@@ -98,10 +107,6 @@ last_user_brightness=""
 # Consecutive on-screen zero readings; two are required before a 0 is treated
 # as user intent rather than gsd-power's transient blank-side write.
 _C640_ZERO_STREAK=0
-# -g keeps the array global even when this file is sourced from a function
-# (used by the stub test harness).
-declare -gA _C640_WARNED=()
-
 log() {
     echo "[c640-kbd-backlight-sync] $*" >&2
 }
@@ -111,14 +116,23 @@ log_warn() {
     echo "[WARN] [c640-kbd-backlight-sync] $*" >&2
 }
 
-# Rate-limited warning: each key is emitted at most once per process.
+# Rate-limited warning: each key is emitted at most once per runtime dir.
+# A marker FILE is used instead of an in-process array: most callers run in a
+# subshell (command substitutions, the retry/guard subshells, handle_resume
+# and the 5s sampler that calls it), so an array update there never reaches
+# the parent and "once" silently degraded to "every poll".  A marker in the
+# state dir is visible to every subshell; TOCTOU (two subshells logging the
+# same key at once) is harmless.
 log_warn_once() {
     local key="$1"
     shift
-    if [ -z "${_C640_WARNED[$key]:-}" ]; then
-        _C640_WARNED[$key]=1
-        log_warn "$@"
+    local marker="$STATE_DIR/.warned.$key"
+    if [ -e "$marker" ]; then
+        return 0
     fi
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    : > "$marker" 2> /dev/null || true
+    log_warn "$@"
 }
 
 log_debug() {
@@ -675,7 +689,9 @@ sample_brightness_once() {
     # handle_resume serialises itself with RESUME_LOCK, so racing with the
     # login1 monitor cannot issue two writes.
     if [ -f "$HANDOFF_RESUME_FILE" ]; then
-        handle_resume
+        # A DEFER (rc=2) keeps the flag for the next 5s tick; it is not a
+        # sampler failure.  `|| true` is required under set -e.
+        handle_resume || true
     fi
     if [ "$(screensaver_is_active)" = "true" ]; then
         _C640_ZERO_STREAK=0
@@ -865,10 +881,12 @@ recover_pending_state() {
 # blank already saved a replacement).  Returns the write's rc so the caller
 # can report failure and re-arm retries.
 #
-# The state lock is taken BLOCKING here.  Every holder is a short critical
-# section (save_state, a stage step, a retry's stage) and the slow brightness
-# write is already finished before finalize runs, so waiting cannot deadlock.
-# A non-blocking flock used to bail out on transient contention while PENDING
+# The state lock is taken with a bounded wait (flock -w 1) here.  Every holder
+# is a short critical section (save_state, a stage step, a retry's stage) and
+# the slow brightness write is already finished before finalize runs, so one
+# second is enough; on timeout we fall through to the degraded path below and
+# resolve PENDING anyway, so the staged value can never be orphaned.  A purely
+# non-blocking flock used to bail out on transient contention while PENDING
 # held the only copy of the saved value: STATE_FILE was already staged away,
 # so the PENDING guard made every later restore_state/cleanup skip forever
 # until a daemon restart.  If flock (or the open) still fails, resolve PENDING
@@ -877,7 +895,10 @@ finalize_restore() {
     local saved="$1" rc="$2" gen="$3"
     local have_lock=1
     if exec 203> "$STATE_LOCK"; then
-        if ! flock 203; then
+        # PENDING holds the only copy of the staged value, so wait briefly for
+        # a short holder instead of bailing out immediately.  The degraded
+        # path below is unchanged when the bounded wait still fails.
+        if ! flock -w 1 203; then
             log_warn "restore finalize (gen=$gen): flock failed; resolving PENDING without the lock"
             have_lock=0
         fi
@@ -909,6 +930,47 @@ finalize_restore() {
         flock -u 203
     fi
     exec 203>&-
+    return "$rc"
+}
+
+# A zero rc from set_brightness + finalize_restore is NOT proof that the
+# restore completed: finalize may have failed to consume STATE/PENDING (e.g. a
+# blank saved a replacement value), or the LED may never have changed.  Read
+# brightness outside the lock so a slow D-Bus query cannot starve save_state;
+# the STATE/PENDING check is then done under a short STATE_LOCK critical section.
+verify_restore_applied() {
+    local saved="$1" gen="$2"
+    local cur
+    cur="$(get_brightness 2> /dev/null || echo "")"
+    if ! exec 208> "$STATE_LOCK"; then
+        log_warn "restore verify (gen=$gen): cannot open state lock $STATE_LOCK"
+        return "$RC_DEFER"
+    fi
+    if ! flock -n 208; then
+        exec 208>&-
+        log "restore verify (gen=$gen): state lock busy; not completed"
+        return "$RC_DEFER"
+    fi
+    local rc="$RC_DONE"
+    if [ -f "$RESTORE_PENDING_FILE" ] || [ -f "$STATE_FILE" ]; then
+        log_warn "restore verify (gen=$gen): rc=0 but STATE/PENDING still exists; not completed"
+        rc="$RC_DEFER"
+    elif [[ "$cur" =~ ^[0-9]+$ ]] && [ "$((10#$cur))" -ne "$((10#$saved))" ]; then
+        log_warn "restore verify (gen=$gen): brightness readback $cur != $saved; not completed"
+        rc="$RC_FAIL"
+        # Do NOT re-seed STATE_FILE here: the mismatch may be a deliberate
+        # user brightness change made after the restore write.
+        # Known limitation: set_brightness() can report success via vrc=2
+        # ("no readback path; trust the write") on the legacy/ectool path,
+        # while this get_brightness() can still read a DIFFERENT backend
+        # (ectool or a stale sysfs value).  That cross-backend mismatch is
+        # reported as FAIL even though the write may have succeeded and the
+        # staged state is already consumed.  Re-seeding would overwrite a
+        # genuine user change, so it is deliberately not done; a later
+        # unblank can still save/restore from the last-user cache.
+    fi
+    flock -u 208 2> /dev/null || true
+    exec 208>&-
     return "$rc"
 }
 
@@ -987,11 +1049,12 @@ restore_state() {
     local force="${1:-0}"
     if ! exec 201> "$STATE_LOCK"; then
         log_warn "cannot open state lock $STATE_LOCK"
-        return 1
+        return "$RC_DEFER"
     fi
     if ! flock -n 201; then
         exec 201>&-
-        return 0
+        log "restore deferred: state lock busy; keeping state for retry"
+        return "$RC_DEFER"
     fi
 
     # PENDING is the marker for a restore between stage and finalize.  Such a
@@ -1003,7 +1066,7 @@ restore_state() {
         log "restore skipped: another restore is in progress (staged value pending)"
         flock -u 201
         exec 201>&-
-        return 0
+        return "$RC_DEFER"
     fi
 
     # Bump the generation only after owning the lock: two concurrent restores
@@ -1019,7 +1082,9 @@ restore_state() {
         rm -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null || true
         flock -u 201
         exec 201>&-
-        return 0
+        # Nothing usable to restore: a safe no-op, so the caller may consume
+        # its resume flag (DONE), unlike a deferral or a failure.
+        return "$RC_DONE"
     fi
 
     # Defer while the screen is still active (re-blank race, TROUBLESHOOTING
@@ -1033,7 +1098,7 @@ restore_state() {
         flock -u 201
         exec 201>&-
         schedule_restore_retries "$gen" 0.5 1.5 3
-        return 0
+        return "$RC_DEFER"
     fi
     if [ "$ss" != "inactive" ]; then
         log_warn "restore: explicit C640_KBD_RESUME_ALLOW_UNKNOWN=1 overrides ScreenSaver=$ss"
@@ -1048,7 +1113,7 @@ restore_state() {
         log_warn "cannot stage saved brightness $saved; keeping $STATE_FILE"
         flock -u 201
         exec 201>&-
-        return 1
+        return "$RC_FAIL"
     fi
     log "restoring brightness $saved"
     # Release the state lock BEFORE the D-Bus write. set_brightness can block
@@ -1064,9 +1129,15 @@ restore_state() {
     if [ "$rc" -ne 0 ]; then
         # Re-arm the same generation once; retries themselves do not recurse.
         schedule_restore_retries "$gen" 0.5 1.5 3
-        return 1
+        return "$RC_FAIL"
     fi
-    return 0
+    # A zero write rc alone does not mean the restore completed (e.g. a blank
+    # saved a new STATE_FILE while the write was in flight).
+    if verify_restore_applied "$saved" "$gen"; then :; else rc=$?; fi
+    if [ "$rc" -eq "$RC_DEFER" ]; then
+        schedule_restore_retries "$gen" 0.5 1.5 3
+    fi
+    return "$rc"
 }
 
 # --- Phase 4b: resume handoff ---------------------------------------------
@@ -1091,7 +1162,10 @@ _adopt_suspend_handoff_locked() {
     raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
     raw="${raw%$'\n'}"
     if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
-        log_warn "suspend handoff invalid ('$raw'); daemon state left unchanged"
+        # The sampler calls handle_resume every 5s in a subshell; the
+        # file-backed log_warn_once keeps a stale invalid handoff from
+        # flooding the journal (an in-process array cannot do this).
+        log_warn_once "suspend-handoff-invalid" "suspend handoff invalid ('$raw'); daemon state left unchanged"
         return 1
     fi
     val=$((10#$raw))
@@ -1102,6 +1176,8 @@ _adopt_suspend_handoff_locked() {
     # brightness.  Never let the blank-side 0 overwrite a valid non-zero saved
     # value: the next unlock must restore the user's brightness, not 0.  The
     # handoff is still consumed so a later cycle cannot re-adopt this stale 0.
+    # The RC_DONE here means "handoff consumed AND a valid STATE_FILE remains"
+    # for the following restore -- it does NOT mean a brightness was written.
     # All other cases are unchanged: 0 with no/absent/invalid saved state is
     # adopted (a real "user switched it off"), and a non-zero handoff wins.
     if [ "$val" -eq 0 ] && [ -f "$STATE_FILE" ] && [[ "$existing" =~ ^[0-9]+$ ]] && [ "$((10#$existing))" -ne 0 ]; then
@@ -1141,29 +1217,56 @@ _adopt_suspend_handoff_locked() {
 adopt_suspend_handoff() {
     if [ ! -f "$HANDOFF_SUSPEND_FILE" ]; then
         log_warn "suspend handoff $HANDOFF_SUSPEND_FILE missing; nothing to adopt"
-        return 0
+        # Neutral: the caller simply restores from a valid STATE_FILE if any.
+        return "$RC_DONE"
     fi
     (
         local arc=0
         if ! exec 205> "$STATE_LOCK"; then
             log_warn "cannot open state lock in adopt_suspend_handoff"
-            exit 0
+            exit "$RC_DEFER"
         fi
         if ! flock -n 205; then
             exec 205>&-
-            exit 0
+            log "suspend handoff adoption deferred: state lock busy"
+            exit "$RC_DEFER"
         fi
-        # Propagate the locked body's rc: 2 means "deferred while a staged
-        # restore owns STATE_FILE", which handle_resume() must honour by
-        # returning immediately instead of clearing the resume flag (P2-1).
+        # Propagate the locked body's rc: 2 (deferred while a staged restore
+        # owns STATE_FILE) and 1 (invalid handoff / I/O failure) both mean the
+        # resume flag and the handoff must be kept.  Anything outside the
+        # contract is treated as a failure, never as success.
         _adopt_suspend_handoff_locked || arc=$?
         # Release explicitly: the stub flock keys on the open fd and a real
         # flock would release on fd close, but leaving a lock file behind would
         # make the immediately following restore_state() skip its write.
         flock -u 205 2> /dev/null || true
         exec 205>&-
-        exit "$arc"
+        case "$arc" in
+            0 | 1 | 2) exit "$arc" ;;
+            *) exit "$RC_FAIL" ;;
+        esac
     )
+}
+
+# Map restore_state()'s result to the resume contract.  Only RC_DONE consumes
+# the resume flag; RC_DEFER and RC_FAIL keep it (and the saved state) for retry.
+_finish_resume_restore() {
+    local rc="$1"
+    case "$rc" in
+        "$RC_DONE")
+            rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+            log "resume: restore complete; resume flag consumed"
+            return "$RC_DONE"
+            ;;
+        "$RC_DEFER")
+            log "resume: restore deferred (rc=$rc); keeping resume flag and state for retry"
+            return "$RC_DEFER"
+            ;;
+        *)
+            log_warn "resume: restore failed (rc=$rc); keeping resume flag; state may already be consumed — captured value retained only in last-user cache"
+            return "$RC_FAIL"
+            ;;
+    esac
 }
 
 # The only implementation of "restore after thaw".  RESUME_LOCK makes the
@@ -1181,14 +1284,25 @@ _handle_resume_locked() {
 
     local adopt_rc=0
     adopt_suspend_handoff || adopt_rc=$?
-    if [ "$adopt_rc" -eq 2 ]; then
-        # P2-1: adoption was deferred because a staged restore owns STATE_FILE.
-        # Do NOT clear the resume flag, do NOT adopt again and do NOT restore:
-        # the in-flight restore (or its PENDING recovery) still owns this cycle.
-        # The sampler/startup handler retries after PENDING disappears.
-        log "resume: handoff adoption deferred (restore in flight); keeping flag and handoff"
-        return 0
-    fi
+    case "$adopt_rc" in
+        "$RC_DEFER")
+            # P2-1: adoption was deferred (a staged restore owns STATE_FILE, or
+            # the lock was busy).  Do NOT clear the resume flag, do NOT adopt
+            # again and do NOT restore: another writer still owns this cycle.
+            # The sampler/startup handler retries when the lock/PENDING clears.
+            log "resume: handoff adoption deferred (restore in flight); keeping flag and handoff"
+            return "$RC_DEFER"
+            ;;
+        "$RC_FAIL")
+            log_warn "resume: handoff adoption failed (rc=$adopt_rc); keeping flag and handoff"
+            return "$RC_FAIL"
+            ;;
+        0) ;;
+        *)
+            log_warn "resume: unexpected handoff adoption rc=$adopt_rc; keeping flag and handoff"
+            return "$RC_FAIL"
+            ;;
+    esac
 
     if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
         log_debug "resume: no resume flag present; continuing from saved state"
@@ -1200,7 +1314,7 @@ _handle_resume_locked() {
         # Nothing to restore: LED_CORE_SUSPENDRESUME normally kept the value.
         rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
         log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
-        return 0
+        return "$RC_DONE"
     fi
     saved=$((10#$saved))
 
@@ -1237,18 +1351,14 @@ _handle_resume_locked() {
             log "resume deferred: ScreenSaver still active (saved=$saved)"
             bump_restore_gen
             schedule_restore_retries "$restore_gen" 0.5 1.5 3
-            return 0
+            return "$RC_DEFER"
             ;;
         inactive)
             rc=0
             if restore_state; then rc=0; else rc=$?; fi
-            if [ "$rc" -eq 0 ]; then
-                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
-                log "resume: restore complete; resume flag consumed"
-            else
-                log_warn "resume: restore failed (rc=$rc); keeping resume flag and state for retry"
-            fi
-            return "$rc"
+            local frc=0
+            _finish_resume_restore "$rc" || frc=$?
+            return "$frc"
             ;;
         unknown)
             cur="$(get_brightness 2> /dev/null || echo "")"
@@ -1258,12 +1368,12 @@ _handle_resume_locked() {
             # under the lock also protects against a non-cooperative writer.
             if ! exec 207> "$STATE_LOCK"; then
                 log_warn "resume: cannot open state lock for convergence check; keeping state"
-                return 0
+                return "$RC_DEFER"
             fi
             if ! flock -n 207; then
                 exec 207>&-
                 log "resume: state lock busy during convergence check; keeping state"
-                return 0
+                return "$RC_DEFER"
             fi
             local latest=""
             latest="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
@@ -1271,7 +1381,7 @@ _handle_resume_locked() {
                 log "resume: unknown but a restore is in flight; not consuming state"
                 flock -u 207 2> /dev/null || true
                 exec 207>&-
-                return 0
+                return "$RC_DEFER"
             fi
             if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$((10#$cur))" -eq "$saved" ]; then
                 if [ "$latest" != "$saved" ]; then
@@ -1280,7 +1390,7 @@ _handle_resume_locked() {
                     log "resume: state changed to $latest during probe; keeping it"
                     flock -u 207 2> /dev/null || true
                     exec 207>&-
-                    return 0
+                    return "$RC_DEFER"
                 fi
                 # Safe convergence: firmware already shows the saved value and
                 # STATE_FILE is unchanged, so consume it WITHOUT any write.
@@ -1289,7 +1399,7 @@ _handle_resume_locked() {
                 log "resume: ScreenSaver unknown but brightness already $saved; state consumed without writing"
                 flock -u 207 2> /dev/null || true
                 exec 207>&-
-                return 0
+                return "$RC_DONE"
             fi
             flock -u 207 2> /dev/null || true
             exec 207>&-
@@ -1299,18 +1409,16 @@ _handle_resume_locked() {
                 # Explicit opt-in is the only allowed bypass of the
                 # fail-closed tristate guard inside restore_state.
                 if restore_state 1; then rc=0; else rc=$?; fi
-                if [ "$rc" -eq 0 ]; then
-                    rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
-                else
-                    log_warn "resume: opt-in unknown restore failed (rc=$rc); keeping resume flag"
-                fi
-                return "$rc"
+                local frc=0
+                _finish_resume_restore "$rc" || frc=$?
+                return "$frc"
             fi
             log_warn "resume: ScreenSaver unknown (current=$cur saved=$saved); deferring restore, handoff kept"
-            return 0
+            return "$RC_DEFER"
             ;;
     esac
-    return 0
+    # Defensive fallback: an unhandled tristate value is never a success.
+    return "$RC_DEFER"
 }
 
 handle_resume() {
@@ -1436,8 +1544,15 @@ handle_unblank() {
     # overwriting a brightness the user changed in between).
     if [ -f "$HANDOFF_RESUME_FILE" ]; then
         log "unblank: resume flag present; routing through handle_resume"
-        handle_resume
-        return $?
+        local rrc=0
+        handle_resume || rrc=$?
+        # DEFER is the normal "retry later" outcome, not a handler failure:
+        # callers using `handle_unblank || log_warn ...` must not print a false
+        # failure.  Other rc values still propagate.
+        if [ "$rrc" -eq "$RC_DEFER" ]; then
+            rrc=0
+        fi
+        return "$rrc"
     fi
     local saved=""
     if [ -f "$STATE_FILE" ]; then
@@ -1445,7 +1560,12 @@ handle_unblank() {
     fi
     local rc=0
     if restore_state; then rc=0; else rc=$?; fi
-    if [ "$rc" -ne 0 ]; then
+    # RC_DEFER is a normal retryable outcome (active screen, lock contention
+    # or a staged restore in flight), not a failure.  Printing "restore
+    # failed" here would cry wolf on every ordinary deferral.
+    if [ "$rc" -eq "$RC_DEFER" ]; then
+        log "unblank: restore deferred (rc=$rc); state kept for retry"
+    elif [ "$rc" -ne 0 ]; then
         log_warn "unblank: restore failed (rc=$rc)"
     elif [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
         guard_unblank "$saved"
@@ -1524,7 +1644,12 @@ monitor_login1() {
                 # The hook no longer probes D-Bus or writes brightness while
                 # user.slice is frozen.  It only published handoff files; the
                 # thawed daemon owns the single restore path now.
-                handle_resume || log_warn "login1: resume handler failed"
+                local rrc=0
+                handle_resume || rrc=$?
+                # rc=2 means deferred (retry via sampler/unblank), not failure.
+                if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
+                    log_warn "login1: resume handler failed (rc=$rrc)"
+                fi
                 ;;
         esac
     done
@@ -1634,7 +1759,7 @@ cleanup() {
     local rc=0
     if restore_state; then rc=0; else rc=$?; fi
     if [ "$rc" -ne 0 ]; then
-        log_warn "cleanup restore failed (rc=$rc); saved state was kept for retry"
+        log_warn "cleanup restore not completed (rc=$rc); state kept for retry"
     fi
     # kill background jobs
     jobs -p | xargs -r kill 2> /dev/null || true
@@ -1665,7 +1790,12 @@ main() {
         local rc=0
         if restore_state; then rc=0; else rc=$?; fi
         if [ "$rc" -ne 0 ]; then
-            echo "simulated unblank: restore failed (rc=$rc)" >&2
+            if [ "$rc" -eq "$RC_DEFER" ]; then
+                echo "simulated unblank: restore deferred (rc=$rc); state kept for retry" >&2
+            else
+                echo "simulated unblank: restore failed (rc=$rc)" >&2
+            fi
+            # Keep the non-zero CLI contract even for a deferral.
             exit 1
         fi
         echo "simulated unblank: restored"

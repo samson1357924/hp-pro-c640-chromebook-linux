@@ -24,6 +24,10 @@ DAEMON_ERR="$TMP_DIR/daemon.err"
 FLOCK_DIR="$TMP_DIR/flock"
 FLOCK_LOG="$TMP_DIR/flock.log"
 RECOVER_LOG="$TMP_DIR/recover.log"
+# One-shot gate for ordered ScreenSaver answers (N2).  A file is required:
+# screensaver_tristate() is called from command substitutions, so an in-process
+# counter would be lost in each subshell.
+STUB_ACTIVE_SEQ_FILE="$TMP_DIR/active-seq"
 HANDOFF_DIR="$TMP_DIR/handoff"
 HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
@@ -336,6 +340,7 @@ reset_case() {
     : > "$SET_LOG"
     : > "$DAEMON_ERR"
     : > "$RECOVER_LOG"
+    : > "$STUB_ACTIVE_SEQ_FILE"
     : > "$TMP_DIR/ectool.log"
     : > "$LEGACY_LOG"
     rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$LAST_USER_META_FILE" \
@@ -360,7 +365,9 @@ reset_case() {
     export STUB_ECTOOL_FAIL=0
     export C640_KBD_RESUME_PROBE_MAX=0
     export C640_KBD_RESUME_ALLOW_UNKNOWN=0
-    _C640_WARNED=()
+    # log_warn_once now uses markers in the state dir so it also rate-limits
+    # warnings emitted from subshells; clear them for a clean test case.
+    rm -f "$D_STATE_DIR"/.warned.* 2> /dev/null || true
     _C640_ZERO_STREAK=0
     last_user_brightness=""
 }
@@ -666,7 +673,7 @@ printf '30\n' > "$RAW_FILE"
 export STUB_GNOME_ACTIVE=true
 rc="$(run_fn_rc restore_state)"
 export STUB_GNOME_ACTIVE=false
-assert_eq "deferred saved 0: initial restore returns 0" "0" "$rc"
+assert_eq "deferred saved 0: initial restore returns 2 (DEFER)" "2" "$rc"
 assert_file "deferred saved 0: LED stays at 30 while ScreenSaver active" "$RAW_FILE" "30"
 assert_file "deferred saved 0: state retained while deferred" "$STATE_FILE" "0"
 rc="$(run_fn_rc restore_state)"
@@ -1412,6 +1419,360 @@ if grep -q 'flock fd=207 .* op=n' "$FLOCK_LOG"; then
 else
     bad "P2-2: STATE_LOCK not acquired (flock log: $(cat "$FLOCK_LOG"))"
 fi
+
+# ==========================================================================
+# Phase 1 (sixth re-review, P1): result-code contract
+# RC_DONE=0 is the ONLY code that may delete the resume flag / saved state.
+# RC_DEFER=2 (retryable) and RC_FAIL=1 (invalid/I/O) must keep it.
+# ==========================================================================
+
+# Retry subshells scheduled by earlier cases can outlive their parent
+# handle_resume() subshell (reset_case's `wait` only reaps this shell's jobs).
+# Push the generation far ahead of every earlier case so any stale retry sees
+# a generation mismatch and exits before touching this case's state.
+isolate_retry_generation() {
+    local n=20
+    while [ "$n" -gt 0 ]; do
+        bump_restore_gen
+        n=$((n - 1))
+    done
+}
+
+# N1. adopt_suspend_handoff() lock contention must DEFER rather than silently
+# succeed (the old `exit 0` made handle_resume delete the flag forever).
+reset_case
+isolate_retry_generation
+write_state 30
+write_handoff_suspend 30
+write_handoff_resume
+export STUB_FLOCK_FAIL_FD=205 STUB_FLOCK_FAIL_COUNT=1
+rc="$(run_fn_rc handle_resume)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+assert_eq "N1: adopt lock contention returns DEFER (2)" "2" "$rc"
+assert_present "N1: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_present "N1: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_file "N1: saved state retained" "$STATE_FILE" "30"
+assert_file "N1: LED untouched while deferred" "$RAW_FILE" "42"
+assert_eq "N1: no gsd write while deferred" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'handoff adoption deferred: state lock busy' "$DAEMON_ERR"; then
+    ok "N1: lock contention is logged as a deferral"
+else
+    bad "N1: no deferral log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+: > "$SET_LOG"
+run_fn sample_brightness_once
+assert_eq "N1: sampler retry issues exactly one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "N1: sampler retry writes adopted 30" "$RAW_FILE" "30"
+assert_absent "N1: state consumed after retry" "$STATE_FILE"
+assert_absent "N1: suspend handoff consumed after retry" "$HANDOFF_SUSPEND_FILE"
+assert_absent "N1: resume flag consumed after retry" "$HANDOFF_RESUME_FILE"
+
+# N2. Deferred restore: outer ScreenSaver probe sees inactive, but the
+# fail-closed probe inside restore_state() sees active.  Nothing is written and
+# the flag must survive; clearing the gate lets the next attempt converge.
+reset_case
+isolate_retry_generation
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+_orig_tristate_n2="$(declare -f screensaver_tristate)"
+declare -f screensaver_tristate | sed '1s/^screensaver_tristate ()/real_screensaver_tristate_n2 ()/' > "$TMP_DIR/real_tristate_n2.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_tristate_n2.def"
+_n2_gate=1
+screensaver_tristate() {
+    if [ "$_n2_gate" -eq 1 ]; then
+        local n
+        n="$(cat "$STUB_ACTIVE_SEQ_FILE" 2> /dev/null || echo 0)"
+        case "$n" in
+            '' | *[!0-9]*) n=0 ;;
+        esac
+        n=$((n + 1))
+        printf '%s\n' "$n" > "$STUB_ACTIVE_SEQ_FILE"
+        if [ "$n" -ge 2 ]; then
+            echo "active"
+            return 0
+        fi
+    fi
+    real_screensaver_tristate_n2
+}
+# The deferral normally schedules retries; suppressing them here keeps the
+# assertions below a pure observation of the first attempt.  Retry behaviour
+# is exercised by the explicit second handle_resume() call.
+_orig_schedule_n2="$(declare -f schedule_restore_retries)"
+schedule_restore_retries() { :; }
+rc="$(run_fn_rc handle_resume)"
+eval "$_orig_schedule_n2"
+eval "$_orig_tristate_n2"
+wait 2> /dev/null || true
+assert_eq "N2: inner active restore returns DEFER (2)" "2" "$rc"
+assert_present "N2: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_file "N2: state retained" "$STATE_FILE" "7"
+assert_file "N2: LED untouched" "$RAW_FILE" "42"
+assert_eq "N2: no gsd write while inner screen active" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'resume: restore deferred (rc=2)' "$DAEMON_ERR"; then
+    ok "N2: deferral is logged by the resume handler"
+else
+    bad "N2: no resume deferral log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "N2: retry after the gate cleared returns DONE" "0" "$rc"
+assert_eq "N2: retry issues one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "N2: retry writes 7" "$RAW_FILE" "7"
+assert_absent "N2: state consumed after retry" "$STATE_FILE"
+assert_absent "N2: resume flag consumed after retry" "$HANDOFF_RESUME_FILE"
+
+# N3. An invalid suspend handoff is a FAILURE (1), not a success: the resume
+# flag and the handoff are kept so a corrected handoff can be adopted later.
+reset_case
+isolate_retry_generation
+write_handoff_suspend "not-a-number"
+write_handoff_resume
+rc="$(run_fn_rc handle_resume)"
+assert_eq "N3: invalid handoff returns FAIL (1)" "1" "$rc"
+assert_present "N3: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_present "N3: invalid handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "N3: no state written" "$STATE_FILE"
+assert_eq "N3: no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'suspend handoff invalid' "$DAEMON_ERR"; then
+    ok "N3: invalid handoff warns"
+else
+    bad "N3: no invalid-handoff warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+write_handoff_suspend 7
+rc="$(run_fn_rc handle_resume)"
+assert_eq "N3: retry with a corrected handoff returns DONE" "0" "$rc"
+assert_eq "N3: retry issues one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "N3: retry writes 7" "$RAW_FILE" "7"
+assert_absent "N3: handoff consumed after retry" "$HANDOFF_SUSPEND_FILE"
+assert_absent "N3: resume flag consumed after retry" "$HANDOFF_RESUME_FILE"
+
+# N4. restore_state()'s own lock contention must DEFER, never return success.
+reset_case
+isolate_retry_generation
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_FLOCK_FAIL_FD=201 STUB_FLOCK_FAIL_COUNT=1
+rc="$(run_fn_rc handle_resume)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+assert_eq "N4: restore lock contention returns DEFER (2)" "2" "$rc"
+assert_present "N4: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_file "N4: state retained" "$STATE_FILE" "7"
+assert_file "N4: LED untouched" "$RAW_FILE" "42"
+assert_eq "N4: no gsd write while locked out" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'restore deferred: state lock busy' "$DAEMON_ERR"; then
+    ok "N4: restore lock contention is logged as deferred"
+else
+    bad "N4: no restore deferral log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "N4: retry once the lock is free returns DONE" "0" "$rc"
+assert_eq "N4: retry issues one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "N4: retry writes 7" "$RAW_FILE" "7"
+assert_absent "N4: state consumed after retry" "$STATE_FILE"
+assert_absent "N4: resume flag consumed after retry" "$HANDOFF_RESUME_FILE"
+
+# N5. A zero write/finalize rc is not proof of completion.  Simulate a blank
+# writing a NEW state right after finalize: verify must detect STATE_FILE and
+# return DEFER instead of letting handle_resume consume the flag.
+reset_case
+isolate_retry_generation
+write_state 7
+write_handoff_suspend 7
+write_handoff_resume
+_orig_finalize_n5="$(declare -f finalize_restore)"
+declare -f finalize_restore | sed '1s/^finalize_restore ()/real_finalize_n5 ()/' > "$TMP_DIR/real_finalize_n5.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_finalize_n5.def"
+_orig_schedule_n5="$(declare -f schedule_restore_retries)"
+# Keep the injected state in place for the assertions; retry scheduling itself
+# is covered by the other cases.
+schedule_restore_retries() { :; }
+finalize_restore() {
+    real_finalize_n5 "$@"
+    local frc=$?
+    printf '9\n' > "$STATE_FILE" # a blank saves a newer value after finalize
+    return "$frc"
+}
+rc="$(run_fn_rc handle_resume)"
+eval "$_orig_finalize_n5"
+eval "$_orig_schedule_n5"
+assert_eq "N5: lingering STATE after a zero-rc write returns DEFER (2)" "2" "$rc"
+assert_file "N5: newer state 9 is not consumed" "$STATE_FILE" "9"
+assert_present "N5: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_eq "N5: gsd did write the saved 7" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'STATE/PENDING still exists; not completed' "$DAEMON_ERR"; then
+    ok "N5: incomplete restore is logged"
+else
+    bad "N5: no 'not completed' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# N6. A zero write rc with a mismatching readback is a FAILURE, not success;
+# the state must NOT be re-seeded (the mismatch may be user intent).
+reset_case
+isolate_retry_generation
+write_handoff_suspend 7
+write_handoff_resume
+_orig_set_brightness_n6="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_n6 ()/' > "$TMP_DIR/real_set_brightness_n6.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_n6.def"
+set_brightness() {
+    real_set_brightness_n6 "$@"
+    local brc=$?
+    printf '42\n' > "$RAW_FILE" # hardware never applied the write
+    return "$brc"
+}
+rc="$(run_fn_rc handle_resume)"
+eval "$_orig_set_brightness_n6"
+wait 2> /dev/null || true
+assert_eq "N6: readback mismatch returns FAIL (1)" "1" "$rc"
+assert_present "N6: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_absent "N6: state not re-seeded after a mismatch" "$STATE_FILE"
+assert_absent "N6: pending absent" "$RESTORE_PENDING_FILE"
+if grep -q 'brightness readback 42 != 7; not completed' "$DAEMON_ERR"; then
+    ok "N6: readback mismatch warns"
+else
+    bad "N6: no readback warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# N7. handle_unblank() routes through handle_resume(), normalises DEFER to 0
+# (so dbus-monitor's `|| log_warn` does not print a false failure), and the
+# login1 monitor applies the same normalisation.
+reset_case
+isolate_retry_generation
+write_state 30
+write_handoff_suspend 30
+write_handoff_resume
+export STUB_FLOCK_FAIL_FD=205 STUB_FLOCK_FAIL_COUNT=3
+rc="$(run_fn_rc handle_unblank)"
+assert_eq "N7: handle_unblank normalises DEFER to 0" "0" "$rc"
+assert_present "N7: resume flag retained on deferral" "$HANDOFF_RESUME_FILE"
+assert_eq "N7: no gsd write while adoption is deferred" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'routing through handle_resume' "$DAEMON_ERR"; then
+    ok "N7: unblank routed through handle_resume"
+else
+    bad "N7: unblank did not route through handle_resume"
+fi
+: > "$DAEMON_ERR"
+if handle_unblank 2> /dev/null; then
+    ok "N7: \`handle_unblank || log_warn\` sees no false failure on DEFER"
+else
+    bad "N7: handle_unblank still reports a false failure on DEFER"
+fi
+# Same rc=2 path through monitor_login1's PrepareForSleep(false) branch.
+cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+printf '   boolean false\n'
+STUB
+chmod +x "$STUB_DIR/dbus-monitor"
+: > "$DAEMON_ERR"
+run_fn monitor_login1
+if grep -q 'login1: resume handler failed' "$DAEMON_ERR"; then
+    bad "N7: login1 monitor logged a false resume failure on DEFER"
+else
+    ok "N7: login1 monitor does not log DEFER as a failure"
+fi
+rm -f "$STUB_DIR/dbus-monitor"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_unblank)"
+assert_eq "N7: retry once the lock is free returns DONE" "0" "$rc"
+assert_eq "N7: retry issues one gsd Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "N7: retry writes 30" "$RAW_FILE" "30"
+assert_absent "N7: resume flag consumed after retry" "$HANDOFF_RESUME_FILE"
+
+# N8. CLI and cleanup compatibility: a deferral is reported, keeps state,
+# keeps the CLI's non-zero exit contract, and cleanup still exits 0.
+reset_case
+isolate_retry_generation
+write_state 7
+cli_rc=0
+cli_out="$(
+    XDG_RUNTIME_DIR="$D_STATE_DIR" \
+        C640_KBD_SYSFS_BRIGHTNESS="$TMP_DIR/no-sysfs-brightness" \
+        C640_KBD_SYSFS_MAX="$FAKE_MAX" \
+        C640_KBD_FORCE_LEGACY=0 \
+        STUB_FLOCK_FAIL_FD=201 STUB_FLOCK_FAIL_COUNT=1 \
+        STUB_GDBUS_LOG="$GDBUS_LOG" STUB_SET_LOG="$SET_LOG" \
+        STUB_ECTOOL_LOG="$TMP_DIR/ectool.log" STUB_FLOCK_DIR="$FLOCK_DIR" \
+        STUB_RAW_FILE="$RAW_FILE" STUB_PCT_FILE="$PCT_FILE" \
+        STUB_KBD_RAW=42 STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false \
+        "$DAEMON" --test-unblank 2> "$DAEMON_ERR"
+)" || cli_rc=$?
+assert_eq "N8: CLI --test-unblank keeps a non-zero exit on DEFER" "1" "$cli_rc"
+if grep -q 'simulated unblank: restore deferred (rc=2); state kept for retry' "$DAEMON_ERR"; then
+    ok "N8: CLI prints the deferred message"
+else
+    bad "N8: CLI did not print a deferred message (stderr: $(cat "$DAEMON_ERR"))"
+fi
+assert_file "N8: CLI deferral preserves state" "$STATE_FILE" "7"
+assert_file "N8: CLI deferral writes nothing" "$RAW_FILE" "42"
+
+reset_case
+isolate_retry_generation
+write_state 7
+export STUB_FLOCK_FAIL_FD=201 STUB_FLOCK_FAIL_COUNT=1
+cleanup_rc=0
+(cleanup) 2> "$DAEMON_ERR" || cleanup_rc=$?
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+assert_eq "N8: cleanup still exits 0 on DEFER" "0" "$cleanup_rc"
+if grep -q 'cleanup restore not completed (rc=2); state kept for retry' "$DAEMON_ERR"; then
+    ok "N8: cleanup logs 'not completed' for a deferral"
+else
+    bad "N8: cleanup did not log 'not completed' (stderr: $(cat "$DAEMON_ERR"))"
+fi
+assert_file "N8: cleanup deferral preserves state" "$STATE_FILE" "7"
+
+# N9 (P2). handle_unblank()'s no-flag path must treat restore_state()'s
+# RC_DEFER as a retryable outcome: log "restore deferred" (INFO), never
+# "restore failed".  An active ScreenSaver is a normal source of DEFER.
+reset_case
+isolate_retry_generation
+write_state 7
+export STUB_GNOME_ACTIVE=true
+# Suppress scheduled retries so this case observes only the first attempt.
+_orig_schedule_n9="$(declare -f schedule_restore_retries)"
+schedule_restore_retries() { :; }
+run_fn handle_unblank
+eval "$_orig_schedule_n9"
+export STUB_GNOME_ACTIVE=false
+wait 2> /dev/null || true
+assert_file "N9: no-flag DEFER keeps state for retry" "$STATE_FILE" "7"
+assert_eq "N9: no-flag DEFER writes nothing" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'unblank: restore failed' "$DAEMON_ERR"; then
+    bad "N9: no-flag DEFER logged a false 'restore failed'"
+else
+    ok "N9: no-flag DEFER does not log 'restore failed'"
+fi
+if grep -q 'unblank: restore deferred (rc=2); state kept for retry' "$DAEMON_ERR"; then
+    ok "N9: no-flag DEFER logs 'restore deferred'"
+else
+    bad "N9: no-flag DEFER missing 'restore deferred' log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# N10 (P3.1). log_warn_once must work from subshells: the sampler re-enters
+# handle_resume every 5s, so a stale invalid handoff must warn once, not on
+# every poll.  An in-process array cannot do this (subshell changes are lost).
+reset_case
+isolate_retry_generation
+write_handoff_suspend "not-a-number"
+write_handoff_resume
+rc1="$(run_fn_rc handle_resume)"
+cp "$DAEMON_ERR" "$TMP_DIR/n10-first.err"
+rc2="$(run_fn_rc handle_resume)"
+assert_eq "N10: first invalid-handoff poll returns FAIL" "1" "$rc1"
+assert_eq "N10: second invalid-handoff poll returns FAIL" "1" "$rc2"
+assert_eq "N10: invalid-handoff warning emitted exactly once across subshells" "1" "$(grep -c 'suspend handoff invalid' "$TMP_DIR/n10-first.err" || true)"
+assert_eq "N10: no repeat warning on the next poll" "0" "$(grep -c 'suspend handoff invalid' "$DAEMON_ERR" || true)"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
