@@ -3491,6 +3491,228 @@ test_uninstall_dryrun_keyd_ownership_messages() {
 }
 
 # ---------------------------------------------------------------------------
+# 35. P1 DATA SAFETY: a corrupt manifest must never be treated as an empty one
+#     and overwritten. Readers/writers fail closed and leave the original bytes
+#     untouched, so old backup/service/group records survive and a fresh V1
+#     backup can never be mislabelled as the ORIGINAL.
+# ---------------------------------------------------------------------------
+
+test_keyd_corrupt_manifest_fails_closed() {
+    local sandbox="/tmp/rollback-test-keyd-corrupt-manifest"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '{not json' > "$manifest"
+    local before
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller.log"; then
+        fail "corrupt manifest: CLI must return 1"
+    fi
+    # The gate sits before backup_file(), so the keyd step keeps its snapshot
+    # and marks it .failed with the usual "backup failed" reason.
+    assert_keyd_backup_failure_fails_closed "$sandbox" "corrupt manifest" 0 0 "backup failed"
+    local after
+    after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    assert_eq "$before" "$after" "corrupt manifest: manifest bytes unchanged"
+    local log
+    log="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
+    assert_contains "MANIFEST_INVALID" "$log" "corrupt manifest: invalid manifest logged"
+    assert_contains "corrupt/invalid" "$log" "corrupt manifest: log names the corrupt manifest"
+}
+
+test_keyd_reinstall_with_corrupt_manifest_keeps_first_backup() {
+    local sandbox="/tmp/rollback-test-keyd-corrupt-reinstall"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    printf 'ORIGINAL\n' > "$sandbox/etc/keyd/cros.conf"
+    ln -s cros.conf "$sandbox/etc/keyd/default.conf"
+    : > "$sandbox/systemctl.log"
+    local manifest="$sandbox/manifest/install-manifest.json"
+
+    if ! run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller1.log"; then
+        fail "corrupt reinstall: first install must succeed"
+        return 0
+    fi
+    local before after count backup_file
+    printf 'V1_MODIFIED\n' > "$sandbox/etc/keyd/cros.conf"
+    printf '{not json' > "$manifest"
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+
+    if run_keyd_caller "$sandbox" 1 0 0 0 2> "$sandbox/caller2.log"; then
+        fail "corrupt reinstall: second install must fail closed"
+    fi
+    assert_eq "1" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
+        "corrupt reinstall: CLI rc 1"
+    after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    assert_eq "$before" "$after" "corrupt reinstall: corrupt manifest bytes unchanged"
+    count="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | wc -l | tr -d '[:space:]')"
+    assert_eq "1" "$count" "corrupt reinstall: still exactly one cros.conf backup"
+    backup_file="$(find "$sandbox/backups" -name cros.conf 2> /dev/null | head -n 1)"
+    assert_eq "ORIGINAL" "$(cat "$backup_file" 2> /dev/null || echo MISSING)" \
+        "corrupt reinstall: first backup still holds ORIGINAL"
+    assert_eq "V1_MODIFIED" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "corrupt reinstall: live config left untouched"
+}
+
+test_corrupt_manifest_payloads_fail_closed() {
+    local sandbox="/tmp/rollback-test-corrupt-payloads"
+    local case_name payload before after tmp_count
+    local manifest="$sandbox/manifest/install-manifest.json"
+    for case_name in not_json truncated bad_records top_array bad_element bad_services; do
+        rm -rf "$sandbox"
+        mkdir -p "$sandbox/backups" "$sandbox/manifest"
+        case "$case_name" in
+            not_json) payload='{not json' ;;
+            truncated) payload='{"records": [' ;;
+            bad_records) payload='{"records": "bad"}' ;;
+            top_array) payload='[]' ;;
+            bad_element) payload='{"version":"2.0","records":[42],"services":[],"groups":[]}' ;;
+            bad_services) payload='{"version":"2.0","records":[],"services":"bad","groups":[]}' ;;
+        esac
+        printf '%s' "$payload" > "$manifest"
+        before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+
+        run_sandboxed "$sandbox" '
+            source "$1/lib/backup.sh"
+            rc=0; manifest_has_target "/tmp/probe" || rc=$?; printf "%s\n" "$rc" > "$2/has-rc.txt"
+            rc=0; manifest_add_entry "/tmp/probe" "demo" 0 || rc=$?; printf "%s\n" "$rc" > "$2/entry-rc.txt"
+            rc=0; manifest_add_service "probe.service" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/svc-rc.txt"
+            rc=0; manifest_add_group "plugdev" "testuser" "demo" || rc=$?; printf "%s\n" "$rc" > "$2/grp-rc.txt"
+        '
+        assert_eq "2" "$(cat "$sandbox/has-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest_has_target fails closed with rc 2"
+        assert_eq "1" "$(cat "$sandbox/entry-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest_add_entry returns 1"
+        assert_eq "1" "$(cat "$sandbox/svc-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest_add_service returns 1"
+        assert_eq "1" "$(cat "$sandbox/grp-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest_add_group returns 1"
+        after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+        assert_eq "$before" "$after" "[$case_name] corrupt manifest bytes unchanged"
+        tmp_count="$(find "$sandbox/manifest" -name '*.tmp' 2> /dev/null | wc -l | tr -d '[:space:]')"
+        assert_eq "0" "$tmp_count" "[$case_name] no .tmp file left behind"
+    done
+}
+
+test_backup_manifest_aware_corrupt_fails_closed() {
+    local sandbox="/tmp/rollback-test-corrupt-backup-gate"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    printf 'ORIGINAL\n' > "$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '{not json' > "$manifest"
+    local before after
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; backup_file_manifest_aware "$2/etc/demo.conf" "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "backup gate: corrupt manifest returns 1"
+    assert_eq "0" "$(find "$sandbox/backups" -type f 2> /dev/null | wc -l | tr -d '[:space:]')" \
+        "backup gate: no backup created"
+    after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    assert_eq "$before" "$after" "backup gate: manifest bytes unchanged"
+}
+
+test_missing_manifest_still_creates_data() {
+    local case_name sandbox
+    for case_name in entry service group; do
+        sandbox="/tmp/rollback-test-missing-manifest-$case_name"
+        rm -rf "$sandbox"
+        mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+        setup_keyd_stubs "$sandbox" none
+        run_sandboxed "$sandbox" '
+            export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+            source "$1/lib/backup.sh"
+            case "$3" in
+                entry) manifest_add_entry "/tmp/probe" "demo" 0 ;;
+                service) manifest_add_service "probe.service" "demo" ;;
+                group) manifest_add_group "plugdev" "testuser" "demo" ;;
+            esac
+            printf "%s\n" "$?" > "$2/writer-rc.txt"
+            printf "%s\n" "$MANIFEST_CREATED" > "$2/created.txt"
+        ' "$case_name"
+        assert_eq "0" "$(cat "$sandbox/writer-rc.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] writer succeeds when the manifest is absent"
+        assert_eq "1" "$(cat "$sandbox/created.txt" 2> /dev/null || echo MISSING)" \
+            "[$case_name] manifest_load reports CREATED=1"
+        local content
+        content="$(cat "$sandbox/manifest/install-manifest.json" 2> /dev/null || echo MISSING)"
+        case "$case_name" in
+            entry) assert_contains '"target": "/tmp/probe"' "$content" "[$case_name] entry written to new manifest" ;;
+            service) assert_contains '"name": "probe.service"' "$content" "[$case_name] service written to new manifest" ;;
+            group) assert_contains '"group": "plugdev"' "$content" "[$case_name] group written to new manifest" ;;
+        esac
+    done
+}
+
+test_legacy_manifest_missing_optional_fields_is_accepted() {
+    local sandbox="/tmp/rollback-test-legacy-optional"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"1.0","records":[{"target":"/tmp/legacy.conf","component":"demo","was_existing":true}]}' > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; manifest_load || rc=$?; printf "%s\n" "$rc" > "$2/load-rc.txt"
+        printf "%s\n" "$MANIFEST_CREATED" > "$2/created.txt"
+        printf "%s\n" "$MANIFEST_JSON" > "$2/json.txt"
+        rc=0; manifest_add_entry "/tmp/probe" "demo" 0 || rc=$?; printf "%s\n" "$rc" > "$2/write-rc.txt"
+    '
+    assert_eq "0" "$(cat "$sandbox/load-rc.txt" 2> /dev/null || echo MISSING)" \
+        "legacy optional fields: manifest_load accepts v1.0"
+    assert_eq "0" "$(cat "$sandbox/created.txt" 2> /dev/null || echo MISSING)" \
+        "legacy optional fields: CREATED=0"
+    assert_eq "0" "$(cat "$sandbox/write-rc.txt" 2> /dev/null || echo MISSING)" \
+        "legacy optional fields: writer succeeds"
+    local canonical
+    canonical="$(cat "$sandbox/json.txt" 2> /dev/null || echo "")"
+    assert_contains '"version":"1.0"' "$canonical" "legacy optional fields: canonical JSON keeps version"
+    assert_contains '"services":[]' "$canonical" "legacy optional fields: services defaulted in canonical JSON"
+    assert_contains '"groups":[]' "$canonical" "legacy optional fields: groups defaulted in canonical JSON"
+    local result
+    result="$(
+        python3 - "$manifest" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("version"), len(d.get("services", [])), len(d.get("groups", [])), len(d.get("records", [])))
+PY
+    )"
+    assert_eq "1.0 0 0 2" "$result" "legacy optional fields: version preserved, arrays filled, record appended"
+}
+
+test_corrupt_manifest_uninstall_does_not_touch_manifest() {
+    local sandbox="/tmp/rollback-test-uninstall-corrupt-manifest"
+    setup_keyd_uninstall_sandbox "$sandbox"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf '{not json' > "$manifest"
+    local before after
+    before="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    : > "$sandbox/systemctl.log"
+
+    local rc=0
+    run_keyd_uninstall "$sandbox" || rc=$?
+    assert_eq "1" "$rc" "corrupt uninstall: rc 1 (no automatic rollback)"
+    after="$(python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$manifest")"
+    assert_eq "$before" "$after" "corrupt uninstall: manifest bytes unchanged"
+    local log
+    log="$(cat "$sandbox/systemctl.log" 2> /dev/null || echo "")"
+    if grep -qE '(^|[[:space:]])disable([[:space:]]|$).*keyd' <<< "$log"; then
+        fail "corrupt uninstall: must not disable keyd without an ownership record"
+    else
+        ok
+    fi
+    assert_eq "USER_OWN_CONFIG" "$(cat "$sandbox/etc/keyd/cros.conf" 2> /dev/null || echo MISSING)" \
+        "corrupt uninstall: cros.conf left untouched"
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -3566,6 +3788,13 @@ test_uninstall_keeps_keyd_without_service_record
 test_uninstall_manifest_without_services_does_not_disable_keyd
 test_keyd_managed_by_us_fail_safe
 test_uninstall_dryrun_keyd_ownership_messages
+test_keyd_corrupt_manifest_fails_closed
+test_keyd_reinstall_with_corrupt_manifest_keeps_first_backup
+test_corrupt_manifest_payloads_fail_closed
+test_backup_manifest_aware_corrupt_fails_closed
+test_missing_manifest_still_creates_data
+test_legacy_manifest_missing_optional_fields_is_accepted
+test_corrupt_manifest_uninstall_does_not_touch_manifest
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

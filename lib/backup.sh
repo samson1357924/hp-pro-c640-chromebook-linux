@@ -15,17 +15,92 @@ BACKUP_BASE_DIR="${CROS_ENABLEMENT_BACKUP_DIR:-/var/backups/cros-enablement}"
 MANIFEST_DIR="${CROS_ENABLEMENT_MANIFEST_DIR:-/var/lib/cros-enablement}"
 MANIFEST_FILE="$MANIFEST_DIR/install-manifest.json"
 
+# Results of the most recent manifest_load(). Every reader and writer shares
+# these so a corrupt manifest can never be mistaken for an empty one and
+# silently overwritten (which would erase all earlier backup/service/group
+# records and make a fresh V1 backup look like the ORIGINAL).
+MANIFEST_JSON=""
+# shellcheck disable=SC2034 # read by callers/tests after manifest_load()
+MANIFEST_CREATED=0
+
+# Single validation source for all manifest readers/writers. Reads the path
+# from argv[1]; malformed input exits 2 with a MANIFEST_INVALID diagnostic on
+# stderr, valid input prints one canonical JSON document on stdout.
+_MANIFEST_VALIDATE_PY='
+import json, sys
+
+mp = sys.argv[1]
+
+def invalid(reason):
+    print("MANIFEST_INVALID: %s: %s" % (mp, reason), file=sys.stderr)
+    sys.exit(2)
+
+try:
+    with open(mp, "r") as f:
+        data = json.load(f)
+except Exception as e:
+    invalid("cannot parse manifest: %s" % e)
+
+if not isinstance(data, dict):
+    invalid("top-level JSON value is not an object")
+if not isinstance(data.get("records"), list):
+    invalid("records is missing or not a list")
+for key in ("services", "groups"):
+    if key in data and not isinstance(data[key], list):
+        invalid("%s is not a list" % key)
+for key in ("records", "services", "groups"):
+    for i, item in enumerate(data.get(key, [])):
+        if not isinstance(item, dict):
+            invalid("%s[%d] is not an object" % (key, i))
+data.setdefault("version", "2.0")
+data.setdefault("services", [])
+data.setdefault("groups", [])
+print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+'
+
+manifest_load() {
+    # shellcheck disable=SC2034 # MANIFEST_CREATED is read by callers/tests
+    MANIFEST_JSON=""
+    MANIFEST_CREATED=0
+    # -e/-L together: a dangling symlink is NOT "missing" and must never be
+    # replaced with a fresh empty manifest.
+    if [ ! -e "$MANIFEST_FILE" ] && [ ! -L "$MANIFEST_FILE" ]; then
+        MANIFEST_JSON='{"records":[],"services":[],"version":"2.0","groups":[]}'
+        MANIFEST_CREATED=1
+        return 0
+    fi
+    local output
+    if ! output="$(python3 -c "$_MANIFEST_VALIDATE_PY" "$MANIFEST_FILE" 2>&1)"; then
+        log_error "MANIFEST_INVALID: $output (manifest at $MANIFEST_FILE is corrupt/invalid; original bytes left untouched)"
+        MANIFEST_JSON=""
+        MANIFEST_CREATED=0
+        return 1
+    fi
+    MANIFEST_JSON="$output"
+    # shellcheck disable=SC2034 # read by callers/tests
+    MANIFEST_CREATED=0
+    return 0
+}
+
 manifest_has_target() {
-    # $1=target; returns 0 if already tracked in the manifest, 1 otherwise
-    [ -f "$MANIFEST_FILE" ] || return 1
-    python3 -c '
-import json, sys, os
-mp, t = sys.argv[1], sys.argv[2]
-if not os.path.exists(mp):
-    sys.exit(1)
-d = json.load(open(mp))
-sys.exit(0 if any(r.get("target") == t for r in d.get("records", [])) else 1)
-' "$MANIFEST_FILE" "$1" 2> /dev/null || return 1
+    # $1=target; 0=tracked (reinstall), 1=not tracked (safe to back up),
+    # 2=manifest corrupt/unreadable (fail closed; never conflated with 1).
+    if ! manifest_load; then
+        return 2
+    fi
+    local rc=0
+    printf '%s' "$MANIFEST_JSON" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+target = sys.argv[1]
+if any(isinstance(r, dict) and r.get("target") == target for r in data.get("records", [])):
+    sys.exit(0)
+sys.exit(1)
+' "$1" 2> /dev/null || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        return 2
+    fi
+    return "$rc"
 }
 
 backup_file_manifest_aware() {
@@ -34,10 +109,22 @@ backup_file_manifest_aware() {
     # (first backup) instead of overwriting it with our custom version, so
     # rollback can always restore the pre-customization file.
     local target="$1" component="$2"
-    if manifest_has_target "$target"; then
-        log_info "Reinstall: keeping original backup for $target"
-        return 0
-    fi
+    local probe_rc=0
+    manifest_has_target "$target" || probe_rc=$?
+    case "$probe_rc" in
+        0)
+            log_info "Reinstall: keeping original backup for $target"
+            return 0
+            ;;
+        1) ;; # untracked target: safe to back up
+        *)
+            # Fail closed BEFORE backup_file: a corrupt manifest must not be
+            # treated as "untracked" and then have a fresh V1 backup written
+            # over it (the new backup would be mislabelled as the ORIGINAL).
+            log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to back up $target"
+            return 1
+            ;;
+    esac
     local existed=0
     [ -e "$target" ] || [ -L "$target" ] && existed=1
     if ! backup_file "$target"; then
@@ -109,6 +196,10 @@ manifest_add_service() {
         log_dryrun "Would record service state: $1"
         return 0
     }
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record service state for $1"
+        return 1
+    fi
     local is_user=0
     local scope="system"
     # Detect user service by path or --global cat success
@@ -145,16 +236,11 @@ manifest_add_service() {
         systemctl is-active "$1" > /dev/null 2>&1 && active=1 || active=0
     fi
     sudo mkdir -p "$MANIFEST_DIR"
-    sudo python3 -c '
+    local write_rc=0
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
 import json, sys, os
 mp, name, comp, enabled, active, scope = sys.argv[1:7]
-data = {"version":"2.0","records":[],"services":[],"groups":[]}
-if os.path.exists(mp):
-    try:
-        with open(mp) as f:
-            data = json.load(f)
-    except Exception:
-        pass
+data = json.load(sys.stdin)
 data.setdefault("version", "2.0")
 data.setdefault("records", [])
 data.setdefault("services", [])
@@ -169,7 +255,9 @@ tmp = mp + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp, mp)
-' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active" "$scope"
+' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active" "$scope" || write_rc=$?
+    [ "$write_rc" -le 1 ] || write_rc=1
+    return "$write_rc"
 }
 
 manifest_add_group() {
@@ -183,21 +271,20 @@ manifest_add_group() {
         log_dryrun "Would record group: $2@$1"
         return 0
     }
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record group $2@$1"
+        return 1
+    fi
     local was_member="${4:-0}"
     if [ "$was_member" != "0" ] && [ "$was_member" != "1" ]; then
         id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1 || was_member=0
     fi
     sudo mkdir -p "$MANIFEST_DIR"
-    sudo python3 -c '
+    local write_rc=0
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
 import json, sys, os
 mp, group, user, comp, member = sys.argv[1:6]
-data = {"version":"2.0","records":[],"services":[],"groups":[]}
-if os.path.exists(mp):
-    try:
-        with open(mp) as f:
-            data = json.load(f)
-    except Exception:
-        pass
+data = json.load(sys.stdin)
 data.setdefault("version", "2.0")
 data.setdefault("records", [])
 data.setdefault("services", [])
@@ -211,7 +298,9 @@ tmp = mp + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp, mp)
-' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member"
+' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member" || write_rc=$?
+    [ "$write_rc" -le 1 ] || write_rc=1
+    return "$write_rc"
 }
 
 remove_group_membership() {
@@ -310,6 +399,13 @@ manifest_add_entry() {
         return 0
     fi
 
+    # Load (and validate) BEFORE any mkdir/tee/write: a corrupt manifest must
+    # never be replaced with an empty skeleton.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record $target"
+        return 1
+    fi
+
     sudo mkdir -p "$MANIFEST_DIR"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -324,21 +420,11 @@ manifest_add_entry() {
         log_warn "python3 not found; install manifest cannot be updated. Rollback for this file will be unavailable."
         return 1
     fi
-    sudo python3 -c '
+    local write_rc=0
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
 import json, sys, os
-manifest_path = sys.argv[1]
-target = sys.argv[2]
-comp = sys.argv[3]
-existing = sys.argv[4] == "1"
-ts = sys.argv[5]
-
-data = {"version":"2.0","records":[],"services":[],"groups":[]}
-if os.path.exists(manifest_path):
-    try:
-        with open(manifest_path, "r") as f:
-            data = json.load(f)
-    except Exception:
-        data = {"version":"2.0","records":[],"services":[],"groups":[]}
+manifest_path, target, comp, existing, ts = sys.argv[1:6]
+data = json.load(sys.stdin)
 
 data.setdefault("version", "2.0")
 data.setdefault("records", [])
@@ -348,7 +434,7 @@ data["records"] = [r for r in data["records"] if r.get("target") != target]
 data["records"].append({
     "target": target,
     "component": comp,
-    "was_existing": existing,
+    "was_existing": existing == "1",
     "installed_at": ts
 })
 
@@ -356,7 +442,9 @@ tmp_manifest = manifest_path + ".tmp"
 with open(tmp_manifest, "w") as f:
     json.dump(data, f, indent=2)
 os.replace(tmp_manifest, manifest_path)
-' "$MANIFEST_FILE" "$target" "$component" "$was_existing" "$timestamp"
+' "$MANIFEST_FILE" "$target" "$component" "$was_existing" "$timestamp" || write_rc=$?
+    [ "$write_rc" -le 1 ] || write_rc=1
+    return "$write_rc"
 }
 
 rollback_component() {
