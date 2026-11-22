@@ -175,6 +175,37 @@ sys.exit(1)
     return "$rc"
 }
 
+manifest_has_group() {
+    # $1=group $2=user $3=component
+    # 0 = a record already exists (first-wins: it must never be rolled back by
+    #     a later failed attempt), 1 = no record, 2 = manifest corrupt/unreadable
+    #     (fail closed; caller must not touch group membership).
+    # Reuses the validator-backed manifest_load exactly like manifest_has_target
+    # so a corrupt manifest can never be mistaken for "no record". The probe is
+    # argc=5 (python3 -c SCRIPT group user component), below every writer stub
+    # threshold used by the test suite.
+    if ! manifest_load; then
+        return 2
+    fi
+    if [ "$MANIFEST_CREATED" = "1" ]; then
+        # No manifest file yet: there are no group records to find. Avoid
+        # python3 here, mirroring manifest_has_target's no-python3 behaviour.
+        return 1
+    fi
+    local rc=0
+    printf '%s' "$MANIFEST_JSON" | python3 -c '
+import json, sys
+group, user, comp = sys.argv[1:4]
+data = json.load(sys.stdin)
+if any(g.get("group") == group and g.get("user") == user and g.get("component") == comp
+        for g in data.get("groups", [])):
+    sys.exit(0)
+sys.exit(1)
+' "$1" "$2" "$3" 2> /dev/null || rc=$?
+    [ "$rc" -le 1 ] || rc=2
+    return "$rc"
+}
+
 backup_file_manifest_aware() {
     # $1=target $2=component
     # On re-install of an already-tracked target, keep the ORIGINAL backup
@@ -379,6 +410,97 @@ os.replace(tmp, mp)
     return "$write_rc"
 }
 
+manifest_remove_group() {
+    # $1=group $2=user $3=component — remove EXACTLY one group record with a
+    # precise list filter + atomic os.replace (never sed/text substitution), so
+    # records of other users/components and all records/services stay intact.
+    # Shared by uninstall (consume after a successful gpasswd -d) and by the
+    # install rollback path (undo a record we just wrote when usermod failed).
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    [ -f "$MANIFEST_FILE" ] || return 0
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group record $2@$1"
+        return 1
+    fi
+    sudo python3 -c '
+import json, sys, os
+mp, group, user, comp = sys.argv[1:5]
+if not os.path.exists(mp):
+    sys.exit(0)
+d = json.load(open(mp))
+d.setdefault("groups", [])
+before = len(d["groups"])
+d["groups"] = [g for g in d["groups"]
+               if not (g.get("group") == group and g.get("user") == user
+                       and g.get("component") == comp)]
+if len(d["groups"]) == before:
+    sys.exit(0)          # no matching record: do not rewrite the file at all
+tmp = mp + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, mp)
+' "$MANIFEST_FILE" "$1" "$2" "$3"
+}
+
+ensure_group_membership() {
+    # $1=group $2=user $3=component
+    # Invariant: if this function returns non-zero, the user's membership in
+    # $1 has NOT been changed by us AND no "we added this membership" record
+    # was left behind for a failed action. This is the group analogue of the
+    # keyd install flow: persist original state FIRST, then mutate /etc/group.
+    local group="$1" user="$2" component="$3"
+    [ -z "$user" ] || [ "$user" = "root" ] && return 0
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Would ensure '$user' is a member of group '$group'"
+        return 0
+    fi
+
+    # (1) Snapshot the PRE-install state before any side effect.
+    local was_member=0
+    id -nG "$user" 2> /dev/null | tr ' ' '\n' | grep -qx "$group" && was_member=1 || was_member=0
+
+    # (2) Probe for an existing record BEFORE writing. first-wins: a record
+    # created by an earlier install must never be removed by a later failure.
+    local probe_rc=0 had_record=0
+    manifest_has_group "$group" "$user" "$component" || probe_rc=$?
+    case "$probe_rc" in
+        0) had_record=1 ;;
+        1) had_record=0 ;;
+        *)
+            # Fail closed before touching /etc/group, just like the manifest
+            # gate in backup_file_manifest_aware() and remove_group_membership().
+            log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to change '$user' membership in '$group'"
+            return 1
+            ;;
+    esac
+
+    # (3) Persist the original state first. If the write fails we do not even
+    # attempt usermod: an untracked privilege change is worse than no change.
+    if ! manifest_add_group "$group" "$user" "$component" "$was_member"; then
+        log_error "Group manifest write failed for $user@$group; refusing to change membership (uninstall could not undo it)"
+        return 1
+    fi
+
+    # (4) Only now perform the real group change, with an explicit rc check.
+    # No `|| true`: a failed usermod must never be reported as "Added".
+    if [ "$was_member" = "0" ]; then
+        if ! sudo usermod -aG "$group" "$user"; then
+            log_error "Failed to add '$user' to group '$group'"
+            if [ "$had_record" = "0" ]; then
+                # We just wrote the record for THIS attempt; undo it so a
+                # later uninstall cannot remove a membership the user
+                # obtains on their own. A pre-existing record is left alone.
+                if ! manifest_remove_group "$group" "$user" "$component"; then
+                    log_error "Could not roll back group record for $user@$group; kept for manual cleanup"
+                fi
+            fi
+            return 1
+        fi
+        log_info "Added '$user' to group '$group' (re-login required)"
+    fi
+    return 0
+}
+
 remove_group_membership() {
     # $1=group $2=user $3=component — call AFTER rollback_component (so udev
     # rules are gone and the reference check is accurate).
@@ -432,19 +554,13 @@ sys.exit(1)
         log_warn "Could not remove '$2' from group '$1'; keeping manifest record for retry."
         return 0
     fi
-    sudo python3 -c '
-import json, sys, os
-mp, group, user, comp = sys.argv[1:5]
-if not os.path.exists(mp):
-    sys.exit(0)
-d = json.load(open(mp))
-d.setdefault("groups", [])
-d["groups"] = [g for g in d["groups"] if not (g.get("group") == group and g.get("user") == user and g.get("component") == comp)]
-tmp = mp + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(d, f, indent=2)
-os.replace(tmp, mp)
-' "$MANIFEST_FILE" "$1" "$2" "$3"
+    # Consume the record only after the membership was actually removed. This
+    # is the same precise list-filter + os.replace helper used by the install
+    # rollback path, so uninstall and rollback can never diverge.
+    if ! manifest_remove_group "$1" "$2" "$3"; then
+        log_warn "Could not consume group record for '$2'@'$1'; keeping it for retry."
+        return 1
+    fi
 }
 
 backup_file() {

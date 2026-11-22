@@ -65,37 +65,47 @@ PY
 }
 
 # Echo 1 when the manifest explicitly tracks a keyboard-scoped, system-scope
-# keyd service, otherwise 0. A user-scope record (the kbd backlight sync
-# service uses that scope) must never authorize disabling the system keyd.
-# This is the SOLE authority for deciding whether uninstall may
-# disable/stop keyd: manifest_add_service("keyd", "keyboard") writes that
-# record and lib/backup.sh's rollback reads it. A mere on-disk cros.conf is
-# NOT evidence of ownership (a user may have installed keyd and used the same
-# filename), so it is deliberately not consulted here. Read-only, DRY_RUN-safe
-# and fail-safe: any missing/unreadable/malformed manifest yields 0.
+# keyd service WITH a valid original-state snapshot, otherwise 0. A user-scope
+# record (the kbd backlight sync service uses that scope) must never authorize
+# disabling the system keyd. The service record's was_enabled/was_active are
+# safety-decision fields: if either is missing or not a bool, the original
+# state is UNKNOWN, so we must NOT claim ownership (and therefore must not
+# disable/stop keyd before rollback). This is the SOLE authority for deciding
+# whether uninstall may disable/stop keyd: manifest_add_service("keyd",
+# "keyboard") writes that record and lib/backup.sh's rollback reads it. A mere
+# on-disk cros.conf is NOT evidence of ownership (a user may have installed
+# keyd and used the same filename), so it is deliberately not consulted here.
+# Read-only, DRY_RUN-safe and fail-safe: any missing/unreadable/malformed
+# manifest yields 0.
 _keyd_managed_by_us() {
     # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
     [ -f "$MANIFEST_FILE" ] || {
         echo 0
         return 0
     }
-    # shellcheck disable=SC2154 # MANIFEST_FILE is defined in lib/backup.sh
-    python3 - "$MANIFEST_FILE" << 'PY' 2> /dev/null || echo 0
+    # Go through the same validator every writer/rollback uses, so a record
+    # with a missing/non-bool was_* flag can never be mistaken for ownership.
+    # manifest_load is read-only (it only fills MANIFEST_JSON) and is safe in
+    # DRY_RUN. On any failure fall back to "not managed".
+    if ! manifest_load; then
+        echo 0
+        return 0
+    fi
+    # shellcheck disable=SC2154 # MANIFEST_JSON is defined in lib/backup.sh
+    printf '%s' "$MANIFEST_JSON" | python3 -c '
 import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        data = json.load(f)
-    for svc in data.get("services", []) or []:
-        if (svc.get("name") in ("keyd", "keyd.service")
-                and svc.get("component") == "keyboard"
-                and svc.get("scope", "system") != "user"):
-            print(1)
-            break
-    else:
-        print(0)
-except Exception:
+data = json.load(sys.stdin)
+for svc in data.get("services", []) or []:
+    if (svc.get("name") in ("keyd", "keyd.service")
+            and svc.get("component") == "keyboard"
+            and svc.get("scope", "system") != "user"
+            and isinstance(svc.get("was_enabled"), bool)
+            and isinstance(svc.get("was_active"), bool)):
+        print(1)
+        break
+else:
     print(0)
-PY
+' 2> /dev/null || echo 0
 }
 
 # Mirror lib/backup.sh rollback's lookup: the oldest backup matching
@@ -1204,14 +1214,14 @@ install_keyboard() {
             real_user="$(get_real_user)"
             if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
                 if id -u "$real_user" > /dev/null 2>&1; then
-                    local was_member=0
-                    id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1 || was_member=0
-                    # Only add if not already member
-                    if [ "$was_member" = "0" ]; then
-                        sudo usermod -aG plugdev "$real_user" 2> /dev/null || true
-                        log_info "Added $real_user to plugdev group for kbd backlight access (re-login required)"
+                    # The helper records the original membership FIRST and only
+                    # then touches /etc/group; it rolls its own record back if
+                    # usermod fails. Check rc explicitly: the test harness calls
+                    # install_keyboard with `||`, which suppresses errexit.
+                    if ! ensure_group_membership "plugdev" "$real_user" "keyboard"; then
+                        log_error "plugdev membership setup failed for '$real_user'; refusing to continue (udev rule would grant backlight access with no uninstall ownership record)"
+                        return 1
                     fi
-                    manifest_add_group "plugdev" "$real_user" "keyboard" "$was_member"
                 fi
             fi
         fi

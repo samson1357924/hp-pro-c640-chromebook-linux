@@ -43,6 +43,15 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    # $1=needle $2=haystack $3=message
+    if printf '%s' "$2" | grep -qF -- "$1"; then
+        fail "$3 (unexpected: '$1')"
+    else
+        ok
+    fi
+}
+
 # Small helpers shared by the re-review #1/#2/#3 regression tests.
 file_hex() { python3 -c 'import sys; print(open(sys.argv[1],"rb").read().hex())' "$1"; }
 manifest_count() {
@@ -429,6 +438,335 @@ test_group_remove_keeps_record_on_failure() {
     local groups
     groups="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("groups", [])))' "$sandbox/manifest/install-manifest.json")"
     assert_contains '"group": "cros-testgrp"' "$groups" "group record kept when gpasswd fails"
+}
+
+# ---------------------------------------------------------------------------
+# Re-review #4 (P2): plugdev membership must be RECORDED before /etc/group is
+# changed, and a failed change must undo the fresh record. Shared fault-
+# injection stubs: sudo execs directly so usermod/gpasswd/python3 are
+# intercepted through PATH. Every write stays inside the sandbox.
+# ---------------------------------------------------------------------------
+setup_group_fault_stubs() {
+    local sandbox="$1"
+    mkdir -p "$sandbox/stub"
+    # sudo just runs the command (all destinations are sandboxed).
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$sandbox/stub/sudo"
+    # getent always reports an existing plugdev so groupadd is skipped.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/getent"
+    # id: -u succeeds for any user; -nG is controlled by STUB_USER_IN_PLUGDEV.
+    cat > "$sandbox/stub/id" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-u" ]; then echo 1000; exit 0; fi
+if [ "$1" = "-nG" ]; then
+    if [ "${STUB_USER_IN_PLUGDEV:-0}" = "1" ]; then echo "audio plugdev"; else echo "audio"; fi
+    exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+    # usermod/gpasswd only record calls; rc is injectable.
+    cat > "$sandbox/stub/usermod" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_USERMOD_LOG:?}"
+exit "${STUB_USERMOD_RC:-0}"
+EOF
+    cat > "$sandbox/stub/gpasswd" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_GPASSWD_LOG:?}"
+exit "${STUB_GPASSWD_RC:-0}"
+EOF
+    chmod +x "$sandbox/stub/sudo" "$sandbox/stub/getent" "$sandbox/stub/id" \
+        "$sandbox/stub/usermod" "$sandbox/stub/gpasswd"
+}
+
+block_group_manifest_write() {
+    # Refuse ONLY manifest_add_group (argc=7, script mentions was_member).
+    # argc=6 (manifest_remove_group / rollback) and argc=3 (validator) pass.
+    local sandbox="$1"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 7 ] && printf '%s' "${2:-}" | grep -q 'was_member'; then
+    printf 'STUB: group manifest write refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+}
+
+group_count() {
+    [ -f "$1" ] || {
+        echo 0
+        return 0
+    }
+    manifest_count "$1" groups
+}
+
+grp_was_member() {
+    python3 -c 'import json,sys; g=json.load(open(sys.argv[1])).get("groups",[]); print(g[0]["was_member"] if g else "none")' "$1"
+}
+
+usermod_calls() {
+    [ -f "$1" ] || {
+        echo 0
+        return 0
+    }
+    wc -l < "$1" | tr -d '[:space:]'
+}
+
+# T1 (helper): manifest write fails -> no usermod, no group record, nonzero rc.
+test_ensure_group_manifest_write_failure_no_membership_change() {
+    local sandbox="/tmp/rollback-test-ensure-grp-manifest-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_fault_stubs "$sandbox"
+    block_group_manifest_write "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" STUB_USER_IN_PLUGDEV=0
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        exit 0
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T1: helper fails closed when group manifest write fails"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod.log")" \
+        "T1: usermod must NOT be called when manifest write failed"
+    assert_eq "0" "$(group_count "$mp")" "T1: no group record written"
+    assert_contains "Group manifest write failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "T1: root cause logged"
+    assert_contains "refusing to change membership" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "T1: explicit refusal logged"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "T1: no .tmp residue"
+}
+
+# T2 (caller): installer propagates the helper failure instead of swallowing it
+# under `install_keyboard || rc=$?` (errexit suppressed in the harness).
+test_plugdev_manifest_write_failure_install_fails_without_membership() {
+    local sandbox="/tmp/rollback-test-plugdev-manifest-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    setup_group_fault_stubs "$sandbox"
+    block_group_manifest_write "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_USERMOD_LOG="$2/usermod.log" STUB_USER_IN_PLUGDEV=0 \
+            WITH_KEYD=0
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo "testuser"; }
+        install_rc=0
+        install_keyboard || install_rc=$?
+        printf "%s\n" "$install_rc" > "$2/install-rc.txt"
+        exit 0
+    '
+    assert_eq "1" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T2: installer propagates the manifest-write helper failure"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod.log")" \
+        "T2: usermod must NOT be called when manifest write failed"
+    assert_eq "0" "$(group_count "$mp")" "T2: no group record written"
+    assert_contains "plugdev membership setup failed for 'testuser'" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "T2: caller logs the membership failure"
+    assert_contains "refusing to continue (udev rule" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "T2: explicit refusal logged"
+}
+
+# T3 (helper): usermod fails -> the record just written is rolled back.
+test_ensure_group_usermod_failure_rolls_back_manifest() {
+    local sandbox="/tmp/rollback-test-ensure-grp-usermod-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_fault_stubs "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_USERMOD_RC=1 STUB_USER_IN_PLUGDEV=0
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        lrc=0
+        manifest_load || lrc=$?
+        printf "%s\n" "$lrc" > "$2/load-rc.txt"
+        exit 0
+    '
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T3: helper returns nonzero when usermod fails"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod.log")" "T3: usermod called exactly once"
+    assert_contains "-aG plugdev testuser" "$(cat "$sandbox/usermod.log" 2> /dev/null || echo "")" \
+        "T3: correct usermod invocation"
+    assert_eq "0" "$(group_count "$mp")" "T3: fresh group record rolled back"
+    assert_contains "Failed to add 'testuser' to group 'plugdev'" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "T3: failure logged (no false 'Added' message)"
+    assert_eq "0" "$(cat "$sandbox/load-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T3: manifest still valid after rollback"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "T3: no .tmp residue"
+}
+
+# T4 (caller): usermod failure propagates; only the group record we just wrote
+# is rolled back. A pre-existing record for a DIFFERENT component (same user,
+# same group) and the file records from earlier steps all survive.
+test_plugdev_usermod_failure_install_nonzero_no_false_record() {
+    local sandbox="/tmp/rollback-test-plugdev-usermod-fail"
+    setup_keyd_caller_sandbox "$sandbox" valid
+    setup_group_fault_stubs "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+    python3 - "$mp" << 'PY'
+import json, sys
+json.dump({"version": "2.0", "records": [], "services": [],
+           "groups": [{"group": "plugdev", "user": "testuser",
+                       "component": "fingerprint", "was_member": False}]},
+          open(sys.argv[1], "w"), indent=2)
+PY
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_SYSTEMCTL_LOG="$2/systemctl.log" \
+            STUB_USERMOD_LOG="$2/usermod.log" STUB_USERMOD_RC=1 \
+            STUB_USER_IN_PLUGDEV=0 WITH_KEYD=0
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo "testuser"; }
+        install_rc=0
+        install_keyboard || install_rc=$?
+        printf "%s\n" "$install_rc" > "$2/install-rc.txt"
+        exit 0
+    '
+    assert_eq "1" "$(cat "$sandbox/install-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T4: installer propagates usermod failure"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod.log")" "T4: usermod called exactly once"
+    assert_eq "1" "$(group_count "$mp")" "T4: only the keyboard record was rolled back"
+    assert_eq "fingerprint" \
+        "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["groups"][0]["component"])' "$mp")" \
+        "T4: other component's group record survives the rollback"
+    if [ "$(manifest_count "$mp" records)" -ge 2 ]; then
+        ok
+    else
+        fail "T4: rollback of the group record must not touch earlier file records"
+    fi
+}
+
+# T5: success path plus reinstall first-wins (the original was_member=false is
+# never overwritten), and a first install of an existing member is never
+# usermod'ed nor later removed by uninstall.
+test_plugdev_success_and_reinstall_first_wins() {
+    local sandbox="/tmp/rollback-test-plugdev-first-wins"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_fault_stubs "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod1.log" STUB_USER_IN_PLUGDEV=0
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper1-rc.txt"
+        exit 0
+    '
+    assert_eq "0" "$(cat "$sandbox/helper1-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T5: first install succeeds"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod1.log")" "T5: usermod called once on first install"
+    assert_eq "1" "$(group_count "$mp")" "T5: one group record"
+    assert_eq "False" "$(grp_was_member "$mp")" "T5: original non-member state recorded"
+
+    # Reinstall: user is now a member. No usermod, no overwrite of was_member.
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod2.log" STUB_USER_IN_PLUGDEV=1
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper2-rc.txt"
+        exit 0
+    '
+    assert_eq "0" "$(cat "$sandbox/helper2-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T5: reinstall succeeds"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod2.log")" "T5: reinstall does not re-add member"
+    assert_eq "1" "$(group_count "$mp")" "T5: still one group record after reinstall"
+    assert_eq "False" "$(grp_was_member "$mp")" "T5: first-wins was_member preserved"
+
+    # First install of a pre-existing member: no usermod; uninstall must not
+    # gpasswd -d them (was_member=true is not our membership).
+    local s2="/tmp/rollback-test-plugdev-already-member"
+    rm -rf "$s2"
+    mkdir -p "$s2/backups" "$s2/manifest"
+    setup_group_fault_stubs "$s2"
+    local mp2="$s2/manifest/install-manifest.json"
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log" STUB_USER_IN_PLUGDEV=1
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/remove-rc.txt"
+        exit 0
+    '
+    assert_eq "0" "$(cat "$s2/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T5: pre-existing member install succeeds"
+    assert_eq "0" "$(usermod_calls "$s2/usermod.log")" "T5: pre-existing member is not usermod'ed"
+    assert_eq "True" "$(grp_was_member "$mp2")" "T5: pre-existing member recorded as was_member=true"
+    assert_eq "0" "$(usermod_calls "$s2/gpasswd.log")" "T5: uninstall keeps pre-existing membership"
+}
+
+# T6: a pre-existing first-wins record must NOT be removed by a later failed
+# usermod. Also cover a corrupt manifest (fail closed before any side effect).
+test_usermod_failure_with_existing_record_keeps_first_wins_record() {
+    local sandbox="/tmp/rollback-test-grp-existing-record"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_fault_stubs "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+    python3 - "$mp" << 'PY'
+import json, sys
+json.dump({"version": "2.0", "records": [], "services": [],
+           "groups": [{"group": "plugdev", "user": "testuser",
+                       "component": "keyboard", "was_member": False}]},
+          open(sys.argv[1], "w"), indent=2)
+PY
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_USERMOD_RC=1 STUB_USER_IN_PLUGDEV=0
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        exit 0
+    '
+    local log
+    log="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
+    assert_eq "1" "$(cat "$sandbox/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T6: usermod failure propagates with an existing record"
+    assert_eq "1" "$(group_count "$mp")" "T6: first-wins record not removed by rollback"
+    assert_eq "False" "$(grp_was_member "$mp")" "T6: original was_member=false preserved"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod.log")" "T6: usermod attempted once"
+    assert_not_contains "Could not roll back" "$log" "T6: no rollback attempted for an existing record"
+    assert_not_contains "Could not consume group record" "$log" "T6: no record consumption attempted"
+
+    local s2="/tmp/rollback-test-grp-corrupt-record"
+    rm -rf "$s2"
+    mkdir -p "$s2/backups" "$s2/manifest"
+    setup_group_fault_stubs "$s2"
+    local mp2="$s2/manifest/install-manifest.json"
+    printf 'this is not json' > "$mp2"
+    local before
+    before="$(file_hex "$mp2")"
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" STUB_USER_IN_PLUGDEV=0
+        source "$1/lib/backup.sh"
+        rc=0
+        ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        exit 0
+    '
+    assert_eq "1" "$(cat "$s2/helper-rc.txt" 2> /dev/null || echo MISSING)" \
+        "T6: corrupt manifest fails closed"
+    assert_eq "0" "$(usermod_calls "$s2/usermod.log")" "T6: corrupt manifest blocks usermod"
+    assert_eq "$before" "$(file_hex "$mp2")" "T6: corrupt manifest bytes unchanged"
 }
 
 # ---------------------------------------------------------------------------
@@ -3439,7 +3777,9 @@ test_keyd_managed_by_us_fail_safe() {
     local sandbox="/tmp/rollback-test-keyd-managed-probe"
     local case_name expected manifest before after actual
     for case_name in no_manifest corrupt no_services_key null_services \
-        wrong_component keyd_service_name user_scope managed; do
+        wrong_component keyd_service_name user_scope managed \
+        keyd_service_name_missing_flags managed_missing_flags non_bool_flags \
+        keyd_service_name_with_flags managed_with_flags; do
         setup_keyd_uninstall_sandbox "$sandbox"
         manifest="$sandbox/manifest/install-manifest.json"
         case "$case_name" in
@@ -3461,8 +3801,10 @@ test_keyd_managed_by_us_fail_safe() {
                 expected=0
                 ;;
             keyd_service_name)
+                # Missing was_* flags means the original state is UNKNOWN:
+                # never claim ownership (even for the name alias).
                 printf '{"version":"2.0","records":[],"services":[{"name":"keyd.service","component":"keyboard"}]}' > "$manifest"
-                expected=1
+                expected=0
                 ;;
             user_scope)
                 # A user-scope record must not authorize disabling system keyd
@@ -3471,7 +3813,30 @@ test_keyd_managed_by_us_fail_safe() {
                 expected=0
                 ;;
             managed)
+                # Minimal record without was_* flags: UNKNOWN -> not managed.
                 write_keyd_manifest "$sandbox" '[{"name":"keyd","component":"keyboard"}]'
+                expected=0
+                ;;
+            keyd_service_name_missing_flags)
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd.service","component":"keyboard","scope":"system"}]}' > "$manifest"
+                expected=0
+                ;;
+            managed_missing_flags)
+                write_keyd_manifest "$sandbox" '[{"name":"keyd","component":"keyboard","was_enabled":true}]'
+                expected=0
+                ;;
+            non_bool_flags)
+                # A string "false" is truthy in Python; the validator must
+                # reject it and the probe must fail safe.
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd","component":"keyboard","was_enabled":"false","was_active":true,"scope":"system"}]}' > "$manifest"
+                expected=0
+                ;;
+            keyd_service_name_with_flags)
+                printf '{"version":"2.0","records":[],"services":[{"name":"keyd.service","component":"keyboard","was_enabled":false,"was_active":true,"scope":"system"}]}' > "$manifest"
+                expected=1
+                ;;
+            managed_with_flags)
+                write_keyd_manifest "$sandbox" '[{"name":"keyd","component":"keyboard","was_enabled":true,"was_active":false,"scope":"system"}]'
                 expected=1
                 ;;
         esac
@@ -5076,6 +5441,13 @@ test_legacy_manifest
 test_group_reinstall_first_wins
 test_service_reinstall_first_wins
 test_group_remove_keeps_record_on_failure
+# Finding #4: record membership before changing /etc/group; roll back on failure
+test_ensure_group_manifest_write_failure_no_membership_change
+test_plugdev_manifest_write_failure_install_fails_without_membership
+test_ensure_group_usermod_failure_rolls_back_manifest
+test_plugdev_usermod_failure_install_nonzero_no_false_record
+test_plugdev_success_and_reinstall_first_wins
+test_usermod_failure_with_existing_record_keeps_first_wins_record
 test_kbd_backlight_sync_install
 test_kbd_backlight_double_install
 test_keyd_legacy_link_helper

@@ -88,10 +88,13 @@ install_ec_tools() {
         real_user="$(get_real_user)"
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             if id -u "$real_user" > /dev/null 2>&1; then
-                local was_member=0
-                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
-                sudo usermod -aG plugdev "$real_user" || true
-                manifest_add_group "plugdev" "$real_user" "ec" "$was_member"
+                # Record the original membership before changing /etc/group;
+                # the helper rolls its own record back if usermod fails. Check
+                # rc explicitly so a harness using `||` cannot swallow it.
+                if ! ensure_group_membership "plugdev" "$real_user" "ec"; then
+                    log_error "plugdev membership setup failed for '$real_user'; refusing to continue"
+                    return 1
+                fi
             else
                 log_warn "User '$real_user' does not exist; skipping plugdev membership."
             fi
