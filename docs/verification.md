@@ -66,9 +66,9 @@ diagnostic bundle.
 | keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:45:37, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10`, all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI match (real modalias) | 🟢 | `udevadm test /sys/class/input/event2` applies `KEYBOARD_KEY_*` via the `evdev:atkbd:` lookup even with the firmware's extra `br0.0:efr0.0` fields; non-`atkbd` lookups printing `No entry found from hwdb` is expected |
 | kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
-| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 244 daemon cases pass; real S3 verified below |
+| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 374 daemon cases pass after the sixth re-review fixes (below); real S3 verified below |
 | kbd backlight user service | 🟢 | `/etc/systemd/user/`, globally enabled and **active for uid 1000** (`systemctl --global is-enabled`, `systemctl --user is-active` both OK); `StandardError=journal` makes daemon log lines visible in `journalctl --user -u c640-kbd-backlight-sync.service` |
-| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + atomic `mv`; `C640_KBD_HANDOFF_DIR`); 73 hook cases pass. **Real S3 freeze/thaw verified 2026-11-22** (details below) |
+| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + atomic `mv`; `C640_KBD_HANDOFF_DIR`); 73 hook cases pass. The root `/run/c640-kbd-backlight/state` is a **single-shot diagnostic snapshot of the first suspend in a boot** — first-wins, not consumed and never used for restore. **Real S3 freeze/thaw verified 2026-11-22** (details below) |
 
 #### Real S3 acceptance (2026-11-22, full systemd freeze/thaw)
 
@@ -88,6 +88,34 @@ brightness = `0` (screen already blank), ScreenSaver = `true`.
 > `PrepareForSleep` freeze/thaw and system-sleep hook path as a lid close. A separate
 > **manual lid-close cycle** was not part of this run and remains a supplementary
 > to-test item.
+
+#### Sixth re-review fixes (2026-11-23, unit-tested)
+
+These are logic/robustness fixes covered by the shell unit suites; the 2026-11-22 real
+S3 records above are kept verbatim and no new hardware run is claimed here.
+
+* **Only an applied restore consumes the flag.** Adoption, restore and the new
+  `verify_restore_applied()` share result codes `0=RC_DONE`, `1=RC_FAIL`, `2=RC_DEFER`.
+  Lock failures, a surviving `STATE`/`restore-pending`, or a brightness readback that
+  differs from the saved value return DEFER/FAIL instead of 0. Only DONE removes the
+  state and both handoff files; DEFER keeps them for the 5s sampler to retry and
+  `handle_unblank()` logs `unblank: restore deferred` rather than a false WARN.
+  `log_warn_once` now uses a state-dir marker so warnings stay once-per-key across
+  subshells.
+* **Corrupt manifest fails closed.** `lib/backup.sh` uses one validator for all readers
+  and writers: a missing manifest creates an empty skeleton, but an existing corrupt one
+  logs `MANIFEST_INVALID ... original bytes left untouched`, leaves the original bytes
+  untouched and makes `manifest_has_target` (tristate 0/1/2) and all three writers fail.
+  Backup is refused before any target is touched.
+* **Persist before blanking.** `compute_save_brightness()` is factored out;
+  `save_state [value]` returns `0` (saved) / `1` (lock wait failed) / `2` (write failed)
+  under `flock -w "$C640_KBD_SAVE_LOCK_WAIT"` (default 2s). `handle_blank()` samples,
+  saves (two retries with the captured value) and **only then** writes 0; on total
+  failure it logs `blank: brightness NOT saved`, keeps the LED on and re-seeds the
+  last-user cache. `--test-blank` exits 1 when saving fails.
+
+Unit-test totals after these fixes: **374** daemon, **73** sleep-hook and **493**
+rollback cases (the last run as root), all 0 failures.
 
 ### 4. Wi-Fi / Bluetooth / Webcam / Storage
 
@@ -137,7 +165,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (244 daemon + 73 hook); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (374 daemon + 73 hook + 493 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -196,7 +224,10 @@ cat /sys/power/mem_sleep
   2026-11-22 (Phase 6 real S3 acceptance of the keyboard-backlight handoff:
   `rtcwake -m no -s 20` + `systemctl suspend` on systemd 259 / gnome-settings-daemon
   50; locked resume defers and keeps `state=30`, then `loginctl unlock-session 2`
-  restores brightness/gsd/UPower to 30 and consumes both handoff files)
+  restores brightness/gsd/UPower to 30 and consumes both handoff files),
+  2026-11-23 (sixth re-review unit-test re-run: 374 daemon + 73 sleep-hook + 493
+  rollback cases, 0 failures; result-code, fail-closed manifest and save-before-blank
+  docs synced — no new real-S3 run)
 * **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
   keyboard/backlight session, `7.0.0-29-generic` for the 2026-08 evidence bundle
 * **Firmware**: MrChromebox `2606.1`

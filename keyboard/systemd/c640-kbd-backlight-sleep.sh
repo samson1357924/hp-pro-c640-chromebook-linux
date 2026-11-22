@@ -16,7 +16,8 @@
 #
 # NEW CONTRACT (P1 blocker fix)
 # -----------------------------
-#   pre  - save the root-readable brightness to the audit/backstop state file,
+#   pre  - write the root-readable brightness to STATE_FILE as a single-shot
+#          diagnostic snapshot of the first suspend in a boot (first-wins),
 #          then publish a user-readable "suspend" handoff (the saved value).
 #   post - publish a "resume" handoff flag (epoch + action) and return.
 # This hook NEVER queries a user/session D-Bus, NEVER writes brightness
@@ -100,9 +101,10 @@ _read_current() {
     fi
 }
 
-# Root-side audit/backstop record. Kept verbatim: it is NOT consumed by the
-# hook any more, only used for diagnostics and as a recovery backstop by the
-# daemon after thaw. A brightness of 0 is stored as well.
+# Root-side single-shot diagnostic snapshot of the first suspend in a boot.
+# First-wins and never consumed: neither this hook nor the daemon reads it for
+# restore. Only the user handoff files and the daemon's own state are consumed.
+# A brightness of 0 is stored as well.
 save_state() {
     _has_backlight || return 0
     if [ -f "$STATE_FILE" ]; then

@@ -235,7 +235,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > queries D-Bus. The thawed **user daemon** is the only writer: it adopts the handoff
   > on `PrepareForSleep(false)` from the **system** bus (not frozen) and restores via
   > gsd-power → UPower → legacy. Do not reintroduce root-side session-bus probing
-  > in the hook — that was the old second-writer bug.
+  > in the hook — that was the old second-writer bug. The root
+  > `/run/c640-kbd-backlight/state` written by `pre` is only a **single-shot diagnostic
+  > snapshot of the first suspend in a boot** (first-wins, kept until reboot); it is not
+  > consumed by the hook or the daemon and is never used for restore.
 
 * **Triage** (all gdbus queries below are read-only):
 
@@ -268,7 +271,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
 
   ```bash
   journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
-    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore deferred|resume deferred|ignoring blank-side|restore failed|another restore is in progress|\[WARN\]'
+    | grep -E 'backends probed|RECOVERED|saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **Common fixes**:
@@ -309,6 +312,29 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     for a later retry; a crash is recovered at daemon startup. `RECOVERED (0 -> 1)` means
     a previously missing gsd-power/UPower D-Bus name came back and the daemon switched
     back to the gsd single writer after re-probing.
+  * `blank: brightness NOT saved (rc=...)` / `blank: deferred save attempt N failed
+    (rc=...)` means the blank-side save could not persist the new brightness. The daemon
+    keeps the LED **on** (rather than going dark with nothing to restore) and leaves the
+    captured value in the last-user cache. Check `C640_KBD_SAVE_LOCK_WAIT` (default 2s):
+    a slow restore can hold `STATE_LOCK` until `save_state` times out. `save_state` rc is
+    `0` = saved, `1` = lock wait failed, `2` = value selection/write failed.
+  * The resume path uses result codes `0 = RC_DONE` (write verified; `STATE` /
+    `restore-pending` consumed), `1 = RC_FAIL` (bad input / I/O error) and `2 = RC_DEFER`
+    (lock contention, a staged restore in flight or ScreenSaver active/unknown). Only
+    `RC_DONE` consumes the resume flag and handoff files. `RC_DEFER` keeps flag/handoff/
+    state and schedules retries for the sampler or next unblank; `RC_FAIL` keeps the
+    resume flag, but the saved state may already have been consumed (only the captured
+    value remains in the last-user cache); a write/finalize FAIL still re-arms the
+    +0.5/+1.5/+3s retries when a state file remains, whereas a verify or adoption FAIL
+    schedules none.
+    `restore verify (gen=...): ... not completed`,
+    `suspend handoff adoption deferred` and `unblank: restore deferred` are retry
+    signals, not failures — wait for the next poll or unlock the session.
+  * `MANIFEST_INVALID ... original bytes left untouched` comes from the **installer**,
+    not the daemon: `/var/lib/cros-enablement/install-manifest.json` is corrupt, so the
+    backup/writer paths fail closed and leave the file byte-for-byte unchanged. Repair
+    or deliberately remove it before reinstalling; never treat a corrupt manifest as an
+    empty one.
 
 ---
 

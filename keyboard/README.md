@@ -82,6 +82,14 @@ root-owned with mode `0700`, every ancestor must be root-owned, and the direct p
 be group/other-writable (a sticky bit does not exempt it). Paths under a user's home directory
 are rejected; if any check fails the installer refuses to deploy keyd config.
 
+**Backup manifest is fail-closed:** deployed files, services and groups are tracked in
+`/var/lib/cros-enablement/install-manifest.json`. A missing manifest is still created as
+an empty skeleton, but an **existing corrupt/invalid** one logs `MANIFEST_INVALID ...
+original bytes left untouched`, leaves the file byte-for-byte unchanged and makes the
+backup/writer paths refuse to continue (no target is backed up or claimed as tracked
+while the manifest cannot be parsed). Repair or deliberately remove the corrupt manifest
+before reinstalling, so rollback coverage is never silently lost.
+
 ---
 
 ### Option 2: `keyd` Daemon (Advanced Multi-Layer & Dual-Role)
@@ -238,6 +246,16 @@ while gsd-power still reports 0). Its sidecar `LAST_USER_META_FILE`
 restart re-seeds the cache from the current reading (`cur=0` → `manual0`). With no
 state file nothing is written, so manual adjustments are preserved.
 
+`save_state()` has an explicit rc: `0` = a valid copy exists (already present or written
+now), `1` = the bounded `flock -w` on the state lock timed out or errored, `2` = value
+selection or the state write failed. `C640_KBD_SAVE_LOCK_WAIT` bounds that wait (default
+`2s`; `0` = no wait). On blank the daemon samples the current value first, saves it
+(retrying twice with the captured value if the first save fails), and **only turns the
+LED off after the save succeeds**; if every attempt fails it logs
+`blank: brightness NOT saved (...)`, `blank: deferred save attempt N failed`, leaves the
+LED on and keeps the captured value in the last-user cache so a later blank can still
+persist it. `--test-blank` exits 1 on a save failure.
+
 `set_brightness()` returns 0 (success) when at least one backend accepted the write and a
 readback (`verify_brightness()`) confirmed it; with no readable path at all the accepted
 write is treated as success with a WARN. rc 1 means every writer failed or every readback
@@ -255,14 +273,18 @@ blank-guard paths.
 
 **Sleep hook = pure handoff:** on a real S3 cycle systemd freezes `user.slice` before
 the `post` phase, so the hook never queries a user/session D-Bus, never writes the LED
-and never deletes state. `pre` stores a root-readable audit/backstop state and publishes
-`c640-kbd-backlight.suspend` (one decimal integer, `0` valid); `post` only publishes
-`c640-kbd-backlight.resume` (`<epoch> <action>`). Both are `0600`, chowned to the
-resolved session user and atomically `mv`-ed into `$XDG_RUNTIME_DIR`;
-`C640_KBD_HANDOFF_DIR` overrides the directory. A blank-side handoff `0` is ignored when
-the daemon holds a different non-zero saved value, so the user's brightness survives a
-suspend started while the screen was blank. The hook never consumes the handoff files —
-the daemon does that after a successful adoption/restore.
+and never deletes state. `pre` writes `/run/c640-kbd-backlight/state` as a **single-shot
+diagnostic snapshot of the first suspend in a boot** (first-wins, kept until reboot) and
+publishes `c640-kbd-backlight.suspend` (one decimal integer, `0` valid); `post` only
+publishes `c640-kbd-backlight.resume` (`<epoch> <action>`). The root snapshot is **not
+consumed by the hook or the daemon and is never used for restore**; the daemon consumes
+only the two handoff files and its own `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`.
+Both handoff files are `0600`, chowned to the resolved session user and atomically
+`mv`-ed into `$XDG_RUNTIME_DIR`; `C640_KBD_HANDOFF_DIR` overrides the directory. A
+blank-side handoff `0` is ignored when the daemon holds a different non-zero saved
+value, so the user's brightness survives a suspend started while the screen was blank.
+The hook never consumes the handoff files — the daemon does that after a successful
+adoption/restore.
 
 **Resume handoff (the thawed daemon is the only writer):** `handle_resume()` runs on
 `PrepareForSleep(false)` from the **system** bus (not frozen), on a resume flag picked
@@ -271,11 +293,24 @@ sampler and startup paths; the daemon re-probes both D-Bus backends, adopts the 
 handoff into `STATE_FILE`, then polls the tristate (0.2/0.4/0.8/1.6/3.2s, capped by
 `C640_KBD_RESUME_PROBE_MAX=10`). `inactive` → restore through gsd-power→UPower→legacy;
 `active` → defer with retries; `unknown` → converge without a write only when the
-current brightness already equals the saved value, otherwise defer. The resume flag is
-consumed only after a verified restore. `C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to
-restoring while the answer is still unknown — this accepts the risk of lighting a
-still-locked screen and is off by default. `handle_unblank()` routes through
-`handle_resume()` whenever a resume flag is present, avoiding a double write.
+current brightness already equals the saved value, otherwise defer.
+`C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring while the answer is still unknown
+— this accepts the risk of lighting a still-locked screen and is off by default.
+`handle_unblank()` routes through `handle_resume()` whenever a resume flag is present,
+avoiding a double write.
+
+Adoption, restore and `verify_restore_applied()` share a result-code contract:
+`0 = RC_DONE` (write verified, `STATE`/`restore-pending` consumed), `1 = RC_FAIL` (bad
+input or I/O failure) and `2 = RC_DEFER` (lock contention, a staged restore in flight,
+or an active/unknown screen). A lock failure, a surviving `STATE`/`PENDING` file or a
+brightness readback that disagrees with the saved value maps to DEFER/FAIL, not success.
+**Only `RC_DONE` consumes the resume flag (and the handoff/state)**. `RC_DEFER` keeps
+flag/handoff/state and schedules retries for the sampler or next unblank; `RC_FAIL`
+keeps the resume flag, but the saved state may already have been consumed (only the
+captured value remains in the last-user cache); a write/finalize FAIL still re-arms the
++0.5/+1.5/+3s retries when a state file remains, whereas a verify or adoption FAIL
+schedules none. `handle_unblank()` logs `unblank: restore deferred` on DEFER instead of
+a false WARN.
 
 **Backend re-probe:** only a successful probe is cached; missing or failing gsd-power /
 UPower are re-probed on every use, so a D-Bus name that appears later is adopted. A
@@ -303,7 +338,7 @@ single writer`. `C640_KBD_FORCE_LEGACY=1` still disables both D-Bus backends and
 
 ```bash
 c640-kbd-backlight-sync --check          # show current brightness & state
-c640-kbd-backlight-sync --test-blank     # simulate screen blank -> save + set 0
+c640-kbd-backlight-sync --test-blank     # simulate blank: save, then set 0 (exit 1 if save fails)
 cat /sys/class/leds/chromeos::kbd_backlight/brightness  # should be 0
 c640-kbd-backlight-sync --test-unblank   # simulate unblank -> restore
 ```
@@ -329,10 +364,13 @@ restore, so the user service must be running.
 **Logs:** all daemon messages go to stderr; the unit sets
 `StandardError=journal`, so they are visible in the user journal (including
 `backends probed: gsd=... upower=...`, `RECOVERED (0 -> 1)`, `saved brightness`,
-`restoring brightness`, `restore deferred: ScreenSaver ...`, `resume deferred:`,
-`ignoring blank-side suspend handoff 0`, `restore failed (... rc=...): keeping
-brightness ... for retry`, `another restore is in progress`,
-`resume: restore complete; resume flag consumed` and `[WARN]` fallback lines):
+`restoring brightness`, `restore verify (gen=...): ... not completed`,
+`suspend handoff adoption deferred`, `restore deferred: ScreenSaver ...`,
+`resume deferred:`, `unblank: restore deferred`, `ignoring blank-side suspend handoff 0`,
+`blank: brightness NOT saved`, `blank: deferred save attempt N failed`,
+`restore failed (... rc=...): keeping brightness ... for retry`,
+`another restore is in progress`, `resume: restore complete; resume flag consumed`
+and `[WARN]` fallback lines):
 
 ```bash
 journalctl --user -u c640-kbd-backlight-sync.service -f
@@ -342,6 +380,7 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 **Runtime environment overrides** (no system files are touched):
 `C640_KBD_FORCE_LEGACY=1` disables both D-Bus backends (see above);
 `C640_KBD_LAST_USER_TTL` sets the manual-off cache TTL (default 15s);
+`C640_KBD_SAVE_LOCK_WAIT` bounds the state-lock wait in `save_state` (default 2s);
 `C640_KBD_RESUME_PROBE_MAX` caps post-thaw ScreenSaver polling (default 10s);
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring on an unknown answer.
 
@@ -355,13 +394,16 @@ accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node a
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 244 cases (write chain, re-probe,
-staging/verify, tristate, resume handoff) and the sleep-hook suite has 73 cases
-(pure handoff, `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes).
+all state is in a temp dir. The daemon suite has 374 cases (write chain, re-probe,
+staging/verify, tristate, resume result codes/retry, save-before-blank) and the
+sleep-hook suite has 73 cases (pure handoff, `0600`/`chown`/atomic `mv`,
+`C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite (`tests/rollback-test.sh`,
+run as root) has 493 cases, including corrupt-manifest fail-closed.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 244 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 374 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
+sudo bash tests/rollback-test.sh                       # 493 cases (root)
 ```
 
 ---

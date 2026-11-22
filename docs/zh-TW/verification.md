@@ -64,9 +64,9 @@
 | keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
-| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——244 個 daemon 案例全過；真實 S3 驗證見下 |
+| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——第六次 re-review 修復後 374 個 daemon 案例全過（見下）；真實 S3 驗證見下 |
 | 鍵盤背光 user service | 🟢 | `/etc/systemd/user/`，全域啟用且 **uid 1000 的服務為 active**（`systemctl --global is-enabled`、`systemctl --user is-active` 皆正常）；`StandardError=journal` 讓 daemon 日誌可由 `journalctl --user -u c640-kbd-backlight-sync.service` 查看 |
-| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；73 個 hook 案例全過。**真實 S3 freeze/thaw 於 2026-11-22 驗證**（詳情見下） |
+| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；73 個 hook 案例全過。root 的 `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**——first-wins、不被消耗、也從不用於還原。**真實 S3 freeze/thaw 於 2026-11-22 驗證**（詳情見下） |
 
 #### 真實 S3 驗收（2026-11-22，完整 systemd freeze/thaw）
 
@@ -84,6 +84,31 @@
 > 這兩次使用 `rtcwake` + `systemctl suspend`，走的是與蓋蓋相同的 systemd
 > `PrepareForSleep` freeze/thaw 與 system-sleep hook 路徑。**手動蓋蓋**循環不在
 > 本次範圍內，仍列為補充待測項目。
+
+#### 第六次 re-review 修復（2026-11-23，僅單元測試）
+
+以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
+原文保留，此處不宣稱新的硬體實測。
+
+* **只有實際套用的還原才消耗 flag。** adopt、還原與新的 `verify_restore_applied()`
+  共用結果碼 `0=RC_DONE`、`1=RC_FAIL`、`2=RC_DEFER`。鎖取得失敗、`STATE`/
+  `restore-pending` 仍存在、或亮度讀回與已存值不符，都回 DEFER/FAIL 而非 0。只有
+  DONE 會移除 state 與兩個 handoff 檔；DEFER 保留它們讓 5 秒取樣器重試，且
+  `handle_unblank()` 記錄 `unblank: restore deferred` 而非誤發 WARN。
+  `log_warn_once` 改用以 state 目錄中的標記檔，讓警告在跨 subshell 時仍只出現一次。
+* **損毀 manifest 採 fail-closed。** `lib/backup.sh` 對所有 reader/writer 使用單一
+  驗證器：manifest 不存在時建立空骨架；已存在的損毀 manifest 會記錄
+  `MANIFEST_INVALID ... original bytes left untouched`、原檔位元組不變，並讓
+  `manifest_has_target`（三態 0/1/2）與三個 writer 全都失敗。備份在任何目標被碰到前
+  即被拒絕。
+* **熄滅前先保存。** 抽出 `compute_save_brightness()`；`save_state [value]` 在
+  `flock -w "$C640_KBD_SAVE_LOCK_WAIT"`（預設 2 秒）下回傳 `0`（已保存）/
+  `1`（鎖等待失敗）/ `2`（寫入失敗）。`handle_blank()` 先取樣、保存（以擷取值重試
+  兩次），**之後才**寫入 0；全部失敗時記錄 `blank: brightness NOT saved`、保持 LED
+  亮著並重新 seed last-user cache。`--test-blank` 在保存失敗時回傳 1。
+
+修復後的單元測試總數：**374** 個 daemon、**73** 個 sleep-hook、**493** 個 rollback
+案例（最後一項需 root），全部 0 失敗。
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
 
@@ -132,7 +157,7 @@
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（244 daemon + 73 hook）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（374 daemon + 73 hook + 493 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -183,7 +208,10 @@ cat /sys/power/mem_sleep
   2026-11-22（Phase 6 鍵盤背光 handoff 真實 S3 驗收：systemd 259 /
   gnome-settings-daemon 50 上以 `rtcwake -m no -s 20` + `systemctl suspend`；
   鎖定喚醒時延後並保留 `state=30`，再以 `loginctl unlock-session 2` 解鎖後
-  亮度/gsd/UPower 皆還原至 30 且兩個 handoff 檔皆消耗）
+  亮度/gsd/UPower 皆還原至 30 且兩個 handoff 檔皆消耗），
+  2026-11-23（第六次 re-review 單元測試重跑：374 daemon + 73 sleep-hook + 493
+  rollback 案例，0 失敗；結果碼、manifest fail-closed 與熄滅前保存的文件已同步——
+  無新增真實 S3 實測）
 * **OS / 核心**：Ubuntu 26.04 LTS；2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`，2026-08 證據包為 `7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）

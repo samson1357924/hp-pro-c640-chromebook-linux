@@ -72,6 +72,13 @@ chmod +x keyboard/install-keyboard.sh
 `0700`，所有上層目錄也需 root 擁有，直接父目錄不得為群組/其他人可寫（即使有 sticky 位也一樣）。
 家目錄下的路徑會被拒絕；任一檢查失敗時安裝器會拒絕部署 keyd 設定。
 
+**備份 manifest 採 fail-closed：** 部署的檔案、服務與群組會記錄在
+`/var/lib/cros-enablement/install-manifest.json`。manifest 不存在時仍會建立空骨架；
+但若**已存在的 manifest 損毀/無效**，會記錄 `MANIFEST_INVALID ... original bytes left
+untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續（解析失敗時不備份任何目標，
+也不宣稱任何目標已受追蹤）。重裝前請修復或明確移除損毀的 manifest，以免 rollback
+覆蓋範圍被悄悄放棄。
+
 ---
 
 ### 選項 2：`keyd` 常駐程式（進階多層與雙重角色）
@@ -211,6 +218,14 @@ UPower `KbdBacklight.SetBrightness`（raw），再降級到 `sysfs`/`ectool`。�
 重啟時會以當下讀數重新 seed（`cur=0` → `manual0`）。沒有 state 檔時完全不寫入，
 因此使用者手動調整會被保留。
 
+`save_state()` 有明確的 rc：`0` = 已有有效副本（原本就存在或剛寫入）、
+`1` = state lock 的 `flock -w` 逾時或出錯、`2` = 選值或寫入 state 失敗。
+`C640_KBD_SAVE_LOCK_WAIT` 限制該等待時間（預設 `2s`；`0` = 不等待）。熄滅時 daemon
+先取樣目前亮度、予以保存（首次失敗時以擷取到的值再重試兩次），**保存成功才關閉 LED**；
+若全部失敗，會記錄 `blank: brightness NOT saved (...)`、`blank: deferred save attempt N
+failed`、保持 LED 亮著，並把擷取值留在 last-user cache，讓下次熄滅仍有機會保存。
+`--test-blank` 在保存失敗時回傳 1。
+
 `set_brightness()` 在至少一個後端接受寫入且讀回（`verify_brightness()`）確認後回傳 0
 （成功）；沒有任何讀回途徑時，寫入成功會附 WARN 視為成功；rc 1 代表寫入失敗或讀回
 不一致。慢速寫入前，state 會先暫存到
@@ -225,9 +240,12 @@ sampler、seed 與 blank guard 使用。
 
 **sleep hook 只做 handoff**：真實 S3 週期中，systemd 會在 `post` 階段前凍結
 `user.slice`，因此 hook 絕不查詢使用者/session D-Bus、絕不寫 LED、絕不刪 state。
-`pre` 儲存 root 可讀的 audit/backstop state，並發佈 `c640-kbd-backlight.suspend`
+`pre` 寫入 `/run/c640-kbd-backlight/state` 作為**本次開機第一次 suspend 的單次診斷快照**
+（first-wins，保留到重開機），並發佈 `c640-kbd-backlight.suspend`
 （單一十進位整數，`0` 有效）；`post` 只發佈 `c640-kbd-backlight.resume`
-（`<epoch> <action>`）。兩者都是 `0600`、chown 給解析出的 session user，並以原子
+（`<epoch> <action>`）。root 快照**不被 hook 或 daemon 消耗，也從不用於還原**；
+daemon 只消費兩個 handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。
+兩個 handoff 檔都是 `0600`、chown 給解析出的 session user，並以原子
 `mv` 放進 `$XDG_RUNTIME_DIR`；`C640_KBD_HANDOFF_DIR` 可覆寫目錄。當 daemon 持有
 不同的非零已存值時，blank-side 的 handoff `0` 會被忽略，讓使用者亮度在「已熄屏時
 休眠」後仍保留。hook 絕不消耗 handoff 檔——由 daemon 在成功 adopt/還原後消耗。
@@ -238,10 +256,21 @@ bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume 
 探測兩個 D-Bus 後端、把 suspend handoff adopt 進 `STATE_FILE`，再輪詢三態
 （0.2/0.4/0.8/1.6/3.2s，`C640_KBD_RESUME_PROBE_MAX=10` 為上限）。`inactive` →
 經 gsd-power→UPower→legacy 還原；`active` → 延後並重試；`unknown` → 只有目前亮度
-已等於已存值時才不寫入地收斂，否則延後。resume flag 只在驗證還原成功後消耗。
+已等於已存值時才不寫入地收斂，否則延後。
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 可選擇在答案仍為 unknown 時還原——這等於接受
 點亮仍鎖定螢幕的風險，預設關閉。只要有 resume flag，`handle_unblank()` 就會路由到
 `handle_resume()`，避免雙重寫入。
+
+adopt、還原與 `verify_restore_applied()` 共用一組結果碼：
+`0 = RC_DONE`（寫入已驗證，`STATE`/`restore-pending` 已消耗）、`1 = RC_FAIL`（輸入無效
+或 I/O 失敗）、`2 = RC_DEFER`（鎖競爭、暫存還原仍在進行，或螢幕 active/unknown）。
+鎖取得失敗、`STATE`/`PENDING` 仍存在、或亮度讀回與已存值不符，都歸為 DEFER/FAIL 而非
+成功。**只有 `RC_DONE` 會消耗 resume flag（以及 handoff/state）**。`RC_DEFER` 保留
+flag/handoff/state 並排定重試供 sampler 或下次 unblank 使用；`RC_FAIL` 保留 resume
+flag，但 saved state 可能已被消耗（僅 last-user cache 留有擷取值）；寫入/finalize 失敗且 state 仍在時仍會重排
++0.5/+1.5/+3s 重試，而 verify 或 adoption 失敗則不排。
+`handle_unblank()` 在 DEFER 時記錄 `unblank: restore deferred`，而不是
+誤發 WARN。
 
 **後端重新探測**：只有成功的探測才會快取；缺失或失敗的 gsd-power / UPower 每次使用
 都會重新探測，因此晚出現的 D-Bus name 也能被採用。執行期失敗會丟棄快取並記錄
@@ -266,7 +295,7 @@ bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume 
 
 ```bash
 c640-kbd-backlight-sync --check          # 顯示目前亮度與狀態
-c640-kbd-backlight-sync --test-blank     # 模擬螢幕熄滅 -> 儲存並設為 0
+c640-kbd-backlight-sync --test-blank     # 模擬熄滅：先儲存再設 0（儲存失敗則回傳 1）
 cat /sys/class/leds/chromeos::kbd_backlight/brightness  # 應為 0
 c640-kbd-backlight-sync --test-unblank   # 模擬螢幕點亮 -> 恢復
 ```
@@ -290,8 +319,10 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 
 **日誌：** daemon 訊息全部寫到 stderr；unit 設了 `StandardError=journal`，因此
 （含 `backends probed: gsd=... upower=...`、`RECOVERED (0 -> 1)`、
-`saved brightness`、`restoring brightness`、`restore deferred: ScreenSaver ...`、
-`resume deferred:`、`ignoring blank-side suspend handoff 0`、
+`saved brightness`、`restoring brightness`、`restore verify (gen=...): ... not completed`、
+`suspend handoff adoption deferred`、`restore deferred: ScreenSaver ...`、
+`resume deferred:`、`unblank: restore deferred`、`ignoring blank-side suspend handoff 0`、
+`blank: brightness NOT saved`、`blank: deferred save attempt N failed`、
 `restore failed (... rc=...): keeping brightness ... for retry`、
 `another restore is in progress`、`resume: restore complete; resume flag consumed`
 與 `[WARN]` 降級訊息）都可在使用者 journal 看到：
@@ -303,6 +334,7 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 
 **執行期環境變數**（不碰系統檔案）：`C640_KBD_FORCE_LEGACY=1` 停用兩個 D-Bus
 後端（見上）；`C640_KBD_LAST_USER_TTL` 設定手動關閉快取的 TTL（預設 15 秒）；
+`C640_KBD_SAVE_LOCK_WAIT` 限制 `save_state` 的 state lock 等待（預設 2 秒）；
 `C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後 ScreenSaver 輪詢（預設 10 秒）；
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 選擇在答案未知時仍還原。
 
@@ -315,13 +347,15 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 244 個案例（寫入鏈、重新探測、暫存/驗證、
-三態、喚醒 handoff）；sleep hook 測試有 73 個案例（純 handoff、`0600`/`chown`/
-原子 `mv`、`C640_KBD_HANDOFF_DIR`、不寫 LED）。
+所有狀態都在暫存目錄。daemon 測試有 374 個案例（寫入鏈、重新探測、暫存/驗證、
+三態、喚醒結果碼/重試、熄滅前保存）；sleep hook 測試有 73 個案例（純 handoff、
+`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、不寫 LED）。rollback 測試
+（`tests/rollback-test.sh`，需 root）有 493 個案例，包含損毀 manifest fail-closed。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 244 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 374 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
+sudo bash tests/rollback-test.sh                       # 493 個案例（需 root）
 ```
 
 ---
