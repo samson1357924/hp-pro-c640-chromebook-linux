@@ -833,39 +833,79 @@ compute_save_brightness() {
     printf '%s\n' "$curr"
 }
 
-# Persist the brightness to STATE_FILE (atomic, first-wins).
-# rc: 0 = a valid copy exists (already present or written now),
+# --- STATE_FILE value/format helpers ---------------------------------------
+# Single source of truth for the accepted brightness grammar: a bare
+# non-negative decimal integer (leading zeros allowed); "0" is a real value.
+_is_brightness_value() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# Return 0 iff STATE_FILE holds a VALID saved brightness.
+# CALLER MUST HOLD STATE_LOCK: a concurrent restore stages/renames STATE_FILE,
+# so an unlocked read would be a TOCTOU race.
+_state_file_valid() {
+    [ -f "$STATE_FILE" ] || return 1
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo '')" || return 1
+    # cat keeps embedded newlines; multi-line/binary content is not a value.
+    [[ "$saved" != *$'\n'* ]] || return 1
+    _is_brightness_value "$saved"
+}
+
+# Atomically publish a validated value.  CALLER MUST HOLD STATE_LOCK.
+# No first-wins shortcut here -- the caller decides when to call it.
+# rc: 0 = verified on disk; 2 = invalid value / mktemp or write failure.
+_publish_state_file() {
+    local val="${1:-}" tmp
+    _is_brightness_value "$val" || return 2
+    mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null \
+        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX" 2> /dev/null)" || return 2
+    printf '%s\n' "$val" > "$tmp" 2> /dev/null || {
+        rm -f "$tmp" 2> /dev/null || true
+        return 2
+    }
+    chmod 600 "$tmp" 2> /dev/null || true
+    if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
+        cp "$tmp" "$STATE_FILE" 2> /dev/null || {
+            rm -f "$tmp" 2> /dev/null || true
+            return 2
+        }
+    fi
+    rm -f "$tmp" 2> /dev/null || true
+    # cp fallback onto an existing file keeps the OLD mode; never widen it.
+    chmod 600 "$STATE_FILE" 2> /dev/null || true
+    # Keep the silent-write-failure guard from the old save_state: a wrong
+    # value on disk must never be reported as a successful save.
+    [ "$(cat "$STATE_FILE" 2> /dev/null || echo '')" = "$val" ] || return 2
+    return 0
+}
+
+# Persist the brightness to STATE_FILE (atomic, first-wins for a VALID copy).
+# rc: 0 = a valid copy exists (already present or self-healed now),
 #     1 = the bounded lock wait failed / flock errored,
 #     2 = value selection or the state write failed.
 # Optional $1 is an already-sampled value (skips selection); this is what
-# handle_blank uses so a blank's new value cannot be lost to a lock timeout.
+# handle_blank uses so a blank's new value cannot be lost to a lock timeout,
+# nor replaced by a second (blank-side) sample.
 save_state() {
     local val="${1:-}"
     if [ -z "$val" ]; then
         val="$(compute_save_brightness)" || return 2
     fi
-    [[ "$val" =~ ^[0-9]+$ ]] || return 2
+    _is_brightness_value "$val" || return 2
     (
         flock -w "$C640_KBD_SAVE_LOCK_WAIT" 200 || exit 1
-        # First-wins: an existing valid copy must not be overwritten, even by
-        # a later (newer) blank.  The restore staging logic owns that case.
-        [ -f "$STATE_FILE" ] && exit 0
-        mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
-        local tmp
-        tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")" || exit 2
-        printf '%s\n' "$val" > "$tmp" || exit 2
-        chmod 600 "$tmp" 2> /dev/null || true
-        if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
-            cp "$tmp" "$STATE_FILE" 2> /dev/null || {
-                rm -f "$tmp"
-                exit 2
-            }
+        # First-wins applies ONLY to a VALID existing copy.  An empty,
+        # non-numeric or corrupt file is not a copy: self-heal it with the
+        # value sampled before the LED was switched off (finding #1).
+        if _state_file_valid; then
+            exit 0
         fi
-        rm -f "$tmp" 2> /dev/null || true
-        # Verify the value really landed before reporting success: a silent
-        # write failure here would let handle_blank turn the LED off with no
-        # persisted copy of the new brightness.
-        [ "$(cat "$STATE_FILE" 2> /dev/null || echo '')" = "$val" ] || exit 2
+        if [ -f "$STATE_FILE" ]; then
+            log_warn "replacing invalid saved brightness with $val"
+        fi
+        _publish_state_file "$val" || exit 2
         log "saved brightness $val"
         exit 0
     ) 200> "$STATE_LOCK"
@@ -1049,7 +1089,7 @@ schedule_restore_retries() {
             fi
             local saved
             saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-            if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+            if ! _is_brightness_value "$saved"; then
                 rm -f "$STATE_FILE" 2> /dev/null || true
                 flock -u 202
                 exec 202>&-
@@ -1112,7 +1152,7 @@ restore_state() {
 
     local saved
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-    if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+    if ! _is_brightness_value "$saved"; then
         log_warn "discarding invalid saved brightness '$saved'"
         rm -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null || true
         flock -u 201
@@ -1346,7 +1386,7 @@ _handle_resume_locked() {
 
     local saved
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-    if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
+    if ! _is_brightness_value "$saved"; then
         # Nothing to restore: LED_CORE_SUSPENDRESUME normally kept the value.
         rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
         log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
@@ -1567,7 +1607,19 @@ handle_blank() {
     # recomputation afterwards could capture the (meaningless) blank-side 0
     # or nothing at all.  The captured value is reused for every retry.
     captured="$(compute_save_brightness 2> /dev/null || true)"
-    if save_state; then src=0; else src=$?; fi
+    # Save the pre-blank snapshot on the FIRST attempt.  Calling an
+    # un-parameterised save_state here would sample a second time: if
+    # GNOME/firmware drops the LED to 0 between the two reads, the second
+    # compute_save_brightness sees a blank-side 0 and falls back to the stale
+    # last-user cache (e.g. saving 8 instead of the real 30).  A successful
+    # save of that wrong value would never be corrected by the retry below.
+    # Only let save_state sample itself when captured is empty; do NOT pass
+    # an empty string (that would suppress the fallback).
+    if [ -n "$captured" ]; then
+        if save_state "$captured"; then src=0; else src=$?; fi
+    else
+        if save_state; then src=0; else src=$?; fi
+    fi
     if [ "$src" -ne 0 ] && [ -n "$captured" ]; then
         for attempt in 1 2; do
             if save_state "$captured"; then

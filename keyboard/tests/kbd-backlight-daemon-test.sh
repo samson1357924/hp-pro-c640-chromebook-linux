@@ -2118,6 +2118,158 @@ assert_eq "P6-12: PENDING guard still defers restore" "2" "$rc"
 assert_file "P6-12: staged PENDING value preserved" "$RESTORE_PENDING_FILE" "9"
 assert_file "P6-12: guarded restore writes nothing" "$RAW_FILE" "42"
 
+# P7-1. Finding #1 regression: handle_blank must save the PRE-BLANK snapshot on
+# its FIRST attempt.  GNOME/firmware may drop the LED to 0 between the first
+# sample and a second, un-parameterised save_state(): that second sample would
+# see a blank-side 0 and fall back to the stale cache (8), losing the freshly
+# set 30.  A file-backed counter is mandatory because compute_save_brightness
+# calls get_brightness inside command substitutions (a shell variable would be
+# lost in each subshell).
+reset_case
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+write_last_user 8 nonzero
+: > "$SET_LOG"
+: > "$ORDER_FILE"
+P7_GET_LOG="$TMP_DIR/p7-get-log"
+: > "$P7_GET_LOG"
+_orig_get_p71="$(declare -f get_brightness)"
+get_brightness() {
+    local n
+    n="$(grep -c . "$P7_GET_LOG" 2> /dev/null || true)"
+    n="${n:-0}"
+    n=$((n + 1))
+    printf '%s\n' "$n" >> "$P7_GET_LOG"
+    if [ "$n" -eq 1 ]; then
+        printf '30\n'
+    else
+        printf '0\n'
+    fi
+}
+_orig_set_p71="$(declare -f set_brightness)"
+declare -f set_brightness | sed '1s/^set_brightness ()/real_set_brightness_p71 ()/' > "$TMP_DIR/real_set_brightness_p71.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/real_set_brightness_p71.def"
+set_brightness() {
+    if [ "${1:-}" = "0" ]; then
+        cat "$STATE_FILE" > "$ORDER_FILE" 2> /dev/null || true
+    fi
+    real_set_brightness_p71 "$@"
+}
+rc="$(run_fn_rc handle_blank)"
+eval "$_orig_set_p71"
+eval "$_orig_get_p71"
+wait 2> /dev/null || true
+assert_eq "P7-1: handle_blank rc=0" "0" "$rc"
+assert_file "P7-1: pre-blank 30 saved, not stale cache 8" "$STATE_FILE" "30"
+assert_file "P7-1: state held 30 when LED went off" "$ORDER_FILE" "30"
+assert_file "P7-1: LED finally off" "$RAW_FILE" "0"
+assert_eq "P7-1: exactly one gsd Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'int32 0' "$SET_LOG"; then
+    ok "P7-1: the single gsd write is int32 0"
+else
+    bad "P7-1: gsd write is not int32 0: $(cat "$SET_LOG")"
+fi
+assert_eq "P7-1: no UPower direct write (single writer)" "0" "$(grep -c 'UPower.SetBrightness' "$SET_LOG" || true)"
+assert_eq "P7-1: brightness sampled exactly once" "1" "$(grep -c . "$P7_GET_LOG" || true)"
+
+# P6-13. Finding #2: an EMPTY STATE_FILE is not a valid copy.  save_state must
+# self-heal it before handle_blank switches the LED off.
+reset_case
+printf '30\n' > "$RAW_FILE"
+: > "$STATE_FILE"
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-13: empty state self-healed, rc=0" "0" "$rc"
+assert_file "P6-13: saved brightness 30" "$STATE_FILE" "30"
+assert_file "P6-13: LED off" "$RAW_FILE" "0"
+
+# P6-14. Non-numeric state is likewise invalid and gets atomically replaced.
+reset_case
+printf '30\n' > "$RAW_FILE"
+write_state not-an-integer
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-14: non-numeric state self-healed, rc=0" "0" "$rc"
+assert_file "P6-14: saved brightness 30" "$STATE_FILE" "30"
+assert_file "P6-14: LED off" "$RAW_FILE" "0"
+if grep -q 'replacing invalid saved brightness' "$DAEMON_ERR"; then
+    ok "P6-14: WARN explains the replacement"
+else
+    bad "P6-14: missing replacement WARN: $(cat "$DAEMON_ERR")"
+fi
+
+# P6-15. Multi-line JSON is not a brightness value.
+reset_case
+printf '30\n' > "$RAW_FILE"
+printf '{"brightness":30}\n{"brightness":8}\n' > "$STATE_FILE"
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-15: multi-line state self-healed, rc=0" "0" "$rc"
+assert_file "P6-15: saved brightness 30" "$STATE_FILE" "30"
+
+# P6-15b. Binary bytes after a valid prefix must not be accepted either.
+reset_case
+printf '30\n' > "$RAW_FILE"
+printf '30\377\376\n' > "$STATE_FILE"
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-15b: binary state self-healed, rc=0" "0" "$rc"
+assert_file "P6-15b: saved brightness 30" "$STATE_FILE" "30"
+
+# P6-16. First-wins still protects a VALID existing copy (8), both for a direct
+# save and for the blank path.
+reset_case
+printf '30\n' > "$RAW_FILE"
+write_state 8
+rc="$(run_fn_rc save_state)"
+assert_eq "P6-16: first-wins save rc=0" "0" "$rc"
+assert_file "P6-16: valid state 8 not overwritten" "$STATE_FILE" "8"
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-16: handle_blank rc=0 with valid state" "0" "$rc"
+assert_file "P6-16: state still 8 after blank" "$STATE_FILE" "8"
+assert_file "P6-16: LED off" "$RAW_FILE" "0"
+
+# P6-17. A genuine write failure (mktemp fails) must NOT be mistaken for a
+# valid copy: save_state returns 2 through all retries, so handle_blank keeps
+# the LED on and leaves the corrupt state untouched.
+reset_case
+printf '30\n' > "$RAW_FILE"
+write_state not-an-integer
+printf '#!/bin/sh\nexit 1\n' > "$STUB_DIR/mktemp"
+chmod +x "$STUB_DIR/mktemp"
+rc="$(run_fn_rc handle_blank)"
+rm -f "$STUB_DIR/mktemp"
+wait 2> /dev/null || true
+assert_eq "P6-17: write failure propagates rc=2" "2" "$rc"
+assert_file "P6-17: invalid state left untouched" "$STATE_FILE" "not-an-integer"
+assert_file "P6-17: LED left ON (raw still 30)" "$RAW_FILE" "30"
+
+# P6-18. captured=0 is a real value, not an empty sampling failure: self-heal
+# must publish exactly "0" (the manual0 cache plus gsd pct 0 makes live 30 a
+# transient blank-side residue).
+reset_case
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+write_state garbage
+write_last_user 0 manual0
+rc="$(run_fn_rc handle_blank)"
+wait 2> /dev/null || true
+assert_eq "P6-18: captured 0 saved, rc=0" "0" "$rc"
+assert_file "P6-18: state exactly 0" "$STATE_FILE" "0"
+assert_file "P6-18: LED off" "$RAW_FILE" "0"
+
+# P6-19. Backstop: restore_state still discards an externally corrupted value
+# (the self-healing writer never produces one, but recovery must stay safe).
+reset_case
+write_state garbage
+rc="$(run_fn_rc restore_state)"
+assert_eq "P6-19: restore of invalid state is a safe no-op" "0" "$rc"
+assert_absent "P6-19: invalid state removed" "$STATE_FILE"
+
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
     exit 1
