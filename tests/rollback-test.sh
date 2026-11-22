@@ -5181,8 +5181,9 @@ test_rollback_user_scope_start_failure_keeps_record() {
     setup_keyd_caller_sandbox "$sandbox" valid
     local manifest="$sandbox/manifest/install-manifest.json"
     local uid user
-    # The suite runs under sudo: SUDO_USER is the real non-root caller, while
-    # `id -un` would report root (which the production gate rejects).
+    # Under sudo, SUDO_USER is the real non-root caller; in a root-only CI
+    # container it is unset and `id -un` reports root (the production gate
+    # then treats this as "no user manager" -- see the assertions below).
     user="${SUDO_USER:-}"
     if [ -z "$user" ] || [ "$user" = "root" ]; then
         user="$(id -un)"
@@ -5200,14 +5201,33 @@ test_rollback_user_scope_start_failure_keeps_record() {
         rc=0; rollback_component "demo" || rc=$?
         printf "%s\n" "$rc" > "$2/rollback-rc.txt"
     ' "$uid" "$user" 2> "$sandbox/rollback.log"
+    local rollback_log systemctl_log
+    rollback_log="$(cat "$sandbox/rollback.log")"
+    systemctl_log="$(cat "$sandbox/systemctl.log")"
     assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
-        "user scope start failure: rc 1"
+        "user scope start failure: rc non-zero"
     assert_eq "1" "$(manifest_count "$manifest" services)" \
         "user scope start failure: record retained"
-    assert_contains "SERVICE_RESTORE_FAILED name=fail.service action=--user start rc=1" \
-        "$(cat "$sandbox/rollback.log")" "user scope start failure: marker"
-    assert_contains "--user start fail.service" "$(cat "$sandbox/systemctl.log")" \
-        "user scope start failure: --user start was attempted"
+    # Two legitimate fail-closed paths, depending on the host environment:
+    #  * a non-root SUDO_USER with a reachable per-user bus -> --user start is
+    #    attempted by the stub and fails with rc=1;
+    #  * no user manager (CI container: no SUDO_USER, no /run/user/<uid>) ->
+    #    the start is deliberately NOT attempted and rollback reports
+    #    rc=unavailable. Both keep the record and emit a warning.
+    if printf '%s' "$rollback_log" | grep -qF \
+        "SERVICE_RESTORE_FAILED name=fail.service action=--user start rc=1"; then
+        ok
+        assert_contains "--user start fail.service" "$systemctl_log" \
+            "user scope start failure: --user start was attempted"
+    elif printf '%s' "$rollback_log" | grep -qF \
+        "SERVICE_RESTORE_FAILED name=fail.service action=--user start rc=unavailable"; then
+        ok
+        assert_not_contains "--user start" "$systemctl_log" \
+            "user scope start failure: no --user start should be attempted"
+    else
+        fail "user scope start failure: marker (expected SERVICE_RESTORE_FAILED ... rc=1 or rc=unavailable)"
+        fail "user scope start failure: --user start call record consistent with marker"
+    fi
 }
 
 test_rollback_systemctl_spawn_failure_keeps_record() {
