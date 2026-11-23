@@ -8287,27 +8287,36 @@ pam_record_count() {
 
 # Install step: exactly what the fingerprint installer calls, with the seam
 # env vars inherited from the caller's prefix assignment.
+#
+# $3 = per-call rollback fault injection flag (default 0). It is passed as an
+# explicit argument into the sandbox and exported THERE, never from the parent
+# shell: exporting it in the parent would let a fail=1 call leak into every
+# later install/uninstall in the same shell (the CI PAM-8 failure).
 run_pam_install() {
-    local sandbox="$1" distro="$2"
-    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR STUB_FAIL_ROLLBACK_PY
+    local sandbox="$1" distro="$2" fail_rollback="${3:-0}"
+    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         configure_pam_fingerprint
         printf "%s\n" "$?" > "$2/install.rc"
-    ' "$distro"
+    ' "$distro" "$fail_rollback"
 }
 
 # Uninstall step: mirror _uninstall_fp_body() ordering — rollback FIRST, then
 # disable_pam_fingerprint(). No sed or tool call may be injected in between.
+# $3 is the per-call fault flag; see run_pam_install() for why it is scoped to
+# the sandbox snippet instead of the parent environment.
 run_pam_uninstall() {
-    local sandbox="$1" distro="$2"
-    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR STUB_FAIL_ROLLBACK_PY
+    local sandbox="$1" distro="$2" fail_rollback="${3:-0}"
+    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         rc=0
@@ -8315,7 +8324,7 @@ run_pam_uninstall() {
         printf "%s\n" "$rc" > "$2/rollback.rc"
         disable_pam_fingerprint
         printf "%s\n" "$?" > "$2/disable.rc"
-    ' "$distro"
+    ' "$distro" "$fail_rollback"
 }
 
 # PAM-1: original sudo PAM already has the EXACT project line. Install skips
@@ -8397,8 +8406,7 @@ test_pam_4_failed_rollback_keeps_record_and_warns() {
     sed_after_install="$(wc -l < "$s/sed.log")"
 
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
-        STUB_FAIL_ROLLBACK_PY=1 \
-        run_pam_uninstall "$s" debian
+        run_pam_uninstall "$s" debian 1
 
     assert_eq "1" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-4: rollback rc 1"
     assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-4: disable rc 0"
@@ -8500,6 +8508,52 @@ test_pam_8_common_auth_tracked_and_no_uninstall_tool_call() {
     assert_eq "0" "$(pam_record_count "$s")" "PAM-8: manifest records consumed"
 }
 
+# PAM-9 (fault-injection isolation regression): the CI bug was PAM-4's
+# STUB_FAIL_ROLLBACK_PY=1 leaking through the parent shell into PAM-8. The flag
+# is now a per-call argument exported INSIDE the sandbox, so a later fail=0
+# uninstall rolls back cleanly even when the parent environment holds a 1.
+# Two independent sandboxes in one shell mirror the PAM-4 -> PAM-8 sequence.
+test_pam_9_fault_injection_does_not_leak_to_later_uninstall() {
+    local s_fail s_ok sudo_before common_before saved_flag had_flag
+    s_fail="$(setup_pam_sandbox fault-first)"
+    pam_write_initial_files "$s_fail" none fp
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s_fail/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s_fail/pam" \
+        run_pam_install "$s_fail" debian
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s_fail/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s_fail/pam" \
+        run_pam_uninstall "$s_fail" debian 1
+    assert_eq "1" "$(cat "$s_fail/rollback.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-9: first uninstall's injected rollback failure rc 1"
+
+    s_ok="$(setup_pam_sandbox fault-cleared)"
+    pam_write_initial_files "$s_ok" none fp
+    sudo_before="$(file_hex "$s_ok/pam/sudo")"
+    common_before="$(file_hex "$s_ok/pam/common-auth")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s_ok/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s_ok/pam" \
+        run_pam_install "$s_ok" debian
+
+    # Deliberately poison the PARENT environment. The per-call default (0) must
+    # override it inside the sandbox; the inherited value must never win.
+    had_flag="${STUB_FAIL_ROLLBACK_PY+x}"
+    saved_flag="${STUB_FAIL_ROLLBACK_PY-}"
+    export STUB_FAIL_ROLLBACK_PY=1
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s_ok/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s_ok/pam" \
+        run_pam_uninstall "$s_ok" debian
+    if [ -n "$had_flag" ]; then
+        export STUB_FAIL_ROLLBACK_PY="$saved_flag"
+    else
+        unset STUB_FAIL_ROLLBACK_PY
+    fi
+
+    assert_eq "0" "$(cat "$s_ok/rollback.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-9: second uninstall rollback rc 0 (flag not inherited)"
+    assert_eq "$sudo_before" "$(file_hex "$s_ok/pam/sudo")" \
+        "PAM-9: sudo PAM bytes restored by second uninstall"
+    assert_eq "$common_before" "$(file_hex "$s_ok/pam/common-auth")" \
+        "PAM-9: common-auth bytes restored by second uninstall"
+    assert_eq "0" "$(pam_record_count "$s_ok")" \
+        "PAM-9: manifest records consumed by second uninstall"
+}
+
 # Re-review #11 finding #2: original sudo/common PAM bytes must survive
 # fingerprint install -> uninstall (PAM-1..8).
 test_pam_1_preexisting_exact_line_survives
@@ -8510,6 +8564,7 @@ test_pam_5_unsupported_distro_no_sed
 test_pam_6_dry_run_no_side_effects
 test_pam_7_disable_body_has_no_sed
 test_pam_8_common_auth_tracked_and_no_uninstall_tool_call
+test_pam_9_fault_injection_does_not_leak_to_later_uninstall
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
