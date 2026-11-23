@@ -3,7 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
 # tests/rollback-test.sh - Sandboxed tests for lib/backup.sh backup/rollback
 # primitives (install plan backup, manifest schema 2.0, service & group
-# restoration). Run as root or with passwordless sudo:
+# restoration). Run as root (the manifest lock tests create a root-owned 0600
+# lock and call the helpers directly; a non-root shell with passwordless sudo
+# is supported by the installers, but not by this direct-helper test suite):
 #
 #   sudo bash tests/rollback-test.sh
 set -e
@@ -79,11 +81,22 @@ PY
 # rendezvous, so no fixed /tmp path can collide with the legacy cases.
 # ---------------------------------------------------------------------------
 LOCK_TEST_SANDBOXES=()
+# T12's sandbox comes back through `$(make_manifest_lock_sandbox ...)`, so the
+# array append happens in a subshell and never reaches this trap. Track that
+# one path explicitly so an early T12 failure still releases its bounded waiter.
+T12_CRASH_SANDBOX=""
 cleanup_lock_test_sandboxes() {
     local s
     for s in "${LOCK_TEST_SANDBOXES[@]}"; do
-        [ -n "$s" ] && rm -rf -- "$s"
+        [ -n "$s" ] || continue
+        # Release any bounded crash-simulation waiter before removing its
+        # sandbox (T12 polls for this file instead of sleeping for 60s).
+        : > "$s/crash.stop" 2> /dev/null || true
+        rm -rf -- "$s"
     done
+    if [ -n "$T12_CRASH_SANDBOX" ]; then
+        : > "$T12_CRASH_SANDBOX/crash.stop" 2> /dev/null || true
+    fi
 }
 trap cleanup_lock_test_sandboxes EXIT
 
@@ -193,6 +206,8 @@ EOF
 # extended ALLOWED_PREFIXES so targets under the sandbox stay in scope.
 run_sandboxed() {
     # $1=sandbox, remaining args passed to bash -c "$1" _ "$REPO_ROOT" "$sandbox" ...
+    # RB_TEST_TIMEOUT (when > 0) bounds a single snippet; used by the FIFO
+    # fail-closed test so a regression to a blocking open cannot hang CI.
     local sandbox="$1"
     shift
     # Provide a sane default snapshot base, but never overwrite a base that a
@@ -209,7 +224,7 @@ run_sandboxed() {
         CROS_ENABLEMENT_ALLOWED_PREFIXES="/tmp/rollback-test-* /etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/" \
         CROS_ENABLEMENT_INSTALLED_TESTS_PREFIXES="$sandbox/root/usr/libexec/installed-tests/ $sandbox/root/usr/share/installed-tests/" \
         LOG_FILE="$sandbox/log.txt" \
-        bash -c "$1" _ "$REPO_ROOT" "$sandbox" "${@:2}"
+        timeout "${RB_TEST_TIMEOUT:-0}" bash -c "$1" _ "$REPO_ROOT" "$sandbox" "${@:2}"
 }
 
 # ---------------------------------------------------------------------------
@@ -5726,7 +5741,7 @@ test_lock_concurrent_writers_keep_both_records() {
         "LOCK T1: no .tmp residue"
     local lock="$sandbox/manifest/.install-manifest.lock"
     assert_eq "root" "$(stat -c '%U' "$lock" 2> /dev/null || echo MISSING)" "LOCK T1: lock root-owned"
-    assert_eq "644" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" "LOCK T1: lock mode 0644"
+    assert_eq "600" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" "LOCK T1: lock mode 0600 (root-only, no unprivileged flock DoS)"
 }
 
 test_lock_concurrent_install_and_rollback_preserves_records() {
@@ -5895,16 +5910,36 @@ test_lock_nested_no_deadlock() {
         manifest_lock || { printf "lock1-failed\n" > "$2/direct.rc"; exit 0; }
         manifest_lock || { printf "lock2-failed\n" > "$2/direct.rc"; exit 0; }
         printf "depth-inner=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/depth-inner.txt"
+        # Snapshot BEFORE unlocking: release clears the holder variables, so
+        # checking them afterwards would be a tautology (both empty -> the
+        # write/kill always fail even if release leaked the fd and helper).
+        saved_wfd="$MANIFEST_LOCK_HOLDER_WFD"
+        saved_pid="$MANIFEST_LOCK_HOLDER_PID"
         manifest_unlock
         manifest_unlock
-        if : <&9 2> /dev/null; then printf "fd-open\n" > "$2/fd.txt"; else printf "fd-closed\n" > "$2/fd.txt"; fi
+        # The lock fd now lives in the root holder, not in this shell. A
+        # balanced release must have closed the coproc write fd and reaped the
+        # helper; writing to the stale WFD must fail and kill -0 must fail.
+        if eval ": >&${saved_wfd}" 2> /dev/null; then
+            printf "wfd-open\n" > "$2/wfd.txt"
+        else
+            printf "wfd-closed\n" > "$2/wfd.txt"
+        fi
+        if kill -0 "$saved_pid" 2> /dev/null; then
+            printf "holder-alive\n" > "$2/holder.txt"
+        else
+            printf "holder-reaped\n" > "$2/holder.txt"
+        fi
         printf "depth=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/depth.txt"
         printf "ok\n" > "$2/direct.rc"
     '
     assert_eq "ok" "$(cat "$sandbox/direct.rc" 2> /dev/null || echo MISSING)" "LOCK T4: direct nested lock rc ok"
     assert_eq "depth-inner=2" "$(cat "$sandbox/depth-inner.txt" 2> /dev/null || echo MISSING)" \
-        "LOCK T4: reentrant lock increments depth (no silent unlock via fd reopen)"
-    assert_eq "fd-closed" "$(cat "$sandbox/fd.txt" 2> /dev/null || echo MISSING)" "LOCK T4: fd 9 closed after balanced unlocks"
+        "LOCK T4: reentrant lock increments depth (no second coproc holder)"
+    assert_eq "wfd-closed" "$(cat "$sandbox/wfd.txt" 2> /dev/null || echo MISSING)" \
+        "LOCK T4: coproc write fd closed after balanced unlocks"
+    assert_eq "holder-reaped" "$(cat "$sandbox/holder.txt" 2> /dev/null || echo MISSING)" \
+        "LOCK T4: root holder reaped after balanced unlocks"
     assert_eq "depth=0" "$(cat "$sandbox/depth.txt" 2> /dev/null || echo MISSING)" "LOCK T4: depth back to zero"
 
     # (b) Public gate -> manifest_add_entry (two levels).
@@ -6127,6 +6162,356 @@ test_lock_same_target_first_backup_wins() {
 }
 
 # ---------------------------------------------------------------------------
+# 46. Re-review #10 findings #2/#3 (fixed together): the lock file must reject
+#     symlinks/non-regular paths, verify the fd it actually holds against the
+#     path, and be root-only 0600 so an unprivileged account cannot take an
+#     exclusive flock and starve every installer. The lock is acquired by a
+#     short-lived root holder coproc whose stdin is our lifetime leash.
+# ---------------------------------------------------------------------------
+_SEC_MANIFEST='{"version":"2.0","records":[],"services":[],"groups":[]}'
+
+_lock_sec_prepare() {
+    printf '%s' "$_SEC_MANIFEST" > "$1/manifest/install-manifest.json"
+    printf 'ORIGINAL AUDIO\n' > "$1/root/audio.conf"
+}
+
+_lock_sec_try() {
+    local s="$1"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/lock.rc"
+        if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+            printf "holder-alive\n" > "$2/holder.txt"
+        else
+            printf "holder-none\n" > "$2/holder.txt"
+        fi
+        if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2> /dev/null; then
+            printf "wfd-open\n" > "$2/wfd.txt"
+        else
+            printf "wfd-closed\n" > "$2/wfd.txt"
+        fi
+        if [ "$rc" -eq 0 ]; then
+            g=0; backup_file_manifest_aware "$2/root/audio.conf" audio || g=$?
+            printf "%s\n" "$g" > "$2/gate.rc"
+            manifest_unlock
+        else
+            printf "1\n" > "$2/gate.rc"
+        fi
+    '
+}
+
+_lock_sec_fail_asserts() {
+    local s="$1" needle="$2"
+    assert_eq "1" "$(cat "$s/lock.rc" 2> /dev/null || echo MISSING)" "SEC: manifest_lock fails closed"
+    assert_eq "holder-none" "$(cat "$s/holder.txt" 2> /dev/null || echo MISSING)" "SEC: no root holder left alive"
+    assert_eq "wfd-closed" "$(cat "$s/wfd.txt" 2> /dev/null || echo MISSING)" "SEC: coproc write fd closed"
+    assert_eq "1" "$(cat "$s/gate.rc" 2> /dev/null || echo MISSING)" "SEC: mutation helper blocked"
+    assert_contains "$needle" "$(cat "$s/log.txt" 2> /dev/null || echo "")" "SEC: explicit error logged"
+    assert_eq "$_SEC_MANIFEST" "$(cat "$s/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC: manifest bytes unchanged"
+    assert_eq "0" "$(find "$s/backups" -type f | wc -l | tr -d '[:space:]')" "SEC: no backup written"
+}
+
+# A paused `stat -c %i -- <lock>` stub lets a test mutate the path AFTER the
+# root holder has already opened fd 9 but BEFORE it compares fd inode to path.
+_lock_sec_stat_stub() {
+    local s="$1"
+    cat > "$s/stub/stat" << 'EOF'
+#!/usr/bin/env bash
+if [ "${STUB_STAT_SPOOF:-0}" = 1 ] && [ "${1:-}" = "-c" ] && [ "${2:-}" = "%i" ] &&
+   [ "${3:-}" = "--" ] && [ "${4:-}" = "${STUB_LOCK_PATH:-}" ] &&
+   [ ! -e "${STUB_STAT_GO:-/nonexistent}" ]; then
+    : > "${STUB_STAT_READY:?}"
+    i=0
+    while [ ! -e "${STUB_STAT_GO:-/nonexistent}" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+fi
+exec /usr/bin/stat "$@"
+EOF
+    chmod +x "$s/stub/stat"
+}
+
+_lock_sec_wait_stub() {
+    local s="$1" i=0
+    while [ ! -e "$s/stat.ready" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$s/stat.ready" ]; then ok; else fail "SEC: helper never reached the inode check"; fi
+}
+
+test_sec_lock_rejects_symlink_to_regular() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s1)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    printf 'ATTACKER\n' > "$s/other"
+    chmod 0644 "$s/other"
+    ln -s "$s/other" "$lock"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "is a symlink"
+    assert_eq "644" "$(stat -c '%a' "$s/other")" "SEC S1: symlink target mode untouched (no path chmod)"
+    assert_eq "ATTACKER" "$(cat "$s/other")" "SEC S1: symlink target bytes untouched"
+}
+
+test_sec_lock_rejects_dangling_symlink() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s2)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    ln -s "$s/no-such-target" "$lock"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "is a symlink"
+}
+
+test_sec_lock_rejects_symlink_to_directory() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s3)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    ln -s "$s/manifest" "$lock"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "is a symlink"
+}
+
+test_sec_lock_rejects_fifo_without_blocking() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s4)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    mkfifo "$lock"
+    RB_TEST_TIMEOUT=15 _lock_sec_try "$s" || true
+    _lock_sec_fail_asserts "$s" "not a regular file"
+}
+
+test_sec_lock_rejects_device_node() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s5)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    if ! mknod "$lock" c 1 3 2> /dev/null; then
+        echo "SKIP: SEC S5 (no CAP_MKNOD in this container)"
+        return 0
+    fi
+    RB_TEST_TIMEOUT=15 _lock_sec_try "$s" || true
+    _lock_sec_fail_asserts "$s" "not a regular file"
+}
+
+test_sec_lock_rejects_world_writable_parent() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s6)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    chmod 0777 "$s/manifest"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "group/other-writable"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC S6: no lock file created in an untrusted parent"
+}
+
+test_sec_lock_rejects_symlinked_parent() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s7)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    mkdir -p "$s/otherdir"
+    cp "$s/manifest/install-manifest.json" "$s/otherdir/install-manifest.json"
+    chmod 0777 "$s/otherdir"
+    rm -rf "$s/manifest"
+    ln -s "$s/otherdir" "$s/manifest"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "is a symlink or not a directory"
+}
+
+test_sec_lock_rejects_post_open_inode_swap() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s8)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    _lock_sec_stat_stub "$s"
+    export STUB_STAT_SPOOF=1 STUB_LOCK_PATH="$lock" \
+        STUB_STAT_READY="$s/stat.ready" STUB_STAT_GO="$s/stat.go"
+    _lock_sec_try "$s" &
+    local p=$!
+    _lock_sec_wait_stub "$s"
+    # fd 9 is already open on the old inode; make the path point to a different
+    # regular file with identical mode/owner before the holder compares them.
+    mv "$lock" "$s/lock.old"
+    cp "$s/lock.old" "$lock"
+    chmod 0600 "$lock"
+    : > "$s/stat.go"
+    worker_wait_pid "$p"
+    unset STUB_STAT_SPOOF STUB_LOCK_PATH STUB_STAT_READY STUB_STAT_GO
+    _lock_sec_fail_asserts "$s" "FAILED:inode"
+}
+
+test_sec_lock_rejects_third_party_owner() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s9)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    : > "$lock"
+    chmod 0600 "$lock"
+    chown 12345 "$lock"
+    _lock_sec_try "$s"
+    _lock_sec_fail_asserts "$s" "owned by uid 12345"
+}
+
+test_sec_lock_rejects_post_open_owner_swap() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s9b)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    _lock_sec_stat_stub "$s"
+    export STUB_STAT_SPOOF=1 STUB_LOCK_PATH="$lock" \
+        STUB_STAT_READY="$s/stat.ready" STUB_STAT_GO="$s/stat.go"
+    _lock_sec_try "$s" &
+    local p=$!
+    _lock_sec_wait_stub "$s"
+    # init already accepted root ownership; change the inode's uid while the
+    # holder's fd is open so only its fstat() check can catch the swap.
+    chown 12345 "$lock"
+    : > "$s/stat.go"
+    worker_wait_pid "$p"
+    unset STUB_STAT_SPOOF STUB_LOCK_PATH STUB_STAT_READY STUB_STAT_GO
+    _lock_sec_fail_asserts "$s" "FAILED:inode"
+}
+
+test_sec_unprivileged_cannot_flock() {
+    local s lock out rc=0
+    s="$(make_manifest_lock_sandbox sec-t9)"
+    _lock_sec_prepare "$s"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+        printf "%s\n" "$rc" > "$2/admin.rc"
+    '
+    assert_eq "0" "$(cat "$s/admin.rc" 2> /dev/null || echo MISSING)" \
+        "SEC T9: administrator can still acquire and release the lock"
+    lock="$s/manifest/.install-manifest.lock"
+    assert_eq "600" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" "SEC T9: lock mode 0600"
+    # Let another uid traverse the sandbox; only the lock's 0600 should stop it.
+    chmod 0755 "$s" "$s/manifest"
+    out="$(sudo -n -u nobody -- bash -c 'export LC_ALL=C; exec 9<"$1" && flock -x -w 1 9' _ "$lock" 2>&1)" || rc=$?
+    assert_eq "1" "$rc" "SEC T9: nobody cannot even open the lock (OPEN-DENIED)"
+    assert_contains "Permission denied" "$out" "SEC T9: denial is the open() permission check"
+}
+
+test_sec_holder_contention_and_recovery() {
+    local s
+    s="$(make_manifest_lock_sandbox sec-t10)"
+    _lock_sec_prepare "$s"
+    # A holds the lock until we tell it to let go.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=5
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/a.rc"
+        if [ "$rc" -eq 0 ]; then
+            : > "$2/a.held"
+            while [ ! -e "$2/a.release" ]; do sleep 0.05; done
+            manifest_unlock
+            : > "$2/a.done"
+        fi
+    ' &
+    local pa=$! i=0
+    while [ ! -e "$s/a.held" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$s/a.held" ]; then ok; else fail "SEC T10: holder A never acquired the lock"; fi
+
+    # B must time out against A and fail closed.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=1
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/b.rc"
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    '
+    assert_eq "1" "$(cat "$s/b.rc" 2> /dev/null || echo MISSING)" "SEC T10: contender times out (rc 1)"
+
+    : > "$s/a.release"
+    worker_wait_pid "$pa"
+    assert_eq "0" "$(cat "$s/a.rc" 2> /dev/null || echo MISSING)" "SEC T11: holder A rc 0"
+    assert_eq "present" "$([ -e "$s/a.done" ] && echo present || echo absent)" \
+        "SEC T11: holder A finished its release"
+
+    # Once A is gone, a fresh acquisition succeeds.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/c.rc"
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    '
+    assert_eq "0" "$(cat "$s/c.rc" 2> /dev/null || echo MISSING)" "SEC T11: later contender succeeds"
+}
+
+test_sec_crash_releases_lock_without_unlock() {
+    local s ms_start ms_end
+    s="$(make_manifest_lock_sandbox sec-t12)"
+    T12_CRASH_SANDBOX="$s"
+    _lock_sec_prepare "$s"
+    # A dies with SIGKILL while holding the lock and never calls unlock.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=5
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/crash.rc"
+        if [ "$rc" -eq 0 ]; then
+            # Publish the real lock-holder PID before the readiness marker so
+            # the test can SIGKILL the bash that actually owns the coproc lock
+            # (killing $pc would only kill the `timeout` wrapper layer).
+            printf "%s\n" "$$" > "$2/crash.pid"
+            : > "$2/crash.held"
+            # Bounded poll instead of `sleep 60`: no orphan sleeper even if the
+            # test fails early (the EXIT trap also creates crash.stop).
+            for i in $(seq 1 100); do
+                [ -e "$2/crash.stop" ] && break
+                sleep 0.1
+            done
+        fi
+    ' &
+    local pc=$! i=0
+    while [ ! -e "$s/crash.held" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$s/crash.held" ]; then ok; else fail "SEC T12: crashing holder never acquired the lock"; fi
+    # Kill the real holder (the snippet bash), not the `timeout` wrapper $pc.
+    if [ -r "$s/crash.pid" ]; then
+        kill -9 "$(cat "$s/crash.pid")" 2> /dev/null || true
+    fi
+    : > "$s/crash.stop" 2> /dev/null || true
+    worker_wait_pid "$pc"
+    sleep 0.2
+
+    ms_start="$(date +%s%3N)"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/after.rc"
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    '
+    ms_end="$(date +%s%3N)"
+    assert_eq "0" "$(cat "$s/after.rc" 2> /dev/null || echo MISSING)" \
+        "SEC T12: no stale lock after SIGKILL (no explicit unlock)"
+    if [ "$((ms_end - ms_start))" -lt 3000 ]; then
+        ok
+    else
+        fail "SEC T12: recovery took longer than the 2s wait window"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 44. Non-keyboard uninstall callers must not abort on a failed rollback.
 #     rollback_component now returns 1 for failed/unknown items; with `set -e`
 #     an unguarded call skips the caller's remaining cleanup. These tests run
@@ -6159,6 +6544,9 @@ setup_caller_uninstall_sandbox() {
     # (re-review #9 finding #1), and this keeps the caller-rc tests focused on
     # rollback rc propagation.
     : > "$sandbox/manifest/.install-manifest.lock"
+    # The root holder now requires a root-owned 0600 lock. This sudo stub never
+    # actually runs chmod (it has no stub for it), so pre-create the final mode.
+    chmod 0600 "$sandbox/manifest/.install-manifest.lock"
 
     # sudo logs each command and only execs commands that have a sandbox stub
     # (python3/udevadm/ldconfig/gpasswd/systemctl), so no host command can be
@@ -6171,7 +6559,9 @@ case "${1:-}" in
 esac
 [ "${1:-}" = "-u" ] && shift 2
 cmd="${1:-}"
-if [ -x "${STUB_DIR:?}/$cmd" ]; then
+# `bash` is the root lock holder started through coproc; it must really run
+# (the other commands only need a stub when one exists).
+if [ "$cmd" = bash ] || [ -x "${STUB_DIR:?}/$cmd" ]; then
     exec "$@"
 fi
 exit 0
@@ -6438,6 +6828,20 @@ test_lock_timeout_fails_closed
 test_lock_dryrun_and_no_python3_untouched
 test_lock_high_contention_all_records_survive
 test_lock_same_target_first_backup_wins
+# Re-review #10 findings #2/#3: lock inode/symlink hardening and root holder
+test_sec_lock_rejects_symlink_to_regular
+test_sec_lock_rejects_dangling_symlink
+test_sec_lock_rejects_symlink_to_directory
+test_sec_lock_rejects_fifo_without_blocking
+test_sec_lock_rejects_device_node
+test_sec_lock_rejects_world_writable_parent
+test_sec_lock_rejects_symlinked_parent
+test_sec_lock_rejects_post_open_inode_swap
+test_sec_lock_rejects_third_party_owner
+test_sec_lock_rejects_post_open_owner_swap
+test_sec_unprivileged_cannot_flock
+test_sec_holder_contention_and_recovery
+test_sec_crash_releases_lock_without_unlock
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

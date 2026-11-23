@@ -34,49 +34,202 @@ MANIFEST_CREATED=0
 # the final atomic replace, and every writer re-reads the manifest *inside* the
 # lock so it never mutates a stale snapshot.
 #
-# Design details:
-#  - root-owned lock file next to the manifest (same filesystem), fixed fd 9;
-#  - bounded `flock -x -w TIMEOUT` (never -n): a contended installer waits;
+# Design details (re-review #10 findings #2 and #3, fixed together):
+#  - the lock file is root-owned 0600 next to the manifest (same filesystem).
+#    An unprivileged account cannot even open it, so it cannot hold an
+#    exclusive flock and starve every installer for the whole wait window;
+#  - a non-root installer therefore cannot open the lock itself. Acquisition
+#    is delegated to a short-lived ROOT holder started with `coproc`:
+#    `sudo bash -c HELPER`. The helper owns fd 9, verifies fd<->path
+#    inode/owner/type/mode INSIDE the process that actually holds fd 9 (real
+#    sudo closes inherited fds, so a separate `sudo python3 fstat(9)` would be
+#    both wrong on a real system and stub-green in tests), takes the bounded
+#    `flock -x -w TIMEOUT`, prints READY, then blocks reading its stdin;
+#  - the bash parent controls the helper's lifetime only via the coproc pipe:
+#    closing the write fd makes the helper see EOF, exit and let the kernel
+#    release the flock. There is deliberately NO EXIT/INT/TERM trap: a killed
+#    installer closes its pipe too, so no stale lock can survive a crash;
 #  - MANIFEST_LOCK_DEPTH makes nested public helpers (backup gate -> add_entry,
 #    ensure_group_membership -> has_group/add_group/remove_group) re-entrant
-#    without re-flocking the same process's fd (which would deadlock);
-#  - missing/broken flock => fail closed (mutation returns 1, bytes intact);
+#    without spawning a second holder (which would deadlock against ourselves);
+#  - missing/broken flock, a symlink/non-regular lock, a swapped inode or a
+#    bad parent directory all fail closed (mutation returns 1, bytes intact);
 #  - DRY_RUN callers return BEFORE this lock, so no lock file is created;
 #  - manifest_load() itself stays lock-free (pure reader): the public entry
 #    point owns the lock and calls manifest_load() again inside it.
 # ---------------------------------------------------------------------------
 MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+# shellcheck disable=SC2034 # fd number is used by the root holder below
 MANIFEST_LOCK_FD=9
 MANIFEST_LOCK_DEPTH=0
 MANIFEST_LOCK_TIMEOUT="${CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT:-10}"
+MANIFEST_LOCK_HOLDER_PID=""
+MANIFEST_LOCK_HOLDER_RFD=""
+MANIFEST_LOCK_HOLDER_WFD=""
+
+# Pure-bash parent-directory gate (no sudo, no python3). The lock path may only
+# be replaced by an account that can write its parent, so an untrusted parent
+# must be rejected before any privileged chmod/chown/open happens.
+_manifest_lock_dir_ok() {
+    local dir="$1" meta uid mode
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        return 0 # first run: init creates it and calls us again
+    fi
+    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+        log_error "Manifest lock parent $dir is a symlink or not a directory; refusing to lock"
+        return 1
+    fi
+    meta="$(stat -c '%u|%a' -- "$dir" 2> /dev/null)" || {
+        log_error "Cannot stat manifest lock parent $dir; refusing to lock"
+        return 1
+    }
+    uid="${meta%%|*}"
+    mode="${meta#*|}"
+    if [ "$uid" != 0 ] && [ "$uid" != "${EUID:-$(id -u)}" ] && [ "$uid" != "${UID:-$(id -u)}" ]; then
+        log_error "Manifest lock parent $dir is owned by uid $uid (not root or current user); refusing to lock"
+        return 1
+    fi
+    if [ -z "$mode" ] || [ $(((8#$mode & 022) != 0)) -eq 1 ]; then
+        log_error "Manifest lock parent $dir is group/other-writable (mode $mode); refusing to lock"
+        return 1
+    fi
+    return 0
+}
 
 manifest_lock_init() {
-    # A dangling symlink counts as "present": opening it below fails closed.
-    if [ -e "$MANIFEST_LOCK_FILE" ] || [ -L "$MANIFEST_LOCK_FILE" ]; then
-        return 0
+    local lock="$MANIFEST_LOCK_FILE" meta owner mode
+    _manifest_lock_dir_ok "$MANIFEST_DIR" || return 1
+
+    # Reject symlinks and EVERY non-regular type before any open or chmod:
+    # `exec 9< directory` succeeds on Linux and a FIFO would block forever.
+    if [ -L "$lock" ]; then
+        log_error "Manifest lock path $lock is a symlink; refusing to lock"
+        return 1
     fi
-    sudo mkdir -p "$MANIFEST_DIR" || return 1
-    # NEVER use `install` here: GNU install replaces the destination inode on
-    # every call. A racer that already opened fd 9 would then hold a lock on an
-    # orphaned inode while another locks the fresh one -> NO mutual exclusion.
-    # A noclobber redirection creates the file once without ever replacing an
-    # existing inode; racers that lose simply see the winner's file and go on.
-    if ! { sudo sh -c 'set -C; : > "$1"' _ "$MANIFEST_LOCK_FILE"; } 2> /dev/null; then
-        if [ ! -e "$MANIFEST_LOCK_FILE" ] && [ ! -L "$MANIFEST_LOCK_FILE" ]; then
-            log_error "Could not create manifest lock $MANIFEST_LOCK_FILE"
+    if [ -e "$lock" ] && [ ! -f "$lock" ]; then
+        log_error "Manifest lock path $lock is not a regular file; refusing to lock"
+        return 1
+    fi
+    if [ ! -e "$lock" ]; then
+        sudo mkdir -p "$MANIFEST_DIR" || {
+            log_error "Could not create manifest dir $MANIFEST_DIR"
+            return 1
+        }
+        _manifest_lock_dir_ok "$MANIFEST_DIR" || return 1
+        # NEVER use `install`: it replaces the destination inode on every call.
+        # `set -C` is O_EXCL|O_NOFOLLOW (it rejects an existing symlink too),
+        # and umask 077 makes the single creation root:0600 atomically.
+        if ! { sudo sh -c 'umask 077; set -C; : > "$1"' _ "$lock"; } 2> /dev/null; then
+            # Losing the creation race is fine only if the winner left a
+            # regular file behind; anything else fails closed.
+            if [ -L "$lock" ] || [ ! -f "$lock" ]; then
+                log_error "Could not create manifest lock $lock"
+                return 1
+            fi
+        fi
+    fi
+
+    # The parent directory is not group/other-writable, so hardening a path we
+    # have just confirmed to be a regular non-symlink cannot be redirected by
+    # an unprivileged account to somebody else's inode.
+    meta="$(stat -c '%u|%a' -- "$lock" 2> /dev/null)" || {
+        log_error "Cannot stat manifest lock $lock; refusing to lock"
+        return 1
+    }
+    owner="${meta%%|*}"
+    mode="${meta#*|}"
+    if [ "$owner" != 0 ]; then
+        # Self-owned leftovers (e.g. a stubbed sudo run as the current user)
+        # are repairable; a third-party owner is a hard failure.
+        if [ "$owner" = "${EUID:-$(id -u)}" ] || [ "$owner" = "${UID:-$(id -u)}" ]; then
+            if ! sudo chown 0:0 "$lock" 2> /dev/null; then
+                log_error "Could not set manifest lock owner to root; refusing to lock"
+                return 1
+            fi
+        else
+            log_error "Manifest lock $lock is owned by uid $owner (not root); refusing to lock"
             return 1
         fi
     fi
-    # Best-effort hardening of the winner's file (its contents are unused).
-    sudo chmod 0644 "$MANIFEST_LOCK_FILE" 2> /dev/null || true
-    sudo chown 0:0 "$MANIFEST_LOCK_FILE" 2> /dev/null || true
+    # Existing 0644 locks left by older versions must be tightened.
+    if [ "$(stat -c '%a' -- "$lock" 2> /dev/null)" != 600 ]; then
+        if ! sudo chmod 0600 "$lock" 2> /dev/null; then
+            log_error "Could not set manifest lock mode to 0600; refusing to lock"
+            return 1
+        fi
+    fi
+    # Re-check the FINAL on-disk state: a stubbed or broken sudo must never let
+    # us proceed with a lock an unprivileged account can open.
+    meta="$(stat -c '%u|%a' -- "$lock" 2> /dev/null)" || {
+        log_error "Cannot stat manifest lock $lock; refusing to lock"
+        return 1
+    }
+    owner="${meta%%|*}"
+    mode="${meta#*|}"
+    if [ -L "$lock" ] || [ ! -f "$lock" ] || [ "$owner" != 0 ] || [ "$mode" != 600 ]; then
+        log_error "Manifest lock $lock is not a root-owned 0600 regular file (uid=$owner mode=$mode); refusing to lock"
+        return 1
+    fi
     return 0
+}
+
+# Runs as `sudo bash -c` inside the coproc, i.e. as root and with fd 9 owned by
+# this very process. Everything security-relevant is checked HERE, after open,
+# so it cannot be fooled by a path swap between init and acquisition. The
+# trailing `read` is the lifetime leash: EOF on stdin means the parent is gone.
+# shellcheck disable=SC2034 # assigned and consumed by the helper process
+_MANIFEST_LOCK_HOLDER_SH='
+lock=$1
+timeout=$2
+if [ -L "$lock" ]; then printf "FAILED:symlink\n"; exit 1; fi
+# -f is locale-independent and true for both empty and non-empty regular
+# files; it rejects directories and FIFOs BEFORE open (opening a FIFO blocks).
+if [ ! -f "$lock" ]; then printf "FAILED:type\n"; exit 1; fi
+if ! { exec 9< "$lock"; } 2>/dev/null; then printf "FAILED:open\n"; exit 1; fi
+path_ino=$(stat -c %i -- "$lock" 2>/dev/null || echo "")
+path_dev=$(stat -c %d -- "$lock" 2>/dev/null || echo "")
+fd_ino=$(stat -Lc %i -- /proc/$$/fd/9 2>/dev/null || echo "")
+fd_dev=$(stat -Lc %d -- /proc/$$/fd/9 2>/dev/null || echo "")
+fd_uid=$(stat -Lc %u -- /proc/$$/fd/9 2>/dev/null || echo "")
+fd_mode=$(stat -Lc %a -- /proc/$$/fd/9 2>/dev/null || echo "")
+fd_ftype=$(stat -Lc %f -- /proc/$$/fd/9 2>/dev/null || echo "")
+if [ -z "$path_ino" ] || [ -z "$path_dev" ] || [ -z "$fd_ino" ] || [ -z "$fd_dev" ] ||
+   [ -z "$fd_uid" ] || [ -z "$fd_mode" ] || [ -z "$fd_ftype" ] ||
+   [ "$path_ino" != "$fd_ino" ] || [ "$path_dev" != "$fd_dev" ] ||
+   [ "$fd_uid" != 0 ] || [ "$fd_mode" != 600 ] ||
+   [ $(( (16#$fd_ftype & 0170000) )) -ne $((0100000)) ]; then
+    printf "FAILED:inode\n"; exit 1
+fi
+if ! flock -x -w "$timeout" 9; then printf "FAILED:flock\n"; exit 1; fi
+printf "READY\n"
+IFS= read -r _ || true
+exit 0
+'
+
+_manifest_lock_release() {
+    # Order matters: close the READ fd, then the WRITE fd (that EOF is what
+    # makes the helper exit and drop the flock), and only then reap it.
+    if [ -n "$MANIFEST_LOCK_HOLDER_RFD" ]; then
+        # shellcheck disable=SC2294
+        eval "exec ${MANIFEST_LOCK_HOLDER_RFD}<&-" 2> /dev/null || true
+    fi
+    if [ -n "$MANIFEST_LOCK_HOLDER_WFD" ]; then
+        # shellcheck disable=SC2294
+        eval "exec ${MANIFEST_LOCK_HOLDER_WFD}>&-" 2> /dev/null || true
+    fi
+    if [ -n "$MANIFEST_LOCK_HOLDER_PID" ]; then
+        wait "$MANIFEST_LOCK_HOLDER_PID" 2> /dev/null || true
+    fi
+    MANIFEST_LOCK_HOLDER_PID=""
+    MANIFEST_LOCK_HOLDER_RFD=""
+    MANIFEST_LOCK_HOLDER_WFD=""
+    MANIFEST_LOCK_DEPTH=0
 }
 
 manifest_lock() {
     if [ "$MANIFEST_LOCK_DEPTH" -gt 0 ]; then
-        # Already held by this process: just track nesting. A second flock on a
-        # different fd would block against ourselves and deadlock.
+        # Already held by this process: just track nesting. A second holder
+        # would block on our own flock and deadlock.
         MANIFEST_LOCK_DEPTH=$((MANIFEST_LOCK_DEPTH + 1))
         return 0
     fi
@@ -84,20 +237,27 @@ manifest_lock() {
         log_error "flock not found; refusing manifest mutation (install util-linux)"
         return 1
     fi
-    manifest_lock_init || return 1
-    # The group redirects suppress only bash's redirection-error message;
-    # `exec 9<...` still applies to the current shell. An `if` guard keeps
-    # `set -e` installers from aborting on a failed open.
-    if ! { exec 9< "$MANIFEST_LOCK_FILE"; } 2> /dev/null; then
-        log_error "Cannot open manifest lock $MANIFEST_LOCK_FILE; refusing manifest mutation"
+    # A still-running holder means a previous acquisition was never released;
+    # spawning a second coproc with the same name would be ambiguous.
+    if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2> /dev/null; then
+        log_error "Manifest lock holder pid $MANIFEST_LOCK_HOLDER_PID still alive; refusing to lock"
         return 1
     fi
-    local rc=0
-    flock -x -w "$MANIFEST_LOCK_TIMEOUT" "$MANIFEST_LOCK_FD" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        { exec 9<&-; } 2> /dev/null || true
-        MANIFEST_LOCK_DEPTH=0
-        log_error "Manifest lock wait failed (rc=$rc after ${MANIFEST_LOCK_TIMEOUT}s) on $MANIFEST_LOCK_FILE; refusing to write"
+    manifest_lock_init || return 1
+
+    coproc MANIFEST_LOCK_HOLDER {
+        sudo bash -c "$_MANIFEST_LOCK_HOLDER_SH" _ "$MANIFEST_LOCK_FILE" "$MANIFEST_LOCK_TIMEOUT"
+    }
+    MANIFEST_LOCK_HOLDER_RFD="${MANIFEST_LOCK_HOLDER[0]}"
+    MANIFEST_LOCK_HOLDER_WFD="${MANIFEST_LOCK_HOLDER[1]}"
+    local line="" rc=0
+    if ! IFS= read -r -t "$((MANIFEST_LOCK_TIMEOUT + 3))" -u "$MANIFEST_LOCK_HOLDER_RFD" line; then
+        rc=1
+    fi
+    if [ "$line" != "READY" ]; then
+        [ "$rc" -ne 0 ] || rc=1
+        log_error "Manifest lock wait failed (rc=$rc after ${MANIFEST_LOCK_TIMEOUT}s) on $MANIFEST_LOCK_FILE (holder: ${line:-no response}); refusing to write"
+        _manifest_lock_release
         return 1
     fi
     MANIFEST_LOCK_DEPTH=1
@@ -110,9 +270,8 @@ manifest_unlock() {
     fi
     if [ "$MANIFEST_LOCK_DEPTH" -eq 0 ]; then
         # Always release: even when the python writer returned non-zero the
-        # caller must not leak the lock to the next mutation.
-        { flock -u "$MANIFEST_LOCK_FD"; } 2> /dev/null || true
-        { exec 9<&-; } 2> /dev/null || true
+        # caller must not leak the flock to the next mutation.
+        _manifest_lock_release
     fi
     return 0
 }
