@@ -393,20 +393,32 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     (fsync + `chmod 0644` + `os.replace`), so parallel runs cannot drop each other's first-wins
     records. Retry after the other run finishes; raise the timeout (e.g. `300`) if a
     `fingerprint/install-fingerprint.sh --source` build is still holding the lock.
-  * `... (holder: FAILED:symlink)`, `FAILED:type`, `FAILED:open`, `FAILED:inode` or
-    `FAILED:flock` is the root helper's reason for refusing the lock. `FAILED:symlink` /
-    `FAILED:type` / `FAILED:inode` mean the lock path was a symlink, a non-regular file (e.g. a
-    directory or FIFO) or was swapped between init and open: the helper compares fd 9 with the
-    path's `(dev,ino)` via `/proc/$$/fd/9` plus owner `0`, mode `600` and regular-file type
-    INSIDE the process that actually holds fd 9, so an unprivileged inode swap cannot redirect
-    the flock. `FAILED:flock` is ordinary contention. The same checks log
-    `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a root-owned 0600
-    regular file (uid=... mode=...)` when they fail before the helper starts.
-  * `Manifest lock parent ... is group/other-writable (mode ...)` (also `is a symlink or not a
-    directory`, `is owned by uid ...` or `Cannot stat manifest lock parent ...`) means the
-    manifest directory itself is not trusted, so no privileged chmod/chown/open is attempted.
-    Keep `/var/lib/cros-enablement` root-owned (or owned by the current user) at mode `0755` —
-    a `0775` group-writable directory now fails closed, and a sticky bit does not exempt it.
+  * `... (holder: FAILED:symlink)`, `FAILED:type`, `FAILED:open`, `FAILED:inode`,
+    `FAILED:parentdir` or `FAILED:flock` is the root helper's reason for refusing the lock.
+    `FAILED:symlink` / `FAILED:type` / `FAILED:inode` mean the lock path was a symlink, a
+    non-regular file (e.g. a directory or FIFO) or was swapped between init and open: the
+    helper compares fd 9 with the path's `(dev,ino)` via `/proc/$$/fd/9` plus owner `0`, mode
+    `600` and regular-file type INSIDE the process that actually holds fd 9, so an unprivileged
+    inode swap cannot redirect the flock. `FAILED:flock` is ordinary contention. The same
+    checks log `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a
+    root-owned 0600 regular file (uid=... mode=...)` when they fail before the helper starts.
+  * `FAILED:parentdir` means the fd-8 pin of the lock's **direct parent** failed inside the
+    root holder: the parent was not root-owned, was group/other-writable, was not a directory,
+    or its `(dev,ino)` no longer matched the pathname. This closes the rename race where A
+    holds a live lock, its parent owner renames the path away and B locks a brand-new inode.
+    Re-check the directory ownership/mode and retry; the manifest bytes are left intact.
+  * `Manifest lock parent ... is group/other-writable (mode ...)`, `is owned by uid ... (must be
+    root-owned)`, `is a symlink or not a directory` or `Cannot stat manifest lock parent ...`
+    means the direct parent is not trusted, so no privileged chmod/chown/open is attempted.
+    Keep `/var/lib/cros-enablement` **root-owned** at mode `0755`; ownership by the current
+    EUID/UID is no longer accepted (a caller-owned parent can rename a live lock), a `0775`
+    group-writable directory fails closed, and a sticky bit does not exempt the direct parent.
+    Every ancestor is checked too: `Manifest lock ancestor ... is not root-controlled
+    (uid=... mode=...)` rejects a non-root-owned or g/o-writable layer **without** a sticky bit
+    (a root-owned sticky world-writable layer such as `/tmp` `1777` is allowed), and
+    `Manifest lock ancestor ... is an untrusted symlink` rejects a symlink unless the directory
+    holding it is root-owned and not g/o-writable. A custom lock parent under a user-writable
+    tree is therefore refused even when the lock file itself would be root-owned.
   * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
     means the lock could not be made root-owned `0600` (an older `0644` lock is upgraded
     automatically), so the installer fails closed. A plain `permission denied` when a peer
@@ -417,7 +429,29 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * Group membership is now recorded **before** `usermod` runs: the installer persists the
     original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
     the change fails with no earlier record, removes the record it just wrote. Uninstall
-    consumes the group record only after `gpasswd -d` succeeds (`manifest_remove_group`).
+    consumes **all** component records for the pair only after `gpasswd -d` succeeds
+    (`manifest_remove_group_all`), so the module uninstall order cannot leave a stale
+    `was_member` record behind. If no record proves we added the membership, it logs
+    `No record proves we added '<user>' to group '<group>'; keeping membership.` and leaves
+    it alone; a wrong safety-field type logs `Cannot determine original membership of
+    <user>@<group>; refusing to change it` and returns rc 1.
+  * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
+    means `gpasswd -d` failed. This is now a **real failure** (log_error, rc 1) — the three
+    component uninstallers capture it and fold it into their exit code, so a full
+    `./setup.sh --uninstall` no longer reports success while the membership remains.
+    Fix the group/permission problem and re-run uninstall; the records are kept for retry.
+    `Could not consume group records for '<user>'@'<group>'; keeping them for retry.` has
+    the same rc-1/retry meaning when the manifest write after a successful removal fails.
+  * `Manifest still records /etc/pam.d/sudo: rollback did not restore it. Uninstall did NOT
+    modify this file; remove the project line manually if needed.` is the read-only
+    post-rollback PAM check: uninstall never sed-edits sudo PAM (all restoration comes from
+    `rollback_component("fingerprint")`), so a pre-existing exact `pam_fprintd` line is not
+    deleted. If the manifest is corrupt it instead warns `Manifest at ... is corrupt/invalid;
+    cannot confirm rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.` — either
+    way it only warns. On Debian/Ubuntu the original `common-*` bytes are backed up before
+    `pam-auth-update --remove fprintd` and restored by rollback; Fedora `authselect` and
+    openSUSE `pam-config` profile state is outside the manifest, so restore any pre-existing
+    profile manually as the warning says.
 
 ---
 

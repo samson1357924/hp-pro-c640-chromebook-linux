@@ -33,8 +33,9 @@
    因此 rollback 永遠還原到專案介入前的狀態）。
 7. 還原安裝器曾修改的 systemd 服務啟用/運作狀態（`thermald`、`tlp`、
    `c640-battery-limit.service`、`c640-kbd-backlight-sync.service` 的 `scope: user`
-   經 `--global` + per-user `daemon-reload` 等），並移除**安裝器新增的 plugdev 群組成員**
-   （安裝前已存在、或仍被其他 udev 規則引用的成員資格會被保留）。
+   經 `--global` + per-user `daemon-reload` 等），並移除**安裝器新增的 plugdev 群組成員**。
+   歸屬由所有元件的原始狀態紀錄共同判定，故安裝前已存在或其他 udev 規則引用的
+   成員資格會被保留，且各模組的解除安裝順序不影響結果。
 8. 移除指紋加密種子 `/var/lib/fprint/crfpmoc.key`，並提示發行版重裝原生
    `libfprint` 套件的指令。
 
@@ -64,6 +65,22 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 * **先記錄群組 membership 再變更。** 安裝器先把原始 `plugdev` 成員資格寫入 manifest，
   之後才明確檢查 `usermod` 的 rc。若變更失敗，就移除剛寫入的紀錄（除非已有較早的
   紀錄），以免日後 uninstall 移除使用者自行取得的成員資格。
+* **plugdev 歸屬由所有元件共同判定。** 完整安裝可能對同一組 `(group,user)` 寫入兩筆紀錄
+  （例如 keyboard 記錄 `was_member=false`，fingerprint 之後記錄 `was_member=true`）。
+  uninstall 會彙總所有元件的紀錄：任一明確的 `was_member=false` 即證明是我們加入的，
+  授權移除；全部為 `true` 或沒有紀錄則保留；欄位缺失或型別錯誤則 fail closed、不更動。
+  `gpasswd -d` 成功後，該組的所有紀錄（含他元件的 `true`）一併消耗，因此先解除安裝
+  fingerprint 或先解除安裝 keyboard 結果相同。`gpasswd -d` 失敗現在會記錄 error 並回
+  rc 1（三個 uninstaller 會把它折進結束碼），不再謊報移除成功，紀錄留待日後重試。
+* **PAM 設定只由 rollback 還原；uninstall 絕不刪除既有行。**
+  `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
+  或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，
+  因此安裝前就已存在的精確 `pam_fprintd` 行會被保留。Debian/Ubuntu 上，`pam-auth-update
+  --remove fprintd` 只在安裝階段對確實含 `pam_fprintd` 行的 `common-*` 檔呼叫，
+  並先備份原始檔；uninstall 不再呼叫該工具。唯讀的 rollback 後檢查會在 manifest 仍
+  記錄 `/etc/pam.d/sudo` 時警告（可能需要手動清理），或在 manifest 損毀時警告——
+  兩者都不修改檔案。Fedora 的 `authselect` 與 openSUSE 的 `pam-config` profile 狀態
+  不在 manifest 內：工具呼叫仍保留，但會警告請手動還原原本的 profile。
 * **並行的安裝/解除安裝不會遺失追蹤紀錄，也不會留下未追蹤的部署。** 每個元件安裝器
   透過 `lib/backup.sh` 的 `run_manifest_operation()`，在**整個元件操作交易**——備份/紀錄 →
   部署檔案與服務 → 完成或回滾——只取得一把操作級鎖。巢狀 helper（備份 gate、群組 helper、
@@ -82,11 +99,20 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   等待（`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）、印出 `READY`，然後阻塞讀取
   stdin。關閉父行程的 write fd 會讓 helper 看到 EOF、結束並讓核心釋放 flock，因此崩潰或
   `kill -9` 不會留下 stale lock（刻意不安裝 EXIT/INT/TERM trap）。symlink 與非普通檔的鎖
-  會被拒絕；父目錄必須由 root 或目前使用者擁有，且不可群組/其他可寫（`mode & 022 == 0`，
-  因此 `/var/lib/cros-enablement` 請維持 `0755`）；root helper 並在**實際持有 fd 9 的行程內**
-  比對 `/proc/$$/fd/9` 的 `(dev,ino)` 與鎖路徑，檢查 fd owner 為 `0`、mode 為 `600`、
-  型別為普通檔，因此 init 期間或等待 `flock` 期間的 inode 替換都會 fail closed。缺少
-  `flock`、逾時或上述任何檢查失敗都會保持 manifest 位元組不變並回 rc 1。
+  會被拒絕。直接父目錄**必須由 root 擁有**——呼叫者擁有的父目錄可在鎖仍生效時
+  將 lock inode 重新命名，因此目前 EUID/UID 擁有不再合格，擁有者錯誤會記錄
+  `must be root-owned`——且不可群組/其他可寫（`mode & 022 == 0`，因此
+  `/var/lib/cros-enablement` 請維持 `0755`）。每一層祖先目錄也都會檢查：非 root 擁有，
+  或群組/其他可寫但**沒有 sticky bit** 的層會 fail closed 並記錄 `not root-controlled`
+  （root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，可通過）；symlink 只在其所在
+  目錄由 root 擁有且不可群組/其他可寫時放行，否則記錄 `untrusted symlink`。因此自訂於
+  使用者可寫目錄下的 lock parent 會被拒絕。root helper 並在**實際持有 fd 9 的行程內**
+  比對 `/proc/$$/fd/9` 的 `(dev,ino)` 與鎖路徑，檢查 fd
+  owner 為 `0`、mode 為 `600`、型別為普通檔，因此 init 期間或等待 `flock` 期間的 inode
+  替換都會 fail closed。同一 holder 並以 **fd 8** 釘住直接父目錄，重新檢查 uid `0`、
+  `mode & 022 == 0`、目錄型別，以及路徑的 `(dev,ino)` 是否一致；任一不符即印出
+  `FAILED:parentdir` 並在取鎖前中止，防止重新命名讓第二個程序對新 inode 取第二把鎖。
+  缺少 `flock`、逾時或上述任何檢查失敗都會保持 manifest 位元組不變並回 rc 1。
 * **長時間操作可能需要調高鎖等待上限。** `fingerprint/install-fingerprint.sh --source`
   會在 `git clone`/建置/編譯期間持續持有操作鎖，因此平行的安裝/解除安裝可能撞上預設
   10 秒等待而 fail closed。在該時段啟動平行操作前，請調高
@@ -108,11 +134,11 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
 
-  *（會還原備份的 `libfprint` 函式庫與 `60-cros-fp.rules`、將
-  `pam_fprintd` 的 PAM 變更還原（`/etc/pam.d/sudo` 回到 stock、fprintd
-  移出 `common-auth`）、移除 `fprintd-sleep.sh` system-sleep hook、移除
-  `/var/lib/fprint/crfpmoc.key` 與安裝器新增的 plugdev 成員資格，並還原
-  服務狀態。）*
+  *（會透過 manifest rollback 還原備份的 `libfprint` 函式庫、`60-cros-fp.rules`
+  與 sudo/`common-*` PAM 位元組——uninstall 絕不對 `/etc/pam.d/sudo` 執行 sed，
+  安裝前已存在的 `pam_fprintd` 行會被保留。並移除 `fprintd-sleep.sh`
+  system-sleep hook 與 `/var/lib/fprint/crfpmoc.key`、移除安裝器新增的
+  plugdev 成員資格（歸屬由所有元件共同判定），並還原服務狀態。）*
 
 * **僅移除鍵盤頂排映射與背光同步**（上述 5 項）：
 
@@ -123,7 +149,8 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   > 此操作會移除全部 5 項鍵盤相關檔案、全域停用 user service、
   > 若背光停留在 0 則恢復為 50%、清除 `/run/c640-kbd-backlight/state` 與
   > `/run/user/$UID/c640-kbd-backlight.state`，並移除安裝器新增的 `plugdev`
-  > 成員（保留原本已存在的成員）。
+  > 成員（歸屬由所有元件共同判定、保留原本已存在的成員；`gpasswd -d`
+  > 失敗會回 rc 1）。
   >
   > 若當初使用 `--with-keyd` 安裝，也會移除 `/etc/keyd/cros.conf` 與
   > 舊版指向 `cros.conf` 的 `/etc/keyd/default.conf` symlink（有安裝前備份時會

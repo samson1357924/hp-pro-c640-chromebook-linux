@@ -334,19 +334,29 @@
     `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），平行程序不會
     互相遺失 first-wins 紀錄。等另一程序結束後重試；若
     `fingerprint/install-fingerprint.sh --source` 仍在建置並持鎖，請調高 timeout（例如 300）。
-  * `... (holder: FAILED:symlink)`、`FAILED:type`、`FAILED:open`、`FAILED:inode` 或
-    `FAILED:flock` 是 root helper 拒絕取鎖的原因。`FAILED:symlink` / `FAILED:type` /
-    `FAILED:inode` 代表鎖路徑是 symlink、非普通檔（例如目錄或 FIFO），或在 init 與 open
-    之間被替換：helper 會在**實際持有 fd 9 的行程內**以 `/proc/$$/fd/9` 比對路徑的
-    `(dev,ino)`，並檢查 owner 為 `0`、mode 為 `600` 與普通檔型別，因此非特權的 inode 替換
-    無法轉移 flock。`FAILED:flock` 是一般的鎖競爭。這些檢查若在 helper 啟動前就失敗，會記錄
-    `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a root-owned 0600
-    regular file (uid=... mode=...)`。
-  * `Manifest lock parent ... is group/other-writable (mode ...)`（或 `is a symlink or not a
-    directory`、`is owned by uid ...`、`Cannot stat manifest lock parent ...`）代表 manifest
-    目錄本身不受信任，安裝器不會對鎖做任何特權 chmod/chown/open。請讓
-    `/var/lib/cros-enablement` 由 root（或目前使用者）擁有且權限為 `0755` — `0775`
-    群組可寫目錄現在會 fail closed，sticky bit 也不能豁免。
+  * `... (holder: FAILED:symlink)`、`FAILED:type`、`FAILED:open`、`FAILED:inode`、
+    `FAILED:parentdir` 或 `FAILED:flock` 是 root helper 拒絕取鎖的原因。`FAILED:symlink` /
+    `FAILED:type` / `FAILED:inode` 代表鎖路徑是 symlink、非普通檔（例如目錄或 FIFO），或在
+    init 與 open 之間被替換：helper 會在**實際持有 fd 9 的行程內**以 `/proc/$$/fd/9` 比對
+    路徑的 `(dev,ino)`，並檢查 owner 為 `0`、mode 為 `600` 與普通檔型別，因此非特權的
+    inode 替換無法轉移 flock。`FAILED:flock` 是一般的鎖競爭。這些檢查若在 helper 啟動前
+    就失敗，會記錄 `Manifest lock path ... is a symlink` / `is not a regular file` /
+    `is not a root-owned 0600 regular file (uid=... mode=...)`。
+  * `FAILED:parentdir` 代表 root holder 以 fd 8 釘住鎖的**直接父目錄**失敗：父目錄不是
+    root 擁有、群組/其他可寫、不是目錄，或其 `(dev,ino)` 與路徑不符。這防堵以下競態：
+    A 持鎖中，父目錄擁有者把路徑重新命名，B 便對全新的 inode 取到第二把鎖。請檢查
+    目錄的擁有者/權限後重試；manifest 位元組保持不變。
+  * `Manifest lock parent ... is group/other-writable (mode ...)`、`is owned by uid ... (must
+    be root-owned)`、`is a symlink or not a directory` 或 `Cannot stat manifest lock parent
+    ...` 代表直接父目錄不受信任，安裝器不會對鎖做任何特權 chmod/chown/open。請讓
+    `/var/lib/cros-enablement` **由 root 擁有**且權限為 `0755`；目前 EUID/UID 擁有不再接受
+    （呼叫者擁有的父目錄可以重新命名有效的鎖），`0775` 群組可寫目錄會 fail closed，
+    sticky bit 也不能豁免直接父目錄。每一層祖先目錄也都會檢查：`Manifest lock ancestor ...
+    is not root-controlled (uid=... mode=...)` 拒絕非 root 擁有或群組/其他可寫但**沒有**
+    sticky bit 的層（root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，可通過）；
+    `Manifest lock ancestor ... is an untrusted symlink` 拒絕 symlink，除非其所在目錄由
+    root 擁有且不可群組/其他可寫。因此自訂在使用者可寫目錄下的 lock parent 即使鎖檔本身
+    是 root 擁有，仍會被拒絕。
   * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
     代表鎖無法被設為 root 擁有的 `0600`（舊的 `0644` 鎖會自動升級），安裝器因此 fail closed。
     peer 帳號直接開啟 `$MANIFEST_DIR/.install-manifest.lock` 時看到 `permission denied` 是
@@ -354,8 +364,27 @@
     請勿以非特權使用者手動 chmod/chown 鎖檔——修正 `sudo` helper 或父目錄權限後重試。
   * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
     寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
-    紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗群組紀錄
-    (`manifest_remove_group`)。
+    紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗該組的**
+    所有元件紀錄**（`manifest_remove_group_all`），因此模組解除安裝順序不會留下過期的
+    `was_member` 紀錄。若沒有紀錄證明是我們加入的，會記錄
+    `No record proves we added '<user>' to group '<group>'; keeping membership.` 並保持原樣；
+    安全欄位型別錯誤則記錄 `Cannot determine original membership of <user>@<group>; refusing
+    to change it` 並回 rc 1。
+  * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
+    代表 `gpasswd -d` 失敗。現在這是**真正的失敗**（log_error、rc 1）：三個元件 uninstaller
+    會捕捉它並折進結束碼，因此完整的 `./setup.sh --uninstall` 不會在成員資格仍存在時回報
+    成功。請修正群組/權限問題後重跑 uninstall；紀錄會保留供重試。移除成功後 manifest
+    寫入失敗時，`Could not consume group records for '<user>'@'<group>'; keeping them for
+    retry.` 有相同的 rc 1／重試語意。
+  * `Manifest still records /etc/pam.d/sudo: rollback did not restore it. Uninstall did NOT
+    modify this file; remove the project line manually if needed.` 來自唯讀的 rollback 後
+    PAM 檢查：uninstall 絕不對 sudo PAM 執行 sed（所有還原都由
+    `rollback_component("fingerprint")` 負責），因此原本就存在的精確 `pam_fprintd` 行不會
+    被刪除。若 manifest 損毀，則改為警告 `Manifest at ... is corrupt/invalid; cannot confirm
+    rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.`——兩種情況都只警告。
+    Debian/Ubuntu 上，原始 `common-*` 位元組會在 `pam-auth-update --remove fprintd` 前先
+    備份並由 rollback 還原；Fedora 的 `authselect` 與 openSUSE 的 `pam-config` profile 狀態
+    不在 manifest 內，請依警告手動還原原本的 profile。
 
 ---
 
