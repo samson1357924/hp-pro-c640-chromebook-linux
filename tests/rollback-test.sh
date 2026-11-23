@@ -8799,10 +8799,11 @@ test_plugdev_preexisting_consume_failure_keeps_record
 test_plugdev_dry_run_all_true_no_side_effects
 
 # ---------------------------------------------------------------------------
-# Re-review #11 finding #2 (P2 DATA SAFETY, PAM-1..8): uninstall must not delete
-# a pre-existing pam_fprintd line from /etc/pam.d/sudo after rollback. The ONLY
-# writer of those bytes is rollback_component(); disable_pam_fingerprint() is
-# read-only apart from distro-tool state messages.
+# Re-review #11/#12 finding #2 (P2 DATA SAFETY / STATE RESTORATION, PAM-1..12):
+# uninstall must not delete a pre-existing pam_fprintd line from /etc/pam.d/sudo
+# after rollback, and the Debian profile selection must survive install+uninstall.
+# The ONLY writer of those bytes is rollback_component(); disable_pam_fingerprint()
+# is read-only apart from distro-tool state messages.
 #
 # Every case uses a fresh /tmp/rollback-test-pam-* sandbox. BOTH path seams are
 # redirected and every tool is stubbed inside the sandbox; the stubs refuse any
@@ -8813,7 +8814,7 @@ setup_pam_sandbox() {
     # $1=short case name; echoes the fresh sandbox path.
     local s
     s="$(mktemp -d "/tmp/rollback-test-pam-$LOCK_TEST_RUN_TAG-$1-XXXXXX")"
-    mkdir -p "$s/pam" "$s/backups" "$s/manifest" "$s/stub"
+    mkdir -p "$s/pam" "$s/backups" "$s/manifest" "$s/stub" "$s/debconf"
     : > "$s/tool.log"
     : > "$s/sed.log"
 
@@ -8847,17 +8848,65 @@ done
 exec /usr/bin/sed "$@"
 EOF
 
-    # pam-auth-update: log the tool call, then simulate its rewrite of common-*.
+    # pam-auth-update: log the tool call, then model BOTH side effects of the
+    # real tool. `--remove fprintd` drops the profile from debconf's selection
+    # (the persistent state rollback cannot restore) and rewrites common-*.
+    # `--regenerate` is TEST-ONLY: model an administrator re-running the tool,
+    # which rebuilds common-auth FROM the current selection.
     cat > "$s/stub/pam-auth-update" << 'EOF'
 #!/usr/bin/env bash
 printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+_sel="${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+_dir="${CROS_ENABLEMENT_PAM_DIR:?PAM dir seam missing}"
+
+if [ "${1:-}" = "--regenerate" ]; then
+    # TEST-ONLY mode: the tool reads the selection and rewrites common-auth.
+    {
+        printf '%s\n' 'auth [success=1 default=ignore] pam_unix.so nullok'
+        if [ -f "$_sel" ] && grep -qF 'fprintd' "$_sel"; then
+            printf '%s\n' 'auth sufficient pam_fprintd.so'
+        fi
+        printf '%s\n' 'auth requisite pam_deny.so'
+    } > "$_dir/common-auth"
+    exit 0
+fi
+
 if [ "${1:-}" = "--remove" ] && [ "${2:-}" = "fprintd" ]; then
-    for _f in "${CROS_ENABLEMENT_PAM_DIR:?PAM dir seam missing}"/common-*; do
+    # Real --remove side effect: drop the profile from debconf, THEN rewrite
+    # the generated files. Use /usr/bin/sed so the mutation is not counted as
+    # one of the project's own sed calls in sed.log.
+    if [ -f "$_sel" ]; then
+        _new="$(/usr/bin/sed -e 's/[[:space:]]*fprintd[[:space:]]*//g' \
+            -e 's/,,*/,/g' -e 's/^,//' -e 's/,$//' \
+            -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$_sel")"
+        printf '%s\n' "$_new" > "$_sel"
+    fi
+    for _f in "$_dir"/common-*; do
         [ -f "$_f" ] || continue
         /usr/bin/sed -i '/pam_fprintd\.so/d' "$_f"
     done
 fi
 exit 0
+EOF
+
+    # debconf tools: log EVERY call so a test can prove the installer and
+    # uninstaller never touch the profile selection. set-selections really
+    # writes the selection file, so any mutation is observable.
+    cat > "$s/stub/debconf-show" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-show %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+[ "${1:-}" = "libpam-runtime" ] || exit 0
+printf '  libpam-runtime/profiles: %s\n' "$(cat "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}")"
+EOF
+
+    cat > "$s/stub/debconf-set-selections" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-set-selections %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+if [ "${1:-}" = "-" ] || [ -z "${1:-}" ]; then
+    cat > "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+else
+    printf '%s\n' "$*" > "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+fi
 EOF
 
     # authselect / pam-config: log only, never call real distro tooling.
@@ -8889,6 +8938,17 @@ EOF
     PAM_TEST_SANDBOXES+=("$s")
     printf '%s\n' "$s"
 }
+
+# Model debconf's libpam-runtime/profiles value — the persistent state that
+# review12 #2 says `pam-auth-update --remove` destroys. The file holds the raw
+# comma-separated value; debconf-show formats it on output and
+# debconf-set-selections writes it back. pam_selection() reads it directly so
+# tests compare the EXACT string (no normalisation).
+pam_write_selection() { # $1=sandbox  $2="unix, systemd, fprintd"
+    mkdir -p "$1/debconf"
+    printf '%s\n' "$2" > "$1/debconf/profiles"
+}
+pam_selection() { cat "$1/debconf/profiles"; }
 
 # Write a Debian-style sudo PAM file (and optionally common-auth) into the
 # sandbox. $2 = sudo content: exact | other | none. $3 = common-auth: none | fp.
@@ -8954,6 +9014,7 @@ run_pam_install() {
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -8972,6 +9033,7 @@ run_pam_uninstall() {
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -9116,13 +9178,21 @@ test_pam_6_dry_run_no_side_effects() {
 # PAM-7: static source guard. The disable function body must contain no sed at
 # all, and the stubs must refuse a host PAM path if a seam is misconfigured.
 test_pam_7_disable_body_has_no_sed() {
-    local s body rc=0
+    local s body install_body rc=0
     body="$(sed -n '/^disable_pam_fingerprint()/,/^}/p' "$REPO_ROOT/lib/pam.sh")"
     assert_not_contains "pam_fprintd.so/d" "$body" \
         "PAM-7: disable_pam_fingerprint has no unconditional pam_fprintd sed"
     assert_not_contains "sed -i" "$body" "PAM-7: disable_pam_fingerprint has no sed call"
     assert_contains "_pam_sudo_post_rollback_check" "$body" \
         "PAM-7: post-rollback check is called inside disable_pam_fingerprint"
+
+    # Re-review #12 #2: the install body must use the direct strip helper,
+    # never the profile tool (whose --remove would destroy the debconf state).
+    install_body="$(sed -n '/^_configure_pam_fingerprint_body()/,/^}/p' "$REPO_ROOT/lib/pam.sh")"
+    assert_not_contains "pam-auth-update --remove" "$install_body" \
+        "PAM-7: install body never calls pam-auth-update --remove"
+    assert_contains "_pam_strip_fprintd_from_common_files" "$install_body" \
+        "PAM-7: install body uses the direct strip helper"
 
     s="$(setup_pam_sandbox seam-guard)"
     PATH="$s/stub:$PATH" STUB_SED_LOG="$s/sed.log" \
@@ -9131,8 +9201,9 @@ test_pam_7_disable_body_has_no_sed() {
 }
 
 # PAM-8 (Tier 2): Debian common-auth with a pre-existing fp line must be backed
-# up BEFORE pam-auth-update --remove, restored on rollback, and must not trigger
-# a second tool call on uninstall.
+# up, stripped by a DIRECT sed (no profile tool, so the debconf selection is
+# never touched), restored on rollback, and must not trigger any tool or sed
+# call on uninstall.
 test_pam_8_common_auth_tracked_and_no_uninstall_tool_call() {
     local s sudo_before common_before sed_after_install tool_after_install
     s="$(setup_pam_sandbox common-auth)"
@@ -9145,8 +9216,12 @@ test_pam_8_common_auth_tracked_and_no_uninstall_tool_call() {
     sed_after_install="$(wc -l < "$s/sed.log")"
     tool_after_install="$(cat "$s/tool.log")"
 
-    assert_eq "1" "$(printf '%s\n' "$tool_after_install" | grep -cF -- 'pam-auth-update --remove fprintd')" \
-        "PAM-8: one --remove tool call on install"
+    assert_eq "" "$(grep -E 'pam-auth-update|debconf-(show|set-selections)' "$s/tool.log" || true)" \
+        "PAM-8: no profile/debconf tool call on install"
+    assert_eq "1" "$(grep -cF -- '/pam_fprintd\.so/d' "$s/sed.log")" \
+        "PAM-8: one direct fp strip on common-auth"
+    assert_eq "3" "$sed_after_install" \
+        "PAM-8: three install sed calls (1 common strip + 2 sudo)"
     assert_eq "2" "$(pam_record_count "$s")" \
         "PAM-8: common-auth and sudo both tracked for rollback"
 
@@ -9157,8 +9232,10 @@ test_pam_8_common_auth_tracked_and_no_uninstall_tool_call() {
     assert_eq "$sudo_before" "$(file_hex "$s/pam/sudo")" "PAM-8: sudo PAM bytes restored"
     assert_eq "$common_before" "$(file_hex "$s/pam/common-auth")" \
         "PAM-8: common-auth bytes restored by rollback"
+    assert_eq "" "$(grep -E 'pam-auth-update|debconf-' "$s/tool.log" || true)" \
+        "PAM-8: no profile/debconf tool call after uninstall"
     assert_eq "$tool_after_install" "$(cat "$s/tool.log")" \
-        "PAM-8: uninstall added no pam-auth-update call"
+        "PAM-8: uninstall added no tool call"
     assert_eq "$sed_after_install" "$(wc -l < "$s/sed.log")" \
         "PAM-8: uninstall added no sed call"
     assert_eq "0" "$(pam_record_count "$s")" "PAM-8: manifest records consumed"
@@ -9210,8 +9287,104 @@ test_pam_9_fault_injection_does_not_leak_to_later_uninstall() {
         "PAM-9: manifest records consumed by second uninstall"
 }
 
-# Re-review #11 finding #2: original sudo/common PAM bytes must survive
-# fingerprint install -> uninstall (PAM-1..8).
+# PAM-10 (STATE RESTORATION, review12 #2): after Debian install -> uninstall,
+# BOTH the common-* bytes AND the debconf profile selection must match the
+# original, so re-running pam-auth-update regenerates the ORIGINAL stack.
+test_pam_10_debian_selection_and_stack_restored() {
+    local s sudo_before common_before sel_before generated_before pristine
+    s="$(setup_pam_sandbox debian-state)"
+    pam_write_initial_files "$s" none fp
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    sudo_before="$(file_hex "$s/pam/sudo")"
+    common_before="$(file_hex "$s/pam/common-auth")"
+    sel_before="$(pam_selection "$s")"
+
+    # What the tool WOULD generate from the original selection, captured before
+    # anything is touched. --regenerate writes only common-auth in the sandbox.
+    pristine="$s/common.pristine"
+    cp "$s/pam/common-auth" "$pristine"
+    PATH="$s/stub:$PATH" STUB_TOOL_LOG="$s/regen.log" \
+        STUB_DEBCONF_PROFILES="$s/debconf/profiles" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" "$s/stub/pam-auth-update" --regenerate
+    generated_before="$(file_hex "$s/pam/common-auth")"
+    cp "$pristine" "$s/pam/common-auth"
+    : > "$s/tool.log"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-10: selection unchanged after install"
+    assert_eq "" "$(grep -E 'pam-auth-update|debconf-' "$s/tool.log" || true)" \
+        "PAM-10: install called no profile/debconf tool"
+    assert_not_contains 'pam_fprintd.so' "$(cat "$s/pam/common-auth")" \
+        "PAM-10: fp line removed from common-auth after install"
+    assert_eq "2" "$(pam_record_count "$s")" "PAM-10: sudo + common-auth tracked"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-10: rollback rc 0"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-10: disable rc 0"
+    assert_eq "$common_before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-10: common-auth bytes restored"
+    assert_eq "$sudo_before" "$(file_hex "$s/pam/sudo")" "PAM-10: sudo bytes restored"
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-10: selection preserved after uninstall"
+    assert_eq "" "$(grep -E 'pam-auth-update|debconf-' "$s/tool.log" || true)" \
+        "PAM-10: uninstall called no profile/debconf tool"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-10: all records consumed"
+
+    # THE key regression assertion: re-run the tool from the preserved selection.
+    PATH="$s/stub:$PATH" STUB_TOOL_LOG="$s/regen.log" \
+        STUB_DEBCONF_PROFILES="$s/debconf/profiles" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" "$s/stub/pam-auth-update" --regenerate
+    assert_eq "$generated_before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-10: re-running pam-auth-update yields the ORIGINAL stack"
+}
+
+# PAM-11: an EXPLICIT pre-existing fprintd selection must survive untouched
+# (exact string, no normalisation), with no debconf tool call in either direction.
+test_pam_11_explicit_selection_survives() {
+    local s sel_before
+    s="$(setup_pam_sandbox explicit-selection)"
+    pam_write_initial_files "$s" none fp
+    pam_write_selection "$s" 'unix, fprintd, systemd'
+    sel_before="$(pam_selection "$s")"
+    assert_contains 'fprintd' "$sel_before" "PAM-11: initial selection contains fprintd"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-11: exact explicit selection string preserved"
+    assert_eq "" "$(grep -E 'pam-auth-update|debconf-(show|set-selections)' "$s/tool.log" || true)" \
+        "PAM-11: no profile/debconf tool call in either direction"
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-11: rollback rc 0"
+}
+
+# PAM-12: STUB FIDELITY CONTROL — prove the harness really models the bug from
+# review12 #2. Calling the OLD tool path MUST mutate the selection; otherwise
+# PAM-10/11 would be vacuous assertions.
+test_pam_12_stub_removes_selection_control() {
+    local s sel_before
+    s="$(setup_pam_sandbox fidelity-control)"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    sel_before="$(pam_selection "$s")"
+    assert_contains 'fprintd' "$sel_before" "PAM-12: initial selection contains fprintd"
+
+    PATH="$s/stub:$PATH" STUB_TOOL_LOG="$s/tool.log" \
+        STUB_DEBCONF_PROFILES="$s/debconf/profiles" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" "$s/stub/pam-auth-update" --remove fprintd
+    assert_contains 'pam-auth-update --remove fprintd' "$(cat "$s/tool.log")" \
+        "PAM-12: old tool call is logged"
+    assert_not_contains 'fprintd' "$(pam_selection "$s")" \
+        "PAM-12: stub --remove really drops fprintd from selection (fidelity)"
+    assert_eq "0" "$(printf '%s' "$(pam_selection "$s")" | grep -cF fprintd || true)" \
+        "PAM-12: selection actually changed (control is sensitive)"
+}
+
+# Re-review #11/#12 finding #2: original sudo/common PAM bytes AND the Debian
+# profile selection must survive fingerprint install -> uninstall (PAM-1..12).
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -9221,6 +9394,9 @@ test_pam_6_dry_run_no_side_effects
 test_pam_7_disable_body_has_no_sed
 test_pam_8_common_auth_tracked_and_no_uninstall_tool_call
 test_pam_9_fault_injection_does_not_leak_to_later_uninstall
+test_pam_10_debian_selection_and_stack_restored
+test_pam_11_explicit_selection_survives
+test_pam_12_stub_removes_selection_control
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
