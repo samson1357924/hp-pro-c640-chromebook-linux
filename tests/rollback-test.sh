@@ -983,6 +983,10 @@ test_plugdev_success_and_reinstall_first_wins() {
         rc=0
         ensure_group_membership plugdev testuser keyboard || rc=$?
         printf "%s\n" "$rc" > "$2/helper-rc.txt"
+        # Snapshot the ORIGINAL state right after install: the rc-3 uninstall
+        # path may consume all-true records when no udev rule needs the group,
+        # so reading the manifest after uninstall is not a stable assertion.
+        python3 -c "import json,sys; g=json.load(open(sys.argv[1])).get(\"groups\",[]); print(g[0][\"was_member\"] if g else \"none\")" "$2/manifest/install-manifest.json" > "$2/was-member-before.txt"
         remove_group_membership plugdev testuser keyboard || rc=$?
         printf "%s\n" "$rc" > "$2/remove-rc.txt"
         exit 0
@@ -990,7 +994,8 @@ test_plugdev_success_and_reinstall_first_wins() {
     assert_eq "0" "$(cat "$s2/helper-rc.txt" 2> /dev/null || echo MISSING)" \
         "T5: pre-existing member install succeeds"
     assert_eq "0" "$(usermod_calls "$s2/usermod.log")" "T5: pre-existing member is not usermod'ed"
-    assert_eq "True" "$(grp_was_member "$mp2")" "T5: pre-existing member recorded as was_member=true"
+    assert_eq "True" "$(cat "$s2/was-member-before.txt" 2> /dev/null || echo MISSING)" \
+        "T5: pre-existing member recorded as was_member=true"
     assert_eq "0" "$(usermod_calls "$s2/gpasswd.log")" "T5: uninstall keeps pre-existing membership"
 }
 
