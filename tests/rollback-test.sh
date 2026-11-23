@@ -7044,6 +7044,352 @@ test_sec_lock_ancestor_gate() {
 }
 
 # ---------------------------------------------------------------------------
+# Re-review #12 finding #1 (P2 SECURITY, BLOCKER for a custom manifest path).
+# The trust boundary is the CANONICAL (realpath-resolved, symlink-free) parent,
+# not the literal pathname. R1 rejects a relative path in a user-owned CWD;
+# R2 rejects a root-owned symlink and probes the resolved ancestor directly;
+# R2e2e closes the end-to-end gap: with NO literal symlink and a root-owned
+# direct parent, production manifest_lock() must still fail on a user-owned
+# CANONICAL ancestor (the mut-C guard); R3 proves the holder re-derives the
+# canonical path inside its own fd-9 process and rejects a symlink-derived
+# lock path (no second-holder/flock contention is claimed there); R4 is the
+# no-regression control. All sandboxes live under /tmp (root-owned sticky),
+# so the legitimate /tmp exception stays on.
+# ---------------------------------------------------------------------------
+
+test_sec_lock_rejects_relative_manifest_dir() {
+    local s cwd lock before
+    s="$(make_manifest_lock_sandbox sec-r1)"
+    chmod 0755 "$s" # let uid 1000 traverse the sandbox
+    cwd="$s/relcwd"
+    mkdir -p "$cwd/state"
+    chown 0:0 "$cwd/state"
+    chmod 0755 "$cwd/state" # the literal 'state' is root-owned
+    chown 1000:1000 "$cwd"
+    chmod 0700 "$cwd" # but the REAL parent (CWD) is not
+    lock="$cwd/state/.install-manifest.lock"
+    printf '%s' "$_SEC_MANIFEST" > "$cwd/state/install-manifest.json"
+    before="$(cat "$cwd/state/install-manifest.json")"
+    cat > "$s/user-relative.sh" << 'EOF'
+#!/usr/bin/env bash
+export PATH="$1/stub:$PATH" LOG_FILE="$1/relcwd/test.log"
+cd "$1/relcwd" || exit 99
+source "$2/lib/backup.sh"
+MANIFEST_DIR="state"
+MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+rc=0; manifest_lock || rc=$?
+printf '%s\n' "$rc" > "$1/relcwd/lock.rc"
+if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+    printf 'holder-alive\n' > "$1/relcwd/holder.txt"
+else
+    printf 'holder-none\n' > "$1/relcwd/holder.txt"
+fi
+if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2>/dev/null; then
+    printf 'wfd-open\n' > "$1/relcwd/wfd.txt"
+else
+    printf 'wfd-closed\n' > "$1/relcwd/wfd.txt"
+fi
+EOF
+    chmod 0755 "$s/user-relative.sh"
+    run_sandboxed "$s" '
+        setpriv --reuid=1000 --regid=1000 --clear-groups \
+            bash "$2/user-relative.sh" "$2" "$1"
+    '
+    assert_eq "1" "$(cat "$cwd/lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R1: relative manifest directory fails closed"
+    assert_contains "must be an absolute path" "$(cat "$cwd/test.log" 2> /dev/null || echo "")" \
+        "SEC R1: absolute-path requirement is logged"
+    assert_eq "holder-none" "$(cat "$cwd/holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R1: no root holder left alive"
+    assert_eq "wfd-closed" "$(cat "$cwd/wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R1: coproc write fd closed"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC R1: no lock inode created for the relative path"
+    assert_eq "$before" "$(cat "$cwd/state/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC R1: manifest bytes unchanged"
+}
+
+test_sec_lock_rejects_trusted_symlink_to_user_target() {
+    local s lock before canon
+    s="$(make_manifest_lock_sandbox sec-r2)"
+    chmod 0755 "$s"
+    mkdir -p "$s/sym/store/state" "$s/sym/trusted"
+    chown 1000:1000 "$s/sym/store"
+    chmod 0700 "$s/sym/store" # the symlink TARGET's parent is user-owned
+    chown 0:0 "$s/sym/store/state"
+    chmod 0755 "$s/sym/store/state" # the literal 'state' component is root-owned
+    chown 0:0 "$s/sym/trusted"
+    chmod 0755 "$s/sym/trusted"
+    ln -s "$s/sym/store" "$s/sym/trusted/link" # root-owned symlink
+    lock="$s/sym/store/state/.install-manifest.lock"
+    printf '%s' "$_SEC_MANIFEST" > "$s/sym/store/state/install-manifest.json"
+    before="$(cat "$s/sym/store/state/install-manifest.json")"
+    canon="$(realpath -e -- "$s/sym/trusted/link/state")"
+    cat > "$s/user-symlink.sh" << 'EOF'
+#!/usr/bin/env bash
+export PATH="$1/stub:$PATH" LOG_FILE="$1/sym/store/test.log"
+cd / || exit 99
+source "$2/lib/backup.sh"
+MANIFEST_DIR="$1/sym/trusted/link/state"
+MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+rc=0; manifest_lock || rc=$?
+printf '%s\n' "$rc" > "$1/sym/store/lock.rc"
+if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+    printf 'holder-alive\n' > "$1/sym/store/holder.txt"
+else
+    printf 'holder-none\n' > "$1/sym/store/holder.txt"
+fi
+if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2>/dev/null; then
+    printf 'wfd-open\n' > "$1/sym/store/wfd.txt"
+else
+    printf 'wfd-closed\n' > "$1/sym/store/wfd.txt"
+fi
+# Probe the ancestor gate on the RESOLVED path independently of the literal
+# symlink rejection: its real parent is uid 1000, so it must also be rejected.
+resolved="$(realpath -e -- "$MANIFEST_DIR" 2>/dev/null || echo MISSING)"
+printf '%s\n' "$resolved" > "$1/sym/store/canon.txt"
+arc=0; _manifest_lock_ancestors_ok "$resolved" || arc=$?
+printf '%s\n' "$arc" > "$1/sym/store/ancestor.rc"
+EOF
+    chmod 0755 "$s/user-symlink.sh"
+    run_sandboxed "$s" '
+        setpriv --reuid=1000 --regid=1000 --clear-groups \
+            bash "$2/user-symlink.sh" "$2" "$1"
+    '
+    assert_eq "1" "$(cat "$s/sym/store/lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R2: root-owned symlink to a user-owned target fails closed"
+    assert_contains "contains a symlink" "$(cat "$s/sym/store/test.log" 2> /dev/null || echo "")" \
+        "SEC R2: literal symlink rejection is logged"
+    assert_eq "$canon" "$(cat "$s/sym/store/canon.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R2: resolved realpath is the user-owned target"
+    assert_eq "1" "$(cat "$s/sym/store/ancestor.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R2: ancestor gate rejects the resolved user-owned parent"
+    assert_contains "not root-controlled" "$(cat "$s/sym/store/test.log" 2> /dev/null || echo "")" \
+        "SEC R2: realpath ancestor rejection is logged"
+    assert_eq "holder-none" "$(cat "$s/sym/store/holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R2: no root holder left alive"
+    assert_eq "wfd-closed" "$(cat "$s/sym/store/wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R2: coproc write fd closed"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC R2: no lock inode created behind the symlink"
+    assert_eq "$before" "$(cat "$s/sym/store/state/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC R2: manifest bytes unchanged"
+}
+
+# R2 only reaches the ancestor gate through a DIRECT _manifest_lock_ancestors_ok()
+# probe: its literal path contains a symlink, so manifest_lock() fails earlier
+# at the literal-symlink check. No-op'ing the production gate call (mut-C) left
+# all R2 assertions green. R2e2e removes that escape hatch: every literal
+# component is a real directory, the literal direct parent is root-owned 0755,
+# and ONLY the canonical realpath exposes the user-owned layer. The rejection
+# therefore has to come from _manifest_lock_canonical_dir() -> ancestor gate.
+test_sec_lock_canonical_ancestor_user_dir() {
+    local s dir canon canon_expected lock before
+    s="$(make_manifest_lock_sandbox sec-r2e2e)"
+    chmod 0755 "$s"
+    mkdir -p "$s/trusted" "$s/userdir/sub"
+    chown 0:0 "$s/trusted" "$s/userdir/sub"
+    chmod 0755 "$s/trusted" "$s/userdir/sub"
+    chown 1000:1000 "$s/userdir"
+    chmod 0700 "$s/userdir"
+
+    # trusted/.. contains no symlink; stat() of the literal path resolves to
+    # the root-owned 'sub', but realpath() resolves to the user-owned parent.
+    dir="$s/trusted/../userdir/sub"
+    canon="$(realpath -e -- "$dir")"
+    canon_expected="$(realpath -e -- "$s/userdir/sub")"
+    lock="$canon/.install-manifest.lock"
+    printf '%s' "$_SEC_MANIFEST" > "$dir/install-manifest.json"
+    before="$(cat "$dir/install-manifest.json")"
+
+    # Setup preconditions: prove this is NOT caught by the literal checks.
+    assert_eq "no" "$([ -L "$s/trusted" ] || [ -L "$s/userdir" ] || [ -L "$s/userdir/sub" ] && echo yes || echo no)" \
+        "SEC R2e2e: the literal path has no symlink component"
+    assert_eq "0:755" "$(stat -c '%u:%a' -- "$dir")" \
+        "SEC R2e2e: the literal direct parent is root-owned 0755"
+    assert_eq "$canon_expected" "$canon" \
+        "SEC R2e2e: canonical realpath hides the trusted/.. layer"
+    assert_eq "1000:700" "$(stat -c '%u:%a' -- "$s/userdir")" \
+        "SEC R2e2e: the canonical ancestor is user-owned 0700"
+
+    _lock_sec_ancestor_case "$s" r2e2e "$dir" "$before"
+    assert_eq "1" "$(cat "$s/r2e2e.lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R2e2e: production manifest_lock fails closed on a user-owned canonical ancestor"
+    assert_contains "not root-controlled" "$(cat "$s/r2e2e.log" 2> /dev/null || echo "")" \
+        "SEC R2e2e: the ancestor gate logged the user-owned realpath layer"
+    assert_contains "untrusted realpath ancestor" "$(cat "$s/r2e2e.log" 2> /dev/null || echo "")" \
+        "SEC R2e2e: _manifest_lock_canonical_dir reported the untrusted realpath"
+    assert_eq "holder-none" "$(cat "$s/r2e2e.holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R2e2e: no root holder left alive"
+    assert_eq "wfd-closed" "$(cat "$s/r2e2e.wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R2e2e: coproc write fd closed"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC R2e2e: no lock inode created"
+    assert_eq "$before" "$(cat "$dir/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC R2e2e: manifest bytes unchanged"
+}
+
+test_sec_lock_holder_rejects_symlink_derived_path() {
+    local s before pa new_ino
+    s="$(make_manifest_lock_sandbox sec-r3)"
+    chmod 0755 "$s" # let uid 1000 traverse and rename
+    _lock_sec_prepare "$s"
+    before="$(cat "$s/manifest/install-manifest.json")"
+
+    # A holds a real lock on its own root-owned sandbox manifest path. It is
+    # NOT a contender for B's path below (different inode, no flock sharing):
+    # it only proves the ordinary lock machinery works in this sandbox first.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=5
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/a.rc"
+        if [ "$rc" -eq 0 ]; then
+            printf "%s\n" "$(stat -c %i -- "$MANIFEST_LOCK_FILE")" > "$2/a.ino"
+            : > "$2/a.held"
+            i=0
+            while [ ! -e "$2/a.release" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i+1)); done
+            manifest_unlock
+        fi
+    ' &
+    pa=$!
+    if op_wait_for_file "$s/a.held" 200; then ok; else fail "SEC R3: A never acquired the lock"; fi
+
+    # Set up a root-owned symlink in a trusted dir pointing into 'store', which
+    # uid 1000 owns. The rename below refreshes the lock inode at the symlink
+    # target; B's literal path traverses the symlink, so its canonical realpath
+    # differs from the literal pathname the holder was handed.
+    mkdir -p "$s/store/state" "$s/trusted"
+    chown 1000:1000 "$s/store"
+    chmod 0700 "$s/store"
+    chown 0:0 "$s/store/state"
+    chmod 0755 "$s/store/state"
+    chown 0:0 "$s/trusted"
+    chmod 0755 "$s/trusted"
+    ln -s "$s/store" "$s/trusted/link"
+    printf '%s' "$_SEC_MANIFEST" > "$s/store/state/install-manifest.json"
+    : > "$s/store/state/.install-manifest.lock"
+    chmod 0600 "$s/store/state/.install-manifest.lock"
+
+    cat > "$s/user-rename.sh" << 'EOF'
+#!/usr/bin/env bash
+mv "$1/store/state" "$1/store/state.moved" || exit 1
+mkdir -p "$1/store/state" || exit 1
+printf 'ok\n' > "$1/store/rename.rc"
+EOF
+    chmod 0755 "$s/user-rename.sh"
+    run_sandboxed "$s" '
+        setpriv --reuid=1000 --regid=1000 --clear-groups \
+            bash "$2/user-rename.sh" "$2"
+    '
+    assert_eq "ok" "$(cat "$s/store/rename.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R3: uid 1000 legally renamed the user-owned store/state"
+    chown 0:0 "$s/store/state"
+    chmod 0755 "$s/store/state"
+    printf '%s' "$_SEC_MANIFEST" > "$s/store/state/install-manifest.json"
+    : > "$s/store/state/.install-manifest.lock"
+    chmod 0600 "$s/store/state/.install-manifest.lock"
+    new_ino="$(stat -c %i -- "$s/store/state/.install-manifest.lock")"
+
+    # B bypasses the parent-shell gate (a TOCTOU simulation, as in S10c) so the
+    # ONLY guard under test is the holder's canonical re-verification inside the
+    # fd-9 process. No second-holder/flock contention with A is implied here.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        _manifest_lock_dir_ok() { return 0; }
+        MANIFEST_DIR="$2/trusted/link/state"
+        MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/b.rc"
+        if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+            printf "holder-alive\n" > "$2/b.holder.txt"
+        else
+            printf "holder-none\n" > "$2/b.holder.txt"
+        fi
+        if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2>/dev/null; then
+            printf "wfd-open\n" > "$2/b.wfd.txt"
+        else
+            printf "wfd-closed\n" > "$2/b.wfd.txt"
+        fi
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    '
+    : > "$s/a.release"
+    worker_wait_pid "$pa"
+    assert_eq "0" "$(cat "$s/a.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R3: A held and released its legitimate lock"
+    assert_eq "1" "$(cat "$s/b.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R3: B's lock request on the symlink-derived path fails closed"
+    assert_eq "holder-none" "$(cat "$s/b.holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R3: no holder survives for the symlink-derived path"
+    assert_eq "wfd-closed" "$(cat "$s/b.wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R3: B's coproc write fd closed"
+    assert_contains "FAILED:canonical" "$(cat "$s/log.txt" 2> /dev/null || echo "")" \
+        "SEC R3: holder re-derived the canonical realpath inside fd 9's process and rejected the symlink-derived path"
+    assert_eq "1" "$(find "$s/store/state" -maxdepth 1 -name '.install-manifest.lock*' | wc -l | tr -d '[:space:]')" \
+        "SEC R3: exactly one lock inode in the symlink target directory"
+    assert_eq "$new_ino" "$(stat -c %i -- "$s/store/state/.install-manifest.lock" 2> /dev/null || echo MISSING)" \
+        "SEC R3: the symlink target's lock inode was not replaced"
+    assert_eq "$before" "$(cat "$s/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC R3: A's manifest bytes unchanged"
+}
+
+test_sec_lock_absolute_root_owned_dir_control() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-r4)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+
+    # (a) root caller: the canonical path must be published and usable.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/r4-root-lock.rc"
+        printf "%s\n" "$MANIFEST_LOCK_CANON_DIR" > "$2/r4-root-dir.txt"
+        printf "%s\n" "$MANIFEST_LOCK_CANON_FILE" > "$2/r4-root-file.txt"
+        if [ "$rc" -eq 0 ]; then
+            g=0; backup_file_manifest_aware "$2/root/audio.conf" audio || g=$?
+            printf "%s\n" "$g" > "$2/r4-root-gate.rc"
+            manifest_unlock
+        fi
+    '
+    assert_eq "0" "$(cat "$s/r4-root-lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R4(a): absolute root-owned path accepted (root caller)"
+    assert_eq "$s/manifest" "$(cat "$s/r4-root-dir.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R4(a): canonical lock directory published"
+    assert_eq "$lock" "$(cat "$s/r4-root-file.txt" 2> /dev/null || echo MISSING)" \
+        "SEC R4(a): canonical lock file published"
+    assert_eq "0" "$(cat "$s/r4-root-gate.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R4(a): mutation helper runs under the lock"
+    assert_eq "600" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" \
+        "SEC R4(a): lock stays root-owned 0600"
+
+    # (b) a caller that reports uid 1000 via `id -u` still succeeds, because
+    # ownership/permission checks use stat, never the caller's identity.
+    _lock_sec_nonroot_id_stub "$s"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/r4-stub-lock.rc"
+        if [ "$rc" -eq 0 ]; then
+            g=0; backup_file_manifest_aware "$2/root/audio.conf" audio || g=$?
+            printf "%s\n" "$g" > "$2/r4-stub-gate.rc"
+            manifest_unlock
+        fi
+    '
+    assert_eq "0" "$(cat "$s/r4-stub-lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R4(b): absolute root-owned path accepted (id -u stub = 1000)"
+    assert_eq "0" "$(cat "$s/r4-stub-gate.rc" 2> /dev/null || echo MISSING)" \
+        "SEC R4(b): mutation helper runs under the lock"
+    assert_eq "1" "$(manifest_count "$s/manifest/install-manifest.json" records)" \
+        "SEC R4(b): exactly one record written (first-wins preserved)"
+    assert_eq "0" "$(manifest_count "$s/manifest/install-manifest.json" services)" \
+        "SEC R4: no spurious service records"
+}
+
+# ---------------------------------------------------------------------------
 # Re-review #10 finding #1: operation-level lock regressions (OP1-OP4).
 # OP1/OP2 use a REAL `sudo install -D` barrier: A records the target, pauses
 # before writing it, B races with rollback on the SAME target. OP3 proves the
@@ -8122,6 +8468,12 @@ test_sec_lock_helper_rechecks_parent_dir
 test_sec_lock_nonroot_root_owned_dir_succeeds
 # Phase 3: ancestor gate must require root ownership even for a sticky layer
 test_sec_lock_ancestor_gate
+# Re-review #12 finding #1: canonical realpath trust boundary / holder recheck
+test_sec_lock_rejects_relative_manifest_dir
+test_sec_lock_rejects_trusted_symlink_to_user_target
+test_sec_lock_canonical_ancestor_user_dir
+test_sec_lock_holder_rejects_symlink_derived_path
+test_sec_lock_absolute_root_owned_dir_control
 # Re-review #10 finding #1: operation-level (backup -> deploy -> rollback) lock
 test_op_deploy_vs_rollback_barrier OP1 keyboard-hwdb keyboard
 test_op_deploy_vs_rollback_barrier OP1 audio-ucm audio

@@ -70,6 +70,12 @@ MANIFEST_LOCK_TIMEOUT="${CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT:-10}"
 MANIFEST_LOCK_HOLDER_PID=""
 MANIFEST_LOCK_HOLDER_RFD=""
 MANIFEST_LOCK_HOLDER_WFD=""
+# Re-review #12 finding #1: canonical, symlink-free lock parent/lock resolved by
+# the gate below. Empty when a test deliberately overrides _manifest_lock_dir_ok
+# to exercise the root holder alone; the holder then falls back to the literal
+# path and its own rechecks still fail closed.
+MANIFEST_LOCK_CANON_DIR=""
+MANIFEST_LOCK_CANON_FILE=""
 
 # Pure-bash ancestor gate (no sudo, no python3). Anyone who can write a
 # directory on the path can rename the lock pathname out from under a live
@@ -128,10 +134,71 @@ _manifest_lock_ancestors_ok() {
     return 0
 }
 
-# Pure-bash parent-directory gate (no sudo, no python3). The lock path may only
-# be replaced by an account that can write its parent, so an untrusted parent
-# must be rejected before any privileged chmod/chown/open happens.
-_manifest_lock_dir_ok() {
+# Re-review #12 finding #1: CROS_ENABLEMENT_MANIFEST_DIR may be RELATIVE, or
+# may traverse a symlink whose real target lives in a user-owned directory. The
+# old walker only inspected literal components, so it could accept a path while
+# the directory that can actually rename the lock is user-controlled. Require
+# an absolute path, reject literal symlinks, canonicalize the deepest EXISTING
+# prefix (realpath -e; init creates missing layers and re-checks), then run the
+# root-controlled ancestor gate on the REAL path.
+_manifest_lock_literal_no_symlink() {
+    local dir="$1" rest cur comp
+    rest="${dir#/}"
+    cur=""
+    while [ -n "$rest" ]; do
+        comp="${rest%%/*}"
+        if [ -n "$comp" ]; then
+            cur="$cur/$comp"
+            if [ -L "$cur" ]; then
+                log_error "Manifest lock directory $dir contains a symlink ($cur); untrusted symlink; refusing to lock"
+                return 1
+            fi
+        fi
+        case "$rest" in
+            */*) rest="${rest#*/}" ;;
+            *) rest="" ;;
+        esac
+    done
+    return 0
+}
+
+# Echoes the canonical (symlink-free, absolute) lock parent, or fails closed.
+_manifest_lock_canonical_dir() {
+    local dir="$1" probe suffix="" canon
+    case "$dir" in
+        /*) ;;
+        *)
+            log_error "Manifest directory $dir must be an absolute path; refusing to lock"
+            return 1
+            ;;
+    esac
+    _manifest_lock_literal_no_symlink "$dir" || return 1
+    probe="$dir"
+    while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do
+        suffix="/${probe##*/}$suffix"
+        probe="${probe%/*}"
+        [ -n "$probe" ] || probe="/"
+    done
+    if ! canon="$(realpath -e -- "$probe" 2> /dev/null)"; then
+        log_error "Cannot canonicalize manifest lock parent $dir; refusing to lock"
+        return 1
+    fi
+    canon="${canon%/}"
+    [ -n "$canon" ] || canon="/"
+    canon="$canon$suffix"
+    if ! _manifest_lock_ancestors_ok "$canon"; then
+        log_error "Manifest lock canonical path $canon has an untrusted realpath ancestor; refusing to lock"
+        return 1
+    fi
+    printf '%s\n' "$canon"
+}
+
+# Direct-parent type/owner/mode check, shared by the literal and canonical
+# paths. The literal pass is first so the long-standing S6/S7/S10 diagnostics
+# (group/other-writable, is a symlink or not a directory, must be root-owned)
+# are preserved; the canonical pass is what actually enforces the trust
+# boundary when a symlink hides the real target.
+_manifest_lock_parent_perm_ok() {
     local dir="$1" meta uid mode
     if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
         log_error "Manifest lock parent $dir is a symlink or not a directory; refusing to lock"
@@ -144,9 +211,6 @@ _manifest_lock_dir_ok() {
         }
         uid="${meta%%|*}"
         mode="${meta#*|}"
-        # Re-review #11 finding #3: a caller-owned parent can rename the root-
-        # owned 0600 lock inode while a holder is live. Privileged locking
-        # requires root ownership of the directory itself, never EUID/UID.
         if [ "$uid" != 0 ]; then
             log_error "Manifest lock parent $dir is owned by uid $uid (must be root-owned); refusing to lock"
             return 1
@@ -156,15 +220,33 @@ _manifest_lock_dir_ok() {
             return 1
         fi
     fi
-    # Missing dirs are created by init (as root) and re-checked then; the
-    # ancestor chain is checked now so an untrusted parent is never created.
-    _manifest_lock_ancestors_ok "$dir" || return 1
+    return 0
+}
+
+# Keeps the original (dir) signature so test overrides still work; publishes
+# the canonical parent/lock for init() and the root holder.
+_manifest_lock_dir_ok() {
+    local dir="$1" canon base
+    _manifest_lock_parent_perm_ok "$dir" || return 1
+    if ! canon="$(_manifest_lock_canonical_dir "$dir")"; then return 1; fi
+    [ -n "$canon" ] || return 1
+    _manifest_lock_parent_perm_ok "$canon" || return 1
+    base="${MANIFEST_LOCK_FILE##*/}"
+    [ -n "$base" ] || base=".install-manifest.lock"
+    MANIFEST_LOCK_CANON_DIR="$canon"
+    MANIFEST_LOCK_CANON_FILE="$canon/$base"
     return 0
 }
 
 manifest_lock_init() {
-    local lock="$MANIFEST_LOCK_FILE" meta owner mode
-    _manifest_lock_dir_ok "$MANIFEST_DIR" || return 1
+    local lock="$MANIFEST_LOCK_FILE" dir="$MANIFEST_DIR" meta owner mode
+    MANIFEST_LOCK_CANON_DIR=""
+    MANIFEST_LOCK_CANON_FILE=""
+    _manifest_lock_dir_ok "$dir" || return 1
+    # The canonical path is empty only when a test overrides the gate to
+    # exercise the root holder alone (S10c); keep the literal path in that case.
+    dir="${MANIFEST_LOCK_CANON_DIR:-$dir}"
+    lock="${MANIFEST_LOCK_CANON_FILE:-$lock}"
 
     # Reject symlinks and EVERY non-regular type before any open or chmod:
     # `exec 9< directory` succeeds on Linux and a FIFO would block forever.
@@ -177,11 +259,15 @@ manifest_lock_init() {
         return 1
     fi
     if [ ! -e "$lock" ]; then
-        sudo mkdir -p "$MANIFEST_DIR" || {
-            log_error "Could not create manifest dir $MANIFEST_DIR"
+        sudo mkdir -p "$dir" || {
+            log_error "Could not create manifest dir $dir"
             return 1
         }
-        _manifest_lock_dir_ok "$MANIFEST_DIR" || return 1
+        # Re-run the gate on the canonical directory after mkdir creates any
+        # missing layers, so the final on-disk owner/mode are checked too.
+        _manifest_lock_dir_ok "$dir" || return 1
+        dir="${MANIFEST_LOCK_CANON_DIR:-$dir}"
+        lock="${MANIFEST_LOCK_CANON_FILE:-$lock}"
         # NEVER use `install`: it replaces the destination inode on every call.
         # `set -C` is O_EXCL|O_NOFOLLOW (it rejects an existing symlink too),
         # and umask 077 makes the single creation root:0600 atomically.
@@ -263,6 +349,11 @@ fd_ftype=$(stat -Lc %f -- /proc/$$/fd/9 2>/dev/null || echo "")
 # that holds fd 9. A stale parent-shell stat, or an ancestor the caller can
 # rename, must never let us lock a path whose parent an attacker controls.
 dir=${lock%/*}; [ -n "$dir" ] || dir=/
+# Re-review #12: the parent hands us a canonical path; re-derive it HERE,
+# inside the process that actually holds fd 9. A symlink swapped in after the
+# parent-shell gate must be rejected before any flock is taken.
+cdir=$(realpath -e -- "$dir" 2>/dev/null || echo "")
+if [ -z "$cdir" ] || [ "$cdir" != "$dir" ]; then printf "FAILED:canonical\n"; exit 1; fi
 if ! { exec 8< "$dir"; } 2>/dev/null; then printf "FAILED:parentdir\n"; exit 1; fi
 dm="$(stat -Lc "%u|%a|%i|%d|%f" -- /proc/$$/fd/8 2>/dev/null || echo "")"
 du=${dm%%|*}; r=${dm#*|}; dmode=${r%%|*}; r=${r#*|}; dino=${r%%|*}; r=${r#*|}; ddev=${r%%|*}; dtype=${r#*|}
@@ -275,6 +366,22 @@ if [ -z "$dm" ] || [ -z "$du" ] || [ -z "$dmode" ] || [ -z "$dino" ] || [ -z "$d
    [ "$pdi" != "$dino" ] || [ "$pdd" != "$ddev" ]; then
     printf "FAILED:parentdir\n"; exit 1
 fi
+# Re-review #12: every REAL ancestor (not just the direct parent) must be
+# root-controlled, with the root-owned sticky (/tmp) exception preserved.
+# This runs AFTER the fd-8 parent check so S10c keeps its FAILED:parentdir
+# diagnostic when the direct parent itself is caller-owned.
+p="$dir"
+while :; do
+    am="$(stat -Lc "%u|%a" -- "$p" 2>/dev/null || echo "")"
+    [ -n "$am" ] || { printf "FAILED:ancestor\n"; exit 1; }
+    au=${am%%|*}; amode=${am#*|}
+    bad=0
+    [ "$au" = 0 ] || bad=1
+    if [ $(((8#$amode & 022) != 0)) -eq 1 ] && [ $(((8#$amode & 01000) == 0)) -eq 1 ]; then bad=1; fi
+    [ "$bad" -eq 0 ] || { printf "FAILED:ancestor\n"; exit 1; }
+    [ "$p" = "/" ] && break
+    p="${p%/*}"; [ -n "$p" ] || p="/"
+done
 if [ -z "$path_ino" ] || [ -z "$path_dev" ] || [ -z "$fd_ino" ] || [ -z "$fd_dev" ] ||
    [ -z "$fd_uid" ] || [ -z "$fd_mode" ] || [ -z "$fd_ftype" ] ||
    [ "$path_ino" != "$fd_ino" ] || [ "$path_dev" != "$fd_dev" ] ||
@@ -328,7 +435,7 @@ manifest_lock() {
     manifest_lock_init || return 1
 
     coproc MANIFEST_LOCK_HOLDER {
-        sudo bash -c "$_MANIFEST_LOCK_HOLDER_SH" _ "$MANIFEST_LOCK_FILE" "$MANIFEST_LOCK_TIMEOUT"
+        sudo bash -c "$_MANIFEST_LOCK_HOLDER_SH" _ "${MANIFEST_LOCK_CANON_FILE:-$MANIFEST_LOCK_FILE}" "$MANIFEST_LOCK_TIMEOUT"
     }
     MANIFEST_LOCK_HOLDER_RFD="${MANIFEST_LOCK_HOLDER[0]}"
     MANIFEST_LOCK_HOLDER_WFD="${MANIFEST_LOCK_HOLDER[1]}"
