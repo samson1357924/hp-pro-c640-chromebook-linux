@@ -102,14 +102,20 @@ read-modify-write（備份 helper 加上此處的 keyd-link 正規化）都在�
 closed 且保持 manifest 位元組不變。鎖檔是 root 擁有的 `0600` 普通檔，由短暫的
 `coproc sudo bash -c` root helper 持有 fd 9，並以 `/proc/$$/fd/9` 檢查 fd/路徑
 `(dev,ino)`、owner `0`、mode `600` 與檔案型別；父行程關閉 pipe 即釋放 flock（無 stale
-lock、無 EXIT trap）。**直接父目錄必須由 root 擁有**——目前 EUID/UID 擁有不再合格，
-因為其擁有者可將有效的鎖重新命名——且每一層祖先都必須由 root 控管：非 root 擁有或
-群組/其他可寫但無 sticky 的層會 fail closed（`not root-controlled`），root 擁有且具
-sticky 的世界可寫層（例如 `/tmp` `1777`）可通過，symlink 只在其所在目錄由 root 擁有且
-不可群組/其他可寫時放行（否則 `untrusted symlink`）。`/var/lib/cros-enablement` 請維持
-`0755`；舊的 `0644` 鎖會升級為 `0600`。holder 並以 **fd 8** 釘住直接父目錄（重新檢查
-uid/mode/type/dev+ino，失敗印 `FAILED:parentdir`），防止重新命名讓第二個程序對新 inode
-取鎖；symlink、非普通檔與 inode 替換同樣 fail closed。gate → 重新讀取 → 決策 → 寫入
+lock、無 EXIT trap）。`CROS_ENABLEMENT_MANIFEST_DIR` 必須是絕對路徑（否則記錄
+`must be an absolute path`），且**任何字面 symlink component 一律拒絕**
+（`contains a symlink` / `untrusted symlink`），即使是 root 擁有也一樣——這是 fail-closed
+取捨，因為 symlink 可隱藏使用者可寫、能重新命名鎖的目標。gate 以 `realpath -e` 解析最深的
+存在前綴並補回缺少的層（仍支援首次建立），再檢查 **canonical** 祖先
+（`untrusted realpath ancestor`）。**直接父目錄必須由 root 擁有**——目前 EUID/UID 擁有
+不再合格，因為其擁有者可將有效的鎖重新命名——且每一層祖先都必須由 root 控管：非 root
+擁有或群組/其他可寫但無 sticky 的層會 fail closed（`not root-controlled`），root 擁有且具
+sticky 的世界可寫層（例如 `/tmp` `1777`）可通過。`/var/lib/cros-enablement` 請維持
+`0755`；舊的 `0644` 鎖會升級為 `0600`。在 holder 行程內，`realpath -e "$dir"` 必須仍等於
+canonical 父目錄（否則 `FAILED:canonical`），且每一層真實祖先必須 uid `0`，並為非群組/
+其他可寫或 root sticky（否則 `FAILED:ancestor`）。holder 並以 **fd 8** 釘住直接父目錄
+（重新檢查 uid/mode/type/dev+ino，失敗印 `FAILED:parentdir`），防止重新命名讓第二個
+程序對新 inode 取鎖；symlink、非普通檔與 inode 替換同樣 fail closed。gate → 重新讀取 → 決策 → 寫入
 全在 critical section 內，因此平行程序不會遺失另一程序
 first-wins 的備份/服務/群組紀錄。每個 writer 使用唯一的 `.install-manifest.*.tmp`
 （mkstemp + fsync + `chmod 0644` + `os.replace`）而非共用 `.tmp`，避免平行 writer 覆寫彼此
@@ -145,15 +151,24 @@ remain for retry)` 並回傳 rc 1，而不是謊稱成功。
   再明確檢查 `sudo usermod -aG` 的 rc（移除 `|| true`）；若 `usermod` 失敗且先前沒有紀錄，
   就移除剛寫入的紀錄。keyboard、fingerprint 與 EC 程式共用 `manifest_has_group` /
   `manifest_remove_group` / `ensure_group_membership` helper。
-* **plugdev 歸屬由所有元件共同判定。** uninstall 時 `remove_group_membership()` 彙總
-  所有元件的 `(group,user)` 紀錄：任一 `was_member=false` 即證明是我們加入的，全部為
-  `true`／沒有紀錄則保留，欄位型別錯誤則 fail closed。`gpasswd -d` 成功後會消耗該組的
-  **所有紀錄**（`manifest_remove_group_all`），因此完整安裝/解除安裝不論元件順序皆可。
-  `gpasswd -d` 失敗現在是真正的錯誤（rc 1），會折進 uninstaller 的結束碼，不再謊報成功。
+* **plugdev 歸屬由所有元件共同判定，過期紀錄會更新。** uninstall 時
+  `remove_group_membership()` 彙總所有元件的 `(group,user)` 紀錄：任一 `was_member=false`
+  即證明是我們加入的（rc 0），沒有紀錄代表無需 rollback（rc 1），**全部為 `true`** 代表
+  原本就存在（rc 3），欄位型別錯誤則 fail closed。first-wins 不變——rc 0 才執行
+  `gpasswd -d`（除非仍有 udev rule 需要該 group），成功後會消耗該組的**所有紀錄**
+  （`manifest_remove_group_all`），因此完整安裝/解除安裝不論元件順序皆可。**rc 3 時完全
+  不呼叫 gpasswd**：有 udev rule 仍引用時保留快照；一旦沒有 rule 引用（所有使用該 group
+  的元件皆已卸載），就以零次 gpasswd 消耗全部過期紀錄，讓下次安裝重新擷取真實的成員
+  資格。消耗失敗會 fail closed（rc 1）。`gpasswd -d` 失敗是真正的錯誤（rc 1），會折進
+  uninstaller 的結束碼，不再謊報成功。
 * **PAM 還原由 rollback 全權負責。** 指紋 uninstaller 絕不對 `/etc/pam.d/sudo` 執行 sed；
   原始位元組由 `rollback_component("fingerprint")` 還原，因此原本就存在的精確
-  `pam_fprintd` 行會被保留。Debian 的 `common-*` 備份、唯讀的 stale-record 檢查與
-  authselect/pam-config 限制見 [UNINSTALL.md](../docs/UNINSTALL.md)。
+  `pam_fprintd` 行會被保留。Debian/Ubuntu 安裝時**直接**以
+  `sed -i '/pam_fprintd\.so/d'` 移除 `common-*` 中的 fp 行，絕不呼叫
+  `pam-auth-update --remove fprintd`（那會摧毀 rollback 無法還原的 debconf profile
+  selection）；uninstall 不呼叫任何 profile 工具。Debian 的 Tier 2 備份、selection 保留
+  取捨、唯讀的 stale-record 檢查與 authselect/pam-config 限制見
+  [UNINSTALL.md](../docs/UNINSTALL.md)。
 
 所有安裝 caller 會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e` 在
 rollback 失敗時提前中止收尾。
@@ -438,18 +453,19 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1392 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1509 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
-找不到備份回 rc 1、root-only `0600` holder 鎖的 symlink/inode/祖先/父目錄拒絕與 fd 8 釘住、
-跨元件 plugdev 歸屬與 gpasswd 失敗回 rc 1、PAM 原始行保護、整個操作鎖
+找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
+祖先/父目錄拒絕與 fd 8 釘住、跨元件 plugdev 歸屬（含 all-true 過期紀錄零 gpasswd 消耗）
+與 gpasswd 失敗回 rc 1、PAM 原始行保護與 profile selection 保留、整個操作鎖
 （部署 vs rollback 的 OP1/OP2 FIFO barrier 回歸、真實安裝器 barrier 與 fail-closed body）、
 唯一 writer 暫存檔與 systemctl 還原檢查 rc。
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 1392 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1509 個案例（需 root）
 ```
 
 ---

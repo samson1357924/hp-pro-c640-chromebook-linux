@@ -393,8 +393,23 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     (fsync + `chmod 0644` + `os.replace`), so parallel runs cannot drop each other's first-wins
     records. Retry after the other run finishes; raise the timeout (e.g. `300`) if a
     `fingerprint/install-fingerprint.sh --source` build is still holding the lock.
+  * `Manifest directory ... must be an absolute path; refusing to lock` means
+    `CROS_ENABLEMENT_MANIFEST_DIR` was relative. Set an absolute path (normally
+    `/var/lib/cros-enablement`); the lock trust boundary cannot be evaluated against an
+    ambiguous CWD. `Manifest lock directory ... contains a symlink (...); untrusted symlink;
+    refusing to lock` means a literal symlink component was found on the path. Since the
+    twelfth re-review **every** literal symlink component is refused, even a root-owned,
+    otherwise safe one: a symlink can hide the real target in a user-writable tree whose
+    owner could rename the lock. Replace the symlink with a real directory (fail-closed by
+    design; this is stricter than the old "trusted symlink" allowance).
+    `Manifest lock canonical path ... has an untrusted realpath ancestor; refusing to lock`
+    (`untrusted realpath ancestor`) means the **real** path — the deepest existing prefix
+    resolved with `realpath -e` plus the missing layers — has an ancestor that is not
+    root-controlled. Fix the ownership/mode of that real ancestor; do not route around it
+    with another symlink.
   * `... (holder: FAILED:symlink)`, `FAILED:type`, `FAILED:open`, `FAILED:inode`,
-    `FAILED:parentdir` or `FAILED:flock` is the root helper's reason for refusing the lock.
+    `FAILED:canonical`, `FAILED:ancestor`, `FAILED:parentdir` or `FAILED:flock` is the root
+    helper's reason for refusing the lock.
     `FAILED:symlink` / `FAILED:type` / `FAILED:inode` mean the lock path was a symlink, a
     non-regular file (e.g. a directory or FIFO) or was swapped between init and open: the
     helper compares fd 9 with the path's `(dev,ino)` via `/proc/$$/fd/9` plus owner `0`, mode
@@ -402,6 +417,12 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     inode swap cannot redirect the flock. `FAILED:flock` is ordinary contention. The same
     checks log `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a
     root-owned 0600 regular file (uid=... mode=...)` when they fail before the helper starts.
+    **`FAILED:canonical`** means the holder re-derived `realpath -e "$dir"` inside the
+    process that owns fd 9 and it no longer equals the canonical directory handed over by
+    the gate — a symlink was swapped in after the gate ran. **`FAILED:ancestor`** means a
+    **real** ancestor above the direct parent was not uid `0`, or was group/other-writable
+    without being a root-owned sticky world-writable layer (e.g. `/tmp` `1777`). Both abort
+    before any `flock` is taken and leave the manifest bytes intact; fix the path and retry.
   * `FAILED:parentdir` means the fd-8 pin of the lock's **direct parent** failed inside the
     root holder: the parent was not root-owned, was group/other-writable, was not a directory,
     or its `(dev,ino)` no longer matched the pathname. This closes the rename race where A
@@ -417,8 +438,11 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     (uid=... mode=...)` rejects a non-root-owned or g/o-writable layer **without** a sticky bit
     (a root-owned sticky world-writable layer such as `/tmp` `1777` is allowed), and
     `Manifest lock ancestor ... is an untrusted symlink` rejects a symlink unless the directory
-    holding it is root-owned and not g/o-writable. A custom lock parent under a user-writable
-    tree is therefore refused even when the lock file itself would be root-owned.
+    holding it is root-owned and not g/o-writable. Separately, the literal path check now
+    rejects **any** symlink component (`contains a symlink`) before canonicalization, and the
+    canonical path's ancestors are checked as well (`untrusted realpath ancestor`). A custom
+    lock parent under a user-writable tree is therefore refused even when the lock file itself
+    would be root-owned.
   * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
     means the lock could not be made root-owned `0600` (an older `0644` lock is upgraded
     automatically), so the installer fails closed. A plain `permission denied` when a peer
@@ -428,13 +452,23 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     parent directory mode and retry.
   * Group membership is now recorded **before** `usermod` runs: the installer persists the
     original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
-    the change fails with no earlier record, removes the record it just wrote. Uninstall
-    consumes **all** component records for the pair only after `gpasswd -d` succeeds
-    (`manifest_remove_group_all`), so the module uninstall order cannot leave a stale
-    `was_member` record behind. If no record proves we added the membership, it logs
-    `No record proves we added '<user>' to group '<group>'; keeping membership.` and leaves
-    it alone; a wrong safety-field type logs `Cannot determine original membership of
-    <user>@<group>; refusing to change it` and returns rc 1.
+    the change fails with no earlier record, removes the record it just wrote. The shared
+    ownership probe returns rc 0 when some record is explicitly `was_member=false` (we added
+    it), rc 1 for **no record** (`No group record for '<user>'@'<group>'; nothing to roll
+    back.`), rc 3 when **all** records are `was_member=true` (pre-existing), rc 2 for a bad
+    field type (`Cannot determine original membership of <user>@<group>; refusing to change
+    it`, rc 1). first-wins is unchanged: rc 0 runs `gpasswd -d`, and a udev rule that still
+    references the group keeps the membership. On **rc 3** no `gpasswd` ever runs: if a udev
+    rule still references the group it logs `udev rules still reference group '<group>';
+    keeping '<user>' in it (all records pre-existing).` and keeps the snapshot; once no rule
+    references it (all components using the group have gone) it logs `All records
+    pre-existing and no udev rule needs '<group>'; consuming stale records for
+    '<user>'@'<group>' (membership unchanged).` and consumes **all** records with **zero**
+    `gpasswd` calls, so the next install re-snapshots the real membership (e.g. after an
+    admin changed it). A consume failure logs `Could not consume stale group records for
+    '<user>'@'<group>'; keeping them for retry.` (rc 1). With rc 0, uninstall consumes all
+    component records only after `gpasswd -d` succeeds (`manifest_remove_group_all`), so the
+    module uninstall order cannot leave a stale `was_member` record behind.
   * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
     means `gpasswd -d` failed. This is now a **real failure** (log_error, rc 1) — the three
     component uninstallers capture it and fold it into their exit code, so a full
@@ -448,10 +482,17 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     `rollback_component("fingerprint")`), so a pre-existing exact `pam_fprintd` line is not
     deleted. If the manifest is corrupt it instead warns `Manifest at ... is corrupt/invalid;
     cannot confirm rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.` — either
-    way it only warns. On Debian/Ubuntu the original `common-*` bytes are backed up before
-    `pam-auth-update --remove fprintd` and restored by rollback; Fedora `authselect` and
-    openSUSE `pam-config` profile state is outside the manifest, so restore any pre-existing
-    profile manually as the warning says.
+    way it only warns. On Debian/Ubuntu the original `common-*` bytes are backed up (Tier 2)
+    and restored by rollback. Install removes fp lines with a **direct**
+    `sed -i '/pam_fprintd\.so/d'` (log `Removed pam_fprintd.so line(s) from ...`), **never**
+    `pam-auth-update --remove fprintd` — that action deletes debconf's
+    `libpam-runtime/profiles` selection, which rollback cannot restore. The selection is
+    therefore untouched: uninstall calls no profile tool, and a later `pam-auth-update`
+    regenerates the original stack. Trade-off: an administrator running
+    `pam-auth-update --force` during install can let the still-enabled selection write the
+    fp line back (briefly restoring the GDM race) — non-persistent, and rollback restores
+    the files. Fedora `authselect` and openSUSE `pam-config` profile state is outside the
+    manifest, so restore any pre-existing profile manually as the warning says.
 
 ---
 
@@ -537,8 +578,11 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   `gdm-fingerprint` PAM service, which now always wins the claim.
 
   ```bash
-  # what the installer does:
-  sudo pam-auth-update --remove fprintd
+  # what the installer does on Debian/Ubuntu:
+  # back up the original common-* bytes first (Tier 2), then remove ONLY fp module lines.
+  # Do NOT use `pam-auth-update --remove fprintd`: it silently deletes the debconf profile
+  # selection, which the manifest cannot restore.
+  sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
 

@@ -115,7 +115,7 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   last-user cache. `--test-blank` exits 1 when saving fails.
 
 Current unit-test totals (these fixes plus the seventh, eighth, ninth, tenth and eleventh
-re-review fixes below): **406** daemon, **73** sleep-hook and **1392** rollback cases (the last
+re-review fixes below): **406** daemon, **73** sleep-hook and **1509** rollback cases (the last
 run as root), all 0 failures.
 
 #### Seventh re-review fixes (2026-11-23, unit-tested)
@@ -152,7 +152,7 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   absolute too), so the installer never writes a record its own validator would reject.
 
 Current unit-test totals (these fixes plus the eighth, ninth, tenth and eleventh re-review
-fixes below): **406** daemon, **73** sleep-hook and **1392** rollback cases (the last run as root),
+fixes below): **406** daemon, **73** sleep-hook and **1509** rollback cases (the last run as root),
 all 0 failures.
 
 #### Eighth re-review fixes (2026-11-23, unit-tested)
@@ -191,7 +191,7 @@ All install callers now save the rollback rc, finish their remaining cleanup and
 that rc last, so `set -e` cannot abort cleanup on a failed rollback.
 
 Current unit-test totals (these fixes plus the ninth, tenth and eleventh re-review fixes
-below): **406** daemon, **73** sleep-hook and **1392** rollback cases (the last run as root),
+below): **406** daemon, **73** sleep-hook and **1509** rollback cases (the last run as root),
 all 0 failures.
 
 #### Ninth re-review fixes (2026-11-23, unit-tested)
@@ -220,7 +220,7 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   so no writer replaces its inode.
 
 Current unit-test totals (these fixes plus the tenth and eleventh re-review fixes below):
-**406** daemon, **73** sleep-hook and **1392** rollback cases (the last run as root),
+**406** daemon, **73** sleep-hook and **1509** rollback cases (the last run as root),
 all 0 failures.
 
 #### Tenth re-review fixes (2026-11-23, unit-tested)
@@ -254,7 +254,7 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   operation.
 
 Current unit-test totals (these fixes plus the eleventh re-review fixes below):
-**406** daemon, **73** sleep-hook and **1392** rollback cases (the last run as root),
+**406** daemon, **73** sleep-hook and **1509** rollback cases (the last run as root),
 all 0 failures.
 
 #### Eleventh re-review fixes (2026-11-23, unit-tested)
@@ -264,9 +264,10 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
 
 * **plugdev ownership is decided across all components.** `remove_group_membership()`
   aggregates the `(group,user)` records of every component: any explicit `was_member=false`
-  proves we added the membership, all `true` (or no record) means keep it, and a
-  wrong safety-field type fails closed. After a successful `gpasswd -d` all records for the
-  pair are consumed together, so a full install/uninstall no longer depends on whether
+  proves we added the membership, all `true` (or no record) meant **keep it at the eleventh
+  re-review** (the twelfth added rc 3 stale-record consumption when no udev rule needs the
+  group), and a wrong safety-field type fails closed. After a successful `gpasswd -d` all
+  records for the pair are consumed together, so a full install/uninstall no longer depends on whether
   keyboard or fingerprint was installed first. `gpasswd -d` failure is now an error with
   rc 1 (R1-R10, including original non-member/already-member, both orders, single-module,
   gpasswd failure, udev gating, DRY_RUN and wrong-type cases); the keyboard, fingerprint
@@ -276,8 +277,10 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   restores the original bytes, so a pre-existing exact `pam_fprintd` line survives. Install
   uses `grep -qFx --` for an exact match and honours the `CROS_ENABLEMENT_PAM_SUDO_PATH` /
   `CROS_ENABLEMENT_PAM_DIR` test seams. On Debian Tier 2 the `common-*` files that really
-  contain a fp line are backed up before `pam-auth-update --remove fprintd`, and uninstall
-  no longer calls the tool. A read-only post-rollback check warns on a stale manifest record
+  contain a fp line are backed up before fp lines are stripped (this eleventh-re-review
+  wording described a `pam-auth-update --remove fprintd` call that the **twelfth** re-review
+  replaced with direct `sed` to keep the debconf selection; uninstall calls no tool).
+  A read-only post-rollback check warns on a stale manifest record
   or a corrupt manifest but never mutates a file; Fedora `authselect` and openSUSE
   `pam-config` profile state is a documented limitation (warning only). PAM-1..8 verify
   byte-identical sudo PAM after install + uninstall when the original already had the line.
@@ -297,10 +300,56 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   `run_pam_uninstall()` and exports it only inside the sandbox snippet, so a later
   uninstall cannot inherit it. New **PAM-9** regression injects fail=1 first, then
   deliberately poisons the parent environment with fail=0 and verifies a clean
-  rollback with byte-identical PAM files (+5 assertions; rollback total **1392**).
+  rollback with byte-identical PAM files (+5 assertions; rollback total **1509**).
 
-Unit-test totals after these fixes: **406** daemon, **73** sleep-hook and **1392** rollback
+Unit-test totals after these fixes: **406** daemon, **73** sleep-hook and **1509** rollback
 cases (the last run as root), all 0 failures.
+
+#### Twelfth re-review fixes (2026-11-24, unit-tested)
+
+These are logic/robustness fixes covered by the shell unit suites; the 2026-11-22 real
+S3 records above are kept verbatim and **no new hardware run is claimed here**.
+
+* **The lock's trust boundary is the canonical, symlink-free path (P2 SECURITY; custom
+  manifest path BLOCKER).** `CROS_ENABLEMENT_MANIFEST_DIR` must be absolute (`must be an
+  absolute path`), and every literal component is checked with `-L`: any symlink component
+  is refused (`contains a symlink` / `untrusted symlink`) even when root-owned and otherwise
+  safe — a deliberate fail-closed trade-off because a symlink can hide a user-writable real
+  target that can rename the lock. The gate resolves the deepest **existing** prefix with
+  `realpath -e`, re-appends the missing layers (so first-time creation still works), runs
+  the root-controlled ancestor gate on the **real** path (`untrusted realpath ancestor`), and
+  uses that canonical path for the lock. Inside the process that actually holds fd 9 the
+  root helper re-derives `realpath -e "$dir"` and requires equality (`FAILED:canonical`),
+  then checks every real ancestor for uid `0` and `mode & 022 == 0` or a root-owned sticky
+  bit (`FAILED:ancestor`); the fd 8 parent pin and `FAILED:parentdir` are unchanged. R1
+  (relative CWD), R2 (trusted symlink → user target), R2e2e (canonical ancestor end-to-end),
+  R3 (holder rejects a symlink-derived path) and R4 (control) cover the regression.
+* **Stale all-true group records are refreshed (P2 PERMISSION LIFECYCLE).**
+  `_GROUP_OWNERSHIP_PY` now returns rc 3 when **every** `(group,user)` record says
+  `was_member=true` (pre-existing) — rc 0 (some `false`) and rc 1 (no record) are unchanged,
+  rc 2 still fails closed. With rc 3 and a udev rule still referencing the group, the
+  first-wins snapshot is kept; with **no** rule (all consumers uninstalled), all stale records
+  are consumed with **zero `gpasswd` calls** — all-true means membership was never added by
+  us, so consuming metadata cannot change permissions and the next install re-snapshots the
+  real, possibly admin-changed state. Consume failure fails closed and keeps the records.
+  R3 was extended and R11 (admin group change → re-install rollback timing), R12/R13/R14
+  and R9b cover the lifecycle.
+* **The Debian PAM profile selection is preserved (P2 STATE RESTORATION).** Install no
+  longer calls `pam-auth-update --remove fprintd` at all: that action also deletes debconf's
+  `libpam-runtime/profiles` selection, which manifest rollback cannot restore. Tier 2 backs
+  up the `common-*` files containing fp, then a direct `sed -i '/pam_fprintd\.so/d'` removes
+  only the module lines — the same `common-auth`-has-no-fp result that closes the GDM unlock
+  claim race — while the selection stays untouched, so a later `pam-auth-update` regenerates
+  the original stack. Uninstall calls no profile/debconf tool; the original bytes come from
+  rollback. Fedora `authselect` / openSUSE `pam-config` profile-state warnings remain.
+  Trade-off: an administrator running `pam-auth-update --force` during install can let the
+  still-enabled selection write fp back into `common-auth` (briefly restoring the GDM race);
+  this is non-persistent and rollback restores the files. After uninstall the selection is
+  the original one (if fprintd was originally enabled, later tool runs regenerate the
+  original fp-containing stack — that is the original state).
+
+Current unit-test totals: **406** daemon, **73** sleep-hook and **1509** rollback cases (the
+last run as root), all 0 failures. No new real S3 run in this round.
 
 ### 4. Wi-Fi / Bluetooth / Webcam / Storage
 
@@ -350,7 +399,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (406 daemon + 73 hook + 1392 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (406 daemon + 73 hook + 1509 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -411,7 +460,7 @@ cat /sys/power/mem_sleep
   50; locked resume defers and keeps `state=30`, then `loginctl unlock-session 2`
   restores brightness/gsd/UPower to 30 and consumes both handoff files),
   2026-11-23 (sixth, seventh, eighth, ninth, tenth and eleventh re-review unit-test re-runs:
-  406 daemon, 73 sleep-hook and 1392 rollback cases, 0 failures; result-code, fail-closed
+  406 daemon, 73 sleep-hook and 1509 rollback cases, 0 failures; result-code, fail-closed
   manifest, save-before-blank, single-sample/invalid-state self-heal, manifest field
   validation, pre-mutation rollback gate and rollback safety semantics — required/unknown-state
   fail closed, absent-target first-backup restore, checked systemctl restores,
@@ -419,7 +468,12 @@ cat /sys/power/mem_sleep
   missing backup, a cross-process manifest lock with unique writer temps, the tenth
   re-review's 0600 root-only holder lock plus whole-operation serialization, and the eleventh
   re-review's cross-component plugdev ownership, rollback-only PAM restoration and
-  root-controlled lock parent with fd 8 pin — docs synced — no new real-S3 run)
+  root-controlled lock parent with fd 8 pin — docs synced — no new real-S3 run),
+  2026-11-24 (twelfth re-review unit-test re-run: 406 daemon, 73 sleep-hook and 1509 rollback
+  cases, 0 failures; canonical symlink-free manifest-lock trust boundary with holder-side
+  `FAILED:canonical` / `FAILED:ancestor` rechecks, stale all-true group-record consumption
+  with zero gpasswd, and Debian PAM profile-selection preservation via direct line removal —
+  docs synced — no new real-S3 run)
 * **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
   keyboard/backlight session, `7.0.0-29-generic` for the 2026-08 evidence bundle
 * **Firmware**: MrChromebox `2606.1`

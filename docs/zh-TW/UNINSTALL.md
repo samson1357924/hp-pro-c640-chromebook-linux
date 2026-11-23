@@ -65,22 +65,38 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 * **先記錄群組 membership 再變更。** 安裝器先把原始 `plugdev` 成員資格寫入 manifest，
   之後才明確檢查 `usermod` 的 rc。若變更失敗，就移除剛寫入的紀錄（除非已有較早的
   紀錄），以免日後 uninstall 移除使用者自行取得的成員資格。
-* **plugdev 歸屬由所有元件共同判定。** 完整安裝可能對同一組 `(group,user)` 寫入兩筆紀錄
-  （例如 keyboard 記錄 `was_member=false`，fingerprint 之後記錄 `was_member=true`）。
-  uninstall 會彙總所有元件的紀錄：任一明確的 `was_member=false` 即證明是我們加入的，
-  授權移除；全部為 `true` 或沒有紀錄則保留；欄位缺失或型別錯誤則 fail closed、不更動。
-  `gpasswd -d` 成功後，該組的所有紀錄（含他元件的 `true`）一併消耗，因此先解除安裝
-  fingerprint 或先解除安裝 keyboard 結果相同。`gpasswd -d` 失敗現在會記錄 error 並回
-  rc 1（三個 uninstaller 會把它折進結束碼），不再謊報移除成功，紀錄留待日後重試。
+* **plugdev 歸屬由所有元件共同判定，過期紀錄會更新。** 完整安裝可能對同一組
+  `(group,user)` 寫入兩筆紀錄（例如 keyboard 記錄 `was_member=false`，fingerprint 之後
+  記錄 `was_member=true`）。共用的歸屬探測回 rc 0 代表至少一筆明確為
+  `was_member=false`（是我們加入的），rc 1 代表該組**完全沒有紀錄**，rc 3 代表
+  **全部紀錄皆為 `was_member=true`**（原本就存在），rc 2 代表欄位缺失或型別錯誤
+  （fail closed、不更動）。first-wins 不變：任一 `false` 即授權 `gpasswd -d`，而仍引用
+  該 group 的 udev rule 會保留成員資格。`gpasswd -d` 成功後，該組的所有紀錄（含他元件的
+  `true`）一併消耗，因此先解除安裝 fingerprint 或先解除安裝 keyboard 結果相同。**rc 3
+  時完全不呼叫 gpasswd**（all-true 代表從未加過 membership）：若仍有 udev rule 引用該
+  group，則保留 first-wins 快照；一旦沒有 rule 引用它——代表所有使用該 group 的元件
+  皆已卸載——就以**零次 gpasswd** 消耗全部過期紀錄，讓下次安裝重新擷取真實、可能包括
+  管理員變更後的成員資格。消耗失敗會 fail closed 並保留紀錄供重試。`gpasswd -d` 失敗
+  會記錄 error 並回 rc 1（三個 uninstaller 會把它折進結束碼），不再謊報移除成功，
+  紀錄留待日後重試。
 * **PAM 設定只由 rollback 還原；uninstall 絕不刪除既有行。**
   `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
   或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，
-  因此安裝前就已存在的精確 `pam_fprintd` 行會被保留。Debian/Ubuntu 上，`pam-auth-update
-  --remove fprintd` 只在安裝階段對確實含 `pam_fprintd` 行的 `common-*` 檔呼叫，
-  並先備份原始檔；uninstall 不再呼叫該工具。唯讀的 rollback 後檢查會在 manifest 仍
-  記錄 `/etc/pam.d/sudo` 時警告（可能需要手動清理），或在 manifest 損毀時警告——
-  兩者都不修改檔案。Fedora 的 `authselect` 與 openSUSE 的 `pam-config` profile 狀態
-  不在 manifest 內：工具呼叫仍保留，但會警告請手動還原原本的 profile。
+  因此安裝前就已存在的精確 `pam_fprintd` 行會被保留。Debian/Ubuntu 上，Tier 2 會先備份
+  確實含 `pam_fprintd.so` 的每個 `common-*` 檔，再**直接以
+  `sed -i '/pam_fprintd\.so/d'` 只移除那些模組行**。安裝器**不呼叫** `pam-auth-update
+  --remove fprintd`：該動作也會刪除 debconf 的 `libpam-runtime/profiles` selection，
+  這是 manifest 無法還原的持久狀態。直接行移除可達成相同目的（`common-auth` 不再含 fp
+  行，GDM 的 `gdm-password` include 故無法搶到裝置），同時讓 selection 完全不變——日後
+  重跑 `pam-auth-update` 會生成**原始**堆疊。uninstall 不呼叫任何 profile 工具；
+  原始 `common-*` 位元組由 rollback 還原。**取捨**：若管理員在安裝期間自行執行
+  `pam-auth-update --force`，仍啟用的 selection 可能把 fp 行寫回 `common-auth`
+  （短暫恢復 GDM 競賽），但這不是持久狀態且 rollback 會還原檔案。解除安裝後 selection
+  回復原始狀態——若原本就啟用 fprintd，日後重跑工具會還原原始含 fp 的堆疊，
+  這正是原始狀態。唯讀的 rollback 後檢查會在 manifest 仍記錄 `/etc/pam.d/sudo` 時警告
+  （可能需要手動清理），或在 manifest 損毀時警告——兩者都不修改檔案。Fedora 的
+  `authselect` 與 openSUSE 的 `pam-config` profile 狀態不在 manifest 內：工具呼叫仍保留，
+  但會警告請手動還原原本的 profile。
 * **並行的安裝/解除安裝不會遺失追蹤紀錄，也不會留下未追蹤的部署。** 每個元件安裝器
   透過 `lib/backup.sh` 的 `run_manifest_operation()`，在**整個元件操作交易**——備份/紀錄 →
   部署檔案與服務 → 完成或回滾——只取得一把操作級鎖。巢狀 helper（備份 gate、群組 helper、
@@ -99,20 +115,28 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   等待（`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）、印出 `READY`，然後阻塞讀取
   stdin。關閉父行程的 write fd 會讓 helper 看到 EOF、結束並讓核心釋放 flock，因此崩潰或
   `kill -9` 不會留下 stale lock（刻意不安裝 EXIT/INT/TERM trap）。symlink 與非普通檔的鎖
-  會被拒絕。直接父目錄**必須由 root 擁有**——呼叫者擁有的父目錄可在鎖仍生效時
-  將 lock inode 重新命名，因此目前 EUID/UID 擁有不再合格，擁有者錯誤會記錄
-  `must be root-owned`——且不可群組/其他可寫（`mode & 022 == 0`，因此
-  `/var/lib/cros-enablement` 請維持 `0755`）。每一層祖先目錄也都會檢查：非 root 擁有，
-  或群組/其他可寫但**沒有 sticky bit** 的層會 fail closed 並記錄 `not root-controlled`
-  （root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，可通過）；symlink 只在其所在
-  目錄由 root 擁有且不可群組/其他可寫時放行，否則記錄 `untrusted symlink`。因此自訂於
-  使用者可寫目錄下的 lock parent 會被拒絕。root helper 並在**實際持有 fd 9 的行程內**
-  比對 `/proc/$$/fd/9` 的 `(dev,ino)` 與鎖路徑，檢查 fd
+  會被拒絕。`CROS_ENABLEMENT_MANIFEST_DIR` 必須是**絕對路徑**（否則記錄
+  `must be an absolute path`），且**任何字面 symlink component 一律拒絕**——即使是
+  root 擁有、其他方面安全的 symlink 也一樣，會記錄 `contains a symlink` 與
+  `untrusted symlink`。這是刻意採取的 fail-closed 取捨：symlink 可能把真正的目標隱藏在
+  使用者可寫的樹中，其擁有者能重新命名鎖。gate 會以 `realpath -e` 正規化最深的存在前綴
+  並補回缺少的層（仍支援首次建立），再對**真實**路徑執行 root 控管檢查——非 root 控管的
+  canonical 祖先會記錄 `untrusted realpath ancestor`。直接父目錄**必須由 root 擁有**
+  ——呼叫者擁有的父目錄可在鎖仍生效時將 lock inode 重新命名，因此目前 EUID/UID 擁有
+  不再合格，擁有者錯誤會記錄 `must be root-owned`——且不可群組/其他可寫
+  （`mode & 022 == 0`，因此 `/var/lib/cros-enablement` 請維持 `0755`）。每一層祖先目錄
+  也都會檢查：非 root 擁有，或群組/其他可寫但**沒有 sticky bit** 的層會 fail closed
+  並記錄 `not root-controlled`（root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，
+  可通過）。因此自訂於使用者可寫目錄下的 lock parent 會被拒絕。root helper 並在
+  **實際持有 fd 9 的行程內**比對 `/proc/$$/fd/9` 的 `(dev,ino)` 與鎖路徑，檢查 fd
   owner 為 `0`、mode 為 `600`、型別為普通檔，因此 init 期間或等待 `flock` 期間的 inode
-  替換都會 fail closed。同一 holder 並以 **fd 8** 釘住直接父目錄，重新檢查 uid `0`、
-  `mode & 022 == 0`、目錄型別，以及路徑的 `(dev,ino)` 是否一致；任一不符即印出
-  `FAILED:parentdir` 並在取鎖前中止，防止重新命名讓第二個程序對新 inode 取第二把鎖。
-  缺少 `flock`、逾時或上述任何檢查失敗都會保持 manifest 位元組不變並回 rc 1。
+  替換都會 fail closed。同一行程並重新導出 `realpath -e "$dir"`，要求它等於傳入的目錄，
+  否則印出 `FAILED:canonical`；每一層真實祖先都必須 uid `0`，且不為群組/其他可寫，
+  或為 root 擁有且具 sticky bit，否則印出 `FAILED:ancestor`。同一 holder 並以 **fd 8**
+  釘住直接父目錄，重新檢查 uid `0`、`mode & 022 == 0`、目錄型別，以及路徑的 `(dev,ino)`
+  是否一致；任一不符即印出 `FAILED:parentdir` 並在取鎖前中止，防止重新命名讓第二個
+  程序對新 inode 取第二把鎖。缺少 `flock`、逾時或上述任何檢查失敗都會保持 manifest
+  位元組不變並回 rc 1。
 * **長時間操作可能需要調高鎖等待上限。** `fingerprint/install-fingerprint.sh --source`
   會在 `git clone`/建置/編譯期間持續持有操作鎖，因此平行的安裝/解除安裝可能撞上預設
   10 秒等待而 fail closed。在該時段啟動平行操作前，請調高

@@ -73,28 +73,46 @@ but the final exit code is non-zero and `finished!` is not printed:
   original `plugdev` membership first and only then checks `usermod` rc explicitly. If
   the change fails it removes the record it just wrote (unless an older one existed), so
   uninstall will not later drop a membership the user obtained on their own.
-* **plugdev ownership is decided across all components.** A full install can write two
-  records for the same `(group,user)` (for example keyboard records `was_member=false`
-  and fingerprint later records `was_member=true`). Uninstall aggregates all components'
-  records: any explicit `was_member=false` proves we added the membership and authorizes
-  removal; all `true` or no record means keep it; a missing/wrong-type field fails closed
-  and changes nothing. After a successful `gpasswd -d` all records for that pair are
-  consumed together (including a sibling's `true`), so uninstalling fingerprint before
-  keyboard — or the reverse — gives the same result. `gpasswd -d` failure now logs an
-  error and returns rc 1 (the three uninstallers fold it into their exit code); no
-  "removed" success is reported, and the records stay for a later retry.
+* **plugdev ownership is decided across all components, and stale records are refreshed.**
+  A full install can write two records for the same `(group,user)` (for example keyboard
+  records `was_member=false` and fingerprint later records `was_member=true`). The shared
+  ownership probe returns rc 0 when at least one record is explicitly `was_member=false`
+  (we added the membership), rc 1 when there is **no** record for the pair, rc 3 when
+  **every** record is `was_member=true` (pre-existing), and rc 2 for a missing/wrong-type
+  field (fail closed, change nothing). first-wins is unchanged: any `false` authorizes
+  `gpasswd -d`, and a udev rule that still references the group keeps the membership.
+  After a successful `gpasswd -d` all records for that pair are consumed together
+  (including a sibling's `true`), so uninstalling fingerprint before keyboard — or the
+  reverse — gives the same result. On **rc 3** no `gpasswd` runs at all (all-true means we
+  never added the user): if a udev rule still references the group the snapshot is kept;
+  once no rule references it — the signal that every component using the group is gone —
+  all stale records are consumed **with zero `gpasswd` calls**, so the next install takes
+  a fresh snapshot of the real, possibly admin-changed membership. A consume failure
+  fails closed and keeps the records for retry. `gpasswd -d` failure logs an error and
+  returns rc 1 (the three uninstallers fold it into their exit code); no "removed" success
+  is reported, and the records stay for a later retry.
 * **PAM files are restored by rollback only; uninstall never deletes a pre-existing line.**
   `disable_pam_fingerprint()` performs **no sed and no direct edit** of `/etc/pam.d/sudo`
   (or any distro PAM file). All bytes come from the first backup via
   `rollback_component("fingerprint")`, so an exact `pam_fprintd` line that was already
-  present before installation is preserved. On Debian/Ubuntu, `pam-auth-update --remove
-  fprintd` is called during install only for `common-*` files that actually contain a
-  `pam_fprintd` line, and those originals are backed up first; uninstall does not call the
-  tool again. A read-only post-rollback check warns if a manifest record still covers
-  `/etc/pam.d/sudo` (manual cleanup may be needed) or if the manifest is corrupt — it
-  never modifies a file. Fedora `authselect` and openSUSE `pam-config` profile state is
-  outside the manifest: the tool calls remain but a warning asks you to restore any
-  pre-existing profile manually.
+  present before installation is preserved. On Debian/Ubuntu, Tier 2 backs up every
+  `common-*` file that actually contains `pam_fprintd.so`, then removes **only those module
+  lines with a direct `sed -i '/pam_fprintd\.so/d'`**. The installer never calls
+  `pam-auth-update --remove fprintd`: that action also deletes debconf's
+  `libpam-runtime/profiles` selection, a persistent state the manifest cannot restore.
+  Direct line removal reaches the same goal (`common-auth` has no fp line, so GDM's
+  `gdm-password` include cannot win the device claim) while leaving the selection intact —
+  a later `pam-auth-update` regenerates the **original** stack. Uninstall calls no profile
+  tool at all; the original `common-*` bytes come back from rollback. Trade-off: if an
+  administrator runs `pam-auth-update --force` during installation, the still-enabled
+  selection can write the fp line back into `common-auth` (briefly restoring the GDM race);
+  that is non-persistent and rollback restores the files. After uninstall the selection is
+  the original one — if fprintd was originally enabled, later tool runs regenerate the
+  original fp-containing stack, which is by definition the original state. A read-only
+  post-rollback check warns if a manifest record still covers `/etc/pam.d/sudo` (manual
+  cleanup may be needed) or if the manifest is corrupt — it never modifies a file. Fedora
+  `authselect` and openSUSE `pam-config` profile state is outside the manifest: the tool
+  calls remain but a warning asks you to restore any pre-existing profile manually.
 * **Concurrent install/uninstall runs cannot lose tracking records or leave untracked
   deployments.** Each component installer takes ONE operation-level lock around its whole
   transaction — backup/record → deploy files and services → finish or rollback — through
@@ -119,23 +137,33 @@ but the final exit code is non-zero and `finished!` is not printed:
   default 10s), prints `READY`, then blocks reading its stdin. Closing the parent's write fd
   makes the helper see EOF, exit and let the kernel release the flock, so a crash or `kill -9`
   cannot leave a stale lock (there is deliberately no EXIT/INT/TERM trap). Symlinks and
-  non-regular lock files are refused. The direct parent must be **root-owned** — a
-  caller-owned parent can rename a live lock inode, so ownership by the current EUID/UID no
-  longer qualifies and a wrong owner logs `must be root-owned` — and must not be
-  group/other-writable (`mode & 022 == 0`, so keep `/var/lib/cros-enablement` at `0755`). Every
-  ancestor is also checked: a non-root-owned or group/other-writable layer without a sticky
-  bit fails closed with `not root-controlled` (a root-owned sticky world-writable layer such
-  as `/tmp` `1777` is allowed), and a symlink is accepted only when the directory holding it
-  is root-owned and not group/other-writable — otherwise `untrusted symlink` is logged. A
-  custom lock parent under a user-writable tree is therefore refused. The root helper
+  non-regular lock files are refused. `CROS_ENABLEMENT_MANIFEST_DIR` must be an **absolute
+  path** (otherwise `must be an absolute path`), and **any literal symlink component is
+  rejected** — even a root-owned, otherwise safe one — logging `contains a symlink` and
+  `untrusted symlink`. This is a deliberate fail-closed choice: a symlink can hide a real
+  target in a user-writable tree whose owner could rename the lock. The gate canonicalizes
+  the deepest existing prefix with `realpath -e` and re-appends the missing layers
+  (first-time creation is still supported), then runs the root-controlled check on the
+  **real** path — a non-root-controlled canonical ancestor logs `untrusted realpath
+  ancestor`. The direct parent must be **root-owned** — a caller-owned parent can rename a
+  live lock inode, so ownership by the current EUID/UID no longer qualifies and a wrong
+  owner logs `must be root-owned` — and must not be group/other-writable (`mode & 022 == 0`,
+  so keep `/var/lib/cros-enablement` at `0755`). Every ancestor is also checked: a
+  non-root-owned or group/other-writable layer without a sticky bit fails closed with
+  `not root-controlled` (a root-owned sticky world-writable layer such as `/tmp` `1777` is
+  allowed). A custom lock parent under a user-writable tree is therefore refused. The root helper
   compares the `(dev,ino)` of fd 9 (via `/proc/$$/fd/9`) with the lock path and
   checks fd owner `0`, mode `600` and regular-file type — all inside the process that actually
-  holds fd 9 — so an inode swap during init or while waiting for `flock` fails closed. The
-  same holder also pins the direct parent with **fd 8**, re-checking uid `0`,
-  `mode & 022 == 0`, directory type and the parent's `(dev,ino)` against the pathname; any
-  mismatch prints `FAILED:parentdir` and aborts before the lock is taken, defeating a rename
-  that would let a second process lock a fresh inode while the first holder is live. Missing
-  `flock`, a timeout or any failed check leaves the manifest bytes intact and returns rc 1.
+  holds fd 9 — so an inode swap during init or while waiting for `flock` fails closed.
+  Inside that same process the holder also re-derives `realpath -e "$dir"` and requires it
+  to equal the handed-in directory, otherwise it prints `FAILED:canonical`; every real
+  ancestor must be uid `0` and either not group/other-writable or root-owned with a sticky
+  bit, otherwise `FAILED:ancestor`. The holder also pins the direct parent with **fd 8**,
+  re-checking uid `0`, `mode & 022 == 0`, directory type and the parent's `(dev,ino)` against
+  the pathname; any mismatch prints `FAILED:parentdir` and aborts before the lock is taken,
+  defeating a rename that would let a second process lock a fresh inode while the first
+  holder is live. Missing `flock`, a timeout or any failed check leaves the manifest bytes
+  intact and returns rc 1.
 * **Long-running operations may need a larger lock timeout.**
   `fingerprint/install-fingerprint.sh --source` holds the operation lock across the
   `git clone`/build/compile steps, so a parallel install/uninstall can hit the default 10s

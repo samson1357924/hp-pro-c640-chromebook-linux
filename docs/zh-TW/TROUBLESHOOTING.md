@@ -334,14 +334,32 @@
     `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），平行程序不會
     互相遺失 first-wins 紀錄。等另一程序結束後重試；若
     `fingerprint/install-fingerprint.sh --source` 仍在建置並持鎖，請調高 timeout（例如 300）。
+  * `Manifest directory ... must be an absolute path; refusing to lock` 代表
+    `CROS_ENABLEMENT_MANIFEST_DIR` 是相對路徑。請改用絕對路徑（通常是
+    `/var/lib/cros-enablement`）；信任邊界無法針對曖昧的 CWD 評估。
+    `Manifest lock directory ... contains a symlink (...); untrusted symlink; refusing to
+    lock` 代表路徑上有字面 symlink component。自第十二次 re-review 起，**任何**字面
+    symlink component 一律拒絕，即使是 root 擁有、其他方面安全的 symlink：symlink 可能
+    把真正的目標隱藏在使用者可寫的樹中，其擁有者能重新命名鎖。請改用真正的目錄
+    （這是刻意採取的 fail-closed 取捨，比舊版「信任的 symlink」放行更嚴格）。
+    `Manifest lock canonical path ... has an untrusted realpath ancestor; refusing to lock`
+    （`untrusted realpath ancestor`）代表**真實**路徑——以 `realpath -e` 解析最深的存在
+    前綴再加上缺少的層——有非 root 控管的祖先。請修正該真實祖先的擁有者/權限，
+    不要用另一個 symlink 繞過。
   * `... (holder: FAILED:symlink)`、`FAILED:type`、`FAILED:open`、`FAILED:inode`、
-    `FAILED:parentdir` 或 `FAILED:flock` 是 root helper 拒絕取鎖的原因。`FAILED:symlink` /
+    `FAILED:canonical`、`FAILED:ancestor`、`FAILED:parentdir` 或 `FAILED:flock` 是
+    root helper 拒絕取鎖的原因。`FAILED:symlink` /
     `FAILED:type` / `FAILED:inode` 代表鎖路徑是 symlink、非普通檔（例如目錄或 FIFO），或在
     init 與 open 之間被替換：helper 會在**實際持有 fd 9 的行程內**以 `/proc/$$/fd/9` 比對
     路徑的 `(dev,ino)`，並檢查 owner 為 `0`、mode 為 `600` 與普通檔型別，因此非特權的
     inode 替換無法轉移 flock。`FAILED:flock` 是一般的鎖競爭。這些檢查若在 helper 啟動前
     就失敗，會記錄 `Manifest lock path ... is a symlink` / `is not a regular file` /
     `is not a root-owned 0600 regular file (uid=... mode=...)`。
+    **`FAILED:canonical`** 代表 holder 在實際持有 fd 9 的行程內重新導出
+    `realpath -e "$dir"`，結果不再等於 gate 交下的 canonical 目錄——gate 執行後有人換入
+    symlink。**`FAILED:ancestor`** 代表直接父目錄之上的**真實**祖先不是 uid `0`，
+    或為群組/其他可寫但不是 root 擁有的 sticky 世界可寫層（例如 `/tmp` `1777`）。
+    兩者都會在任何 `flock` 前中止且保持 manifest 位元組不變；修正路徑後重試。
   * `FAILED:parentdir` 代表 root holder 以 fd 8 釘住鎖的**直接父目錄**失敗：父目錄不是
     root 擁有、群組/其他可寫、不是目錄，或其 `(dev,ino)` 與路徑不符。這防堵以下競態：
     A 持鎖中，父目錄擁有者把路徑重新命名，B 便對全新的 inode 取到第二把鎖。請檢查
@@ -355,8 +373,10 @@
     is not root-controlled (uid=... mode=...)` 拒絕非 root 擁有或群組/其他可寫但**沒有**
     sticky bit 的層（root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，可通過）；
     `Manifest lock ancestor ... is an untrusted symlink` 拒絕 symlink，除非其所在目錄由
-    root 擁有且不可群組/其他可寫。因此自訂在使用者可寫目錄下的 lock parent 即使鎖檔本身
-    是 root 擁有，仍會被拒絕。
+    root 擁有且不可群組/其他可寫。此外，字面路徑檢查現在會在正規化前拒絕**任何** symlink
+    component（`contains a symlink`），canonical 路徑的祖先也一併檢查
+    （`untrusted realpath ancestor`）。因此自訂在使用者可寫目錄下的 lock parent 即使鎖檔
+    本身是 root 擁有，仍會被拒絕。
   * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
     代表鎖無法被設為 root 擁有的 `0600`（舊的 `0644` 鎖會自動升級），安裝器因此 fail closed。
     peer 帳號直接開啟 `$MANIFEST_DIR/.install-manifest.lock` 時看到 `permission denied` 是
@@ -364,12 +384,20 @@
     請勿以非特權使用者手動 chmod/chown 鎖檔——修正 `sudo` helper 或父目錄權限後重試。
   * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
     寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
-    紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗該組的**
-    所有元件紀錄**（`manifest_remove_group_all`），因此模組解除安裝順序不會留下過期的
-    `was_member` 紀錄。若沒有紀錄證明是我們加入的，會記錄
-    `No record proves we added '<user>' to group '<group>'; keeping membership.` 並保持原樣；
-    安全欄位型別錯誤則記錄 `Cannot determine original membership of <user>@<group>; refusing
-    to change it` 並回 rc 1。
+    紀錄，就移除剛寫入的紀錄。共用的歸屬探測在至少一筆明確為 `was_member=false` 時回 rc 0
+    （是我們加入的），**沒有紀錄**回 rc 1（`No group record for '<user>'@'<group>'; nothing
+    to roll back.`），**全部皆為 `was_member=true`** 回 rc 3（原本就存在），欄位型別錯誤
+    回 rc 2（`Cannot determine original membership of <user>@<group>; refusing to change it`，
+    rc 1）。first-wins 不變：rc 0 才執行 `gpasswd -d`，而仍引用該 group 的 udev rule 會
+    保留成員資格。**rc 3 時完全不呼叫 gpasswd**：若仍有 udev rule 引用該 group，會記錄
+    `udev rules still reference group '<group>'; keeping '<user>' in it (all records
+    pre-existing).` 並保留快照；一旦沒有 rule 引用它（所有使用該 group 的元件皆已卸載），
+    會記錄 `All records pre-existing and no udev rule needs '<group>'; consuming stale
+    records for '<user>'@'<group>' (membership unchanged).` 並以**零次 gpasswd** 消耗全部
+    紀錄，讓下次安裝重新擷取真實的成員資格（例如管理員已變更）。消耗失敗會記錄
+    `Could not consume stale group records for '<user>'@'<group>'; keeping them for retry.`
+    （rc 1）。rc 0 時，uninstall 只有在 `gpasswd -d` 成功後才消耗該組的所有元件紀錄
+    （`manifest_remove_group_all`），因此模組解除安裝順序不會留下過期的 `was_member` 紀錄。
   * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
     代表 `gpasswd -d` 失敗。現在這是**真正的失敗**（log_error、rc 1）：三個元件 uninstaller
     會捕捉它並折進結束碼，因此完整的 `./setup.sh --uninstall` 不會在成員資格仍存在時回報
@@ -382,9 +410,15 @@
     `rollback_component("fingerprint")` 負責），因此原本就存在的精確 `pam_fprintd` 行不會
     被刪除。若 manifest 損毀，則改為警告 `Manifest at ... is corrupt/invalid; cannot confirm
     rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.`——兩種情況都只警告。
-    Debian/Ubuntu 上，原始 `common-*` 位元組會在 `pam-auth-update --remove fprintd` 前先
-    備份並由 rollback 還原；Fedora 的 `authselect` 與 openSUSE 的 `pam-config` profile 狀態
-    不在 manifest 內，請依警告手動還原原本的 profile。
+    Debian/Ubuntu 上，原始 `common-*` 位元組會先備份（Tier 2）並由 rollback 還原。
+    安裝時**直接**以 `sed -i '/pam_fprintd\.so/d'` 移除 fp 行（記錄
+    `Removed pam_fprintd.so line(s) from ...`），**絕不呼叫** `pam-auth-update --remove
+    fprintd`——該動作會刪除 debconf 的 `libpam-runtime/profiles` selection，而 rollback
+    無法還原它。因此 selection 全程不變：uninstall 不呼叫任何 profile 工具，日後重跑
+    `pam-auth-update` 會生成原始堆疊。**取捨**：管理員若在安裝期間執行
+    `pam-auth-update --force`，仍啟用的 selection 可能把 fp 行寫回（短暫恢復 GDM 競賽）
+    ——這不是持久狀態，且 rollback 會還原檔案。Fedora 的 `authselect` 與 openSUSE 的
+    `pam-config` profile 狀態不在 manifest 內，請依警告手動還原原本的 profile。
 
 ---
 
@@ -462,8 +496,11 @@
   `gdm-fingerprint` PAM 服務運作，從此必定搶到 Claim。
 
   ```bash
-  # 安裝器實際執行的動作：
-  sudo pam-auth-update --remove fprintd
+  # Debian/Ubuntu 上安裝器實際執行的動作：
+  # 先備份原始 common-* 位元組（Tier 2），再只移除 fp 模組行。
+  # 切勿使用 `pam-auth-update --remove fprintd`：它會靜默刪除 debconf 的 profile
+  # selection，而 manifest 無法還原。
+  sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
 

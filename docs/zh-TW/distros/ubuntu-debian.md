@@ -95,8 +95,15 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > `pam_fprintd` 注入 `common-auth`（`gdm-password` 會引入它）；解鎖時 GDM
 > 同時 fork `gdm-password` 與 `gdm-fingerprint` worker 爭搶唯一的 fprintd
 > 裝置，鎖定畫面的指紋提示會消失（GNOME/gdm#1071）。安裝腳本只會在
-> `/etc/pam.d/sudo` 啟用指紋；若你已在 `common-auth` 啟用，請移除：
+> `/etc/pam.d/sudo` 啟用指紋，並在安裝時**直接**以 `sed -i '/pam_fprintd\.so/d'`
+> 移除 `common-*` 中的 fp 行。
+>
+> **請勿自行執行 `pam-auth-update --remove fprintd`。** 該動作同時會刪除 debconf 的
+> `libpam-runtime/profiles` selection——這是安裝器刻意保留的持久狀態（rollback 只能
+> 還原檔案位元組，無法還原 debconf）；刪除後，日後 `pam-auth-update` 就無法重新生成
+> 你原本的堆疊。若舊安裝的 `common-auth` 仍有 fp 行，請只移除該行，或重跑
+> `./fingerprint/install-fingerprint.sh`（腳本會處理）：
 
 ```bash
-sudo pam-auth-update --remove fprintd
+sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```

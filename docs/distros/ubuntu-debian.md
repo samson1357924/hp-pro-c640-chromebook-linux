@@ -95,9 +95,16 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > unlock GDM forks the `gdm-password` and `gdm-fingerprint` workers
 > concurrently and both try to Claim the single fprintd device, so the lock
 > screen shows no fingerprint prompt (GNOME/gdm#1071). The installer keeps
-> fingerprint **only in `/etc/pam.d/sudo`**; if you already enabled it in
-> `common-auth`, remove it:
+> fingerprint **only in `/etc/pam.d/sudo`** and removes fp lines from `common-*`
+> with a direct `sed -i '/pam_fprintd\.so/d'` during installation.
+>
+> **Do not run `pam-auth-update --remove fprintd` yourself.** That action also
+> deletes debconf's `libpam-runtime/profiles` selection — persistent state the
+> installer deliberately preserves (rollback restores file bytes, not debconf):
+> deleting it would stop a later `pam-auth-update` from regenerating your original
+> stack. If `common-auth` still has an fp line on an older install, remove only
+> that line, or re-run `./fingerprint/install-fingerprint.sh`, which handles it:
 
 ```bash
-sudo pam-auth-update --remove fprintd
+sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```

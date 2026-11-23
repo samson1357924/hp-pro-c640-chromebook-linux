@@ -118,14 +118,21 @@ the keyd-link normalizer here) runs inside that lock, and `flock -x -w` waits on
 closed with the manifest bytes intact. The lock is a root-owned `0600` regular file, held by
 a short-lived `coproc sudo bash -c` root helper that owns fd 9, checks the fd/path `(dev,ino)`,
 owner `0`, mode `600` and file type via `/proc/$$/fd/9`, and releases the flock when the
-parent closes the pipe (no stale lock, no EXIT trap). The **direct parent must be root-owned**
-(ownership by the current EUID/UID no longer qualifies: its owner could rename a live lock);
-every ancestor must also be root-controlled — a non-root-owned or g/o-writable layer without
-a sticky bit fails closed (`not root-controlled`), a root-owned sticky world-writable layer
-such as `/tmp` `1777` is allowed, and a symlink is accepted only when its container is
-root-owned and not g/o-writable (`untrusted symlink` otherwise). Keep
-`/var/lib/cros-enablement` at `0755`; older `0644` locks are upgraded to `0600`. The holder
-also pins the direct parent with **fd 8** (uid/mode/type/dev+ino recheck, `FAILED:parentdir`),
+parent closes the pipe (no stale lock, no EXIT trap). `CROS_ENABLEMENT_MANIFEST_DIR` must be
+absolute (`must be an absolute path`), and **every literal symlink component is rejected**
+(`contains a symlink` / `untrusted symlink`) even when root-owned — a fail-closed choice,
+because a symlink can hide a user-writable target that can rename the lock. The gate resolves
+the deepest existing prefix with `realpath -e`, appends missing layers (first-time creation
+still works) and checks the **canonical** ancestors (`untrusted realpath ancestor`). The
+**direct parent must be root-owned** (ownership by the current EUID/UID no longer qualifies:
+its owner could rename a live lock); every ancestor must also be root-controlled — a
+non-root-owned or g/o-writable layer without a sticky bit fails closed (`not root-controlled`),
+a root-owned sticky world-writable layer such as `/tmp` `1777` is allowed. Keep
+`/var/lib/cros-enablement` at `0755`; older `0644` locks are upgraded to `0600`. Inside the
+holder process, `realpath -e "$dir"` must still equal the canonical parent (`FAILED:canonical`)
+and every real ancestor must be uid `0` plus non-g/o-writable or root-sticky
+(`FAILED:ancestor`). The holder also pins the direct parent with **fd 8**
+(uid/mode/type/dev+ino recheck, `FAILED:parentdir`),
 defeating a rename that would let a second process lock a fresh inode. Symlinks, non-regular
 files and inode swaps fail closed too. The gate → re-read → decision → write sequence runs
 inside the critical section, so a parallel
@@ -170,18 +177,26 @@ remain for retry)` and returns rc 1 instead of claiming success.
   `|| true`); if `usermod` fails and no earlier record existed it removes the just-written
   record. The shared `manifest_has_group` / `manifest_remove_group` /
   `ensure_group_membership` helpers are used by the keyboard, fingerprint and EC code.
-* **plugdev ownership is decided across all components.** On uninstall
-  `remove_group_membership()` aggregates every component's `(group,user)` record: any
-  `was_member=false` proves we added the membership, all `true`/no record keeps it, and a
-  wrong field type fails closed. A successful `gpasswd -d` consumes **all** records for the
-  pair (`manifest_remove_group_all`), so a full install/uninstall works in either component
-  order. `gpasswd -d` failure is now a real error (rc 1), folded into the uninstaller's exit
-  code instead of being reported as success.
+* **plugdev ownership is decided across all components; stale records are refreshed.** On
+  uninstall `remove_group_membership()` aggregates every component's `(group,user)` record:
+  any `was_member=false` proves we added the membership (rc 0), no record means nothing to
+  roll back (rc 1), and **all `true`** means pre-existing (rc 3); a wrong field type fails
+  closed. first-wins is unchanged — rc 0 runs `gpasswd -d` unless a udev rule still needs the
+  group, and a successful removal consumes **all** records for the pair
+  (`manifest_remove_group_all`) so a full install/uninstall works in either component order.
+  On rc 3 **no gpasswd runs at all**: with a live udev rule the snapshot is kept; once no rule
+  references the group (every consumer uninstalled), all stale records are consumed with
+  zero `gpasswd` calls so the next install re-snapshots the real membership. Consume failure
+  fails closed (rc 1). `gpasswd -d` failure is a real error (rc 1), folded into the
+  uninstaller's exit code instead of being reported as success.
 * **PAM restoration is rollback-owned.** The fingerprint uninstaller never sed-edits
   `/etc/pam.d/sudo`; the original bytes come from `rollback_component("fingerprint")`, so a
-  pre-existing exact `pam_fprintd` line is preserved. See
-  [UNINSTALL.md](../docs/UNINSTALL.md) for the Debian `common-*` backup, the read-only
-  stale-record check and the authselect/pam-config limits.
+  pre-existing exact `pam_fprintd` line is preserved. On Debian/Ubuntu, install removes fp
+  lines from `common-*` with a direct `sed -i '/pam_fprintd\.so/d'` — never
+  `pam-auth-update --remove fprintd`, which would destroy the debconf profile selection
+  that rollback cannot restore; uninstall calls no profile tool. See
+  [UNINSTALL.md](../docs/UNINSTALL.md) for the Tier 2 backup, the selection-preservation
+  trade-off, the read-only stale-record check and the authselect/pam-config limits.
 
 All install callers save the rollback rc, complete their remaining cleanup and return
 that rc last, so `set -e` cannot abort cleanup when a rollback fails.
@@ -508,19 +523,21 @@ all state is in a temp dir. The daemon suite has 406 cases (write chain, re-prob
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
 `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1392 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1509 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
-lock with symlink/inode/ancestor/parent-dir rejection and fd 8 pin, cross-component plugdev
-ownership and gpasswd failure rc 1, PAM original-line protection, the whole-operation lock
-(OP1/OP2 FIFO-barrier regressions for deploy vs rollback, a real-installer barrier and
-fail-closed bodies), unique writer temps and checked `systemctl` restores.
+lock with absolute-path/canonical/literal-symlink/inode/ancestor/parent-dir rejection and fd
+8 pin, cross-component plugdev ownership including stale all-true record consumption with
+zero gpasswd and gpasswd failure rc 1, PAM original-line protection and profile-selection
+preservation, the whole-operation lock (OP1/OP2 FIFO-barrier regressions for deploy vs
+rollback, a real-installer barrier and fail-closed bodies), unique writer temps and checked
+`systemctl` restores.
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 1392 cases (root)
+sudo bash tests/rollback-test.sh                       # 1509 cases (root)
 ```
 
 ---
