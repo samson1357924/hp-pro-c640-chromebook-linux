@@ -54,6 +54,10 @@ MANIFEST_CREATED=0
 #    without spawning a second holder (which would deadlock against ourselves);
 #  - missing/broken flock, a symlink/non-regular lock, a swapped inode or a
 #    bad parent directory all fail closed (mutation returns 1, bytes intact);
+#    re-review #11 finding #3 tightens this further: only a root-controlled
+#    parent (and root-controlled ancestors) may host the lock, because the
+#    parent's owner can rename a live lock and let a second process lock a
+#    brand-new inode. The holder pins the direct parent with fd 8 too.
 #  - DRY_RUN callers return BEFORE this lock, so no lock file is created;
 #  - manifest_load() itself stays lock-free (pure reader): the public entry
 #    point owns the lock and calls manifest_load() again inside it.
@@ -67,32 +71,94 @@ MANIFEST_LOCK_HOLDER_PID=""
 MANIFEST_LOCK_HOLDER_RFD=""
 MANIFEST_LOCK_HOLDER_WFD=""
 
+# Pure-bash ancestor gate (no sudo, no python3). Anyone who can write a
+# directory on the path can rename the lock pathname out from under a live
+# holder, so every existing layer must be root-controlled. A ROOT-owned sticky
+# world-writable layer (e.g. /tmp) is the one exception: there a non-owner
+# cannot rename or unlink somebody else's entry, while the owner is root.
+_manifest_lock_ancestors_ok() {
+    local dir="$1" p pp meta uid mode
+    p="${dir%/}"
+    [ -n "$p" ] || p="/"
+    while :; do
+        if [ -L "$p" ]; then
+            # A symlink is only trustworthy when only root can replace it (its
+            # containing directory is root-owned and not group/other-writable).
+            pp="${p%/*}"
+            [ -n "$pp" ] || pp="/"
+            meta="$(stat -c '%u|%a' -- "$pp" 2> /dev/null)" || {
+                log_error "Cannot stat manifest lock ancestor parent $pp; refusing to lock"
+                return 1
+            }
+            uid="${meta%%|*}"
+            mode="${meta#*|}"
+            if [ "$uid" != 0 ] || [ -z "$mode" ] \
+                || [ $(((8#$mode & 022) != 0)) -eq 1 ] || [ ! -d "$p" ]; then
+                log_error "Manifest lock ancestor $p is an untrusted symlink; refusing to lock"
+                return 1
+            fi
+        elif [ -d "$p" ]; then
+            # A missing layer is skipped (init creates it as root and re-checks
+            # afterwards), but higher ancestors are still walked and checked.
+            meta="$(stat -c '%u|%a' -- "$p" 2> /dev/null)" || {
+                log_error "Cannot stat manifest lock ancestor $p; refusing to lock"
+                return 1
+            }
+            uid="${meta%%|*}"
+            mode="${meta#*|}"
+            if [ -z "$mode" ]; then
+                log_error "Manifest lock ancestor $p is not root-controlled (uid=$uid mode=$mode); refusing to lock"
+                return 1
+            fi
+            if [ "$uid" != 0 ] \
+                || { [ $(((8#$mode & 022) != 0)) -eq 1 ] && [ $(((8#$mode & 01000) == 0)) -eq 1 ]; }; then
+                log_error "Manifest lock ancestor $p is not root-controlled (uid=$uid mode=$mode); refusing to lock"
+                return 1
+            fi
+        fi
+        [ "$p" = "/" ] && break
+        case "$p" in
+            */*)
+                p="${p%/*}"
+                [ -n "$p" ] || p="/"
+                ;;
+            *) p="/" ;;
+        esac
+    done
+    return 0
+}
+
 # Pure-bash parent-directory gate (no sudo, no python3). The lock path may only
 # be replaced by an account that can write its parent, so an untrusted parent
 # must be rejected before any privileged chmod/chown/open happens.
 _manifest_lock_dir_ok() {
     local dir="$1" meta uid mode
-    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
-        return 0 # first run: init creates it and calls us again
-    fi
-    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
         log_error "Manifest lock parent $dir is a symlink or not a directory; refusing to lock"
         return 1
     fi
-    meta="$(stat -c '%u|%a' -- "$dir" 2> /dev/null)" || {
-        log_error "Cannot stat manifest lock parent $dir; refusing to lock"
-        return 1
-    }
-    uid="${meta%%|*}"
-    mode="${meta#*|}"
-    if [ "$uid" != 0 ] && [ "$uid" != "${EUID:-$(id -u)}" ] && [ "$uid" != "${UID:-$(id -u)}" ]; then
-        log_error "Manifest lock parent $dir is owned by uid $uid (not root or current user); refusing to lock"
-        return 1
+    if [ -e "$dir" ]; then
+        meta="$(stat -c '%u|%a' -- "$dir" 2> /dev/null)" || {
+            log_error "Cannot stat manifest lock parent $dir; refusing to lock"
+            return 1
+        }
+        uid="${meta%%|*}"
+        mode="${meta#*|}"
+        # Re-review #11 finding #3: a caller-owned parent can rename the root-
+        # owned 0600 lock inode while a holder is live. Privileged locking
+        # requires root ownership of the directory itself, never EUID/UID.
+        if [ "$uid" != 0 ]; then
+            log_error "Manifest lock parent $dir is owned by uid $uid (must be root-owned); refusing to lock"
+            return 1
+        fi
+        if [ -z "$mode" ] || [ $(((8#$mode & 022) != 0)) -eq 1 ]; then
+            log_error "Manifest lock parent $dir is group/other-writable (mode $mode); refusing to lock"
+            return 1
+        fi
     fi
-    if [ -z "$mode" ] || [ $(((8#$mode & 022) != 0)) -eq 1 ]; then
-        log_error "Manifest lock parent $dir is group/other-writable (mode $mode); refusing to lock"
-        return 1
-    fi
+    # Missing dirs are created by init (as root) and re-checked then; the
+    # ancestor chain is checked now so an untrusted parent is never created.
+    _manifest_lock_ancestors_ok "$dir" || return 1
     return 0
 }
 
@@ -193,6 +259,22 @@ fd_dev=$(stat -Lc %d -- /proc/$$/fd/9 2>/dev/null || echo "")
 fd_uid=$(stat -Lc %u -- /proc/$$/fd/9 2>/dev/null || echo "")
 fd_mode=$(stat -Lc %a -- /proc/$$/fd/9 2>/dev/null || echo "")
 fd_ftype=$(stat -Lc %f -- /proc/$$/fd/9 2>/dev/null || echo "")
+# Re-review #11 finding #3: pin the DIRECT parent with fd 8 INSIDE the process
+# that holds fd 9. A stale parent-shell stat, or an ancestor the caller can
+# rename, must never let us lock a path whose parent an attacker controls.
+dir=${lock%/*}; [ -n "$dir" ] || dir=/
+if ! { exec 8< "$dir"; } 2>/dev/null; then printf "FAILED:parentdir\n"; exit 1; fi
+dm="$(stat -Lc "%u|%a|%i|%d|%f" -- /proc/$$/fd/8 2>/dev/null || echo "")"
+du=${dm%%|*}; r=${dm#*|}; dmode=${r%%|*}; r=${r#*|}; dino=${r%%|*}; r=${r#*|}; ddev=${r%%|*}; dtype=${r#*|}
+pdi=$(stat -c %i -- "$dir" 2>/dev/null || echo "")
+pdd=$(stat -c %d -- "$dir" 2>/dev/null || echo "")
+if [ -z "$dm" ] || [ -z "$du" ] || [ -z "$dmode" ] || [ -z "$dino" ] || [ -z "$ddev" ] ||
+   [ -z "$dtype" ] || [ -z "$pdi" ] || [ -z "$pdd" ] || [ "$du" != 0 ] ||
+   [ $(((8#$dmode & 022) != 0)) -eq 1 ] ||
+   [ $(((16#$dtype & 0170000) != 0040000)) -eq 1 ] ||
+   [ "$pdi" != "$dino" ] || [ "$pdd" != "$ddev" ]; then
+    printf "FAILED:parentdir\n"; exit 1
+fi
 if [ -z "$path_ino" ] || [ -z "$path_dev" ] || [ -z "$fd_ino" ] || [ -z "$fd_dev" ] ||
    [ -z "$fd_uid" ] || [ -z "$fd_mode" ] || [ -z "$fd_ftype" ] ||
    [ "$path_ino" != "$fd_ino" ] || [ "$path_dev" != "$fd_dev" ] ||

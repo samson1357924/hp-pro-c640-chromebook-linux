@@ -6686,6 +6686,364 @@ test_sec_crash_releases_lock_without_unlock() {
 }
 
 # ---------------------------------------------------------------------------
+# Re-review #11 finding #3 (P2 SECURITY): the lock's parent must be genuinely
+# root-controlled. A parent owned by the caller can rename a LIVE lock out of
+# the way; a second process then creates a new root-owned 0600 inode at the old
+# path and takes a second "exclusive" flock. These cases pin the trust boundary
+# to the directory's owner (never EUID/UID), the ancestor chain, and the root
+# holder's own fd-8 recheck of the direct parent.
+# ---------------------------------------------------------------------------
+
+# Write a script that really runs as uid 1000 (setpriv changes EUID/UID too,
+# so a regression to accepting `${EUID}`/`${UID}` is visible even though this
+# suite itself runs as root) and reports manifest_lock's rc. The `id` stub is
+# also installed so a regression to a bare `id -u` check is caught as well.
+_lock_sec_nonroot_id_stub() {
+    printf '#!/usr/bin/env bash\nif [ "$1" = "-u" ]; then echo 1000; else /usr/bin/id "$@"; fi\n' > "$1/stub/id"
+    chmod +x "$1/stub/id"
+}
+
+test_sec_lock_rejects_user_owned_parent() {
+    local s lock before
+    s="$(make_manifest_lock_sandbox sec-s10)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    before="$(cat "$s/manifest/install-manifest.json")"
+    chmod 0755 "$s" # let uid 1000 traverse the sandbox
+    chown 1000:1000 "$s/manifest"
+    chmod 0700 "$s/manifest"
+    _lock_sec_nonroot_id_stub "$s"
+    cat > "$s/user-lock.sh" << 'EOF'
+#!/usr/bin/env bash
+export PATH="$1/stub:$PATH" LOG_FILE="$1/manifest/test.log"
+cd /
+source "$2/lib/backup.sh"
+rc=0; manifest_lock || rc=$?
+printf '%s\n' "$rc" > "$1/manifest/lock.rc"
+EOF
+    chmod 0755 "$s/user-lock.sh"
+    run_sandboxed "$s" '
+        setpriv --reuid=1000 --regid=1000 --clear-groups \
+            bash "$2/user-lock.sh" "$2" "$1"
+    '
+    assert_eq "1" "$(cat "$s/manifest/lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10: caller-owned 0700 parent fails closed"
+    assert_contains "must be root-owned" "$(cat "$s/manifest/test.log" 2> /dev/null || echo "")" \
+        "SEC S10: root-owned parent requirement is logged"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC S10: no lock inode created in the untrusted parent"
+    assert_eq "$before" "$(cat "$s/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC S10: manifest bytes unchanged"
+}
+
+test_sec_lock_rename_after_acquire_cannot_create_second_holder() {
+    local s lock before
+    # (i) A user-owned parent cannot host even ONE holder, so rename-and-relock
+    #     cannot start. Both attempts must fail with no live holder and no lock.
+    s="$(make_manifest_lock_sandbox sec-s10b-user)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    before="$(cat "$s/manifest/install-manifest.json")"
+    chmod 0755 "$s"
+    chown 1000:1000 "$s/manifest"
+    chmod 0700 "$s/manifest"
+    _lock_sec_nonroot_id_stub "$s"
+    cat > "$s/user-two.sh" << 'EOF'
+#!/usr/bin/env bash
+export PATH="$1/stub:$PATH" LOG_FILE="$1/manifest/test.log"
+cd /
+source "$2/lib/backup.sh"
+for who in a b; do
+    rc=0; manifest_lock || rc=$?
+    printf '%s\n' "$rc" > "$1/manifest/$who.rc"
+    printf '%s\n' "${MANIFEST_LOCK_HOLDER_PID:-<empty>}" > "$1/manifest/$who.pid"
+done
+EOF
+    chmod 0755 "$s/user-two.sh"
+    run_sandboxed "$s" '
+        setpriv --reuid=1000 --regid=1000 --clear-groups \
+            bash "$2/user-two.sh" "$2" "$1"
+    '
+    assert_eq "1" "$(cat "$s/manifest/a.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(i): first acquisition in user-owned parent fails"
+    assert_eq "1" "$(cat "$s/manifest/b.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(i): second acquisition in user-owned parent fails"
+    assert_eq "<empty>" "$(cat "$s/manifest/a.pid" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(i): no holder A left behind"
+    assert_eq "<empty>" "$(cat "$s/manifest/b.pid" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(i): no holder B left behind"
+    assert_eq "absent" "$([ -e "$lock" ] || [ -L "$lock" ] && echo present || echo absent)" \
+        "SEC S10b(i): no lock inode created"
+    assert_eq "$before" "$(cat "$s/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(i): manifest bytes unchanged"
+
+    # (ii) With a root-owned parent, an unprivileged account cannot rename the
+    #      live lock aside; a contender times out instead of locking a new inode.
+    s="$(make_manifest_lock_sandbox sec-s10b-root)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    before="$(cat "$s/manifest/install-manifest.json")"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=5
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/a.rc"
+        if [ "$rc" -eq 0 ]; then
+            printf "%s\n" "$(stat -c %i -- "$MANIFEST_LOCK_FILE")" > "$2/a.ino"
+            : > "$2/a.held"
+            i=0
+            while [ ! -e "$2/a.release" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i+1)); done
+            manifest_unlock
+        fi
+    ' &
+    local pa=$! i=0
+    while [ ! -e "$s/a.held" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$s/a.held" ]; then ok; else fail "SEC S10b(ii): A never acquired the lock"; fi
+    chmod 0755 "$s" "$s/manifest"
+    local rename_rc=0
+    # The redirect is intentionally performed by the root shell, not by sudo.
+    # Force an English diagnostic: the host locale may render EACCES in any
+    # language, but the assertion below checks for "Permission denied".
+    # shellcheck disable=SC2024
+    sudo -n -u nobody -- env LC_ALL=C mv "$lock" "$s/manifest/moved" > "$s/rename.log" 2>&1 || rename_rc=$?
+    assert_eq "1" "$rename_rc" \
+        "SEC S10b(ii): nobody cannot rename the live lock in a root-owned parent"
+    # A non-zero rc alone is not proof: a broken sudo/user lookup would also
+    # return 1. Require the real EACCES diagnostic so this case cannot pass
+    # for an unrelated reason.
+    assert_contains "Permission denied" "$(cat "$s/rename.log" 2> /dev/null || echo "")" \
+        "SEC S10b(ii): rename was denied by permissions (not sudo/user lookup)"
+    if [ -s "$s/rename.log" ]; then ok; else fail "SEC S10b(ii): rename denial left no diagnostic"; fi
+    assert_eq "$(cat "$s/a.ino" 2> /dev/null || echo MISSING)" \
+        "$(stat -c %i -- "$lock" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(ii): the locked inode is still at the original path"
+    assert_eq "absent" "$([ -e "$s/manifest/moved" ] && echo present || echo absent)" \
+        "SEC S10b(ii): no renamed lock file appeared"
+
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=1
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/b.rc"
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    '
+    assert_eq "1" "$(cat "$s/b.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(ii): contender B times out instead of holding a second inode"
+    : > "$s/a.release"
+    worker_wait_pid "$pa"
+    assert_eq "0" "$(cat "$s/a.rc" 2> /dev/null || echo MISSING)" "SEC S10b(ii): A released cleanly"
+    assert_eq "$before" "$(cat "$s/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC S10b(ii): manifest bytes unchanged"
+    assert_eq "1" "$(find "$s/manifest" -maxdepth 1 -name '.install-manifest.lock*' | wc -l | tr -d '[:space:]')" \
+        "SEC S10b(ii): exactly one lock inode exists"
+}
+
+test_sec_lock_helper_rechecks_parent_dir() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-s10c)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    chown 1000:1000 "$s/manifest"
+    chmod 0700 "$s/manifest"
+    # Force the snippet past the parent-shell gate: the ONLY remaining guard is
+    # the root holder's fd-8 recheck of the direct parent.
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        _manifest_lock_dir_ok() { return 0; }
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/lock.rc"
+        if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+            printf "holder-alive\n" > "$2/holder.txt"
+        else
+            printf "holder-none\n" > "$2/holder.txt"
+        fi
+        if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2> /dev/null; then
+            printf "wfd-open\n" > "$2/wfd.txt"
+        else
+            printf "wfd-closed\n" > "$2/wfd.txt"
+        fi
+        # No hardcoded rc: actually run the mutation helper and record the
+        # rc it returns. With the holder rejecting the parent it must fail
+        # closed for real, not just because a test wrote "1" into gate.rc.
+        if [ "$rc" -ne 0 ]; then
+            g=0; backup_file_manifest_aware "$2/root/audio.conf" audio || g=$?
+            printf "%s\n" "$g" > "$2/gate.rc"
+        else
+            printf "unexpected-lock-success\n" > "$2/gate.rc"
+        fi
+    '
+    _lock_sec_fail_asserts "$s" "FAILED:parentdir"
+    # init may leave the 0600 inode behind; what matters is that nobody holds
+    # it (asserted above by holder-none / wfd-closed / blocked mutation gate).
+    assert_eq "600" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" \
+        "SEC S10c: lock stays root-owned 0600 after the holder rejected the parent"
+}
+
+test_sec_lock_nonroot_root_owned_dir_succeeds() {
+    local s lock
+    s="$(make_manifest_lock_sandbox sec-t13)"
+    _lock_sec_prepare "$s"
+    lock="$s/manifest/.install-manifest.lock"
+    chmod 0755 "$s"
+    # The rule is about the DIRECTORY's owner, never the caller's. The `id`
+    # stub makes a caller-based gate fail visibly even though this suite runs
+    # as root (same control pattern as the keyd snapshot-base tests).
+    _lock_sec_nonroot_id_stub "$s"
+    run_sandboxed "$s" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/lock.rc"
+        if [ "$rc" -eq 0 ]; then
+            g=0; backup_file_manifest_aware "$2/root/audio.conf" audio || g=$?
+            printf "%s\n" "$g" > "$2/gate.rc"
+            manifest_unlock
+            printf "%s\n" "$?" > "$2/unlock.rc"
+        else
+            printf "1\n" > "$2/gate.rc"
+            printf "1\n" > "$2/unlock.rc"
+        fi
+    '
+    assert_eq "0" "$(cat "$s/lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC T13: root-owned parent accepted despite non-root id -u stub"
+    assert_eq "0" "$(cat "$s/gate.rc" 2> /dev/null || echo MISSING)" \
+        "SEC T13: mutation helper runs under the lock"
+    assert_eq "0" "$(cat "$s/unlock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC T13: unlock succeeds"
+    assert_eq "600" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" \
+        "SEC T13: lock is still root-owned 0600"
+    assert_eq "1" "$(manifest_count "$s/manifest/install-manifest.json" records)" \
+        "SEC T13: exactly one record written"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3 (ancestor-gate) regression coverage. A sticky world-writable layer
+# is only safe when ROOT owns it: a user-owned 1777 ancestor still lets its
+# owner rename a live lock pathname and plant a second "exclusive" holder.
+# Every case below drives manifest_lock() (or the gate itself), so no-op'ing
+# _manifest_lock_ancestors_ok() (mutation M4) makes S10d fail.
+# ---------------------------------------------------------------------------
+_lock_sec_ancestor_case() {
+    # $1=sandbox $2=case name $3=manifest dir $4=expected manifest bytes
+    run_sandboxed "$1" '
+        export LOG_FILE="$2/$3.log"
+        source "$1/lib/backup.sh"
+        MANIFEST_DIR="$4"
+        MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+        printf "%s" "$5" > "$MANIFEST_DIR/install-manifest.json"
+        rc=0; manifest_lock || rc=$?
+        printf "%s\n" "$rc" > "$2/$3.lock.rc"
+        if [ -n "$MANIFEST_LOCK_HOLDER_PID" ] && kill -0 "$MANIFEST_LOCK_HOLDER_PID" 2>/dev/null; then
+            printf "holder-alive\n" > "$2/$3.holder.txt"
+        else
+            printf "holder-none\n" > "$2/$3.holder.txt"
+        fi
+        if eval ": >&${MANIFEST_LOCK_HOLDER_WFD}" 2>/dev/null; then
+            printf "wfd-open\n" > "$2/$3.wfd.txt"
+        else
+            printf "wfd-closed\n" > "$2/$3.wfd.txt"
+        fi
+        if [ -e "$MANIFEST_LOCK_FILE" ] || [ -L "$MANIFEST_LOCK_FILE" ]; then
+            printf "present\n" > "$2/$3.inode.txt"
+        else
+            printf "absent\n" > "$2/$3.inode.txt"
+        fi
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+    ' "$2" "$3" "$4"
+}
+
+test_sec_lock_ancestor_gate() {
+    local s before
+    s="$(make_manifest_lock_sandbox sec-s10d)"
+    chmod 0755 "$s"
+    before="$_SEC_MANIFEST"
+
+    # (i) The bug: a user-owned 01777 ancestor was previously accepted purely
+    # because it is sticky. Its owner can still rename the lock pathname.
+    mkdir -p "$s/untrusted/manifest"
+    chown 0:0 "$s/untrusted" "$s/untrusted/manifest"
+    chmod 0755 "$s/untrusted/manifest"
+    chown 1000:1000 "$s/untrusted"
+    chmod 01777 "$s/untrusted"
+    _lock_sec_ancestor_case "$s" u1777 "$s/untrusted/manifest" "$before"
+    assert_eq "1" "$(cat "$s/u1777.lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(i): user-owned 01777 ancestor is rejected"
+    assert_contains "not root-controlled" "$(cat "$s/u1777.log" 2> /dev/null || echo "")" \
+        "SEC S10d(i): rejection is logged"
+    assert_eq "holder-none" "$(cat "$s/u1777.holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(i): no root holder left alive"
+    assert_eq "wfd-closed" "$(cat "$s/u1777.wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(i): coproc write fd closed"
+    assert_eq "absent" "$(cat "$s/u1777.inode.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(i): no lock inode created"
+    assert_eq "$before" "$(cat "$s/untrusted/manifest/install-manifest.json" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(i): manifest bytes unchanged"
+
+    # (ii) Control: a ROOT-owned sticky world-writable ancestor (/tmp itself)
+    # must stay usable, so the fix does not break the legitimate exception.
+    mkdir -p "$s/sticky/manifest"
+    chown 0:0 "$s/sticky" "$s/sticky/manifest"
+    chmod 01777 "$s/sticky"
+    chmod 0755 "$s/sticky/manifest"
+    _lock_sec_ancestor_case "$s" sticky "$s/sticky/manifest" "$before"
+    assert_eq "0" "$(cat "$s/sticky.lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(ii): root-owned 01777 ancestor is accepted"
+    assert_eq "holder-alive" "$(cat "$s/sticky.holder.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(ii): holder really acquired the lock"
+    assert_eq "wfd-open" "$(cat "$s/sticky.wfd.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(ii): coproc write fd still open while held"
+    assert_eq "present" "$(cat "$s/sticky.inode.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(ii): lock inode created under root-owned sticky ancestor"
+
+    # (iii) A root-owned but group/other-writable NON-sticky ancestor is still
+    # rejected: any group member could rename the lock pathname.
+    mkdir -p "$s/groupwritable/manifest"
+    chown 0:0 "$s/groupwritable" "$s/groupwritable/manifest"
+    chmod 0775 "$s/groupwritable"
+    chmod 0755 "$s/groupwritable/manifest"
+    _lock_sec_ancestor_case "$s" gw "$s/groupwritable/manifest" "$before"
+    assert_eq "1" "$(cat "$s/gw.lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(iii): root-owned group-writable non-sticky ancestor is rejected"
+    assert_contains "not root-controlled" "$(cat "$s/gw.log" 2> /dev/null || echo "")" \
+        "SEC S10d(iii): rejection is logged"
+    assert_eq "absent" "$(cat "$s/gw.inode.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(iii): no lock inode created"
+
+    # (iv) An ancestor symlink inside an untrusted containing directory is
+    # rejected with the dedicated diagnostic.
+    mkdir -p "$s/linktarget/manifest" "$s/linkparent"
+    chown 0:0 "$s/linktarget" "$s/linktarget/manifest"
+    chmod 0755 "$s/linktarget" "$s/linktarget/manifest"
+    chown 1000:1000 "$s/linkparent"
+    chmod 0755 "$s/linkparent"
+    ln -s "$s/linktarget" "$s/linkparent/link"
+    _lock_sec_ancestor_case "$s" symlink "$s/linkparent/link/manifest" "$before"
+    assert_eq "1" "$(cat "$s/symlink.lock.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(iv): untrusted symlink ancestor is rejected"
+    assert_contains "untrusted symlink" "$(cat "$s/symlink.log" 2> /dev/null || echo "")" \
+        "SEC S10d(iv): symlink rejection is logged"
+    assert_eq "absent" "$(cat "$s/symlink.inode.txt" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(iv): no lock inode created behind the symlink"
+
+    # Direct mutation guard: call the gate itself, so an M4 no-op is caught
+    # even if a future refactor bypasses manifest_lock()'s normal path.
+    run_sandboxed "$s" '
+        export LOG_FILE="$2/direct.log"
+        source "$1/lib/backup.sh"
+        rc=0; _manifest_lock_ancestors_ok "$2/untrusted/manifest" || rc=$?
+        printf "%s\n" "$rc" > "$2/direct.rc"
+    '
+    assert_eq "1" "$(cat "$s/direct.rc" 2> /dev/null || echo MISSING)" \
+        "SEC S10d(v): _manifest_lock_ancestors_ok rejects the user-owned ancestor directly"
+    assert_contains "not root-controlled" "$(cat "$s/direct.log" 2> /dev/null || echo "")" \
+        "SEC S10d(v): direct gate rejection is logged"
+}
+
+# ---------------------------------------------------------------------------
 # Re-review #10 finding #1: operation-level lock regressions (OP1-OP4).
 # OP1/OP2 use a REAL `sudo install -D` barrier: A records the target, pauses
 # before writing it, B races with rollback on the SAME target. OP3 proves the
@@ -7757,6 +8115,13 @@ test_sec_lock_rejects_post_open_owner_swap
 test_sec_unprivileged_cannot_flock
 test_sec_holder_contention_and_recovery
 test_sec_crash_releases_lock_without_unlock
+# Re-review #11 finding #3: lock parent trust boundary / rename double-holder
+test_sec_lock_rejects_user_owned_parent
+test_sec_lock_rename_after_acquire_cannot_create_second_holder
+test_sec_lock_helper_rechecks_parent_dir
+test_sec_lock_nonroot_root_owned_dir_succeeds
+# Phase 3: ancestor gate must require root ownership even for a sticky layer
+test_sec_lock_ancestor_gate
 # Re-review #10 finding #1: operation-level (backup -> deploy -> rollback) lock
 test_op_deploy_vs_rollback_barrier OP1 keyboard-hwdb keyboard
 test_op_deploy_vs_rollback_barrier OP1 audio-ucm audio
