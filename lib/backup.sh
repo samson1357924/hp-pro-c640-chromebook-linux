@@ -350,6 +350,40 @@ def atomic_write_json(mp, data):
         raise
 '
 
+# Ownership of a (group,user) membership is decided by the EARLIEST observed
+# state across ALL components, not by the component currently uninstalling.
+# A full install records keyboard:was_member=false then
+# fingerprint:was_member=true (same pair); each component's own record alone
+# cannot answer "did we add this membership?", so uninstall must aggregate.
+# rc 0 = at least one component recorded was_member=false => we added it
+# rc 1 = no record, or every record was_member=true => keep (pre-existing)
+# rc 2 = unreadable / wrong safety-field type => caller fails closed
+# argc = 6 (python3 -c SCRIPT mp group user): below every writer-stub threshold
+# used by the test suite, and it does not contain any rollback-fault marker.
+_GROUP_OWNERSHIP_PY='
+import json, sys, os
+mp, group, user = sys.argv[1:4]
+if not os.path.exists(mp):
+    sys.exit(2)
+try:
+    with open(mp) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(2)
+matches = [g for g in data.get("groups", [])
+           if isinstance(g, dict) and g.get("group") == group and g.get("user") == user]
+if not matches:
+    sys.exit(1)
+for g in matches:
+    w = g.get("was_member")
+    if not isinstance(w, bool):
+        sys.exit(2)          # defence in depth; the validator gate rejects this too
+for g in matches:
+    if not g["was_member"]:
+        sys.exit(0)          # explicit bool false is the only proof we added it
+sys.exit(1)
+'
+
 # Single validation source for all manifest readers/writers. Reads the path
 # from argv[1]; malformed input exits 2 with a MANIFEST_INVALID diagnostic on
 # stderr, valid input prints one canonical JSON document on stdout.
@@ -798,13 +832,52 @@ manifest_remove_group() {
     # $1=group $2=user $3=component — remove EXACTLY one group record with a
     # precise list filter + atomic os.replace (never sed/text substitution), so
     # records of other users/components and all records/services stay intact.
-    # Shared by uninstall (consume after a successful gpasswd -d) and by the
-    # install rollback path (undo a record we just wrote when usermod failed).
+    # Shared by the install rollback path (undo a record we just wrote when
+    # usermod failed); the uninstall consumer uses manifest_remove_group_all().
     [ "${DRY_RUN:-0}" = "1" ] && return 0
     [ -f "$MANIFEST_FILE" ] || return 0
     manifest_lock || return 1
     local rc=0
     _manifest_remove_group_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
+_manifest_remove_group_all_body() {
+    # Held under the reentrant manifest lock. Unlike manifest_remove_group()
+    # this consumes EVERY component record for the same (group,user): once the
+    # membership has actually been removed, a sibling's stale true/false record
+    # must not survive to mislead a later uninstall pass.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group records for $2@$1"
+        return 1
+    fi
+    # argc=5 (python3 -c SCRIPT mp group user): same unique-temp + fsync +
+    # os.replace path as every other manifest writer, argv below stub thresholds.
+    sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
+mp, group, user = sys.argv[1:4]
+if not os.path.exists(mp):
+    sys.exit(0)
+d = json.load(open(mp))
+d.setdefault("groups", [])
+before = len(d["groups"])
+d["groups"] = [g for g in d["groups"]
+               if not (g.get("group") == group and g.get("user") == user)]
+if len(d["groups"]) == before:
+    sys.exit(0)              # nothing matched: do not rewrite at all
+atomic_write_json(mp, d)
+' "$MANIFEST_FILE" "$1" "$2"
+}
+
+manifest_remove_group_all() {
+    # $1=group $2=user — consume all component records for this pair, but ONLY
+    # after a successful gpasswd -d. Same lock + unique-temp + os.replace path
+    # as manifest_remove_group; no second lock primitive is introduced.
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    [ -f "$MANIFEST_FILE" ] || return 0
+    manifest_lock || return 1
+    local rc=0
+    _manifest_remove_group_all_body "$@" || rc=$?
     manifest_unlock
     return "$rc"
 }
@@ -882,60 +955,53 @@ ensure_group_membership() {
 }
 
 _remove_group_membership_body() {
-    # Held under the manifest lock: the membership decision (which reads the
-    # manifest directly), the udev reference check, gpasswd and the final
-    # manifest_remove_group are one transaction. The nested remove_group call
-    # only bumps MANIFEST_LOCK_DEPTH; the wrapper releases once at the end.
+    # Held under the manifest lock for its ENTIRE duration: the fail-closed
+    # gate, the cross-component ownership probe, the udev reference check,
+    # gpasswd and the final record consumption are one transaction. The nested
+    # consumer only bumps MANIFEST_LOCK_DEPTH; the wrapper releases once at end.
     local group="$1" user="$2" component="$3"
     # Fail closed BEFORE gpasswd -d (a real side effect): a schema-invalid
     # group record (e.g. was_member="false", truthy in Python) must never be
-    # accepted as evidence that we should delete a membership. This also
-    # protects the fingerprint/EC uninstall callers of this helper.
+    # accepted as evidence that we should delete a membership.
     if ! manifest_load; then
         log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group membership for $user@$group"
         return 1
     fi
-    # Only remove membership if WE recorded adding it (user was not already
-    # a member before our install).
-    local ours
-    ours=$(python3 -c '
-import json, sys, os
-mp, group, user, comp = sys.argv[1:5]
-if not os.path.exists(mp):
-    sys.exit(1)
-d = json.load(open(mp))
-for g in d.get("groups", []):
-    if g.get("group") == group and g.get("user") == user and g.get("component") == comp:
-        # was_member is a safety-decision field: only an explicit bool false
-        # proves that WE added the membership. Missing/wrong type is unknown,
-        # never "false" — keep the membership (fail closed). The validator
-        # gate above already rejects such manifests; this is defence in depth
-        # for this direct json.load path.
-        was_member = g.get("was_member")
-        sys.exit(0 if isinstance(was_member, bool) and not was_member else 1)
-sys.exit(1)
-' "$MANIFEST_FILE" "$group" "$user" "$component" 2> /dev/null) && ours="1" || ours="0"
-    if [ "$ours" != "1" ]; then
-        log_info "User '$user' was already in group '$group' before install; keeping membership."
-        return 0
-    fi
-    # Keep membership if another udev rule (e.g. from another component
-    # still installed) references the group.
+    # Aggregate across ALL components for (group,user). A sibling component's
+    # was_member=false is proof that WE added the membership, even when this
+    # component's own record says true (keyboard-then-fingerprint full install).
+    local own_rc=0
+    python3 -c "$_GROUP_OWNERSHIP_PY" "$MANIFEST_FILE" "$group" "$user" \
+        > /dev/null 2>&1 || own_rc=$?
+    case "$own_rc" in
+        0) ;;
+        1)
+            log_info "No record proves we added '$user' to group '$group'; keeping membership. [$component]"
+            return 0
+            ;;
+        *)
+            log_error "Cannot determine original membership of $user@$group; refusing to change it (manifest rc=$own_rc)"
+            return 1
+            ;;
+    esac
+    # Keep membership if another udev rule (e.g. from a component still
+    # installed, or a third-party rule) still references the group.
     if grep -rl "GROUP=\"$group\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .; then
         log_info "udev rules still reference group '$group'; keeping '$user' in it."
         return 0
     fi
     if sudo gpasswd -d "$user" "$group" 2> /dev/null; then
-        log_info "Removed '$user' from group '$group'."
+        log_info "Removed '$user' from group '$group' (per the original-state manifest snapshot) [$component]."
     else
-        log_warn "Could not remove '$user' from group '$group'; keeping manifest record for retry."
-        return 0
+        # FAIL LOUD: the caller (and setup.sh via its rc fold) must know that
+        # the membership was NOT restored. Records stay for a later retry.
+        log_error "Could not remove '$user' from group '$group'; keeping manifest records for retry."
+        return 1
     fi
-    # Consume the record only after the membership was actually removed. This
-    # is the same precise list-filter + os.replace helper used by the install
-    # rollback path, so uninstall and rollback can never diverge.
-    if ! manifest_remove_group "$group" "$user" "$component"; then
-        log_warn "Could not consume group record for '$user'@'$group'; keeping it for retry."
+    # Consume ALL component records for this pair only AFTER a successful
+    # removal, so no stale false/true evidence survives for a later pass.
+    if ! manifest_remove_group_all "$group" "$user"; then
+        log_error "Could not consume group records for '$user'@'$group'; keeping them for retry."
         return 1
     fi
 }

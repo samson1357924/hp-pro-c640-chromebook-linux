@@ -170,7 +170,11 @@ _uninstall_ec_tools_body() {
     # cleanup step, and propagate it at the very end of the function.
     local rollback_rc=0
     rollback_component "ec" || rollback_rc=$?
-    remove_group_membership "plugdev" "$(get_real_user)" "ec"
+    # gpasswd -d failure is reported by the helper as rc 1; capture it here so
+    # `set -e` does not skip the daemon-reload below, then fold it in.
+    local group_rc=0
+    remove_group_membership "plugdev" "$(get_real_user)" "ec" || group_rc=$?
+    [ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemctl daemon-reload

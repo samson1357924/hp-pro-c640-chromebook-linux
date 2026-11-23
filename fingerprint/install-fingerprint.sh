@@ -89,7 +89,11 @@ _uninstall_fp_body() {
     # every cleanup step, and propagate it at the very end of the function.
     local rollback_rc=0
     rollback_component "fingerprint" || rollback_rc=$?
-    remove_group_membership "plugdev" "$(get_real_user)" "fingerprint"
+    # gpasswd -d failure is reported by the helper as rc 1; capture it here so
+    # `set -e` does not skip the udev/PAM cleanup below, then fold it in.
+    local group_rc=0
+    remove_group_membership "plugdev" "$(get_real_user)" "fingerprint" || group_rc=$?
+    [ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"
 
     # Remove prebuilt package if installed via package manager
     if [ "${DRY_RUN:-0}" != "1" ]; then

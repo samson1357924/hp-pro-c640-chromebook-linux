@@ -1110,7 +1110,11 @@ _uninstall_keyboard_body() {
     # cleanup step, and propagate it at the very end of the function.
     local rollback_rc=0
     rollback_component "keyboard" || rollback_rc=$?
-    remove_group_membership "plugdev" "$(get_real_user)" "keyboard"
+    # gpasswd -d failure is reported by the helper as rc 1; capture it here so
+    # `set -e` does not skip the udev/brightness cleanup below, then fold it in.
+    local group_rc=0
+    remove_group_membership "plugdev" "$(get_real_user)" "keyboard" || group_rc=$?
+    [ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemd-hwdb update 2> /dev/null || true
