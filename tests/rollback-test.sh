@@ -87,6 +87,10 @@ LOCK_TEST_SANDBOXES=()
 # with this run's PID and sweep by that exact prefix: nothing left behind, and
 # no wildcard that could delete another session's sandboxes.
 LOCK_TEST_RUN_TAG="$$"
+# PAM sandbox paths (re-review #11 finding #2) use the same per-run tag so the
+# EXIT trap below can sweep them even though setup_pam_sandbox() runs inside a
+# $(...) subshell whose array append is not visible to the parent.
+PAM_TEST_SANDBOXES=()
 # T12 publishes its path here so an early failure still releases its bounded
 # waiter (the prefix sweep below is the actual removal safety net).
 T12_CRASH_SANDBOX=""
@@ -99,10 +103,15 @@ cleanup_lock_test_sandboxes() {
         : > "$s/crash.stop" 2> /dev/null || true
         rm -rf -- "$s"
     done
+    for s in "${PAM_TEST_SANDBOXES[@]}"; do
+        [ -n "$s" ] || continue
+        rm -rf -- "$s"
+    done
     if [ -n "$T12_CRASH_SANDBOX" ]; then
         : > "$T12_CRASH_SANDBOX/crash.stop" 2> /dev/null || true
     fi
     rm -rf -- /tmp/rollback-test-lock-"$LOCK_TEST_RUN_TAG"-* 2> /dev/null || true
+    rm -rf -- /tmp/rollback-test-pam-"$LOCK_TEST_RUN_TAG"-* 2> /dev/null || true
 }
 trap cleanup_lock_test_sandboxes EXIT
 
@@ -7767,6 +7776,375 @@ test_plugdev_udev_rule_gates_removal_until_last_one_disappears
 test_plugdev_three_components_ec_included
 test_plugdev_remove_fails_closed_on_invalid_manifest
 test_plugdev_dry_run_remove_no_side_effects
+
+# ---------------------------------------------------------------------------
+# Re-review #11 finding #2 (P2 DATA SAFETY, PAM-1..8): uninstall must not delete
+# a pre-existing pam_fprintd line from /etc/pam.d/sudo after rollback. The ONLY
+# writer of those bytes is rollback_component(); disable_pam_fingerprint() is
+# read-only apart from distro-tool state messages.
+#
+# Every case uses a fresh /tmp/rollback-test-pam-* sandbox. BOTH path seams are
+# redirected and every tool is stubbed inside the sandbox; the stubs refuse any
+# argument under /etc/pam.d, so a misconfigured seam fails the case instead of
+# touching the host's PAM files. Nothing here writes real sysfs/service/D-Bus.
+# ---------------------------------------------------------------------------
+setup_pam_sandbox() {
+    # $1=short case name; echoes the fresh sandbox path.
+    local s
+    s="$(mktemp -d "/tmp/rollback-test-pam-$LOCK_TEST_RUN_TAG-$1-XXXXXX")"
+    mkdir -p "$s/pam" "$s/backups" "$s/manifest" "$s/stub"
+    : > "$s/tool.log"
+    : > "$s/sed.log"
+
+    # sudo: pass through, but never let a /etc/pam.d path escape the sandbox.
+    cat > "$s/stub/sudo" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        /etc/pam.d/*|*/etc/pam.d/*)
+            printf 'STUB ESCAPE: sudo asked to touch host PAM: %s\n' "$_a" >&2
+            exit 99
+            ;;
+    esac
+done
+exec "$@"
+EOF
+
+    # sed: log every mutation call (uninstall must add ZERO entries) and refuse
+    # host PAM paths before delegating to the real sed on sandbox files only.
+    cat > "$s/stub/sed" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_SED_LOG:?PAM sed stub missing log}"
+for _a in "$@"; do
+    case "$_a" in
+        /etc/pam.d/*|*/etc/pam.d/*)
+            printf 'STUB ESCAPE: sed asked to touch host PAM: %s\n' "$_a" >&2
+            exit 99
+            ;;
+    esac
+done
+exec /usr/bin/sed "$@"
+EOF
+
+    # pam-auth-update: log the tool call, then simulate its rewrite of common-*.
+    cat > "$s/stub/pam-auth-update" << 'EOF'
+#!/usr/bin/env bash
+printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+if [ "${1:-}" = "--remove" ] && [ "${2:-}" = "fprintd" ]; then
+    for _f in "${CROS_ENABLEMENT_PAM_DIR:?PAM dir seam missing}"/common-*; do
+        [ -f "$_f" ] || continue
+        /usr/bin/sed -i '/pam_fprintd\.so/d' "$_f"
+    done
+fi
+exit 0
+EOF
+
+    # authselect / pam-config: log only, never call real distro tooling.
+    cat > "$s/stub/authselect" << 'EOF'
+#!/usr/bin/env bash
+printf 'authselect %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 0
+EOF
+    cat > "$s/stub/pam-config" << 'EOF'
+#!/usr/bin/env bash
+printf 'pam-config %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 0
+EOF
+
+    # Rollback fault injection. argc=6 plus the target_comp marker identifies
+    # the rollback writer; the manifest add-entry writer (argc=7) still works,
+    # so the record survives exactly as on a real failed rollback.
+    cat > "$s/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "${STUB_FAIL_ROLLBACK_PY:-0}" = "1" ] && [ "$1" = "-c" ] && [ "$#" -eq 6 ] \
+        && printf '%s' "$2" | grep -q 'target_comp = sys.argv\[2\]'; then
+    printf 'STUB: rollback python refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+
+    chmod +x "$s/stub/"*
+    PAM_TEST_SANDBOXES+=("$s")
+    printf '%s\n' "$s"
+}
+
+# Write a Debian-style sudo PAM file (and optionally common-auth) into the
+# sandbox. $2 = sudo content: exact | other | none. $3 = common-auth: none | fp.
+pam_write_initial_files() {
+    local s="$1" sudo_mode="$2" common_mode="$3"
+    case "$sudo_mode" in
+        exact)
+            cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - pre-existing EXACT project line
+auth sufficient pam_fprintd.so max-tries=1 timeout=10
+@include common-auth
+@include common-account
+EOF
+            ;;
+        other)
+            cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - pre-existing OTHER fingerprint rules
+auth sufficient pam_fprintd.so
+auth sufficient rust_fp.so
+@include common-auth
+@include common-account
+EOF
+            ;;
+        none)
+            cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - no fingerprint line
+@include common-auth
+@include common-account
+EOF
+            ;;
+    esac
+    case "$common_mode" in
+        fp)
+            cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+auth requisite pam_deny.so
+EOF
+            ;;
+        *) ;; # no common-auth file in the sandbox
+    esac
+}
+
+pam_record_count() {
+    local mp="$1/manifest/install-manifest.json"
+    [ -f "$mp" ] || {
+        printf '0\n'
+        return 0
+    }
+    manifest_count "$mp" records
+}
+
+# Install step: exactly what the fingerprint installer calls, with the seam
+# env vars inherited from the caller's prefix assignment.
+run_pam_install() {
+    local sandbox="$1" distro="$2"
+    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR STUB_FAIL_ROLLBACK_PY
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        source "$1/lib/pam.sh"
+        DISTRO_FAMILY="$3" DISTRO_ID="$3"
+        configure_pam_fingerprint
+        printf "%s\n" "$?" > "$2/install.rc"
+    ' "$distro"
+}
+
+# Uninstall step: mirror _uninstall_fp_body() ordering — rollback FIRST, then
+# disable_pam_fingerprint(). No sed or tool call may be injected in between.
+run_pam_uninstall() {
+    local sandbox="$1" distro="$2"
+    export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR STUB_FAIL_ROLLBACK_PY
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        source "$1/lib/pam.sh"
+        DISTRO_FAMILY="$3" DISTRO_ID="$3"
+        rc=0
+        rollback_component "fingerprint" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback.rc"
+        disable_pam_fingerprint
+        printf "%s\n" "$?" > "$2/disable.rc"
+    ' "$distro"
+}
+
+# PAM-1: original sudo PAM already has the EXACT project line. Install skips
+# backup; uninstall must leave every byte untouched (no sed, no record).
+test_pam_1_preexisting_exact_line_survives() {
+    local s before
+    s="$(setup_pam_sandbox exact-line)"
+    pam_write_initial_files "$s" exact none
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" "PAM-1: install rc 0"
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-1: rollback rc 0"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-1: disable rc 0"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" "PAM-1: original sudo PAM bytes identical"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-1: no manifest record was created"
+    assert_eq "" "$(cat "$s/sed.log")" "PAM-1: uninstall ran no sed"
+    assert_not_contains "Manifest still records" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-1: no stale-record warning"
+}
+
+# PAM-2: original sudo PAM has OTHER fprintd/rust_fp lines. Install backs up
+# and rewrites (2 sed calls); rollback restores the original bytes, and the
+# post-rollback sed must NOT delete them again.
+test_pam_2_preexisting_other_fp_lines_survive() {
+    local s before sed_after_install
+    s="$(setup_pam_sandbox other-lines)"
+    pam_write_initial_files "$s" other none
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    sed_after_install="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-2: rollback rc 0"
+    assert_eq "2" "$sed_after_install" "PAM-2: install used exactly two sed calls"
+    assert_eq "$sed_after_install" "$(wc -l < "$s/sed.log")" "PAM-2: uninstall added no sed call"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" "PAM-2: original sudo PAM bytes identical"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-2: manifest record consumed"
+}
+
+# PAM-3: original sudo PAM has no fp line at all. Install adds one; rollback
+# must restore the original file byte-for-byte with no extra sed.
+test_pam_3_no_fp_line_roundtrip() {
+    local s before sed_after_install
+    s="$(setup_pam_sandbox no-fp-line)"
+    pam_write_initial_files "$s" none none
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    sed_after_install="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-3: rollback rc 0"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" "PAM-3: original sudo PAM bytes identical"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-3: manifest record consumed"
+    assert_eq "$sed_after_install" "$(wc -l < "$s/sed.log")" "PAM-3: uninstall added no sed call"
+}
+
+# PAM-4: rollback FAILS. The record must stay, the file must be left exactly as
+# the failed rollback left it (uninstall adds no mutation), and the user must
+# be warned that the manifest still records the file.
+test_pam_4_failed_rollback_keeps_record_and_warns() {
+    local s after_install sed_after_install
+    s="$(setup_pam_sandbox rollback-fail)"
+    pam_write_initial_files "$s" none none
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    after_install="$(file_hex "$s/pam/sudo")"
+    sed_after_install="$(wc -l < "$s/sed.log")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        STUB_FAIL_ROLLBACK_PY=1 \
+        run_pam_uninstall "$s" debian
+
+    assert_eq "1" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-4: rollback rc 1"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-4: disable rc 0"
+    assert_eq "1" "$(pam_record_count "$s")" "PAM-4: manifest record retained"
+    assert_eq "$after_install" "$(file_hex "$s/pam/sudo")" \
+        "PAM-4: uninstall did not change the file after failed rollback"
+    assert_contains "Manifest still records" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-4: stale record warning logged"
+    assert_eq "$sed_after_install" "$(wc -l < "$s/sed.log")" "PAM-4: uninstall added no sed call"
+}
+
+# PAM-5: an unsupported distro never claims or edits the sudo PAM file.
+test_pam_5_unsupported_distro_no_sed() {
+    local s before
+    s="$(setup_pam_sandbox unsupported-distro)"
+    pam_write_initial_files "$s" exact none
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" plan9
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" plan9
+
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" "PAM-5: sudo PAM bytes unchanged"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-5: no manifest record"
+    assert_eq "" "$(cat "$s/sed.log")" "PAM-5: no sed call in either direction"
+}
+
+# PAM-6: DRY_RUN must create no record, no lock file and no sed side effect.
+test_pam_6_dry_run_no_side_effects() {
+    local s before
+    s="$(setup_pam_sandbox dry-run)"
+    pam_write_initial_files "$s" exact none
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        DRY_RUN=1 run_pam_install "$s" debian
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        DRY_RUN=1 run_pam_uninstall "$s" debian
+
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" "PAM-6: sudo PAM bytes unchanged"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-6: no manifest record"
+    assert_eq "" "$(cat "$s/sed.log")" "PAM-6: no sed call"
+    if [ -e "$s/manifest/.install-manifest.lock" ]; then
+        fail "PAM-6: no lock file may be created in dry-run"
+    else
+        ok
+    fi
+}
+
+# PAM-7: static source guard. The disable function body must contain no sed at
+# all, and the stubs must refuse a host PAM path if a seam is misconfigured.
+test_pam_7_disable_body_has_no_sed() {
+    local s body rc=0
+    body="$(sed -n '/^disable_pam_fingerprint()/,/^}/p' "$REPO_ROOT/lib/pam.sh")"
+    assert_not_contains "pam_fprintd.so/d" "$body" \
+        "PAM-7: disable_pam_fingerprint has no unconditional pam_fprintd sed"
+    assert_not_contains "sed -i" "$body" "PAM-7: disable_pam_fingerprint has no sed call"
+    assert_contains "_pam_sudo_post_rollback_check" "$body" \
+        "PAM-7: post-rollback check is called inside disable_pam_fingerprint"
+
+    s="$(setup_pam_sandbox seam-guard)"
+    PATH="$s/stub:$PATH" STUB_SED_LOG="$s/sed.log" \
+        sed -n 'p' /etc/pam.d/sudo > /dev/null 2>&1 || rc=$?
+    assert_eq "99" "$rc" "PAM-7: sed stub refuses a host PAM path (seam guard)"
+}
+
+# PAM-8 (Tier 2): Debian common-auth with a pre-existing fp line must be backed
+# up BEFORE pam-auth-update --remove, restored on rollback, and must not trigger
+# a second tool call on uninstall.
+test_pam_8_common_auth_tracked_and_no_uninstall_tool_call() {
+    local s sudo_before common_before sed_after_install tool_after_install
+    s="$(setup_pam_sandbox common-auth)"
+    pam_write_initial_files "$s" none fp
+    sudo_before="$(file_hex "$s/pam/sudo")"
+    common_before="$(file_hex "$s/pam/common-auth")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    sed_after_install="$(wc -l < "$s/sed.log")"
+    tool_after_install="$(cat "$s/tool.log")"
+
+    assert_eq "1" "$(printf '%s\n' "$tool_after_install" | grep -cF -- 'pam-auth-update --remove fprintd')" \
+        "PAM-8: one --remove tool call on install"
+    assert_eq "2" "$(pam_record_count "$s")" \
+        "PAM-8: common-auth and sudo both tracked for rollback"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-8: rollback rc 0"
+    assert_eq "$sudo_before" "$(file_hex "$s/pam/sudo")" "PAM-8: sudo PAM bytes restored"
+    assert_eq "$common_before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-8: common-auth bytes restored by rollback"
+    assert_eq "$tool_after_install" "$(cat "$s/tool.log")" \
+        "PAM-8: uninstall added no pam-auth-update call"
+    assert_eq "$sed_after_install" "$(wc -l < "$s/sed.log")" \
+        "PAM-8: uninstall added no sed call"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-8: manifest records consumed"
+}
+
+# Re-review #11 finding #2: original sudo/common PAM bytes must survive
+# fingerprint install -> uninstall (PAM-1..8).
+test_pam_1_preexisting_exact_line_survives
+test_pam_2_preexisting_other_fp_lines_survive
+test_pam_3_no_fp_line_roundtrip
+test_pam_4_failed_rollback_keeps_record_and_warns
+test_pam_5_unsupported_distro_no_sed
+test_pam_6_dry_run_no_side_effects
+test_pam_7_disable_body_has_no_sed
+test_pam_8_common_auth_tracked_and_no_uninstall_tool_call
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
