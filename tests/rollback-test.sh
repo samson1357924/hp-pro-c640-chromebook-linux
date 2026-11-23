@@ -73,6 +73,36 @@ json.dump({"version": "2.0", "records": json.loads(records),
 PY
 }
 
+# Fault injection for the #2 (atomic-replace) regressions: make ONLY the final
+# rollback stage->target os.replace() fail. `sudo` is stubbed with exec "$@" so
+# it does NOT strip PYTHONPATH; sitecustomize.py patches os.replace keyed on the
+# stage marker and destination, so the manifest write-back (whose src is a
+# plain *.tmp, not *.cros-rollback-tmp-*) still succeeds and the record is
+# retained. Every path stays under /tmp/rollback-test-*.
+setup_rollback_replace_fault_stub() {
+    local sandbox="$1"
+    mkdir -p "$sandbox/stub" "$sandbox/pyfault"
+    printf '#!/usr/bin/env bash\nexec "$@"\n' > "$sandbox/stub/sudo"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+exec /usr/bin/python3 "$@"
+EOF
+    cat > "$sandbox/pyfault/sitecustomize.py" << 'EOF'
+import os
+_real_replace = os.replace
+
+def _faulty_replace(src, dst, *args, **kwargs):
+    if (os.environ.get("STUB_FAIL_ROLLBACK_REPLACE") == "1"
+            and ".cros-rollback-tmp-" in str(src)
+            and str(dst) == os.environ.get("STUB_FAIL_REPLACE_TARGET", "")):
+        raise OSError(5, "injected EIO on rollback stage replace")
+    return _real_replace(src, dst, *args, **kwargs)
+
+os.replace = _faulty_replace
+EOF
+    chmod +x "$sandbox/stub/sudo" "$sandbox/stub/python3"
+}
+
 # Sandbox helper: run a backup.sh snippet with sandboxed dirs and an
 # extended ALLOWED_PREFIXES so targets under the sandbox stay in scope.
 run_sandboxed() {
@@ -3728,7 +3758,13 @@ test_uninstall_keeps_keyd_without_service_record() {
     write_keyd_manifest "$sandbox" '[]' 1
     : > "$sandbox/systemctl.log"
 
-    run_keyd_uninstall "$sandbox"
+    # The file record has was_existing=true but no backup, so the new
+    # RECORD_BACKUP_MISSING contract makes rollback (and thus uninstall) return
+    # 1. Guard the call or `set -e` would abort the whole suite here.
+    uninstall_rc=0
+    run_keyd_uninstall "$sandbox" || uninstall_rc=$?
+    assert_eq "1" "$uninstall_rc" \
+        "no-svc-record: uninstall propagates rollback rc 1 for a missing backup"
 
     local log
     log="$(cat "$sandbox/systemctl.log")"
@@ -4906,8 +4942,8 @@ test_rollback_absent_target_no_backup_keeps_record() {
         rc=0; rollback_component "demo" || rc=$?
         printf "%s\n" "$rc" > "$2/rollback-rc.txt"
     ' 2> "$sandbox/rollback.log"
-    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
-        "absent target + no backup: rollback rc 0 (historical semantics)"
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "absent target + no backup: rollback rc 1 (missing original is a failure)"
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
         ok
     else
@@ -4917,8 +4953,62 @@ test_rollback_absent_target_no_backup_keeps_record() {
         "absent target + no backup: record retained"
     assert_contains "[WARN NO BACKUP]" "$(cat "$sandbox/rollback.log")" \
         "absent target + no backup: warning emitted"
+    assert_contains "RECORD_BACKUP_MISSING" "$(cat "$sandbox/rollback.log")" \
+        "absent target + no backup: problem marker emitted"
+    assert_contains "ROLLBACK_INCOMPLETE: 1 item(s) retained" "$(cat "$sandbox/rollback.log")" \
+        "absent target + no backup: python reports incomplete"
+    assert_contains "rollback of demo failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo '')" \
+        "absent target + no backup: shell log_error emitted"
+    assert_not_contains "finished!" "$(cat "$sandbox/log.txt" 2> /dev/null || echo '')" \
+        "absent target + no backup: no success line"
     assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
         "absent target + no backup: no .tmp"
+}
+
+test_rollback_mixed_missing_backup_and_success() {
+    local sandbox="/tmp/rollback-test-mixed-no-backup"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local missing="$sandbox/etc/missing.conf"
+    local okfile="$sandbox/etc/ok.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    # Only the second record has a backup; the first one must be kept for retry.
+    mkdir -p "$sandbox/backups/$ts${okfile%/*}"
+    printf 'ORIGINAL-OK\n' > "$sandbox/backups/$ts$okfile"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$missing\",\"component\":\"demo\",\"was_existing\":true},{\"target\":\"$okfile\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "mixed: one missing backup makes the whole rollback non-zero"
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "mixed: only the missing-backup record is retained"
+    assert_contains "$missing" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["records"][0]["target"])' "$manifest")" \
+        "mixed: retained record is the missing-backup one"
+    assert_eq "ORIGINAL-OK" "$(cat "$okfile" 2> /dev/null || echo MISSING)" \
+        "mixed: the backed-up record still restored normally"
+    if [ ! -e "$missing" ] && [ ! -L "$missing" ]; then
+        ok
+    else
+        fail "mixed: no file invented for the missing-backup record"
+    fi
+    local marker_line
+    marker_line="$(grep -F 'RECORD_BACKUP_MISSING' "$sandbox/rollback.log" || true)"
+    assert_contains "target=$missing" "$marker_line" \
+        "mixed: backup-missing marker names the failed record"
+    assert_not_contains "target=$okfile" "$marker_line" \
+        "mixed: the restored record is not marked as backup-missing"
+    assert_contains "RESTORED PREVIOUS BACKUP" "$(cat "$sandbox/rollback.log")" \
+        "mixed: successful restore still logged"
+    assert_contains "ROLLBACK_INCOMPLETE: 1 item(s) retained" "$(cat "$sandbox/rollback.log")" \
+        "mixed: incomplete count is one"
+    assert_not_contains "finished!" "$(cat "$sandbox/log.txt" 2> /dev/null || echo '')" \
+        "mixed: no success line"
 }
 
 test_rollback_absent_target_was_existing_false_is_safe_noop() {
@@ -4971,6 +5061,225 @@ test_rollback_absent_target_restore_failure_keeps_record() {
         "restore failure: warning marker emitted"
     assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
         "restore failure: no staged copy left behind"
+}
+
+# ---------------------------------------------------------------------------
+# 42b. P2 DATA SAFETY: a failed final swap must never unlink the installed
+#      target. Ordinary file/symlink swaps are a single atomic os.replace();
+#      directory-involving swaps move the old entry aside and move it back on
+#      failure. R1/R2 inject a failure; R3-R6 cover the success paths,
+#      including the file<-dir cross-type case that a minimal patch breaks.
+# ---------------------------------------------------------------------------
+
+test_rollback_replace_failure_keeps_installed_file() {
+    local sandbox="/tmp/rollback-test-replace-fail-file"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    mkdir -p "$sandbox/backups/$ts${file%/*}"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$file"
+    printf 'INSTALLED\n' > "$file"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+    setup_rollback_replace_fault_stub "$sandbox"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" PYTHONPATH="$2/pyfault" \
+               STUB_FAIL_ROLLBACK_REPLACE=1 STUB_FAIL_REPLACE_TARGET="$2/etc/demo.conf"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R1 rc 1"
+    assert_eq "INSTALLED" "$(cat "$file" 2> /dev/null || echo MISSING)" \
+        "R1 installed config still intact with original bytes"
+    assert_eq "ORIGINAL" "$(cat "$sandbox/backups/$ts$file")" \
+        "R1 backup intact"
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "R1 record retained"
+    assert_contains "RECORD_RESTORE_FAILED" "$(cat "$sandbox/rollback.log")" \
+        "R1 record-restore-failed marker"
+    assert_contains "ROLLBACK_INCOMPLETE" "$(cat "$sandbox/rollback.log")" \
+        "R1 python incomplete marker"
+    assert_contains "rollback of demo failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo '')" \
+        "R1 shell log_error"
+    assert_not_contains "finished!" "$(cat "$sandbox/log.txt" 2> /dev/null || echo '')" \
+        "R1 no success line"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "R1 stage cleaned"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-old-*' | wc -l | tr -d '[:space:]')" \
+        "R1 no old aside residue"
+}
+
+test_rollback_replace_failure_keeps_installed_symlink() {
+    local sandbox="/tmp/rollback-test-replace-fail-symlink"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local link="$sandbox/etc/liblink"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    printf 'ORIGINAL\n' > "$sandbox/etc/cros.conf"
+    printf 'INSTALLED\n' > "$sandbox/etc/installed.conf"
+    mkdir -p "$sandbox/backups/$ts${link%/*}"
+    ln -s cros.conf "$sandbox/backups/$ts$link"
+    ln -s installed.conf "$link"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$link\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+    setup_rollback_replace_fault_stub "$sandbox"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" PYTHONPATH="$2/pyfault" \
+               STUB_FAIL_ROLLBACK_REPLACE=1 STUB_FAIL_REPLACE_TARGET="$2/etc/liblink"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R2 rc 1"
+    if [ -L "$link" ]; then ok; else fail "R2 installed symlink still exists"; fi
+    assert_eq "installed.conf" "$(readlink "$link" 2> /dev/null || echo MISSING)" \
+        "R2 symlink target unchanged"
+    assert_eq "INSTALLED" "$(cat "$sandbox/etc/installed.conf" 2> /dev/null || echo MISSING)" \
+        "R2 referent bytes untouched"
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "R2 record retained"
+    assert_contains "RECORD_RESTORE_FAILED" "$(cat "$sandbox/rollback.log")" \
+        "R2 record-restore-failed marker"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "R2 stage cleaned"
+}
+
+test_rollback_replace_success_regular_file() {
+    local sandbox="/tmp/rollback-test-replace-ok-file"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    mkdir -p "$sandbox/backups/$ts${file%/*}"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$file"
+    printf 'INSTALLED\n' > "$file"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R3 rc 0"
+    assert_eq "ORIGINAL" "$(cat "$file" 2> /dev/null || echo MISSING)" \
+        "R3 installed file replaced with original"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "R3 record consumed after success"
+    assert_contains "[RESTORED PREVIOUS BACKUP]" "$(cat "$sandbox/rollback.log")" \
+        "R3 restore log emitted"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "R3 stage cleaned"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-old-*' | wc -l | tr -d '[:space:]')" \
+        "R3 no old aside residue"
+}
+
+test_rollback_replace_success_directory() {
+    local sandbox="/tmp/rollback-test-replace-ok-dir"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local dir="$sandbox/etc/conf.d"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    mkdir -p "$sandbox/backups/$ts$dir" "$dir"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$dir/orig.txt"
+    printf 'INSTALLED\n' > "$dir/installed.txt"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$dir\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R4 rc 0"
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then ok; else fail "R4 target still a directory"; fi
+    assert_eq "ORIGINAL" "$(cat "$dir/orig.txt" 2> /dev/null || echo MISSING)" \
+        "R4 original directory content restored"
+    if [ ! -e "$dir/installed.txt" ]; then ok; else fail "R4 installed content removed"; fi
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "R4 record consumed"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-old-*' | wc -l | tr -d '[:space:]')" \
+        "R4 old aside cleaned"
+}
+
+test_rollback_replace_failure_restores_directory() {
+    local sandbox="/tmp/rollback-test-replace-fail-dir"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local dir="$sandbox/etc/conf.d"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    mkdir -p "$sandbox/backups/$ts$dir" "$dir"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$dir/orig.txt"
+    printf 'INSTALLED\n' > "$dir/installed.txt"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$dir\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+    setup_rollback_replace_fault_stub "$sandbox"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" PYTHONPATH="$2/pyfault" \
+               STUB_FAIL_ROLLBACK_REPLACE=1 STUB_FAIL_REPLACE_TARGET="$2/etc/conf.d"
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "1" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R5 rc 1"
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then ok; else fail "R5 target still a directory"; fi
+    assert_eq "INSTALLED" "$(cat "$dir/installed.txt" 2> /dev/null || echo MISSING)" \
+        "R5 installed directory content intact"
+    if [ ! -e "$dir/orig.txt" ]; then ok; else fail "R5 original content not partially applied"; fi
+    assert_eq "1" "$(manifest_count "$manifest" records)" \
+        "R5 record retained"
+    assert_contains "RECORD_RESTORE_FAILED" "$(cat "$sandbox/rollback.log")" \
+        "R5 record-restore-failed marker"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-old-*' | wc -l | tr -d '[:space:]')" \
+        "R5 old aside rolled back"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "R5 stage cleaned"
+}
+
+test_rollback_replace_directory_backup_over_file() {
+    local sandbox="/tmp/rollback-test-replace-dir-over-file"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/etc"
+    local file="$sandbox/etc/demo.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local ts="20260101_000000000000000"
+    mkdir -p "$sandbox/backups/$ts$file"
+    printf 'ORIGINAL\n' > "$sandbox/backups/$ts$file/orig.txt"
+    printf 'INSTALLED\n' > "$file"
+    printf '%s' "{\"version\":\"2.0\",\"records\":[{\"target\":\"$file\",\"component\":\"demo\",\"was_existing\":true}],\"services\":[],\"groups\":[]}" > "$manifest"
+
+    run_sandboxed "$sandbox" '
+        source "$1/lib/backup.sh"
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback-rc.txt"
+    ' > "$sandbox/rollback.log" 2>&1
+
+    assert_eq "0" "$(cat "$sandbox/rollback-rc.txt" 2> /dev/null || echo MISSING)" \
+        "R6 rc 0"
+    if [ -d "$file" ] && [ ! -L "$file" ]; then ok; else fail "R6 target became a directory"; fi
+    assert_eq "ORIGINAL" "$(cat "$file/orig.txt" 2> /dev/null || echo MISSING)" \
+        "R6 original directory content restored"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "R6 record consumed"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-old-*' | wc -l | tr -d '[:space:]')" \
+        "R6 old file aside removed (remove_path, not rmtree)"
+    assert_eq "0" "$(find "$sandbox" -name '*.cros-rollback-tmp-*' | wc -l | tr -d '[:space:]')" \
+        "R6 stage cleaned"
 }
 
 # ---------------------------------------------------------------------------
@@ -5553,8 +5862,16 @@ test_rollback_python_unknown_state_is_fail_closed_without_validator
 test_rollback_absent_target_restores_first_backup_file
 test_rollback_absent_target_restores_first_backup_symlink
 test_rollback_absent_target_no_backup_keeps_record
+test_rollback_mixed_missing_backup_and_success
 test_rollback_absent_target_was_existing_false_is_safe_noop
 test_rollback_absent_target_restore_failure_keeps_record
+# P2 DATA SAFETY: failed final swap must not unlink the installed target
+test_rollback_replace_failure_keeps_installed_file
+test_rollback_replace_failure_keeps_installed_symlink
+test_rollback_replace_success_regular_file
+test_rollback_replace_success_directory
+test_rollback_replace_failure_restores_directory
+test_rollback_replace_directory_backup_over_file
 # Finding #3: systemctl failures keep records and report non-zero
 test_rollback_systemctl_failure_keeps_record
 test_rollback_systemctl_failure_retry_consumes_record

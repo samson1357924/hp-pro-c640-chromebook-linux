@@ -859,8 +859,15 @@ def remove_path(path):
         return str(exc)
 
 def restore_original(target, backup):
-    """Stage next to the target, then swap atomically. Return None on success."""
+    """Stage next to the target, then swap atomically. Return None on success.
+
+    A failed swap NEVER removes an existing target: the ordinary file/symlink
+    path is a single os.replace(); only directory-involving swaps move the old
+    path aside (and move it back on failure), because os.replace() cannot
+    replace a non-empty dir nor cross the file <-> directory type boundary.
+    """
     stage = target + ".cros-rollback-tmp-%d" % os.getpid()
+    old = None
     try:
         parent = os.path.dirname(target)
         if parent and not os.path.isdir(parent):
@@ -883,21 +890,25 @@ def restore_original(target, backup):
         except (OSError, NotImplementedError):
             pass
 
-        if os.path.isdir(target) and not os.path.islink(target):
-            # os.replace() cannot overwrite a non-empty directory: move the
-            # old one aside first and put it back if the swap fails.
+        # A directory stage cannot replace an existing non-directory (ENOTDIR),
+        # and a non-directory stage cannot replace a directory (EISDIR); a dir
+        # stage also cannot replace a non-empty dir (ENOTEMPTY). Move the old
+        # entry aside ONLY for those cases. Regular file / symlink -> regular
+        # file / symlink stays a single atomic replace with NO unlink window.
+        stage_is_dir = os.path.isdir(stage) and not os.path.islink(stage)
+        target_is_dir = os.path.isdir(target) and not os.path.islink(target)
+        if (stage_is_dir or target_is_dir) and os.path.lexists(target):
             old = target + ".cros-rollback-old-%d" % os.getpid()
             os.rename(target, old)
-            try:
-                os.replace(stage, target)
-            except OSError:
-                os.rename(old, target)
-                raise
-            shutil.rmtree(old, ignore_errors=True)
-        else:
-            if os.path.lexists(target):
-                os.remove(target)
+        try:
             os.replace(stage, target)
+        except OSError:
+            if old is not None:
+                os.rename(old, target)   # put the installed entry back
+                old = None
+            raise
+        if old is not None:
+            remove_path(old)             # best effort; handles file/link/dir alike
         return None
     except OSError as exc:
         try:
@@ -938,10 +949,15 @@ for rec in records:
         # original must still be restored from the first backup (finding #2).
         backup = find_first_backup(target)
         if backup is None:
-            # Keep the record for a later retry, but do NOT invent a file and
-            # do NOT fail the whole rollback (matches the historical rc=0).
+            # Keep the record for a later retry, but do NOT invent a file.
+            # This is a real failure: report it via problem() so the single
+            # write-back still happens and the final rc is non-zero, while
+            # other services/files keep rolling back normally.
             print("  [WARN NO BACKUP] %s: original unavailable; record kept" %
                   target, file=sys.stderr)
+            problem("RECORD_BACKUP_MISSING",
+                    "target=%s component=%s backup_base=%s; original unavailable; record kept" %
+                    (target, comp, backup_base))
             remaining_records.append(rec)
             continue
         err = restore_original(target, backup)
