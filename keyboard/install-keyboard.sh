@@ -662,9 +662,16 @@ _normalize_keyd_link_manifest_component() {
         return 0
     fi
 
+    # This is the SIXTH manifest writer (direct json.load + os.replace), so it
+    # must share the exact same cross-process lock as lib/backup.sh's writers.
+    # python re-reads the manifest under the lock, so it never backfills a
+    # stale snapshot. Failure remains a no-op + warn (rc 0) by design.
+    if ! manifest_lock; then
+        log_warn "Could not lock the manifest; skipping component backfill on legacy $KEYD_LINK record"
+        return 0
+    fi
     local updated
-    if ! updated="$(sudo python3 -c '
-import json, sys, os
+    if ! updated="$(sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
 
 manifest_path, target, component = sys.argv[1:4]
 try:
@@ -681,18 +688,15 @@ for record in data.get("records", []):
     changed += 1
 
 if changed:
-    tmp = manifest_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, manifest_path)
+    atomic_write_json(manifest_path, data)
 print(changed)
 ' "$MANIFEST_FILE" "$KEYD_LINK" "keyboard" 2> /dev/null)"; then
         log_warn "Failed to backfill component on legacy $KEYD_LINK manifest record; rollback may not restore the original symlink"
-        return 0
-    fi
-    if [ "${updated:-0}" != "0" ]; then
+    elif [ "${updated:-0}" != "0" ]; then
         log_info "Backfilled component=keyboard on $updated legacy manifest record(s) for $KEYD_LINK"
     fi
+    manifest_unlock
+    return 0
 }
 
 # Single authority for the optional keyd step. Validation runs against the

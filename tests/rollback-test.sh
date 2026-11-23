@@ -73,6 +73,92 @@ json.dump({"version": "2.0", "records": json.loads(records),
 PY
 }
 
+# ---------------------------------------------------------------------------
+# Infrastructure for the re-review #9 finding #1 (cross-process manifest lock)
+# concurrency tests. Each case uses its OWN mktemp -d sandbox and FIFO
+# rendezvous, so no fixed /tmp path can collide with the legacy cases.
+# ---------------------------------------------------------------------------
+LOCK_TEST_SANDBOXES=()
+cleanup_lock_test_sandboxes() {
+    local s
+    for s in "${LOCK_TEST_SANDBOXES[@]}"; do
+        [ -n "$s" ] && rm -rf -- "$s"
+    done
+}
+trap cleanup_lock_test_sandboxes EXIT
+
+make_manifest_lock_sandbox() {
+    # $1=short name; echoes a fresh absolute path and registers it for cleanup.
+    local s
+    s="$(mktemp -d "/tmp/rollback-test-lock-$1-XXXXXX")"
+    mkdir -p "$s/manifest" "$s/backups" "$s/stub" "$s/root" "$s/snapshots"
+    # sudo execs directly: PATH / PYTHONPATH / STUB_* reach the python writers,
+    # so the Phase 1 sitecustomize os.replace fault stub still works with the
+    # lock in place. (No `sudo -u` / `env -i` anywhere in the lock helpers.)
+    printf '#!/usr/bin/env bash\n[ "${1:-}" = "-u" ] && shift 2\nexec "$@"\n' > "$s/stub/sudo"
+    # Delay ONLY real writers (python argc>=6); validator/probe calls (argc 3/5)
+    # pass through. This widens the old stale-snapshot window so the pre-lock
+    # code loses a record deterministically, while the locked code merely
+    # serialises: the second writer waits, re-reads and keeps both records.
+    cat > "$s/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ] && [ -n "${STUB_MANIFEST_WRITE_DELAY:-}" ]; then
+    sleep "$STUB_MANIFEST_WRITE_DELAY"
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$s/stub/sudo" "$s/stub/python3"
+    LOCK_TEST_SANDBOXES+=("$s")
+    printf '%s\n' "$s"
+}
+
+manifest_lock_barrier_init() {
+    # Two FIFOs opened read-write by workers, so neither open() blocks.
+    mkfifo "$1/ready" "$1/go"
+}
+
+barrier_release() {
+    # $1=sandbox $2=worker count. Bounded reads keep a stuck worker from
+    # hanging CI; a timeout simply makes the assertions fail instead.
+    local s="$1" n="$2" i
+    for ((i = 0; i < n; i++)); do
+        if ! read -r -t 20 _ < "$s/ready"; then
+            echo "WARN: barrier ready timed out ($i/$n)" >&2
+            break
+        fi
+    done
+    for ((i = 0; i < n; i++)); do
+        printf 'g\n' > "$s/go" || break
+    done
+}
+
+worker_wait_pid() {
+    # $1=pid — bound `wait` so a deadlocked worker cannot hang the suite.
+    local pid="$1" i=0
+    while kill -0 "$pid" 2> /dev/null && [ "$i" -lt 300 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2> /dev/null; then
+        kill -9 "$pid" 2> /dev/null || true
+    fi
+    wait "$pid" 2> /dev/null || true
+}
+
+# Worker body used by T1/T7: synchronise at the barrier, then install one
+# target. `$3` is the target/component supplied via run_sandboxed.
+LOCK_INSTALL_WORKER='
+    export PATH="$2/stub:$PATH"
+    source "$1/lib/backup.sh"
+    exec 3<>"$2/ready" 4<>"$2/go"
+    printf "r\n" >&3
+    read -r _ <&4
+    rc=0
+    backup_file_manifest_aware "$2/root/$3.conf" "$3" || rc=$?
+    printf "%s\n" "$rc" > "$2/$3.rc"
+    exit 0
+'
+
 # Fault injection for the #2 (atomic-replace) regressions: make ONLY the final
 # rollback stage->target os.replace() fail. `sudo` is stubbed with exec "$@" so
 # it does NOT strip PYTHONPATH; sitecustomize.py patches os.replace keyed on the
@@ -5597,6 +5683,450 @@ test_rollback_all_success_consumes_services_and_records() {
 }
 
 # ---------------------------------------------------------------------------
+# 45. Re-review #9 finding #1: the global manifest is a shared read-modify-write
+#     resource. T1/T2/T7/T8 use a FIFO barrier + delayed python writers so the
+#     PRE-lock code loses a record deterministically; with the lock the second
+#     writer waits, re-reads inside the lock and keeps every record.
+# ---------------------------------------------------------------------------
+
+test_lock_concurrent_writers_keep_both_records() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t1)"
+    manifest_lock_barrier_init "$sandbox"
+    printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+    printf 'ORIGINAL KEYBOARD\n' > "$sandbox/root/keyboard.conf"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    export STUB_MANIFEST_WRITE_DELAY=0.4
+
+    run_sandboxed "$sandbox" "$LOCK_INSTALL_WORKER" audio &
+    local pa=$!
+    run_sandboxed "$sandbox" "$LOCK_INSTALL_WORKER" keyboard &
+    local pk=$!
+    barrier_release "$sandbox" 2
+    worker_wait_pid "$pa"
+    worker_wait_pid "$pk"
+    unset STUB_MANIFEST_WRITE_DELAY
+
+    assert_eq "0" "$(cat "$sandbox/audio.rc" 2> /dev/null || echo MISSING)" "LOCK T1: audio rc 0"
+    assert_eq "0" "$(cat "$sandbox/keyboard.rc" 2> /dev/null || echo MISSING)" "LOCK T1: keyboard rc 0"
+    assert_eq "2" "$(manifest_count "$manifest" records)" "LOCK T1: both records survive"
+    assert_eq "audio keyboard" \
+        "$(python3 -c 'import json,sys; print(" ".join(sorted(r["component"] for r in json.load(open(sys.argv[1]))["records"])))' "$manifest")" \
+        "LOCK T1: both components recorded"
+    assert_eq "2" "$(find "$sandbox/backups" -type f | wc -l | tr -d '[:space:]')" \
+        "LOCK T1: both first-wins backups kept"
+    if grep -rq 'ORIGINAL AUDIO' "$sandbox/backups" && grep -rq 'ORIGINAL KEYBOARD' "$sandbox/backups"; then
+        ok
+    else
+        fail "LOCK T1: both original backups kept byte-for-byte"
+    fi
+    assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T1: no unique temp residue"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T1: no .tmp residue"
+    local lock="$sandbox/manifest/.install-manifest.lock"
+    assert_eq "root" "$(stat -c '%U' "$lock" 2> /dev/null || echo MISSING)" "LOCK T1: lock root-owned"
+    assert_eq "644" "$(stat -c '%a' "$lock" 2> /dev/null || echo MISSING)" "LOCK T1: lock mode 0644"
+}
+
+test_lock_concurrent_install_and_rollback_preserves_records() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t2)"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'ORIGINAL DEMO\n' > "$sandbox/root/demo.conf"
+    # Natural first backup + record (no delay active yet).
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        backup_file_manifest_aware "$2/root/demo.conf" demo
+    '
+    printf 'INSTALLED DEMO\n' > "$sandbox/root/demo.conf"
+    printf 'INSTALLED OTHER\n' > "$sandbox/root/other.conf"
+    manifest_lock_barrier_init "$sandbox"
+    export STUB_MANIFEST_WRITE_DELAY=0.3
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        exec 3<>"$2/ready" 4<>"$2/go"
+        printf "r\n" >&3; read -r _ <&4
+        rc=0; backup_file_manifest_aware "$2/root/other.conf" other || rc=$?
+        printf "%s\n" "$rc" > "$2/install.rc"; exit 0
+    ' other &
+    local pi=$!
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        exec 3<>"$2/ready" 4<>"$2/go"
+        printf "r\n" >&3; read -r _ <&4
+        rc=0; rollback_component "demo" || rc=$?
+        printf "%s\n" "$rc" > "$2/rollback.rc"; exit 0
+    ' demo &
+    local pr=$!
+    barrier_release "$sandbox" 2
+    worker_wait_pid "$pi"
+    worker_wait_pid "$pr"
+    unset STUB_MANIFEST_WRITE_DELAY
+
+    assert_eq "0" "$(cat "$sandbox/install.rc" 2> /dev/null || echo MISSING)" "LOCK T2: install rc 0"
+    assert_eq "0" "$(cat "$sandbox/rollback.rc" 2> /dev/null || echo MISSING)" "LOCK T2: rollback rc 0"
+    assert_eq "1" "$(manifest_count "$manifest" records)" "LOCK T2: exactly one record left"
+    assert_eq "other" \
+        "$(python3 -c 'import json,sys; print(" ".join(r["component"] for r in json.load(open(sys.argv[1]))["records"]))' "$manifest")" \
+        "LOCK T2: only the newly installed record remains (demo consumed)"
+    assert_eq "ORIGINAL DEMO" "$(cat "$sandbox/root/demo.conf" 2> /dev/null || echo MISSING)" \
+        "LOCK T2: demo restored from its original backup"
+    assert_eq "INSTALLED OTHER" "$(cat "$sandbox/root/other.conf" 2> /dev/null || echo MISSING)" \
+        "LOCK T2: other target not partially restored"
+    if grep -rq 'INSTALLED OTHER' "$sandbox/backups"; then
+        ok
+    else
+        fail "LOCK T2: other's backup kept"
+    fi
+    assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T2: no unique temp residue"
+}
+
+test_lock_writers_use_unique_temp() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t3)"
+    local mp="$sandbox/manifest/install-manifest.json"
+    local oldtmp="$sandbox/manifest/install-manifest.json.tmp"
+    mkdir -p "$oldtmp"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/stub/systemctl"
+    chmod +x "$sandbox/stub/systemctl"
+    printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+
+    local backup_writer='
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0
+        case "$3" in
+            add_entry)    manifest_add_entry "$2/root/audio.conf" audio 0 || rc=$? ;;
+            add_service)  manifest_add_service "demo.service" demo || rc=$? ;;
+            add_group)    manifest_add_group plugdev testuser demo 0 || rc=$? ;;
+            remove_group) manifest_remove_group plugdev testuser demo || rc=$? ;;
+            rollback)     rollback_component demo || rc=$? ;;
+        esac
+        printf "%s\n" "$rc" > "$2/$3.rc"
+    '
+    local normalize_writer='
+        export PATH="$2/stub:$PATH"
+        source "$2/install-keyboard-sandbox.sh"
+        _normalize_keyd_link_manifest_component
+        printf "0\n" > "$2/normalize.rc"
+    '
+    prepare_keyd_sandbox_script "$sandbox"
+
+    local case_name
+    for case_name in add_entry add_service add_group remove_group rollback normalize; do
+        python3 - "$mp" << 'PY'
+import json, sys
+json.dump({"version": "2.0", "records": [], "services": [], "groups": []},
+          open(sys.argv[1], "w"), indent=2)
+PY
+        case "$case_name" in
+            remove_group)
+                python3 - "$mp" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["groups"].append({"group": "plugdev", "user": "testuser",
+                    "component": "demo", "was_member": False})
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+                ;;
+            rollback)
+                python3 - "$mp" "$sandbox/root/gone.conf" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["records"].append({"target": sys.argv[2], "component": "demo",
+                     "was_existing": False})
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+                ;;
+            normalize)
+                python3 - "$mp" "$sandbox/etc/keyd/default.conf" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["records"].append({"target": sys.argv[2], "was_existing": True})
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+                ;;
+        esac
+        local rcfile="$sandbox/$case_name.rc"
+        if [ "$case_name" = normalize ]; then
+            run_sandboxed "$sandbox" "$normalize_writer"
+        else
+            run_sandboxed "$sandbox" "$backup_writer" "$case_name"
+        fi
+        assert_eq "0" "$(cat "$rcfile" 2> /dev/null || echo MISSING)" \
+            "[LOCK T3] $case_name: rc 0 despite occupied old .tmp path"
+        assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+            "[LOCK T3] $case_name: no unique temp residue"
+        case "$case_name" in
+            add_entry) assert_eq "1" "$(manifest_count "$mp" records)" "[LOCK T3] add_entry: record written" ;;
+            add_service) assert_eq "1" "$(manifest_count "$mp" services)" "[LOCK T3] add_service: record written" ;;
+            add_group) assert_eq "1" "$(manifest_count "$mp" groups)" "[LOCK T3] add_group: record written" ;;
+            remove_group) assert_eq "0" "$(manifest_count "$mp" groups)" "[LOCK T3] remove_group: record removed" ;;
+            rollback) assert_eq "0" "$(manifest_count "$mp" records)" "[LOCK T3] rollback: record consumed" ;;
+            normalize) assert_eq "keyboard" \
+                "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["records"][0].get("component",""))' "$mp")" \
+                "[LOCK T3] normalize: component backfilled" ;;
+        esac
+    done
+    if [ -d "$oldtmp" ]; then
+        ok
+    else
+        fail "LOCK T3: the old fixed .tmp directory must be left untouched"
+    fi
+    assert_eq "0" "$(find "$sandbox/manifest" -name '*.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T3: no unique temp anywhere"
+}
+
+test_lock_nested_no_deadlock() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t4)"
+    printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+
+    # (a) Direct nesting: depth counts, single fd, fully released at the end.
+    run_sandboxed "$sandbox" '
+        export CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        manifest_lock || { printf "lock1-failed\n" > "$2/direct.rc"; exit 0; }
+        manifest_lock || { printf "lock2-failed\n" > "$2/direct.rc"; exit 0; }
+        printf "depth-inner=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/depth-inner.txt"
+        manifest_unlock
+        manifest_unlock
+        if : <&9 2> /dev/null; then printf "fd-open\n" > "$2/fd.txt"; else printf "fd-closed\n" > "$2/fd.txt"; fi
+        printf "depth=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/depth.txt"
+        printf "ok\n" > "$2/direct.rc"
+    '
+    assert_eq "ok" "$(cat "$sandbox/direct.rc" 2> /dev/null || echo MISSING)" "LOCK T4: direct nested lock rc ok"
+    assert_eq "depth-inner=2" "$(cat "$sandbox/depth-inner.txt" 2> /dev/null || echo MISSING)" \
+        "LOCK T4: reentrant lock increments depth (no silent unlock via fd reopen)"
+    assert_eq "fd-closed" "$(cat "$sandbox/fd.txt" 2> /dev/null || echo MISSING)" "LOCK T4: fd 9 closed after balanced unlocks"
+    assert_eq "depth=0" "$(cat "$sandbox/depth.txt" 2> /dev/null || echo MISSING)" "LOCK T4: depth back to zero"
+
+    # (b) Public gate -> manifest_add_entry (two levels).
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        rc=0; backup_file_manifest_aware "$2/root/audio.conf" audio || rc=$?
+        printf "%s\n" "$rc" > "$2/gate.rc"
+        printf "depth=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/gate-depth.txt"
+    '
+    assert_eq "0" "$(cat "$sandbox/gate.rc" 2> /dev/null || echo MISSING)" "LOCK T4: nested gate rc 0"
+    assert_eq "depth=0" "$(cat "$sandbox/gate-depth.txt" 2> /dev/null || echo MISSING)" "LOCK T4: nested gate leaves depth 0"
+
+    # (c) ensure_group_membership -> has_group/add_group/remove_group (three
+    #     levels) on the usermod-failure cleanup path.
+    setup_group_fault_stubs "$sandbox"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log" STUB_USERMOD_RC=1 STUB_USER_IN_PLUGDEV=0 \
+            CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=2
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser demo || rc=$?
+        printf "%s\n" "$rc" > "$2/group.rc"
+        printf "depth=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/group-depth.txt"
+    '
+    assert_eq "1" "$(cat "$sandbox/group.rc" 2> /dev/null || echo MISSING)" \
+        "LOCK T4: nested group helpers complete (usermod failure rc 1)"
+    assert_eq "depth=0" "$(cat "$sandbox/group-depth.txt" 2> /dev/null || echo MISSING)" "LOCK T4: nested group depth 0"
+    assert_eq "0" "$(manifest_count "$sandbox/manifest/install-manifest.json" groups)" \
+        "LOCK T4: failed group record rolled back"
+    assert_not_contains "Manifest lock wait failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "LOCK T4: no self-deadlock / lock wait failure"
+}
+
+test_lock_timeout_fails_closed() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t5)"
+    local lock="$sandbox/manifest/.install-manifest.lock"
+    local mp="$sandbox/manifest/install-manifest.json"
+    : > "$lock"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' > "$mp"
+    local before
+    before="$(file_hex "$mp")"
+    printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+
+    # A separate process holds the lock; fd 9 is its own, not ours.
+    (
+        exec 9< "$lock"
+        flock -x 9
+        : > "$sandbox/held"
+        sleep 5
+    ) &
+    local holder=$!
+    local i=0
+    while [ ! -e "$sandbox/held" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$sandbox/held" ]; then ok; else fail "LOCK T5: holder never acquired lock"; fi
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=1
+        source "$1/lib/backup.sh"
+        rc=0; manifest_add_entry "$2/root/audio.conf" audio 0 || rc=$?
+        printf "%s\n" "$rc" > "$2/timeout.rc"
+    '
+    assert_eq "1" "$(cat "$sandbox/timeout.rc" 2> /dev/null || echo MISSING)" "LOCK T5: timeout rc 1 (fail closed)"
+    assert_contains "Manifest lock wait failed" "$(cat "$sandbox/log.txt" 2> /dev/null || echo "")" \
+        "LOCK T5: timeout diagnostic logged"
+    assert_eq "$before" "$(file_hex "$mp")" "LOCK T5: manifest bytes unchanged"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T5: no temp residue on fail-closed path"
+    kill "$holder" 2> /dev/null || true
+    worker_wait_pid "$holder"
+
+    # A flock stub that always fails must also fail closed.
+    cat > "$sandbox/stub/flock" << 'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$sandbox/stub/flock"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_add_entry "$2/root/audio.conf" audio 0 || rc=$?
+        printf "%s\n" "$rc" > "$2/stubflock.rc"
+    '
+    assert_eq "1" "$(cat "$sandbox/stubflock.rc" 2> /dev/null || echo MISSING)" "LOCK T5: broken flock rc 1"
+    assert_eq "$before" "$(file_hex "$mp")" "LOCK T5: broken flock leaves manifest unchanged"
+    rm -f "$sandbox/stub/flock"
+}
+
+test_lock_dryrun_and_no_python3_untouched() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t6)"
+    local mp="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' > "$mp"
+    printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" DRY_RUN=1 STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        for fn in add_entry add_service add_group remove_group ensure_group remove_group_membership backup_gate rollback; do
+            rc=0
+            case "$fn" in
+                add_entry)            manifest_add_entry "$2/root/audio.conf" audio 0 || rc=$? ;;
+                add_service)          manifest_add_service demo.service demo || rc=$? ;;
+                add_group)            manifest_add_group plugdev testuser demo 0 || rc=$? ;;
+                remove_group)         manifest_remove_group plugdev testuser demo || rc=$? ;;
+                ensure_group)         ensure_group_membership plugdev testuser demo || rc=$? ;;
+                remove_group_membership) remove_group_membership plugdev testuser demo || rc=$? ;;
+                backup_gate)          backup_file_manifest_aware "$2/root/audio.conf" audio || rc=$? ;;
+                rollback)             rollback_component demo || rc=$? ;;
+            esac
+            printf "%s\n" "$rc" > "$2/dry-$fn.rc"
+        done
+    '
+    local fn
+    for fn in add_entry add_service add_group remove_group ensure_group remove_group_membership backup_gate rollback; do
+        assert_eq "0" "$(cat "$sandbox/dry-$fn.rc" 2> /dev/null || echo MISSING)" \
+            "LOCK T6: dry-run $fn rc 0"
+    done
+    if [ -e "$sandbox/manifest/.install-manifest.lock" ]; then
+        fail "LOCK T6: dry-run must not create a lock file"
+    else
+        ok
+    fi
+
+    # The lock itself must not depend on python3 at all.
+    mkdir -p "$sandbox/failbin"
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$sandbox/failbin/python3"
+    chmod +x "$sandbox/failbin/python3"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/failbin:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_lock || rc=$?
+        if [ "$rc" -eq 0 ]; then manifest_unlock; fi
+        printf "%s\n" "$rc" > "$2/lock-nopy.rc"
+        printf "depth=%s\n" "$MANIFEST_LOCK_DEPTH" > "$2/lock-nopy-depth.txt"
+    '
+    assert_eq "0" "$(cat "$sandbox/lock-nopy.rc" 2> /dev/null || echo MISSING)" "LOCK T6: lock works without python3"
+    assert_eq "depth=0" "$(cat "$sandbox/lock-nopy-depth.txt" 2> /dev/null || echo MISSING)" "LOCK T6: depth released without python3"
+}
+
+test_lock_high_contention_all_records_survive() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t7)"
+    manifest_lock_barrier_init "$sandbox"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    local names="t0 t1 t2 t3 t4 t5 t6 t7" name
+    for name in $names; do
+        printf 'ORIGINAL %s\n' "$name" > "$sandbox/root/$name.conf"
+    done
+    export STUB_MANIFEST_WRITE_DELAY=0.15
+    local pids=()
+    for name in $names; do
+        run_sandboxed "$sandbox" "$LOCK_INSTALL_WORKER" "$name" &
+        pids+=("$!")
+    done
+    barrier_release "$sandbox" 8
+    local pid
+    for pid in "${pids[@]}"; do
+        worker_wait_pid "$pid"
+    done
+    unset STUB_MANIFEST_WRITE_DELAY
+
+    assert_eq "8" "$(manifest_count "$manifest" records)" "LOCK T7: all 8 records survive"
+    assert_eq "8" "$(find "$sandbox/backups" -type f | wc -l | tr -d '[:space:]')" "LOCK T7: all 8 backups kept"
+    assert_eq "8" \
+        "$(for name in $names; do cat "$sandbox/$name.rc" 2> /dev/null || echo MISSING; done | grep -c '^0$')" \
+        "LOCK T7: all 8 workers rc 0"
+    assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T7: no unique temp residue"
+}
+
+test_lock_same_target_first_backup_wins() {
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox t8)"
+    manifest_lock_barrier_init "$sandbox"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    printf 'ORIGINAL SAME\n' > "$sandbox/root/same.conf"
+    export STUB_MANIFEST_WRITE_DELAY=0.3
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        exec 3<>"$2/ready" 4<>"$2/go"
+        printf "r\n" >&3; read -r _ <&4
+        rc=0; backup_file_manifest_aware "$2/root/same.conf" keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/a.rc"; exit 0
+    ' a &
+    local paa=$!
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        exec 3<>"$2/ready" 4<>"$2/go"
+        printf "r\n" >&3; read -r _ <&4
+        rc=0; backup_file_manifest_aware "$2/root/same.conf" keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/b.rc"; exit 0
+    ' b &
+    local pab=$!
+    barrier_release "$sandbox" 2
+    worker_wait_pid "$paa"
+    worker_wait_pid "$pab"
+    unset STUB_MANIFEST_WRITE_DELAY
+
+    assert_eq "0" "$(cat "$sandbox/a.rc" 2> /dev/null || echo MISSING)" "LOCK T8: worker A rc 0"
+    assert_eq "0" "$(cat "$sandbox/b.rc" 2> /dev/null || echo MISSING)" "LOCK T8: worker B rc 0"
+    assert_eq "1" "$(manifest_count "$manifest" records)" "LOCK T8: exactly one record for the target"
+    assert_eq "1" "$(find "$sandbox/backups" -type f | wc -l | tr -d '[:space:]')" \
+        "LOCK T8: only the first backup kept (no backup storm)"
+    if grep -rq 'ORIGINAL SAME' "$sandbox/backups"; then
+        ok
+    else
+        fail "LOCK T8: the single backup is the original first-wins backup"
+    fi
+    assert_eq "0" "$(find "$sandbox/manifest" -name '.install-manifest.*.tmp' | wc -l | tr -d '[:space:]')" \
+        "LOCK T8: no unique temp residue"
+}
+
+# ---------------------------------------------------------------------------
 # 44. Non-keyboard uninstall callers must not abort on a failed rollback.
 #     rollback_component now returns 1 for failed/unknown items; with `set -e`
 #     an unguarded call skips the caller's remaining cleanup. These tests run
@@ -5623,6 +6153,12 @@ setup_caller_uninstall_sandbox() {
     local sandbox="$1" comp="$2"
     rm -rf "$sandbox"
     mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub"
+    # The sudo stub below records but does not execute `install`, so every
+    # manifest mutation would fail to create the cross-process lock file.
+    # Pre-create it: the lock is a normal precondition of the manifest dir
+    # (re-review #9 finding #1), and this keeps the caller-rc tests focused on
+    # rollback rc propagation.
+    : > "$sandbox/manifest/.install-manifest.lock"
 
     # sudo logs each command and only execs commands that have a sandbox stub
     # (python3/udevadm/ldconfig/gpasswd/systemctl), so no host command can be
@@ -5893,6 +6429,15 @@ test_caller_uninstall_rollback_success ec uninstall_ec_tools "systemctl daemon-r
 test_caller_uninstall_rollback_success audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log
 test_caller_uninstall_rollback_success power uninstall_power "Reboot (or log out and back in)" log.txt
 test_caller_uninstall_regression_detects_unguarded_rollback
+# Re-review #9 finding #1: cross-process manifest transaction lock
+test_lock_concurrent_writers_keep_both_records
+test_lock_concurrent_install_and_rollback_preserves_records
+test_lock_writers_use_unique_temp
+test_lock_nested_no_deadlock
+test_lock_timeout_fails_closed
+test_lock_dryrun_and_no_python3_untouched
+test_lock_high_contention_all_records_survive
+test_lock_same_target_first_backup_wins
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

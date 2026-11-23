@@ -23,6 +23,135 @@ MANIFEST_JSON=""
 # shellcheck disable=SC2034 # read by callers/tests after manifest_load()
 MANIFEST_CREATED=0
 
+# ---------------------------------------------------------------------------
+# Cross-process transaction lock for the global install manifest.
+#
+# Every mutation is a read-modify-write over the WHOLE JSON document. Without
+# a shared lock, two concurrent installers can both read the same snapshot,
+# append their own record and os.replace() it: the last writer silently drops
+# the other component's first-wins backup/service/group tracking data (review
+# #9 finding #1). The lock is held from the fail-closed validation gate through
+# the final atomic replace, and every writer re-reads the manifest *inside* the
+# lock so it never mutates a stale snapshot.
+#
+# Design details:
+#  - root-owned lock file next to the manifest (same filesystem), fixed fd 9;
+#  - bounded `flock -x -w TIMEOUT` (never -n): a contended installer waits;
+#  - MANIFEST_LOCK_DEPTH makes nested public helpers (backup gate -> add_entry,
+#    ensure_group_membership -> has_group/add_group/remove_group) re-entrant
+#    without re-flocking the same process's fd (which would deadlock);
+#  - missing/broken flock => fail closed (mutation returns 1, bytes intact);
+#  - DRY_RUN callers return BEFORE this lock, so no lock file is created;
+#  - manifest_load() itself stays lock-free (pure reader): the public entry
+#    point owns the lock and calls manifest_load() again inside it.
+# ---------------------------------------------------------------------------
+MANIFEST_LOCK_FILE="$MANIFEST_DIR/.install-manifest.lock"
+MANIFEST_LOCK_FD=9
+MANIFEST_LOCK_DEPTH=0
+MANIFEST_LOCK_TIMEOUT="${CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT:-10}"
+
+manifest_lock_init() {
+    # A dangling symlink counts as "present": opening it below fails closed.
+    if [ -e "$MANIFEST_LOCK_FILE" ] || [ -L "$MANIFEST_LOCK_FILE" ]; then
+        return 0
+    fi
+    sudo mkdir -p "$MANIFEST_DIR" || return 1
+    # NEVER use `install` here: GNU install replaces the destination inode on
+    # every call. A racer that already opened fd 9 would then hold a lock on an
+    # orphaned inode while another locks the fresh one -> NO mutual exclusion.
+    # A noclobber redirection creates the file once without ever replacing an
+    # existing inode; racers that lose simply see the winner's file and go on.
+    if ! { sudo sh -c 'set -C; : > "$1"' _ "$MANIFEST_LOCK_FILE"; } 2> /dev/null; then
+        if [ ! -e "$MANIFEST_LOCK_FILE" ] && [ ! -L "$MANIFEST_LOCK_FILE" ]; then
+            log_error "Could not create manifest lock $MANIFEST_LOCK_FILE"
+            return 1
+        fi
+    fi
+    # Best-effort hardening of the winner's file (its contents are unused).
+    sudo chmod 0644 "$MANIFEST_LOCK_FILE" 2> /dev/null || true
+    sudo chown 0:0 "$MANIFEST_LOCK_FILE" 2> /dev/null || true
+    return 0
+}
+
+manifest_lock() {
+    if [ "$MANIFEST_LOCK_DEPTH" -gt 0 ]; then
+        # Already held by this process: just track nesting. A second flock on a
+        # different fd would block against ourselves and deadlock.
+        MANIFEST_LOCK_DEPTH=$((MANIFEST_LOCK_DEPTH + 1))
+        return 0
+    fi
+    if ! command -v flock > /dev/null 2>&1; then
+        log_error "flock not found; refusing manifest mutation (install util-linux)"
+        return 1
+    fi
+    manifest_lock_init || return 1
+    # The group redirects suppress only bash's redirection-error message;
+    # `exec 9<...` still applies to the current shell. An `if` guard keeps
+    # `set -e` installers from aborting on a failed open.
+    if ! { exec 9< "$MANIFEST_LOCK_FILE"; } 2> /dev/null; then
+        log_error "Cannot open manifest lock $MANIFEST_LOCK_FILE; refusing manifest mutation"
+        return 1
+    fi
+    local rc=0
+    flock -x -w "$MANIFEST_LOCK_TIMEOUT" "$MANIFEST_LOCK_FD" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        { exec 9<&-; } 2> /dev/null || true
+        MANIFEST_LOCK_DEPTH=0
+        log_error "Manifest lock wait failed (rc=$rc after ${MANIFEST_LOCK_TIMEOUT}s) on $MANIFEST_LOCK_FILE; refusing to write"
+        return 1
+    fi
+    MANIFEST_LOCK_DEPTH=1
+    return 0
+}
+
+manifest_unlock() {
+    if [ "$MANIFEST_LOCK_DEPTH" -gt 0 ]; then
+        MANIFEST_LOCK_DEPTH=$((MANIFEST_LOCK_DEPTH - 1))
+    fi
+    if [ "$MANIFEST_LOCK_DEPTH" -eq 0 ]; then
+        # Always release: even when the python writer returned non-zero the
+        # caller must not leak the lock to the next mutation.
+        { flock -u "$MANIFEST_LOCK_FD"; } 2> /dev/null || true
+        { exec 9<&-; } 2> /dev/null || true
+    fi
+    return 0
+}
+
+# Shared durability helper injected into every manifest WRITER's `-c` script.
+# Keeping one implementation here avoids six subtly different copies while
+# leaving each writer's argv (and therefore the test-stub contract) unchanged.
+# A UNIQUE same-directory temp replaces the old shared "$MANIFEST_FILE.tmp":
+# concurrent writers can never overwrite each other's temp, and os.replace()
+# stays atomic. The dir fsync is best effort; every failure unlinks the temp.
+_MANIFEST_ATOMIC_WRITE_PY='
+import tempfile
+
+def atomic_write_json(mp, data):
+    d = os.path.dirname(os.path.abspath(mp))
+    fd, tmp = tempfile.mkstemp(prefix=".install-manifest.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, mp)
+        try:
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+'
+
 # Single validation source for all manifest readers/writers. Reads the path
 # from argv[1]; malformed input exits 2 with a MANIFEST_INVALID diagnostic on
 # stderr, valid input prints one canonical JSON document on stdout.
@@ -206,11 +335,9 @@ sys.exit(1)
     return "$rc"
 }
 
-backup_file_manifest_aware() {
-    # $1=target $2=component
-    # On re-install of an already-tracked target, keep the ORIGINAL backup
-    # (first backup) instead of overwriting it with our custom version, so
-    # rollback can always restore the pre-customization file.
+_backup_file_manifest_aware_body() {
+    # Gate -> backup -> record as ONE transaction. Called with the manifest
+    # lock already held (or in DRY_RUN, where every helper is a no-op logger).
     local target="$1" component="$2"
     local probe_rc=0
     manifest_has_target "$target" || probe_rc=$?
@@ -239,6 +366,29 @@ backup_file_manifest_aware() {
         return 1
     fi
     return 0
+}
+
+backup_file_manifest_aware() {
+    # $1=target $2=component
+    # On re-install of an already-tracked target, keep the ORIGINAL backup
+    # (first backup) instead of overwriting it with our custom version, so
+    # rollback can always restore the pre-customization file.
+    #
+    # The first-wins GATE and the record WRITE must be one transaction: holding
+    # the lock across both means a concurrent installer cannot slip a record in
+    # between "is this tracked?" and "append my record" (review #9 finding #1).
+    local target="$1" component="$2"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        # No lock in dry-run: no lock file / sudo side effects. The body's
+        # helpers each log their own dry-run message and return 0.
+        _backup_file_manifest_aware_body "$target" "$component" || return $?
+        return 0
+    fi
+    manifest_lock || return 1
+    local rc=0
+    _backup_file_manifest_aware_body "$target" "$component" || rc=$?
+    manifest_unlock
+    return "$rc"
 }
 
 backup_meson_install_plan() {
@@ -293,16 +443,9 @@ _get_real_user_backup() {
     fi
 }
 
-manifest_add_service() {
-    # $1=unit $2=component — record the enable/active state of a systemd
-    # unit at install time so rollback can restore it on uninstall.
-    # First record wins: a reinstall must not overwrite the state captured
-    # at the original install, or rollback would undo installer-created state.
-    # Supports both system services and user services (--global scope).
-    [ "${DRY_RUN:-0}" = "1" ] && {
-        log_dryrun "Would record service state: $1"
-        return 0
-    }
+_manifest_add_service_body() {
+    # Ratified inside the manifest lock: manifest_load() re-reads the latest
+    # bytes so the first-wins check in python operates on a fresh snapshot.
     if ! manifest_load; then
         log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record service state for $1"
         return 1
@@ -344,8 +487,9 @@ manifest_add_service() {
     fi
     sudo mkdir -p "$MANIFEST_DIR"
     local write_rc=0
-    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
-import json, sys, os
+    # argv is UNCHANGED (argc=8): the helper is part of the -c script, not an
+    # extra argument, so the existing python stubs keep matching.
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
 mp, name, comp, enabled, active, scope = sys.argv[1:7]
 data = json.load(sys.stdin)
 data.setdefault("version", "2.0")
@@ -358,11 +502,55 @@ if not any(s.get("name") == name and s.get("component") == comp for s in data["s
         "was_enabled": enabled == "1", "was_active": active == "1",
         "scope": scope
     })
-tmp = mp + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(data, f, indent=2)
-os.replace(tmp, mp)
+atomic_write_json(mp, data)
 ' "$MANIFEST_FILE" "$1" "$2" "$enabled" "$active" "$scope" || write_rc=$?
+    [ "$write_rc" -le 1 ] || write_rc=1
+    return "$write_rc"
+}
+
+manifest_add_service() {
+    # $1=unit $2=component — record the enable/active state of a systemd
+    # unit at install time so rollback can restore it on uninstall.
+    # First record wins: a reinstall must not overwrite the state captured
+    # at the original install, or rollback would undo installer-created state.
+    # Supports both system services and user services (--global scope).
+    # DRY_RUN returns BEFORE the lock so no lock file/sudo call is made.
+    [ "${DRY_RUN:-0}" = "1" ] && {
+        log_dryrun "Would record service state: $1"
+        return 0
+    }
+    manifest_lock || return 1
+    local rc=0
+    _manifest_add_service_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
+_manifest_add_group_body() {
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record group $2@$1"
+        return 1
+    fi
+    local was_member="${4:-0}"
+    if [ "$was_member" != "0" ] && [ "$was_member" != "1" ]; then
+        id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1 || was_member=0
+    fi
+    sudo mkdir -p "$MANIFEST_DIR"
+    local write_rc=0
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
+mp, group, user, comp, member = sys.argv[1:6]
+data = json.load(sys.stdin)
+data.setdefault("version", "2.0")
+data.setdefault("records", [])
+data.setdefault("services", [])
+data.setdefault("groups", [])
+if not any(g.get("group") == group and g.get("user") == user and g.get("component") == comp for g in data["groups"]):
+    data["groups"].append({
+        "group": group, "user": user, "component": comp,
+        "was_member": member == "1"
+    })
+atomic_write_json(mp, data)
+' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member" || write_rc=$?
     [ "$write_rc" -le 1 ] || write_rc=1
     return "$write_rc"
 }
@@ -378,52 +566,21 @@ manifest_add_group() {
         log_dryrun "Would record group: $2@$1"
         return 0
     }
-    if ! manifest_load; then
-        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record group $2@$1"
-        return 1
-    fi
-    local was_member="${4:-0}"
-    if [ "$was_member" != "0" ] && [ "$was_member" != "1" ]; then
-        id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1 || was_member=0
-    fi
-    sudo mkdir -p "$MANIFEST_DIR"
-    local write_rc=0
-    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
-import json, sys, os
-mp, group, user, comp, member = sys.argv[1:6]
-data = json.load(sys.stdin)
-data.setdefault("version", "2.0")
-data.setdefault("records", [])
-data.setdefault("services", [])
-data.setdefault("groups", [])
-if not any(g.get("group") == group and g.get("user") == user and g.get("component") == comp for g in data["groups"]):
-    data["groups"].append({
-        "group": group, "user": user, "component": comp,
-        "was_member": member == "1"
-    })
-tmp = mp + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(data, f, indent=2)
-os.replace(tmp, mp)
-' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member" || write_rc=$?
-    [ "$write_rc" -le 1 ] || write_rc=1
-    return "$write_rc"
+    manifest_lock || return 1
+    local rc=0
+    _manifest_add_group_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
 }
 
-manifest_remove_group() {
-    # $1=group $2=user $3=component — remove EXACTLY one group record with a
-    # precise list filter + atomic os.replace (never sed/text substitution), so
-    # records of other users/components and all records/services stay intact.
-    # Shared by uninstall (consume after a successful gpasswd -d) and by the
-    # install rollback path (undo a record we just wrote when usermod failed).
-    [ "${DRY_RUN:-0}" = "1" ] && return 0
-    [ -f "$MANIFEST_FILE" ] || return 0
+_manifest_remove_group_body() {
+    # Held under the lock: python's own json.load() therefore sees the same
+    # stable bytes that the manifest_load() gate validated.
     if ! manifest_load; then
         log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group record $2@$1"
         return 1
     fi
-    sudo python3 -c '
-import json, sys, os
+    sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
 mp, group, user, comp = sys.argv[1:5]
 if not os.path.exists(mp):
     sys.exit(0)
@@ -435,25 +592,31 @@ d["groups"] = [g for g in d["groups"]
                        and g.get("component") == comp)]
 if len(d["groups"]) == before:
     sys.exit(0)          # no matching record: do not rewrite the file at all
-tmp = mp + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(d, f, indent=2)
-os.replace(tmp, mp)
+atomic_write_json(mp, d)
 ' "$MANIFEST_FILE" "$1" "$2" "$3"
 }
 
-ensure_group_membership() {
-    # $1=group $2=user $3=component
-    # Invariant: if this function returns non-zero, the user's membership in
-    # $1 has NOT been changed by us AND no "we added this membership" record
-    # was left behind for a failed action. This is the group analogue of the
-    # keyd install flow: persist original state FIRST, then mutate /etc/group.
+manifest_remove_group() {
+    # $1=group $2=user $3=component — remove EXACTLY one group record with a
+    # precise list filter + atomic os.replace (never sed/text substitution), so
+    # records of other users/components and all records/services stay intact.
+    # Shared by uninstall (consume after a successful gpasswd -d) and by the
+    # install rollback path (undo a record we just wrote when usermod failed).
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    [ -f "$MANIFEST_FILE" ] || return 0
+    manifest_lock || return 1
+    local rc=0
+    _manifest_remove_group_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
+_ensure_group_membership_body() {
+    # Held under the manifest lock for its ENTIRE duration: the membership
+    # snapshot, the first-wins gate, the group record and the usermod (plus its
+    # cleanup) form one transaction. Returning with the lock still held is the
+    # caller wrapper's responsibility via a single manifest_unlock().
     local group="$1" user="$2" component="$3"
-    [ -z "$user" ] || [ "$user" = "root" ] && return 0
-    if [ "${DRY_RUN:-0}" = "1" ]; then
-        log_dryrun "Would ensure '$user' is a member of group '$group'"
-        return 0
-    fi
 
     # (1) Snapshot the PRE-install state before any side effect.
     local was_member=0
@@ -501,21 +664,37 @@ ensure_group_membership() {
     return 0
 }
 
-remove_group_membership() {
-    # $1=group $2=user $3=component — call AFTER rollback_component (so udev
-    # rules are gone and the reference check is accurate).
-    [ -z "$2" ] || [ "$2" = "root" ] && return 0
+ensure_group_membership() {
+    # $1=group $2=user $3=component
+    # Invariant: if this function returns non-zero, the user's membership in
+    # $1 has NOT been changed by us AND no "we added this membership" record
+    # was left behind for a failed action. This is the group analogue of the
+    # keyd install flow: persist original state FIRST, then mutate /etc/group.
+    local group="$1" user="$2" component="$3"
+    [ -z "$user" ] || [ "$user" = "root" ] && return 0
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        log_dryrun "Would evaluate group membership removal: $2@$1"
+        log_dryrun "Would ensure '$user' is a member of group '$group'"
         return 0
     fi
-    [ -f "$MANIFEST_FILE" ] || return 0
+    manifest_lock || return 1
+    local rc=0
+    _ensure_group_membership_body "$group" "$user" "$component" || rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
+_remove_group_membership_body() {
+    # Held under the manifest lock: the membership decision (which reads the
+    # manifest directly), the udev reference check, gpasswd and the final
+    # manifest_remove_group are one transaction. The nested remove_group call
+    # only bumps MANIFEST_LOCK_DEPTH; the wrapper releases once at the end.
+    local group="$1" user="$2" component="$3"
     # Fail closed BEFORE gpasswd -d (a real side effect): a schema-invalid
     # group record (e.g. was_member="false", truthy in Python) must never be
     # accepted as evidence that we should delete a membership. This also
     # protects the fingerprint/EC uninstall callers of this helper.
     if ! manifest_load; then
-        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group membership for $2@$1"
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to remove group membership for $user@$group"
         return 1
     fi
     # Only remove membership if WE recorded adding it (user was not already
@@ -537,30 +716,46 @@ for g in d.get("groups", []):
         was_member = g.get("was_member")
         sys.exit(0 if isinstance(was_member, bool) and not was_member else 1)
 sys.exit(1)
-' "$MANIFEST_FILE" "$1" "$2" "$3" 2> /dev/null) && ours="1" || ours="0"
+' "$MANIFEST_FILE" "$group" "$user" "$component" 2> /dev/null) && ours="1" || ours="0"
     if [ "$ours" != "1" ]; then
-        log_info "User '$2' was already in group '$1' before install; keeping membership."
+        log_info "User '$user' was already in group '$group' before install; keeping membership."
         return 0
     fi
     # Keep membership if another udev rule (e.g. from another component
     # still installed) references the group.
-    if grep -rl "GROUP=\"$1\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .; then
-        log_info "udev rules still reference group '$1'; keeping '$2' in it."
+    if grep -rl "GROUP=\"$group\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .; then
+        log_info "udev rules still reference group '$group'; keeping '$user' in it."
         return 0
     fi
-    if sudo gpasswd -d "$2" "$1" 2> /dev/null; then
-        log_info "Removed '$2' from group '$1'."
+    if sudo gpasswd -d "$user" "$group" 2> /dev/null; then
+        log_info "Removed '$user' from group '$group'."
     else
-        log_warn "Could not remove '$2' from group '$1'; keeping manifest record for retry."
+        log_warn "Could not remove '$user' from group '$group'; keeping manifest record for retry."
         return 0
     fi
     # Consume the record only after the membership was actually removed. This
     # is the same precise list-filter + os.replace helper used by the install
     # rollback path, so uninstall and rollback can never diverge.
-    if ! manifest_remove_group "$1" "$2" "$3"; then
-        log_warn "Could not consume group record for '$2'@'$1'; keeping it for retry."
+    if ! manifest_remove_group "$group" "$user" "$component"; then
+        log_warn "Could not consume group record for '$user'@'$group'; keeping it for retry."
         return 1
     fi
+}
+
+remove_group_membership() {
+    # $1=group $2=user $3=component — call AFTER rollback_component (so udev
+    # rules are gone and the reference check is accurate).
+    [ -z "$2" ] || [ "$2" = "root" ] && return 0
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        log_dryrun "Would evaluate group membership removal: $2@$1"
+        return 0
+    fi
+    [ -f "$MANIFEST_FILE" ] || return 0
+    manifest_lock || return 1
+    local rc=0
+    _remove_group_membership_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
 }
 
 backup_file() {
@@ -595,6 +790,56 @@ backup_file() {
     return 0
 }
 
+_manifest_add_entry_body() {
+    local target="$1"
+    local component="$2"
+    local was_existing="$3" # 1 = yes, 0 = created new
+
+    # Re-read (and validate) INSIDE the lock, immediately before the write: a
+    # corrupt manifest must never be replaced with an empty skeleton, and a
+    # snapshot taken before another writer committed must never be mutated.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record $target"
+        return 1
+    fi
+
+    sudo mkdir -p "$MANIFEST_DIR"
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Create empty json if not exists
+    if [ ! -f "$MANIFEST_FILE" ]; then
+        echo '{"version":"2.0","records":[],"services":[],"groups":[]}' | sudo tee "$MANIFEST_FILE" > /dev/null
+    fi
+
+    # Append entry using python with atomic file write
+    if ! command -v python3 > /dev/null 2>&1; then
+        log_warn "python3 not found; install manifest cannot be updated. Rollback for this file will be unavailable."
+        return 1
+    fi
+    local write_rc=0
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
+manifest_path, target, comp, existing, ts = sys.argv[1:6]
+data = json.load(sys.stdin)
+
+data.setdefault("version", "2.0")
+data.setdefault("records", [])
+data.setdefault("services", [])
+data.setdefault("groups", [])
+data["records"] = [r for r in data["records"] if r.get("target") != target]
+data["records"].append({
+    "target": target,
+    "component": comp,
+    "was_existing": existing == "1",
+    "installed_at": ts
+})
+
+atomic_write_json(manifest_path, data)
+' "$MANIFEST_FILE" "$target" "$component" "$was_existing" "$timestamp" || write_rc=$?
+    [ "$write_rc" -le 1 ] || write_rc=1
+    return "$write_rc"
+}
+
 manifest_add_entry() {
     local target="$1"
     local component="$2"
@@ -616,52 +861,11 @@ manifest_add_entry() {
         return 0
     fi
 
-    # Load (and validate) BEFORE any mkdir/tee/write: a corrupt manifest must
-    # never be replaced with an empty skeleton.
-    if ! manifest_load; then
-        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to record $target"
-        return 1
-    fi
-
-    sudo mkdir -p "$MANIFEST_DIR"
-    local timestamp
-    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-
-    # Create empty json if not exists
-    if [ ! -f "$MANIFEST_FILE" ]; then
-        echo '{"version":"2.0","records":[],"services":[],"groups":[]}' | sudo tee "$MANIFEST_FILE" > /dev/null
-    fi
-
-    # Append entry using python with atomic file write
-    if ! command -v python3 > /dev/null 2>&1; then
-        log_warn "python3 not found; install manifest cannot be updated. Rollback for this file will be unavailable."
-        return 1
-    fi
-    local write_rc=0
-    printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
-import json, sys, os
-manifest_path, target, comp, existing, ts = sys.argv[1:6]
-data = json.load(sys.stdin)
-
-data.setdefault("version", "2.0")
-data.setdefault("records", [])
-data.setdefault("services", [])
-data.setdefault("groups", [])
-data["records"] = [r for r in data["records"] if r.get("target") != target]
-data["records"].append({
-    "target": target,
-    "component": comp,
-    "was_existing": existing == "1",
-    "installed_at": ts
-})
-
-tmp_manifest = manifest_path + ".tmp"
-with open(tmp_manifest, "w") as f:
-    json.dump(data, f, indent=2)
-os.replace(tmp_manifest, manifest_path)
-' "$MANIFEST_FILE" "$target" "$component" "$was_existing" "$timestamp" || write_rc=$?
-    [ "$write_rc" -le 1 ] || write_rc=1
-    return "$write_rc"
+    manifest_lock || return 1
+    local rc=0
+    _manifest_add_entry_body "$target" "$component" "$was_existing" || rc=$?
+    manifest_unlock
+    return "$rc"
 }
 
 rollback_component() {
@@ -684,11 +888,30 @@ rollback_component() {
         return 1
     fi
 
+    # DRY_RUN MUST return before taking the lock: no lock file / sudo side
+    # effect in a dry run. The fail-closed load above deliberately stays ahead
+    # of this return (a missing python3 cannot be mistaken for a valid gate).
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_dryrun "Rollback would process records in $MANIFEST_FILE for component: $target_comp"
         return 0
     fi
 
+    manifest_lock || return 1
+    local rc=0
+    _rollback_component_body "$target_comp" || rc=$?
+    manifest_unlock # even when python returns non-zero
+    [ "$rc" -eq 0 ] && log_success "Rollback for component [$target_comp] finished!"
+    return "$rc"
+}
+
+_rollback_component_body() {
+    local target_comp="$1"
+    # Re-read INSIDE the lock: this is the authoritative snapshot the python
+    # below consumes, so a concurrent install's record can never be dropped.
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to roll back $target_comp"
+        return 1
+    fi
     if command -v python3 > /dev/null 2>&1; then
         local allowed_prefixes
         allowed_prefixes="${CROS_ENABLEMENT_ALLOWED_PREFIXES:-/etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/}"
@@ -703,8 +926,9 @@ rollback_component() {
         # failure/unknown goes into problems[], the whitelists
         # remaining_services / remaining_records keep everything else, and a
         # SINGLE atomic write-back happens BEFORE the single sys.exit(1).
-        if ! printf '%s' "$MANIFEST_JSON" | sudo python3 -c '
-import json, os, sys, shutil, glob, fnmatch, subprocess
+        # argv is UNCHANGED (argc=6): the durability helper is part of the -c
+        # script, not an extra argument, so the rollback stub keeps matching.
+        if ! printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, os, sys, shutil, glob, fnmatch, subprocess
 
 manifest_path = sys.argv[1]
 target_comp = sys.argv[2]
@@ -986,11 +1210,9 @@ for rec in records:
 # SINGLE atomic write-back of the retained records. This MUST happen before
 # any non-zero exit, otherwise a failure would erase the records needed for
 # the next retry (and erase untouched records of other components as well).
-tmp_manifest = manifest_path + ".tmp"
+# Unique same-directory temp (atomic_write_json) replaces the old shared .tmp.
 data["records"] = remaining_records
-with open(tmp_manifest, "w") as f:
-    json.dump(data, f, indent=2)
-os.replace(tmp_manifest, manifest_path)
+atomic_write_json(manifest_path, data)
 
 if problems:
     print("ROLLBACK_INCOMPLETE: %d item(s) retained (see WARN lines above)" %
@@ -998,11 +1220,10 @@ if problems:
     sys.exit(1)
 ' "$MANIFEST_FILE" "$target_comp" "$BACKUP_BASE_DIR" "$allowed_prefixes"; then
             log_error "rollback of $target_comp failed; service/file state may be partial (retained records remain for retry)"
-            return 1
+            rc=1
         fi
     else
         log_warn "python3 not found; automatic rollback unavailable. Files may need manual restoration."
     fi
-
-    log_success "Rollback for component [$target_comp] finished!"
+    return "$rc"
 }
