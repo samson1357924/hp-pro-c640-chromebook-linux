@@ -105,6 +105,18 @@ bytes untouched. Non-absolute pseudo-targets such as the fingerprint
 `skipping manifest entry with non-absolute target` (Meson install-plan destinations must
 be absolute too), so the installer never writes a record its own validator would reject.
 
+**Manifest writes are serialized across processes:** every read-modify-write (the backup
+helpers in `lib/backup.sh` plus the keyd-link normalizer here) holds a root-controlled
+`flock -x -w` lock on `$MANIFEST_DIR/.install-manifest.lock` (fd 9, re-entrant depth). The
+wait is bounded by `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s); a missing `flock`
+or a timeout fails
+closed with the manifest bytes intact. The gate → re-read → decision → write sequence runs
+inside the critical section, so a parallel install/uninstall run cannot drop another's
+first-wins backup/service/group records. Each writer uses a unique
+`.install-manifest.*.tmp` (mkstemp + fsync + `chmod 0644` + `os.replace`) instead of a
+shared `.tmp`, so concurrent writers cannot clobber each other's temporary file. The lock
+file is created with noclobber — never `install` — so its inode is never replaced.
+
 **Rollback is gated before any side effect:** `rollback_component()`,
 `uninstall_keyboard()` and `remove_group_membership()` validate the manifest first —
 before `systemctl disable keyd` / `gpasswd -d` and before any service or file change —
@@ -125,10 +137,13 @@ remain for retry)` and returns rc 1 instead of claiming success.
   the record carries a valid bool snapshot.
 * **An absent target is still restored.** For a `was_existing` record rollback finds the
   first (oldest) matching backup regardless of whether the target still exists, then
-  stages and atomically replaces the original file/symlink (owner, mode and symlink
-  target restored). The record is consumed only after a confirmed success; if no backup
-  exists it keeps the record and warns (`[WARN NO BACKUP]`) instead of creating a fake
-  file.
+  stages it next to the target and swaps it in with a single atomic `os.replace()` (owner,
+  mode and symlink target restored). Regular files/symlinks are never unlinked first, so a
+  failed swap leaves the installed target in place; any swap involving a directory (including
+  dir→dir) moves the old entry aside and back on failure. The record is consumed only after a confirmed
+  success; if no backup exists it keeps the record, warns (`[WARN NO BACKUP]`), logs
+  `RECORD_BACKUP_MISSING` / `ROLLBACK_INCOMPLETE` and returns rc 1 instead of creating a
+  fake file (other items still roll back normally).
 * **A failed restore keeps its record.** Every `systemctl` enable/disable/start/stop
   checks its return code (including timeouts, stderr and spawn errors). A failed service
   logs `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE`, keeps its record for a later
@@ -464,15 +479,17 @@ all state is in a temp dir. The daemon suite has 406 cases (write chain, re-prob
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
 `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 927 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1061 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
-skipping, unknown-state fail-closed, absent-target first-backup restore, checked
-`systemctl` restores and record-before-change group membership.
+skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
+that keep the target on a failed swap, missing-backup rc 1, the cross-process manifest
+lock, unique writer temps, checked `systemctl` restores and record-before-change group
+membership.
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 927 cases (root)
+sudo bash tests/rollback-test.sh                       # 1061 cases (root)
 ```
 
 ---

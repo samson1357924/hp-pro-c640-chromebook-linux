@@ -114,9 +114,9 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   failure it logs `blank: brightness NOT saved`, keeps the LED on and re-seeds the
   last-user cache. `--test-blank` exits 1 when saving fails.
 
-Current unit-test totals (these fixes plus the seventh and eighth re-review fixes
-below): **406** daemon, **73** sleep-hook and **927** rollback cases (the last run
-as root), all 0 failures.
+Current unit-test totals (these fixes plus the seventh, eighth and ninth re-review
+fixes below): **406** daemon, **73** sleep-hook and **1061** rollback cases (the last
+run as root), all 0 failures.
 
 #### Seventh re-review fixes (2026-11-23, unit-tested)
 
@@ -151,8 +151,8 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
   `skipping manifest entry with non-absolute target` (Meson plan destinations must be
   absolute too), so the installer never writes a record its own validator would reject.
 
-Current unit-test totals (these fixes plus the eighth re-review fixes below):
-**406** daemon, **73** sleep-hook and **927** rollback cases (the last run as root),
+Current unit-test totals (these fixes plus the eighth and ninth re-review fixes below):
+**406** daemon, **73** sleep-hook and **1061** rollback cases (the last run as root),
 all 0 failures.
 
 #### Eighth re-review fixes (2026-11-23, unit-tested)
@@ -190,7 +190,36 @@ S3 records above are kept verbatim and no new hardware run is claimed here.
 All install callers now save the rollback rc, finish their remaining cleanup and return
 that rc last, so `set -e` cannot abort cleanup on a failed rollback.
 
-Unit-test totals after these fixes: **406** daemon, **73** sleep-hook and **927**
+Current unit-test totals (these fixes plus the ninth re-review fixes below):
+**406** daemon, **73** sleep-hook and **1061** rollback cases (the last run as root),
+all 0 failures.
+
+#### Ninth re-review fixes (2026-11-23, unit-tested)
+
+These are logic/robustness fixes covered by the shell unit suites; the 2026-11-22 real
+S3 records above are kept verbatim and no new hardware run is claimed here.
+
+* **A failed restore swap keeps the installed target.** `restore_original()` now stages
+  next to the target and uses a single atomic `os.replace()` for regular files/symlinks
+  without unlinking first, so a failed swap never makes the original configuration
+  disappear. Any swap involving a directory (including dir→dir) moves the old entry aside
+  (and back on failure), then cleans it up with `remove_path()` after success. All eight target×backup
+  combinations are covered by the rollback suite.
+* **A missing backup is a real failure.** For `was_existing` records with no first backup,
+  rollback adds `problem("RECORD_BACKUP_MISSING", ...)`, keeps the record, creates no fake
+  file and lets the other items keep rolling back, but prints
+  `ROLLBACK_INCOMPLETE: N item(s) retained` and returns rc 1 instead of `finished!`.
+* **Concurrent manifest writers are serialized.** Every manifest read-modify-write writer
+  (the backup helpers in `lib/backup.sh` plus the keyboard keyd-link normalizer) shares a
+  root-controlled `flock -x -w` lock on `$MANIFEST_DIR/.install-manifest.lock` (fd 9,
+  re-entrant depth, fail closed if `flock` is missing or the wait times out); the gate →
+  re-read → decision → write critical section keeps first-wins records from being lost,
+  and every writer uses a unique
+  `.install-manifest.*.tmp` (mkstemp + fsync + `chmod 0644` + `os.replace`) so parallel
+  writers cannot clobber each other's temp file. The lock file is created with noclobber
+  so no writer replaces its inode.
+
+Unit-test totals after these fixes: **406** daemon, **73** sleep-hook and **1061**
 rollback cases (the last run as root), all 0 failures.
 
 ### 4. Wi-Fi / Bluetooth / Webcam / Storage
@@ -241,7 +270,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (406 daemon + 73 hook + 927 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (406 daemon + 73 hook + 1061 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -301,12 +330,14 @@ cat /sys/power/mem_sleep
   `rtcwake -m no -s 20` + `systemctl suspend` on systemd 259 / gnome-settings-daemon
   50; locked resume defers and keeps `state=30`, then `loginctl unlock-session 2`
   restores brightness/gsd/UPower to 30 and consumes both handoff files),
-  2026-11-23 (sixth, seventh and eighth re-review unit-test re-runs: 406 daemon,
-  73 sleep-hook and 927 rollback cases, 0 failures; result-code, fail-closed manifest,
+  2026-11-23 (sixth, seventh, eighth and ninth re-review unit-test re-runs: 406 daemon,
+  73 sleep-hook and 1061 rollback cases, 0 failures; result-code, fail-closed manifest,
   save-before-blank, single-sample/invalid-state self-heal, manifest field validation,
   pre-mutation rollback gate and rollback safety semantics — required/unknown-state
-  fail closed, absent-target first-backup restore, checked systemctl restores and
-  record-before-change group membership — docs synced — no new real-S3 run)
+  fail closed, absent-target first-backup restore, checked systemctl restores,
+  record-before-change group membership, atomic restore without unlink and rc 1 for a
+  missing backup, plus a cross-process manifest lock with unique writer temps — docs
+  synced — no new real-S3 run)
 * **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
   keyboard/backlight session, `7.0.0-29-generic` for the 2026-08 evidence bundle
 * **Firmware**: MrChromebox `2606.1`

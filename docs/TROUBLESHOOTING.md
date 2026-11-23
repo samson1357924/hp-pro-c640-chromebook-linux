@@ -365,15 +365,29 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     record is kept with rc 1. No keyd disable either — `_keyd_managed_by_us()` needs a
     valid bool service snapshot before it will disable/stop keyd.
   * `[WARN NO BACKUP]` means a `was_existing` target has no first backup available; the
-    record is kept (no fake file is created) so a later retry can restore it.
+    record is kept (no fake file is created) so a later retry can restore it. Since the
+    ninth re-review this is a real failure: `RECORD_BACKUP_MISSING` is recorded as a
+    problem and `ROLLBACK_INCOMPLETE: N item(s) retained` is printed, so rollback exits
+    rc 1 (no `finished!`) while other processable items still roll back normally. The
+    RC/retry contract is unchanged — re-run uninstall once a backup is available.
     `[RESTORED PREVIOUS BACKUP] <backup> -> <target>` means the original was rebuilt from
     the oldest matching backup even though the installed file was already absent.
     `RECORD_RESTORE_FAILED` / `RECORD_REMOVE_FAILED` means the file operation failed; the
-    record is kept for retry.
+    record is kept for retry. A failed restore swap never unlinks the installed target
+    first (regular files/symlinks use a single atomic `os.replace()`).
   * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` means at least one `systemctl`
-    enable/disable/start/stop returned non-zero (or timed out / failed to spawn); those
-    service records are kept for retry and rollback returns rc 1. Re-run uninstall after
-    fixing the service manager — successful restores log `[RESTORED SERVICE]`.
+    enable/disable/start/stop returned non-zero (or timed out / failed to spawn), or a
+    record such as a missing backup was retained; those records are kept for retry and
+    rollback returns rc 1. Re-run uninstall after fixing the underlying issue —
+    successful restores log `[RESTORED SERVICE]`.
+  * `Manifest lock wait failed (rc=... after ...s)` or `flock not found` comes from the
+    cross-process manifest lock acquired before every read-modify-write. The wait is
+    bounded by `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s) on the root-controlled
+    lock file `$MANIFEST_DIR/.install-manifest.lock` (fd 9); a timeout or missing `flock`
+    fails closed and leaves the manifest bytes intact (rc non-zero). Each writer writes a
+    unique `.install-manifest.*.tmp` file in the manifest directory and applies it with
+    fsync + `chmod 0644` + `os.replace`, so parallel install/uninstall runs cannot drop
+    each other's first-wins records. Retry the command after the other run finishes.
   * Group membership is now recorded **before** `usermod` runs: the installer persists the
     original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
     the change fails with no earlier record, removes the record it just wrote. Uninstall

@@ -41,9 +41,10 @@
 ### Rollback 安全保證
 
 rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它。若下列保證無法達成，紀錄會
-**保留**在 `/var/lib/cros-enablement/install-manifest.json`（附警告；除找不到原始備份外
-並回 rc 1），供日後再次執行 `./setup.sh --uninstall` 重試——絕不會被當成已完成而悄悄
-略過：
+**保留**在 `/var/lib/cros-enablement/install-manifest.json`，附上警告並回 rc 1（找不到
+原始備份時也一樣），供日後再次執行 `./setup.sh --uninstall` 重試——絕不會被當成已完成
+而悄悄略過。其他可處理的項目仍會正常 rollback，但最終結束碼非 0，且不會印出
+`finished!`：
 
 * **原始狀態未知絕不當成 false。** 安全欄位 `was_existing`、`was_enabled`、`was_active`、
   `was_member` 為必填。若快照缺失或不是布林，rollback 拒絕自動還原該筆紀錄：檔案、
@@ -51,9 +52,11 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   `SERVICE_STATE_UNKNOWN`）並回 rc 1。同樣地，沒有有效的布林服務快照時，安裝器也不會
   停用/停止 `keyd`。
 * **目標被移走時仍會還原。** 對安裝前就存在的檔案，rollback 一律從**第一份（最早）
-  備份**還原——即使期間安裝的檔案/symlink 已被移除——先暫存再原子取代原檔，並保留
-  owner、mode 與 symlink 目標。找不到備份時會保留紀錄並警告（`[WARN NO BACKUP]`），
-  不會憑空建立檔案。
+  備份**還原——即使期間安裝的檔案/symlink 已被移除——先暫存到目標旁，再以單次原子
+  `os.replace()` 取代，並保留 owner、mode 與 symlink 目標。普通檔案與 symlink **不會先
+  unlink**，因此取代失敗時已安裝的目標仍保持原樣；任何涉及目錄的交換（含 dir→dir）
+  都會短暫把舊項目移到一旁並在失敗時移回。找不到備份時會保留紀錄、警告（`[WARN NO BACKUP]`）、記錄
+  `RECORD_BACKUP_MISSING` / `ROLLBACK_INCOMPLETE` 並回 rc 1，不會憑空建立檔案。
 * **服務還原失敗就保留紀錄。** 每一次 `systemctl` enable/disable/start/stop 都會檢查
   回傳碼（含 timeout、stderr 與 spawn error）。還原失敗時會記錄
   `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE`、保留服務紀錄供重試，並回傳非 0，
@@ -61,6 +64,14 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 * **先記錄群組 membership 再變更。** 安裝器先把原始 `plugdev` 成員資格寫入 manifest，
   之後才明確檢查 `usermod` 的 rc。若變更失敗，就移除剛寫入的紀錄（除非已有較早的
   紀錄），以免日後 uninstall 移除使用者自行取得的成員資格。
+* **並行的安裝/解除安裝不會遺失追蹤紀錄。** 每一次 manifest read-modify-write 都由
+  root 控管的 `flock -x -w` 鎖序列化（`$MANIFEST_DIR/.install-manifest.lock`、fd 9；
+  等待上限為 `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）。鎖在 fail-closed
+  驗證 gate 之前取得，並持續持有到重新讀取、修改與寫入完成，因此某個程序 first-wins
+  的備份/服務/群組紀錄不會被另一個程序覆寫。缺少 `flock` 或鎖等待逾時都會 fail closed
+  且保持位元組不變；每個 writer 並使用 manifest 目錄中唯一的
+  `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），避免平行
+  writer 互相覆寫暫存檔。
 
 ---
 

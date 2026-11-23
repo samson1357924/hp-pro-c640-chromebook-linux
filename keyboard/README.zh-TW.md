@@ -91,6 +91,16 @@ untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續
 `skipping manifest entry with non-absolute target`（Meson install plan 的目的路徑也必須
 是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
+**manifest 寫入跨程序序列化：** 每一次 read-modify-write（`lib/backup.sh` 的備份 helper
+加上此處的 keyd-link 正規化）都持有 root 控管的 `flock -x -w` 鎖
+（`$MANIFEST_DIR/.install-manifest.lock`、fd 9、可重入 depth）。等待上限為
+`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒）；缺少 `flock` 或等待逾時都會
+fail closed 且保持 manifest 位元組不變。gate → 重新讀取 → 決策 → 寫入全在 critical
+section 內，因此平行的安裝/解除安裝不會遺失另一程序 first-wins 的備份/服務/群組紀錄。
+每個 writer 使用唯一的 `.install-manifest.*.tmp`（mkstemp + fsync + `chmod 0644` +
+`os.replace`）而非共用 `.tmp`，避免平行 writer 覆寫彼此的暫存檔。鎖檔以 noclobber
+建立（絕不用 `install`），因此 inode 不會被替換。
+
 **rollback 在任何副作用前先做 gate：** `rollback_component()`、`uninstall_keyboard()` 與
 `remove_group_membership()` 會先驗證 manifest——在 `systemctl disable keyd` / `gpasswd -d`
 以及任何服務/檔案變更之前——驗證失敗即 fail closed（rc 1、不 log_success）。rollback
@@ -107,9 +117,12 @@ remain for retry)` 並回傳 rc 1，而不是謊稱成功。
   `SERVICE_STATE_UNKNOWN`）並回 rc 1。`_keyd_managed_by_us()` 同樣在沒有有效布林快照時
   拒絕停用/停止 keyd。
 * **目標缺席時仍會還原。** 對 `was_existing` 紀錄，rollback 不論目標是否還存在，一律找出
-  最早且符合的備份，先暫存再原子取代原始檔案/symlink（還原 owner、mode 與 symlink
-  目標）。只有確認成功才消耗紀錄；找不到備份時保留紀錄並警告（`[WARN NO BACKUP]`），
-  不會憑空建立檔案。
+  最早且符合的備份，先暫存到目標旁，再以單次原子 `os.replace()` 取代（還原 owner、
+  mode 與 symlink 目標）。普通檔案/symlink 不會先 unlink，因此取代失敗時已安裝的目標
+  仍保持原樣；任何涉及目錄的交換（含 dir→dir）都會把舊項目移到一旁並在失敗時移回。只有確認
+  成功才消耗紀錄；找不到備份時保留紀錄、警告（`[WARN NO BACKUP]`）、記錄
+  `RECORD_BACKUP_MISSING` / `ROLLBACK_INCOMPLETE` 並回 rc 1，不會憑空建立檔案
+  （其他項目仍會正常 rollback）。
 * **還原失敗就保留紀錄。** 每一次 `systemctl` enable/disable/start/stop 都會檢查回傳碼
   （含 timeout、stderr 與 spawn error）。失敗的服務會記錄 `SERVICE_RESTORE_FAILED` /
   `ROLLBACK_INCOMPLETE`、保留紀錄供日後重試，並讓 rollback 回傳非 0；成功的則記錄
@@ -402,15 +415,16 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 927 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1061 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
-unknown 狀態 fail closed、目標缺席時從第一份備份還原、systemctl 還原檢查 rc 與
+unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
+找不到備份回 rc 1、跨程序 manifest 鎖、唯一 writer 暫存檔、systemctl 還原檢查 rc 與
 先記錄後變更的群組 membership。
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 927 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1061 個案例（需 root）
 ```
 
 ---

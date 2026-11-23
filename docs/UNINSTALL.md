@@ -44,9 +44,10 @@ This command automatically:
 
 Rollback consumes a manifest record only after that record's whole action has been
 confirmed. If a guarantee below cannot be met, the record is **kept** in
-`/var/lib/cros-enablement/install-manifest.json` (with a warning and, except when no
-original backup exists, rc 1) so a later `./setup.sh --uninstall` run can retry — it is
-never silently treated as done:
+`/var/lib/cros-enablement/install-manifest.json` with a warning and rc 1 — including
+when no original backup exists — so a later `./setup.sh --uninstall` run can retry; it
+is never silently treated as done. Other processable items still roll back normally,
+but the final exit code is non-zero and `finished!` is not printed:
 
 * **Unknown original state is never assumed false.** The safety fields
   `was_existing`, `was_enabled`, `was_active` and `was_member` are required. Rollback
@@ -56,9 +57,13 @@ never silently treated as done:
   a valid bool service snapshot the installer will not disable/stop `keyd`.
 * **A target that was moved away is still restored.** For files that existed before
   installation, rollback always restores the **first (oldest) backup** — even if the
-  installed file/symlink was removed in the meantime — staging and atomically replacing
-  the original with owner, mode and symlink target preserved. With no backup available
-  it keeps the record and warns (`[WARN NO BACKUP]`) rather than creating a fake file.
+  installed file/symlink was removed in the meantime — staging it next to the target and
+  swapping it in with a single atomic `os.replace()` (owner, mode and symlink target
+  preserved). Regular files and symlinks are **never unlinked first**, so a failed swap
+  leaves the installed target untouched; any swap involving a directory (including dir→dir)
+  briefly moves the old entry aside and back if it fails. With no backup available it keeps the
+  record, warns (`[WARN NO BACKUP]`), logs `RECORD_BACKUP_MISSING` /
+  `ROLLBACK_INCOMPLETE` and returns rc 1 rather than creating a fake file.
 * **A failed service restore keeps its record.** Every `systemctl` enable/disable/start/
   stop return code is checked (timeouts, stderr and spawn errors included). A failed
   restore logs `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE`, keeps the service record
@@ -67,6 +72,16 @@ never silently treated as done:
   original `plugdev` membership first and only then checks `usermod` rc explicitly. If
   the change fails it removes the record it just wrote (unless an older one existed), so
   uninstall will not later drop a membership the user obtained on their own.
+* **Concurrent install/uninstall runs cannot lose tracking records.** Every manifest
+  read-modify-write is serialized with a root-controlled `flock -x -w` lock
+  (`$MANIFEST_DIR/.install-manifest.lock`, fd 9; the wait is bounded by
+  `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`, default 10s). The lock is acquired before the
+  fail-closed validation gate and held while the manifest is re-read, changed and durably
+  written, so one process's first-wins backup/service/group records cannot be overwritten
+  by another. Missing `flock` or a lock timeout fails closed with the bytes intact, and
+  each writer uses a unique `.install-manifest.*.tmp` file in the manifest directory
+  (fsync + `chmod 0644` + `os.replace`) so parallel writers cannot clobber each other's
+  temporary file.
 
 ---
 

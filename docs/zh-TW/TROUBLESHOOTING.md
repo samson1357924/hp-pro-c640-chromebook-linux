@@ -311,13 +311,25 @@
     並保留紀錄且回 rc 1。keyd 也不會被停用——`_keyd_managed_by_us()` 需要有效的布林服務
     快照才會停用/停止 keyd。
   * `[WARN NO BACKUP]` 代表 `was_existing` 目標找不到第一份備份；紀錄會保留（不會憑空
-    建立檔案），供日後重試還原。`[RESTORED PREVIOUS BACKUP] <backup> -> <target>` 代表
-    即使安裝的檔案已不存在，仍從最早符合的備份重建原檔。`RECORD_RESTORE_FAILED` /
-    `RECORD_REMOVE_FAILED` 代表檔案操作失敗，紀錄保留供重試。
+    建立檔案），供日後重試還原。自第九次 re-review 起這是真正的失敗：會記錄
+    `RECORD_BACKUP_MISSING` 問題並印出 `ROLLBACK_INCOMPLETE: N item(s) retained`，因此
+    rollback 結束碼為 rc 1（不印 `finished!`），但其他可處理的項目仍會正常 rollback。
+    RC/重試語意不變——備份可用後重跑 uninstall 即可。`[RESTORED PREVIOUS BACKUP] <backup>
+    -> <target>` 代表即使安裝的檔案已不存在，仍從最早符合的備份重建原檔。
+    `RECORD_RESTORE_FAILED` / `RECORD_REMOVE_FAILED` 代表檔案操作失敗，紀錄保留供重試。
+    還原取代失敗時不會先 unlink 已安裝的目標（普通檔案/symlink 使用單次原子
+    `os.replace()`）。
   * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` 代表至少一個 `systemctl`
-    enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗）；這些服務紀錄會保留供
-    重試，rollback 回傳 rc 1。修好 service manager 後重跑 uninstall 即可——成功的還原會
-    記錄 `[RESTORED SERVICE]`。
+    enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗），或有像找不到備份的紀錄
+    被保留；這些紀錄會保留供重試，rollback 回傳 rc 1。修好根本問題後重跑 uninstall
+    即可——成功的還原會記錄 `[RESTORED SERVICE]`。
+  * `Manifest lock wait failed (rc=... after ...s)` 或 `flock not found` 來自每次
+    manifest read-modify-write 前取得的跨程序鎖。等待上限為
+    `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒），鎖檔為 root 控管的
+    `$MANIFEST_DIR/.install-manifest.lock`（fd 9）；逾時或缺少 `flock` 都會 fail closed
+    且保持 manifest 位元組不變（回傳非 0）。每個 writer 會在 manifest 目錄寫入唯一的
+    `.install-manifest.*.tmp` 暫存檔，並以 fsync + `chmod 0644` + `os.replace` 套用，
+    因此平行的安裝/解除安裝不會互相遺失 first-wins 紀錄。等另一個程序結束後重試即可。
   * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
     寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
     紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗群組紀錄
