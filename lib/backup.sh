@@ -545,7 +545,9 @@ def atomic_write_json(mp, data):
 # fingerprint:was_member=true (same pair); each component's own record alone
 # cannot answer "did we add this membership?", so uninstall must aggregate.
 # rc 0 = at least one component recorded was_member=false => we added it
-# rc 1 = no record, or every record was_member=true => keep (pre-existing)
+# rc 1 = NO record for this (group,user) => nothing to roll back
+# rc 3 = every record was_member=true => pre-existing; metadata is stale once
+#        no component/udev rule needs the group (consume it, NO gpasswd)
 # rc 2 = unreadable / wrong safety-field type => caller fails closed
 # argc = 6 (python3 -c SCRIPT mp group user): below every writer-stub threshold
 # used by the test suite, and it does not contain any rollback-fault marker.
@@ -568,9 +570,9 @@ for g in matches:
     if not isinstance(w, bool):
         sys.exit(2)          # defence in depth; the validator gate rejects this too
 for g in matches:
-    if not g["was_member"]:
+    if g["was_member"] is False:
         sys.exit(0)          # explicit bool false is the only proof we added it
-sys.exit(1)
+sys.exit(3)                  # all true: pre-existing, safe to drop stale metadata
 '
 
 # Single validation source for all manifest readers/writers. Reads the path
@@ -1043,7 +1045,8 @@ _manifest_remove_group_all_body() {
     fi
     # argc=5 (python3 -c SCRIPT mp group user): same unique-temp + fsync +
     # os.replace path as every other manifest writer, argv below stub thresholds.
-    sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
+    sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'# GROUP_CONSUME_ALL
+import json, sys, os
 mp, group, user = sys.argv[1:4]
 if not os.path.exists(mp):
     sys.exit(0)
@@ -1143,6 +1146,13 @@ ensure_group_membership() {
     return "$rc"
 }
 
+# One authoritative predicate for "some component still needs $group".
+# Kept byte-for-byte identical to the original production scan so the existing
+# grep stub (STUB_UDEV_DIR) keeps intercepting it; every other grep falls through.
+_group_udev_rule_references() {
+    grep -rl "GROUP=\"$1\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .
+}
+
 _remove_group_membership_body() {
     # Held under the manifest lock for its ENTIRE duration: the fail-closed
     # gate, the cross-component ownership probe, the udev reference check,
@@ -1163,19 +1173,38 @@ _remove_group_membership_body() {
     python3 -c "$_GROUP_OWNERSHIP_PY" "$MANIFEST_FILE" "$group" "$user" \
         > /dev/null 2>&1 || own_rc=$?
     case "$own_rc" in
-        0) ;;
         1)
-            log_info "No record proves we added '$user' to group '$group'; keeping membership. [$component]"
+            log_info "No group record for '$user'@'$group'; nothing to roll back. [$component]"
             return 0
             ;;
+        3)
+            # ALL records say was_member=true: we never added this membership,
+            # so NO gpasswd is ever authorised here. Two sub-cases:
+            #  (a) a udev rule still references the group => a component is
+            #      still installed/managing it: keep the first-wins snapshot;
+            #  (b) no rule => every module that could add the user is gone.
+            #      Consume ALL stale records (no membership change) so the NEXT
+            #      install re-snapshots the real, possibly admin-changed state.
+            if _group_udev_rule_references "$group"; then
+                log_info "udev rules still reference group '$group'; keeping '$user' in it (all records pre-existing). [$component]"
+                return 0
+            fi
+            log_info "All records pre-existing and no udev rule needs '$group'; consuming stale records for '$user'@'$group' (membership unchanged). [$component]"
+            if ! manifest_remove_group_all "$group" "$user"; then
+                log_error "Could not consume stale group records for '$user'@'$group'; keeping them for retry."
+                return 1
+            fi
+            return 0
+            ;;
+        0) ;;
         *)
             log_error "Cannot determine original membership of $user@$group; refusing to change it (manifest rc=$own_rc)"
             return 1
             ;;
     esac
-    # Keep membership if another udev rule (e.g. from a component still
-    # installed, or a third-party rule) still references the group.
-    if grep -rl "GROUP=\"$group\"" /etc/udev/rules.d/ 2> /dev/null | grep -q .; then
+    # rc 0: some component recorded was_member=false => WE added the membership.
+    # Keep it while ANY udev rule (ours from a sibling, or third-party) needs it.
+    if _group_udev_rule_references "$group"; then
         log_info "udev rules still reference group '$group'; keeping '$user' in it."
         return 0
     fi
@@ -1193,6 +1222,7 @@ _remove_group_membership_body() {
         log_error "Could not consume group records for '$user'@'$group'; keeping them for retry."
         return 1
     fi
+    return 0
 }
 
 remove_group_membership() {
