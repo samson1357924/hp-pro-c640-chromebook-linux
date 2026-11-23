@@ -508,7 +508,7 @@ all state is in a temp dir. The daemon suite has 406 cases (write chain, re-prob
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
 `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1387 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1392 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -520,7 +520,7 @@ fail-closed bodies), unique writer temps and checked `systemctl` restores.
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 1387 cases (root)
+sudo bash tests/rollback-test.sh                       # 1392 cases (root)
 ```
 
 ---

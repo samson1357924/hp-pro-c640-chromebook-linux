@@ -438,7 +438,7 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1387 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1392 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的 symlink/inode/祖先/父目錄拒絕與 fd 8 釘住、
@@ -449,7 +449,7 @@ unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 1387 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1392 個案例（需 root）
 ```
 
 ---

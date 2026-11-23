@@ -108,7 +108,7 @@
   亮著並重新 seed last-user cache。`--test-blank` 在保存失敗時回傳 1。
 
 目前的單元測試總數（含上述修復與下方第七、八、九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1387** 個 rollback 案例（最後一項需
+修復）：**406** 個 daemon、**73** 個 sleep-hook、**1392** 個 rollback 案例（最後一項需
 root），全部 0 失敗。
 
 #### 第七次 re-review 修復（2026-11-23，僅單元測試）
@@ -139,7 +139,7 @@ root），全部 0 失敗。
   絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
 目前的單元測試總數（含上述修復與下方第八、九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1387** 個 rollback 案例（最後一項需
+修復）：**406** 個 daemon、**73** 個 sleep-hook、**1392** 個 rollback 案例（最後一項需
 root），全部 0 失敗。
 
 #### 第八次 re-review 修復（2026-11-23，僅單元測試）
@@ -172,7 +172,7 @@ root），全部 0 失敗。
 在 rollback 失敗時提前中止收尾。
 
 目前的單元測試總數（含上述修復與下方第九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1387** 個 rollback 案例（最後一項需
+修復）：**406** 個 daemon、**73** 個 sleep-hook、**1392** 個 rollback 案例（最後一項需
 root），全部 0 失敗。
 
 #### 第九次 re-review 修復（2026-11-23，僅單元測試）
@@ -198,7 +198,7 @@ root），全部 0 失敗。
   以 noclobber 建立，不會被任何 writer 換掉 inode。
 
 目前的單元測試總數（含上述修復與下方第十、十一次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1387** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+**73** 個 sleep-hook、**1392** 個 rollback 案例（最後一項需 root），全部 0 失敗。
 
 #### 第十次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -226,7 +226,7 @@ root），全部 0 失敗。
   `fingerprint --source` 會在整個 clone/compile 期間持鎖，平行操作請調高 timeout。
 
 目前的單元測試總數（含上述修復與下方第十一次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1387** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+**73** 個 sleep-hook、**1392** 個 rollback 案例（最後一項需 root），全部 0 失敗。
 
 #### 第十一次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -257,8 +257,14 @@ root），全部 0 失敗。
   取鎖。S10/S10b/S10c/S10d/T13 涵蓋 user-owned 1777 祖先拒絕、root 1777 通過、
   rename 雙持鎖防護與非 root 呼叫者在預設 root-owned 路徑不誤傷。自訂可寫的 lock parent
   不再被接受。
+* **CI 失敗修復——PAM 故障注入改為每次呼叫獨立。** push 後 Backup/Rollback CI job
+  回報 1383 通過 / 4 失敗：PAM-4 的 `STUB_FAIL_ROLLBACK_PY=1` 從父 shell 洩漏到
+  PAM-8。`dab9436` 把故障旗標改為 `run_pam_install()` / `run_pam_uninstall()` 的
+  明確傳參，且只在 sandbox snippet 內 export，後續 uninstall 不會繼承。新增
+  **PAM-9** 回歸先注入 fail=1，再故意把父環境污染為 fail=0，驗證 rollback 乾淨完成、
+  PAM 檔案位元組完全相同（+5 assertions；rollback 總數 **1392**）。
 
-修復後的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1387** 個 rollback
+修復後的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1392** 個 rollback
 案例（最後一項需 root），全部 0 失敗。
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
@@ -308,7 +314,7 @@ root），全部 0 失敗。
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（406 daemon + 73 hook + 1387 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（406 daemon + 73 hook + 1392 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -361,7 +367,7 @@ cat /sys/power/mem_sleep
   鎖定喚醒時延後並保留 `state=30`，再以 `loginctl unlock-session 2` 解鎖後
   亮度/gsd/UPower 皆還原至 30 且兩個 handoff 檔皆消耗），
   2026-11-23（第六、七、八、九、十、十一次 re-review 單元測試重跑：406 daemon +
-  73 sleep-hook + 1387 rollback 案例，0 失敗；結果碼、manifest fail-closed、熄滅前保存、
+  73 sleep-hook + 1392 rollback 案例，0 失敗；結果碼、manifest fail-closed、熄滅前保存、
   單次取樣/無效 state 自我修復、manifest 欄位驗證、副作用前 rollback gate 與 rollback
   安全語意——安全欄位必填/unknown 即 fail closed、目標缺席時從第一份備份還原、
   systemctl 還原檢查 rc、群組先記錄後變更、原子還原不先 unlink 且找不到備份回 rc 1，
