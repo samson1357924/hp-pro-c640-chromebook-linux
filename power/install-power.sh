@@ -58,7 +58,7 @@ check_power_status() {
     fi
 }
 
-uninstall_power() {
+_uninstall_power_body() {
     log_section "Uninstalling Power Optimization Profiles"
     # rollback_component now returns non-zero when a service/file could not be
     # restored. With `set -e` an unguarded call would abort here and SKIP the
@@ -79,7 +79,12 @@ uninstall_power() {
     return "$rollback_rc"
 }
 
-install_power() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_power() {
+    run_manifest_operation _uninstall_power_body "$@"
+}
+
+_install_power_body() {
     log_section "Installing Power & S0ix Optimizations for HP Pro c640 ($DISTRO_NAME)"
 
     # Preflight check
@@ -177,6 +182,11 @@ install_power() {
     log_section "Power optimizations installed successfully! ⚡"
     echo "To test your S0ix Modern Standby health, run:"
     echo "    ./scripts/check-s0ix.sh"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_power() {
+    run_manifest_operation _install_power_body "$@"
 }
 
 ACTION="install"

@@ -81,9 +81,14 @@ PY
 # rendezvous, so no fixed /tmp path can collide with the legacy cases.
 # ---------------------------------------------------------------------------
 LOCK_TEST_SANDBOXES=()
-# T12's sandbox comes back through `$(make_manifest_lock_sandbox ...)`, so the
-# array append happens in a subshell and never reaches this trap. Track that
-# one path explicitly so an early T12 failure still releases its bounded waiter.
+# Every make_manifest_lock_sandbox() call runs inside `$( ...)`, so its array
+# append only mutates a SUBSHELL array — the EXIT trap never saw those paths
+# and /tmp/rollback-test-lock-* accumulated across runs. Tag every sandbox
+# with this run's PID and sweep by that exact prefix: nothing left behind, and
+# no wildcard that could delete another session's sandboxes.
+LOCK_TEST_RUN_TAG="$$"
+# T12 publishes its path here so an early failure still releases its bounded
+# waiter (the prefix sweep below is the actual removal safety net).
 T12_CRASH_SANDBOX=""
 cleanup_lock_test_sandboxes() {
     local s
@@ -97,13 +102,15 @@ cleanup_lock_test_sandboxes() {
     if [ -n "$T12_CRASH_SANDBOX" ]; then
         : > "$T12_CRASH_SANDBOX/crash.stop" 2> /dev/null || true
     fi
+    rm -rf -- /tmp/rollback-test-lock-"$LOCK_TEST_RUN_TAG"-* 2> /dev/null || true
 }
 trap cleanup_lock_test_sandboxes EXIT
 
 make_manifest_lock_sandbox() {
-    # $1=short name; echoes a fresh absolute path and registers it for cleanup.
+    # $1=short name; echoes a fresh absolute path. The run-tag sweep in the
+    # EXIT trap cleans it even though this function runs in a $(...) subshell.
     local s
-    s="$(mktemp -d "/tmp/rollback-test-lock-$1-XXXXXX")"
+    s="$(mktemp -d "/tmp/rollback-test-lock-$LOCK_TEST_RUN_TAG-$1-XXXXXX")"
     mkdir -p "$s/manifest" "$s/backups" "$s/stub" "$s/root" "$s/snapshots"
     # sudo execs directly: PATH / PYTHONPATH / STUB_* reach the python writers,
     # so the Phase 1 sitecustomize os.replace fault stub still works with the
@@ -157,6 +164,69 @@ worker_wait_pid() {
     fi
     wait "$pid" 2> /dev/null || true
 }
+
+op_wait_for_file() {
+    # $1=file $2=attempts (0.05s each); 0 when it appeared, 1 on timeout.
+    local f="$1" n="$2" i=0
+    while [ ! -e "$f" ] && [ "$i" -lt "$n" ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    [ -e "$f" ]
+}
+
+# ---------------------------------------------------------------------------
+# Re-review #10 finding #1: an operation-level lock must cover
+# "backup/record -> deploy -> finish/rollback" for the SAME target. Only
+# `install` is intercepted so A can pause after its manifest record is written
+# but before the deployed file appears; `sudo sh` (lock init) and `sudo cp`
+# (backup_file) still run for real. Env: STUB_DEPLOY_BARRIER=1,
+# STUB_FIRED_FILE, STUB_RELEASE_FILE.
+# ---------------------------------------------------------------------------
+setup_deploy_barrier_stub() {
+    cat > "$1/stub/install" << 'EOF'
+#!/usr/bin/env bash
+if [ "${STUB_DEPLOY_BARRIER:-0}" = "1" ] && [ "${1:-}" = "-D" ]; then
+    : > "${STUB_FIRED_FILE:?}"
+    i=0
+    while [ ! -e "${STUB_RELEASE_FILE:?}" ] && [ "$i" -lt 400 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+fi
+exec /usr/bin/install "$@"
+EOF
+    chmod +x "$1/stub/install"
+}
+
+# A: a REAL run_manifest_operation around the install pattern used by every
+# installer (unguarded backup gate, then sudo install -D). $3=target $4=comp.
+OP_DEPLOY_WORKER='
+    export PATH="$2/stub:$PATH"
+    SB="$2"
+    source "$1/lib/backup.sh"
+    deploy_target() {
+        local target="$1" comp="$2"
+        backup_file_manifest_aware "$target" "$comp" || return $?
+        sudo install -D -m 0644 "$SB/deploy.src" "$target"
+    }
+    exec 3<>"$SB/ready" 4<>"$SB/go"
+    printf "r\n" >&3
+    read -r _ <&4
+    rc=0
+    run_manifest_operation deploy_target "$3" "$4" || rc=$?
+    printf "%s\n" "$rc" > "$SB/a.rc"
+'
+
+# B: rollback of the same component through the SAME operation-level wrapper.
+OP_ROLLBACK_WORKER='
+    export PATH="$2/stub:$PATH"
+    SB="$2"
+    source "$1/lib/backup.sh"
+    rc=0
+    run_manifest_operation rollback_component "$3" || rc=$?
+    printf "%s\n" "$rc" > "$SB/b.rc"
+'
 
 # Worker body used by T1/T7: synchronise at the barrier, then install one
 # target. `$3` is the target/component supplied via run_sandboxed.
@@ -6038,11 +6108,14 @@ test_lock_dryrun_and_no_python3_untouched() {
     local mp="$sandbox/manifest/install-manifest.json"
     printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' > "$mp"
     printf 'ORIGINAL AUDIO\n' > "$sandbox/root/audio.conf"
+    # A real wrapped installer, used below to prove DRY_RUN takes no lock.
+    prepare_caller_sandbox_script "$sandbox" power
 
     run_sandboxed "$sandbox" '
         export PATH="$2/stub:$PATH" DRY_RUN=1 STUB_USERMOD_LOG="$2/usermod.log" \
             STUB_GPASSWD_LOG="$2/gpasswd.log"
         source "$1/lib/backup.sh"
+        SB="$2"
         for fn in add_entry add_service add_group remove_group ensure_group remove_group_membership backup_gate rollback; do
             rc=0
             case "$fn" in
@@ -6057,12 +6130,33 @@ test_lock_dryrun_and_no_python3_untouched() {
             esac
             printf "%s\n" "$rc" > "$2/dry-$fn.rc"
         done
+        # The operation wrapper itself must not take/create a lock in DRY_RUN.
+        dryrun_probe_body() { : > "$SB/dry-probe-ran"; }
+        rc=0
+        run_manifest_operation dryrun_probe_body || rc=$?
+        printf "%s\n" "$rc" > "$SB/dry-operation.rc"
+        # ...and neither may a real wrapped installer (sourced with set -e,
+        # hence the subshell so the rest of this snippet is unaffected).
+        (
+            source "$SB/install-caller-sandbox.sh"
+            uninstall_power
+        )
+        printf "%s\n" "$?" > "$SB/dry-installer.rc"
     '
     local fn
     for fn in add_entry add_service add_group remove_group ensure_group remove_group_membership backup_gate rollback; do
         assert_eq "0" "$(cat "$sandbox/dry-$fn.rc" 2> /dev/null || echo MISSING)" \
             "LOCK T6: dry-run $fn rc 0"
     done
+    assert_eq "0" "$(cat "$sandbox/dry-operation.rc" 2> /dev/null || echo MISSING)" \
+        "LOCK T6: dry-run run_manifest_operation rc 0"
+    assert_eq "0" "$(cat "$sandbox/dry-installer.rc" 2> /dev/null || echo MISSING)" \
+        "LOCK T6: dry-run wrapped installer rc 0"
+    if [ -e "$sandbox/dry-probe-ran" ]; then
+        ok
+    else
+        fail "LOCK T6: dry-run operation body was not called"
+    fi
     if [ -e "$sandbox/manifest/.install-manifest.lock" ]; then
         fail "LOCK T6: dry-run must not create a lock file"
     else
@@ -6512,6 +6606,265 @@ test_sec_crash_releases_lock_without_unlock() {
 }
 
 # ---------------------------------------------------------------------------
+# Re-review #10 finding #1: operation-level lock regressions (OP1-OP4).
+# OP1/OP2 use a REAL `sudo install -D` barrier: A records the target, pauses
+# before writing it, B races with rollback on the SAME target. OP3 proves the
+# body is never entered when acquisition fails. OP4 proves the bare call keeps
+# `set -e` inside a wrapped installer (no fail-open deployment).
+# ---------------------------------------------------------------------------
+
+test_op_deploy_vs_rollback_barrier() {
+    # $1=OP id, $2=target key, $3=component, $4=initial content (empty => absent)
+    local opid="$1" key="$2" comp="$3" initial="${4:-}"
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox "$opid-$key")"
+    setup_deploy_barrier_stub "$sandbox"
+    manifest_lock_barrier_init "$sandbox"
+    local target="$sandbox/root/deployed.conf"
+    if [ -n "$initial" ]; then
+        printf '%s\n' "$initial" > "$target"
+    fi
+    printf 'DEPLOYED CONTENT\n' > "$sandbox/deploy.src"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    export STUB_DEPLOY_BARRIER=1 STUB_FIRED_FILE="$sandbox/fired" \
+        STUB_RELEASE_FILE="$sandbox/release"
+
+    run_sandboxed "$sandbox" "$OP_DEPLOY_WORKER" "$target" "$comp" &
+    local pa=$!
+    barrier_release "$sandbox" 1
+    if op_wait_for_file "$sandbox/fired" 200; then
+        ok
+    else
+        fail "OP [$opid $key]: deploy stub never fired"
+    fi
+    # The record is committed BEFORE the stub fires (backup gate -> record ->
+    # install). A's operation lock must still be held at this point.
+    assert_eq "1" "$(manifest_count "$manifest" records 2> /dev/null || echo MISSING)" \
+        "OP [$opid $key]: deploy record committed before the barrier"
+
+    run_sandboxed "$sandbox" "$OP_ROLLBACK_WORKER" "$comp" &
+    local pb=$!
+    if op_wait_for_file "$sandbox/b.rc" 30; then
+        fail "OP [$opid $key]: rollback finished while deploy still held the operation lock"
+    else
+        ok
+    fi
+    : > "$sandbox/release"
+    worker_wait_pid "$pa"
+    worker_wait_pid "$pb"
+    unset STUB_DEPLOY_BARRIER STUB_FIRED_FILE STUB_RELEASE_FILE
+
+    assert_eq "0" "$(cat "$sandbox/a.rc" 2> /dev/null || echo MISSING)" \
+        "OP [$opid $key]: deploy rc 0"
+    assert_eq "0" "$(cat "$sandbox/b.rc" 2> /dev/null || echo MISSING)" \
+        "OP [$opid $key]: rollback rc 0"
+    assert_eq "0" "$(manifest_count "$manifest" records)" \
+        "OP [$opid $key]: record consumed exactly once"
+    if [ -n "$initial" ]; then
+        assert_eq "$initial" "$(cat "$target" 2> /dev/null || echo MISSING)" \
+            "OP [$opid $key]: ORIGINAL restored, not overwritten by the late deploy"
+        if grep -rq "$initial" "$sandbox/backups"; then
+            ok
+        else
+            fail "OP [$opid $key]: first backup retained"
+        fi
+    else
+        if [ -e "$target" ]; then
+            fail "OP [$opid $key]: untracked deployed file survived (record consumed too early)"
+        else
+            ok
+        fi
+    fi
+}
+
+test_op_lock_failure_skips_operation_body() {
+    # (a) broken flock stub: acquisition fails before any side effect.
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox op3-flock)"
+    cat > "$sandbox/stub/flock" << 'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$sandbox/stub/flock"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        SB="$2"
+        source "$1/lib/backup.sh"
+        probe_body() {
+            : > "$SB/body-called"
+            printf "DEPLOYED\n" > "$SB/root/deployed.conf"
+        }
+        rc=0
+        run_manifest_operation probe_body || rc=$?
+        printf "%s\n" "$rc" > "$SB/op3.rc"
+    '
+    assert_eq "1" "$(cat "$sandbox/op3.rc" 2> /dev/null || echo MISSING)" \
+        "OP3: broken flock -> rc 1"
+    if [ -e "$sandbox/body-called" ]; then
+        fail "OP3: body ran despite lock acquisition failure"
+    else
+        ok
+    fi
+    if [ -e "$sandbox/root/deployed.conf" ]; then
+        fail "OP3: target deployed despite lock acquisition failure"
+    else
+        ok
+    fi
+
+    # (b) real external holder -> bounded timeout, same fail-closed guarantee.
+    sandbox="$(make_manifest_lock_sandbox op3-timeout)"
+    local lock="$sandbox/manifest/.install-manifest.lock"
+    : > "$lock"
+    chmod 0600 "$lock"
+    (
+        exec 9< "$lock"
+        flock -x 9
+        : > "$sandbox/held"
+        sleep 5
+    ) &
+    local holder=$! i=0
+    while [ ! -e "$sandbox/held" ] && [ "$i" -lt 200 ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -e "$sandbox/held" ]; then ok; else fail "OP3: external holder never acquired"; fi
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT=1
+        SB="$2"
+        source "$1/lib/backup.sh"
+        probe_body() {
+            : > "$SB/body-called"
+            printf "DEPLOYED\n" > "$SB/root/deployed.conf"
+        }
+        rc=0
+        run_manifest_operation probe_body || rc=$?
+        printf "%s\n" "$rc" > "$SB/op3-timeout.rc"
+    '
+    assert_eq "1" "$(cat "$sandbox/op3-timeout.rc" 2> /dev/null || echo MISSING)" \
+        "OP3: timeout -> rc 1"
+    if [ -e "$sandbox/body-called" ]; then
+        fail "OP3: body ran despite lock timeout"
+    else
+        ok
+    fi
+    if [ -e "$sandbox/root/deployed.conf" ]; then
+        fail "OP3: target deployed despite lock timeout"
+    else
+        ok
+    fi
+    kill "$holder" 2> /dev/null || true
+    worker_wait_pid "$holder"
+}
+
+test_op_fail_open_guard_under_errexit() {
+    # A failed manifest write must abort a wrapped installer BEFORE its
+    # unguarded `sudo install -D`. Using `|| rc=$?` in run_manifest_operation
+    # would disable errexit inside the body and deploy anyway (OP4 catches it).
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox op4)"
+    prepare_keyd_sandbox_script "$sandbox"
+    # Fail ONLY real writers (argc>=6); validator/probes stay real.
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "${STUB_FAIL_MANIFEST_WRITE:-0}" = "1" ] && [ "$1" = "-c" ] && [ "$#" -ge 6 ]; then
+    printf 'stub: forced manifest write failure\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[]}' \
+        > "$sandbox/manifest/install-manifest.json"
+    local target="$sandbox/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb"
+    local rc=0
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_FAIL_MANIFEST_WRITE=1 WITH_KEYD=0 \
+            STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        # BARE call: sourced installer has `set -e`, so a failed gate aborts.
+        install_keyboard
+    '; then
+        rc=0
+    else
+        rc=$?
+    fi
+    assert_eq "1" "$rc" \
+        "OP4: wrapped installer rc non-zero when the manifest write fails"
+    if [ -e "$target" ]; then
+        fail "OP4: fail-open deployment (file exists without a manifest record)"
+    else
+        ok
+    fi
+    local wrapper_src
+    wrapper_src="$(grep -n -A 16 '^run_manifest_operation()' "$REPO_ROOT/lib/backup.sh")"
+    assert_contains '"$fn" "$@"' "$wrapper_src" \
+        "OP4: wrapper invokes the body with a bare call"
+    assert_not_contains '"$fn" "$@" ||' "$wrapper_src" \
+        'OP4: wrapper does not swallow the body rc with || rc=$?'
+}
+
+test_op_real_installer_barrier() {
+    # Same interleave as OP1 but through the REAL wrapped install_keyboard():
+    # removing its thin wrapper must reintroduce the untracked deployed file.
+    local sandbox
+    sandbox="$(make_manifest_lock_sandbox op1-real-installer)"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    setup_deploy_barrier_stub "$sandbox"
+    manifest_lock_barrier_init "$sandbox"
+    local target="$sandbox/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb"
+    local manifest="$sandbox/manifest/install-manifest.json"
+    export STUB_DEPLOY_BARRIER=1 STUB_FIRED_FILE="$sandbox/fired" \
+        STUB_RELEASE_FILE="$sandbox/release" \
+        STUB_SYSTEMCTL_LOG="$sandbox/systemctl.log"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" WITH_KEYD=0 \
+            STUB_SYSTEMCTL_LOG="$2/systemctl.log"
+        SB="$2"
+        source "$SB/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        exec 3<>"$SB/ready" 4<>"$SB/go"
+        printf "r\n" >&3
+        read -r _ <&4
+        install_keyboard
+        printf "0\n" > "$SB/a.rc"
+    ' &
+    local pa=$!
+    barrier_release "$sandbox" 1
+    if op_wait_for_file "$sandbox/fired" 200; then
+        ok
+    else
+        fail "OP [real installer]: deploy stub never fired"
+    fi
+    assert_eq "1" "$(manifest_count "$manifest" records 2> /dev/null || echo MISSING)" \
+        "OP [real installer]: hwdb record committed before the barrier"
+
+    run_sandboxed "$sandbox" "$OP_ROLLBACK_WORKER" keyboard &
+    local pb=$!
+    if op_wait_for_file "$sandbox/b.rc" 30; then
+        fail "OP [real installer]: rollback finished while install held the operation lock"
+    else
+        ok
+    fi
+    : > "$sandbox/release"
+    worker_wait_pid "$pa"
+    worker_wait_pid "$pb"
+    unset STUB_DEPLOY_BARRIER STUB_FIRED_FILE STUB_RELEASE_FILE STUB_SYSTEMCTL_LOG
+
+    assert_eq "0" "$(cat "$sandbox/a.rc" 2> /dev/null || echo MISSING)" \
+        "OP [real installer]: install_keyboard rc 0"
+    assert_eq "0" "$(cat "$sandbox/b.rc" 2> /dev/null || echo MISSING)" \
+        "OP [real installer]: rollback rc 0"
+    if [ -e "$target" ]; then
+        fail "OP [real installer]: untracked hwdb file survived the race"
+    else
+        ok
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 44. Non-keyboard uninstall callers must not abort on a failed rollback.
 #     rollback_component now returns 1 for failed/unknown items; with `set -e`
 #     an unguarded call skips the caller's remaining cleanup. These tests run
@@ -6842,6 +7195,14 @@ test_sec_lock_rejects_post_open_owner_swap
 test_sec_unprivileged_cannot_flock
 test_sec_holder_contention_and_recovery
 test_sec_crash_releases_lock_without_unlock
+# Re-review #10 finding #1: operation-level (backup -> deploy -> rollback) lock
+test_op_deploy_vs_rollback_barrier OP1 keyboard-hwdb keyboard
+test_op_deploy_vs_rollback_barrier OP1 audio-ucm audio
+test_op_deploy_vs_rollback_barrier OP2 keyboard-hwdb keyboard ORIGINAL
+test_op_deploy_vs_rollback_barrier OP2 audio-ucm audio ORIGINAL
+test_op_lock_failure_skips_operation_body
+test_op_fail_open_guard_under_errexit
+test_op_real_installer_barrier
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

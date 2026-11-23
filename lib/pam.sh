@@ -12,8 +12,12 @@ SCRIPT_DIR_PAM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR_PAM/logger.sh"
 # shellcheck source=lib/distro.sh
 source "$SCRIPT_DIR_PAM/distro.sh"
+# shellcheck source=lib/backup.sh
+# configure_pam_fingerprint() uses run_manifest_operation(); the fingerprint
+# installer already sources backup.sh first, but keep this header self-contained.
+source "$SCRIPT_DIR_PAM/backup.sh"
 
-configure_pam_fingerprint() {
+_configure_pam_fingerprint_body() {
     log_info "Configuring PAM for fingerprint authentication on $DISTRO_FAMILY ($DISTRO_ID)..."
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -221,4 +225,10 @@ disable_pam_fingerprint() {
             log_info "Please revert any manual PAM fprintd entries from /etc/pam.d/system-auth if needed."
             ;;
     esac
+}
+
+# PAM backup/record -> sed mutation is one operation; DRY_RUN is handled by the
+# wrapper before taking the lock (the body also keeps its own early return).
+configure_pam_fingerprint() {
+    run_manifest_operation _configure_pam_fingerprint_body "$@"
 }

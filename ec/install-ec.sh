@@ -26,7 +26,7 @@ show_help() {
     echo "  --help, -h              Show this help message"
 }
 
-install_ec_tools() {
+_install_ec_tools_body() {
     log_section "Installing ChromeOS EC Utilities for HP Pro c640 ($DISTRO_NAME)"
     check_dmi_board || true
 
@@ -112,7 +112,12 @@ install_ec_tools() {
     echo "    c640-ec-control battery-limit 90"
 }
 
-enable_battery_service() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_ec_tools() {
+    run_manifest_operation _install_ec_tools_body "$@"
+}
+
+_enable_battery_service_body() {
     log_section "Enabling 90% Battery Protection Service & Sleep Hook"
     local srv_dst="/etc/systemd/system/c640-battery-limit.service"
     local srv_src="$SCRIPT_DIR/systemd/c640-battery-limit.service"
@@ -144,7 +149,12 @@ enable_battery_service() {
     fi
 }
 
-uninstall_ec_tools() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+enable_battery_service() {
+    run_manifest_operation _enable_battery_service_body "$@"
+}
+
+_uninstall_ec_tools_body() {
     log_section "Uninstalling ChromeOS EC Utilities"
     if [ "${DRY_RUN:-0}" != "1" ]; then
         if [ -x "/usr/local/bin/c640-ec-control" ]; then
@@ -168,6 +178,11 @@ uninstall_ec_tools() {
     log_success "EC utilities removed."
     # Propagate a rollback failure only after ALL cleanup above has run.
     return "$rollback_rc"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_ec_tools() {
+    run_manifest_operation _uninstall_ec_tools_body "$@"
 }
 
 ACTION="install"

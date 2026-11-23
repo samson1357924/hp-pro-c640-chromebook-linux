@@ -75,7 +75,7 @@ check_fp_status() {
     ls -la "$LIBDIR"/libfprint-2.so* 2> /dev/null || log_warn "No libfprint-2.so found in $LIBDIR."
 }
 
-uninstall_fp() {
+_uninstall_fp_body() {
     log_section "Uninstalling Custom crfpmoc Driver"
     # The encryption seed is created at driver runtime (first device open),
     # not at install time, so it can only be cleaned up on uninstall.
@@ -147,6 +147,11 @@ uninstall_fp() {
     log_success "Fingerprint driver uninstallation finished."
     # Propagate a rollback failure only after ALL cleanup above has run.
     return "$rollback_rc"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_fp() {
+    run_manifest_operation _uninstall_fp_body "$@"
 }
 
 configure_udev_and_sleep_hook() {
@@ -463,7 +468,8 @@ install_fp_from_source() {
             git -C "$crfpmoc_dir" fetch --depth 1 origin 56442591a5c302a906289f30988fb50fc3d82ed6 || {
                 log_error "Failed to fetch pinned commit 56442591a5c302a906289f30988fb50fc3d82ed6 of 3v1n0/libfprint (feature/crfpmoc)."
                 log_info "The pinned commit may have been rewritten upstream; verify against https://gitlab.freedesktop.org/3v1n0/libfprint."
-                exit 1
+                # return, not exit: keep the operation wrapper's unlock path.
+                return 1
             }
             git -C "$crfpmoc_dir" checkout --detach FETCH_HEAD
         fi
@@ -535,7 +541,7 @@ install_fp_from_source() {
     fi
 }
 
-install_fp() {
+_install_fp_body() {
     log_section "Installing crfpmoc Fingerprint Driver for HP Pro c640 ($DISTRO_NAME)"
 
     # 0. Preflight checks
@@ -589,6 +595,12 @@ install_fp() {
     echo "    fprintd-enroll \"$real_user\""
     echo "To verify enrollment, run:"
     echo "    fprintd-verify \"$real_user\""
+}
+
+# One operation lock for udev/PAM records, driver deployment and service setup.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_fp() {
+    run_manifest_operation _install_fp_body "$@"
 }
 
 # CLI Argument Parsing

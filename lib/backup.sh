@@ -276,6 +276,45 @@ manifest_unlock() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Operation-level transaction lock (re-review #10 finding #1).
+#
+# The metadata helpers above release the lock before returning, so an
+# installer that does "backup_file_manifest_aware -> sudo install -D" still
+# leaves a window where a concurrent uninstall can consume the just-written
+# `was_existing=false` record while the target is absent. The deployed file
+# then exists with NO manifest record, so no later uninstall can remove it.
+# Installers therefore call THIS once around the whole component operation
+# (backup/record -> deploy -> finish/rollback), using MANIFEST_LOCK_DEPTH for
+# all the nested helpers (backup gate, group helpers, keyd normalization,
+# rollback_component) so they never spawn a second holder.
+#
+# The body is invoked with a BARE call on purpose. `|| rc=$?` or
+# `if "$fn"; then` makes bash ignore `set -e` inside the body, so an
+# unguarded failed backup gate would silently fall through to `sudo install`
+# (fail-open deployment). With a bare call, an errexit-aborted body kills the
+# shell at that line; the root holder's coproc pipe sees EOF and the kernel
+# releases the flock (crash-safe, SEC T12). Deliberately NO EXIT trap here:
+# it would clobber the fingerprint installer's existing EXIT/INT/TERM trap.
+# ---------------------------------------------------------------------------
+run_manifest_operation() {
+    local fn="${1:-}"
+    if [ -z "$fn" ] || ! declare -F "$fn" > /dev/null 2>&1; then
+        log_error "run_manifest_operation: invalid function '${fn:-<empty>}'"
+        return 1
+    fi
+    shift
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        "$fn" "$@" # no lock / no lock file in dry-run (T6)
+        return $?
+    fi
+    manifest_lock || return 1 # fail closed BEFORE any side effect
+    "$fn" "$@"                # BARE call: preserve caller's errexit semantics
+    local rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
 # Shared durability helper injected into every manifest WRITER's `-c` script.
 # Keeping one implementation here avoids six subtly different copies while
 # leaving each writer's argv (and therefore the test-stub contract) unchanged.

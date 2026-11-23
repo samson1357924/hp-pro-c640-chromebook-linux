@@ -76,7 +76,7 @@ check_audio_status() {
     return "$missing"
 }
 
-uninstall_audio() {
+_uninstall_audio_body() {
     log_section "Uninstalling ALSA UCM2 Profiles"
     # rollback_component now returns non-zero when a service/file could not be
     # restored. With `set -e` an unguarded call would abort here and SKIP the
@@ -94,7 +94,12 @@ uninstall_audio() {
     return "$rollback_rc"
 }
 
-install_audio() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_audio() {
+    run_manifest_operation _uninstall_audio_body "$@"
+}
+
+_install_audio_body() {
     log_section "Installing ALSA UCM2 Profiles for HP Pro c640 (Dratini)"
 
     # Pre-flight check
@@ -109,7 +114,8 @@ install_audio() {
 
         if [ ! -f "$src_file" ]; then
             log_error "Missing source UCM file: $src_file"
-            exit 1
+            # return (not exit): the operation wrapper must still unlock.
+            return 1
         fi
 
         backup_file_manifest_aware "$dst_file" "audio"
@@ -158,6 +164,12 @@ install_audio() {
     fi
 
     log_success "Audio UCM configuration completed successfully! 🔊"
+}
+
+# All UCM backups/records + `sudo install -D` deployments are one transaction.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_audio() {
+    run_manifest_operation _install_audio_body "$@"
 }
 
 # CLI Argument Parsing

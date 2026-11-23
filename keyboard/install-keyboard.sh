@@ -704,7 +704,7 @@ print(changed)
 # running keyd daemon. Returns 1 when deployment was skipped, when deployment
 # itself failed, or when the restart failed and recovery had to revert to the
 # pre-install config (dual-role is not active in all of those cases).
-install_keyd_step() {
+_install_keyd_step_body() {
     local had_legacy_link=0 link_target=""
     if [ "${DRY_RUN:-0}" = "1" ]; then
         backup_file_manifest_aware "$KEYD_DST" "keyboard"
@@ -880,6 +880,14 @@ install_keyd_step() {
     return 0
 }
 
+# Operation-level lock: the keyd step has its own backup -> deploy -> service
+# sequence, and tests call it directly. run_manifest_operation() is re-entrant
+# when install_keyboard() already holds the lock.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_keyd_step() {
+    run_manifest_operation _install_keyd_step_body "$@"
+}
+
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -1023,7 +1031,7 @@ check_keyboard_status() {
     fi
 }
 
-uninstall_keyboard() {
+_uninstall_keyboard_body() {
     log_section "Uninstalling Keyboard Top-Row hwdb Mapping & Backlight Sync"
 
     # Fail closed before any service/group side effect. _keyd_managed_by_us()
@@ -1178,7 +1186,15 @@ uninstall_keyboard() {
     return "$rollback_rc"
 }
 
-install_keyboard() {
+# Keep the whole uninstall (service/group mutation, rollback_component and
+# cleanup) under one operation lock so a concurrent install cannot deploy a
+# file after we consumed its manifest record.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_keyboard() {
+    run_manifest_operation _uninstall_keyboard_body "$@"
+}
+
+_install_keyboard_body() {
     log_section "Installing Chromebook Top-Row Function Keys Mapping & Backlight Sync"
     check_dmi_board || true
 
@@ -1369,6 +1385,14 @@ install_keyboard() {
         esac
     fi
     return "$final_rc"
+}
+
+# One lock for the FULL install: every backup_file_manifest_aware call and the
+# matching `sudo install -D` deployments stay in the same transaction, so an
+# uninstall cannot slip in between the manifest record and the real deploy.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_keyboard() {
+    run_manifest_operation _install_keyboard_body "$@"
 }
 
 # CLI Argument Parsing
