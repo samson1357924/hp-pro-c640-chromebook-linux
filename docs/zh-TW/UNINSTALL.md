@@ -64,14 +64,33 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 * **先記錄群組 membership 再變更。** 安裝器先把原始 `plugdev` 成員資格寫入 manifest，
   之後才明確檢查 `usermod` 的 rc。若變更失敗，就移除剛寫入的紀錄（除非已有較早的
   紀錄），以免日後 uninstall 移除使用者自行取得的成員資格。
-* **並行的安裝/解除安裝不會遺失追蹤紀錄。** 每一次 manifest read-modify-write 都由
-  root 控管的 `flock -x -w` 鎖序列化（`$MANIFEST_DIR/.install-manifest.lock`、fd 9；
-  等待上限為 `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）。鎖在 fail-closed
-  驗證 gate 之前取得，並持續持有到重新讀取、修改與寫入完成，因此某個程序 first-wins
-  的備份/服務/群組紀錄不會被另一個程序覆寫。缺少 `flock` 或鎖等待逾時都會 fail closed
-  且保持位元組不變；每個 writer 並使用 manifest 目錄中唯一的
-  `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），避免平行
-  writer 互相覆寫暫存檔。
+* **並行的安裝/解除安裝不會遺失追蹤紀錄，也不會留下未追蹤的部署。** 每個元件安裝器
+  透過 `lib/backup.sh` 的 `run_manifest_operation()`，在**整個元件操作交易**——備份/紀錄 →
+  部署檔案與服務 → 完成或回滾——只取得一把操作級鎖。巢狀 helper（備份 gate、群組 helper、
+  keyd-link 正規化與 `rollback_component()`）透過 `MANIFEST_LOCK_DEPTH` 重入同一把鎖，因此
+  並行的 uninstall 不會在目標檔仍缺席時消耗剛寫入的 `was_existing=false` 紀錄——那會讓已
+  部署的檔案留在磁碟上卻沒有 manifest 紀錄，日後也無法移除。鎖在 fail-closed 驗證 gate
+  之前取得，並持續持有到最終原子取代完成；每一次 manifest read-modify-write 都在鎖內
+  重新讀取文件，因此某程序 first-wins 的備份/服務/群組紀錄不會被另一程序覆寫。每個
+  writer 使用 manifest 目錄中唯一的 `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644`
+  與 `os.replace`），避免平行 writer 互相覆寫暫存檔。`DRY_RUN` 不取鎖，也不建立鎖檔。
+* **鎖檔為 root-only，並能防範惡意路徑。** `$MANIFEST_DIR/.install-manifest.lock` 是
+  root 擁有的 `0600` 普通檔（舊版 `0644` 鎖會在首次使用時升級），因此非特權的 peer 帳號
+  連開啟都做不到，更無法握住 exclusive `flock` 在整個等待期間阻塞所有安裝器——非 root
+  shell 仍能執行安裝器，因為取得鎖的工作交給了透過 passwordless `sudo` 啟動的短暫 root
+  helper。該 helper 以 `coproc sudo bash -c` 啟動：它持有 fd 9、執行有界的 `flock -x -w`
+  等待（`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）、印出 `READY`，然後阻塞讀取
+  stdin。關閉父行程的 write fd 會讓 helper 看到 EOF、結束並讓核心釋放 flock，因此崩潰或
+  `kill -9` 不會留下 stale lock（刻意不安裝 EXIT/INT/TERM trap）。symlink 與非普通檔的鎖
+  會被拒絕；父目錄必須由 root 或目前使用者擁有，且不可群組/其他可寫（`mode & 022 == 0`，
+  因此 `/var/lib/cros-enablement` 請維持 `0755`）；root helper 並在**實際持有 fd 9 的行程內**
+  比對 `/proc/$$/fd/9` 的 `(dev,ino)` 與鎖路徑，檢查 fd owner 為 `0`、mode 為 `600`、
+  型別為普通檔，因此 init 期間或等待 `flock` 期間的 inode 替換都會 fail closed。缺少
+  `flock`、逾時或上述任何檢查失敗都會保持 manifest 位元組不變並回 rc 1。
+* **長時間操作可能需要調高鎖等待上限。** `fingerprint/install-fingerprint.sh --source`
+  會在 `git clone`/建置/編譯期間持續持有操作鎖，因此平行的安裝/解除安裝可能撞上預設
+  10 秒等待而 fail closed。在該時段啟動平行操作前，請調高
+  `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（例如設為 `300`）。
 
 ---
 

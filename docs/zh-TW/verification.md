@@ -107,8 +107,8 @@
   兩次），**之後才**寫入 0；全部失敗時記錄 `blank: brightness NOT saved`、保持 LED
   亮著並重新 seed last-user cache。`--test-blank` 在保存失敗時回傳 1。
 
-目前的單元測試總數（含上述修復與下方第七、八、九次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1061** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+目前的單元測試總數（含上述修復與下方第七、八、九、十次 re-review 修復）：**406** 個
+daemon、**73** 個 sleep-hook、**1199** 個 rollback 案例（最後一項需 root），全部 0 失敗。
 
 #### 第七次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -137,8 +137,8 @@
   `skipping manifest entry with non-absolute target`（Meson plan 的目的路徑也必須是
   絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
-目前的單元測試總數（含上述修復與下方第八、九次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1061** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+目前的單元測試總數（含上述修復與下方第八、九、十次 re-review 修復）：**406** 個 daemon、
+**73** 個 sleep-hook、**1199** 個 rollback 案例（最後一項需 root），全部 0 失敗。
 
 #### 第八次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -169,8 +169,8 @@
 所有安裝 caller 現在會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e`
 在 rollback 失敗時提前中止收尾。
 
-目前的單元測試總數（含上述修復與下方第九次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1061** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+目前的單元測試總數（含上述修復與下方第九、十次 re-review 修復）：**406** 個 daemon、
+**73** 個 sleep-hook、**1199** 個 rollback 案例（最後一項需 root），全部 0 失敗。
 
 #### 第九次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -194,7 +194,35 @@
   fsync、`chmod 0644` 與 `os.replace`），避免平行 writer 覆寫彼此的暫存檔。鎖檔
   以 noclobber 建立，不會被任何 writer 換掉 inode。
 
-修復後的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1061** 個 rollback
+目前的單元測試總數（含上述修復與下方第十次 re-review 修復）：**406** 個 daemon、
+**73** 個 sleep-hook、**1199** 個 rollback 案例（最後一項需 root），全部 0 失敗。
+
+#### 第十次 re-review 修復（2026-11-23，僅單元測試）
+
+以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
+原文保留，此處不宣稱新的硬體實測。
+
+* **鎖已針對 symlink 替換與非特權 DoS 加固。** manifest 鎖
+  （`$MANIFEST_DIR/.install-manifest.lock`、fd 9）現在是 root 擁有的 `0600` 檔案
+  （舊的 `0644` 鎖會升級），因此 peer 帳號無法開啟它並以 exclusive flock 阻塞所有安裝器。
+  取得鎖的工作交給短暫的 `coproc sudo bash -c` root helper：它持有 fd 9，並在**實際持有
+  fd 9 的行程內**以 `/proc/$$/fd/9` 檢查 fd/路徑 `(dev,ino)`、owner `0`、mode `600` 與
+  普通檔型別（真正的 `sudo` 會關閉繼承的 fd，所以用 `sudo python3 fstat(9)` 不只在真實系統
+  上錯誤，還會讓測試 stub 假綠），再執行有界的 `flock -x -w` 等待
+  （`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`，預設 10 秒）、印出 `READY` 並阻塞讀取 stdin。
+  釋放或崩潰時關閉 pipe 即產生 EOF，核心會釋放 flock，不會留下 stale lock，也不需要
+  EXIT trap。symlink、非普通檔、inode 替換與不受信任的父目錄（非 root/目前使用者擁有，
+  或群組/其他可寫 `mode & 022 != 0`——目錄請維持 `0755`）都會在任何特權
+  chmod/chown/open 之前 fail closed；鎖檔以 `umask 077` + `set -C` 建立，絕不用 `install`。
+* **整個元件操作是單一鎖交易。** `run_manifest_operation()` 為 keyboard（含 keyd 步驟）、
+  audio、fingerprint（含 PAM）、EC/電池與 power 安裝器包住備份/紀錄 → 部署 → 完成/回滾，
+  巢狀 helper 以 `MANIFEST_LOCK_DEPTH` 重入，`DRY_RUN` 完全不取鎖。body 以 bare call 呼叫，
+  因此 `set -e` 仍生效（不會 fail-open 部署），且不安裝 EXIT trap（保留指紋安裝器既有的
+  trap）。這消除了以下競態：程序 A 寫入 `was_existing=false` 紀錄後解鎖、程序 B 的 uninstall
+  在目標檔缺席時消耗該紀錄，接著 A 才部署檔案，留下沒有追蹤紀錄的已部署檔案。
+  `fingerprint --source` 會在整個 clone/compile 期間持鎖，平行操作請調高 timeout。
+
+修復後的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1199** 個 rollback
 案例（最後一項需 root），全部 0 失敗。
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
@@ -244,7 +272,7 @@
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（406 daemon + 73 hook + 1061 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（406 daemon + 73 hook + 1199 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -296,12 +324,13 @@ cat /sys/power/mem_sleep
   gnome-settings-daemon 50 上以 `rtcwake -m no -s 20` + `systemctl suspend`；
   鎖定喚醒時延後並保留 `state=30`，再以 `loginctl unlock-session 2` 解鎖後
   亮度/gsd/UPower 皆還原至 30 且兩個 handoff 檔皆消耗），
-  2026-11-23（第六、七、八、九次 re-review 單元測試重跑：406 daemon + 73 sleep-hook +
-  1061 rollback 案例，0 失敗；結果碼、manifest fail-closed、熄滅前保存、單次取樣/無效
+  2026-11-23（第六、七、八、九、十次 re-review 單元測試重跑：406 daemon + 73 sleep-hook +
+  1199 rollback 案例，0 失敗；結果碼、manifest fail-closed、熄滅前保存、單次取樣/無效
   state 自我修復、manifest 欄位驗證、副作用前 rollback gate 與 rollback 安全語意
   ——安全欄位必填/unknown 即 fail closed、目標缺席時從第一份備份還原、systemctl 還原
   檢查 rc、群組先記錄後變更、原子還原不先 unlink 且找不到備份回 rc 1，加上跨程序
-  manifest 鎖與唯一 writer 暫存檔——的文件已同步；無新增真實 S3 實測）
+  manifest 鎖與唯一 writer 暫存檔，以及第十次的 0600 root-only holder 鎖與整個操作
+  序列化——的文件已同步；無新增真實 S3 實測）
 * **OS / 核心**：Ubuntu 26.04 LTS；2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`，2026-08 證據包為 `7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）

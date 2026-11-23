@@ -380,14 +380,40 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     record such as a missing backup was retained; those records are kept for retry and
     rollback returns rc 1. Re-run uninstall after fixing the underlying issue —
     successful restores log `[RESTORED SERVICE]`.
-  * `Manifest lock wait failed (rc=... after ...s)` or `flock not found` comes from the
-    cross-process manifest lock acquired before every read-modify-write. The wait is
-    bounded by `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s) on the root-controlled
-    lock file `$MANIFEST_DIR/.install-manifest.lock` (fd 9); a timeout or missing `flock`
-    fails closed and leaves the manifest bytes intact (rc non-zero). Each writer writes a
-    unique `.install-manifest.*.tmp` file in the manifest directory and applies it with
-    fsync + `chmod 0644` + `os.replace`, so parallel install/uninstall runs cannot drop
-    each other's first-wins records. Retry the command after the other run finishes.
+  * `Manifest lock wait failed (rc=... after ...s) ... (holder: ...)` or `flock not found`
+    comes from the cross-process lock. Since the tenth re-review this is an OPERATION-level
+    lock: `run_manifest_operation()` holds it for the whole component install/uninstall
+    (backup/record → deploy files/services → finish/rollback), so a parallel run cannot consume
+    a just-written record while its target is absent and leave an untracked deployed file. The
+    wait is bounded by `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s) on the root-owned
+    `0600` file `$MANIFEST_DIR/.install-manifest.lock` (fd 9, held by a short-lived `coproc
+    sudo bash -c` root helper); a timeout, a missing `flock` or any validation failure fails
+    closed and leaves the manifest bytes intact (rc non-zero). `flock not found` means
+    `util-linux` is not installed. Each writer uses a unique `.install-manifest.*.tmp` file
+    (fsync + `chmod 0644` + `os.replace`), so parallel runs cannot drop each other's first-wins
+    records. Retry after the other run finishes; raise the timeout (e.g. `300`) if a
+    `fingerprint/install-fingerprint.sh --source` build is still holding the lock.
+  * `... (holder: FAILED:symlink)`, `FAILED:type`, `FAILED:open`, `FAILED:inode` or
+    `FAILED:flock` is the root helper's reason for refusing the lock. `FAILED:symlink` /
+    `FAILED:type` / `FAILED:inode` mean the lock path was a symlink, a non-regular file (e.g. a
+    directory or FIFO) or was swapped between init and open: the helper compares fd 9 with the
+    path's `(dev,ino)` via `/proc/$$/fd/9` plus owner `0`, mode `600` and regular-file type
+    INSIDE the process that actually holds fd 9, so an unprivileged inode swap cannot redirect
+    the flock. `FAILED:flock` is ordinary contention. The same checks log
+    `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a root-owned 0600
+    regular file (uid=... mode=...)` when they fail before the helper starts.
+  * `Manifest lock parent ... is group/other-writable (mode ...)` (also `is a symlink or not a
+    directory`, `is owned by uid ...` or `Cannot stat manifest lock parent ...`) means the
+    manifest directory itself is not trusted, so no privileged chmod/chown/open is attempted.
+    Keep `/var/lib/cros-enablement` root-owned (or owned by the current user) at mode `0755` —
+    a `0775` group-writable directory now fails closed, and a sticky bit does not exempt it.
+  * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
+    means the lock could not be made root-owned `0600` (an older `0644` lock is upgraded
+    automatically), so the installer fails closed. A plain `permission denied` when a peer
+    account tries to open `$MANIFEST_DIR/.install-manifest.lock` directly is expected and is
+    the DoS protection: only the short-lived root holder (via passwordless `sudo`) opens fd 9.
+    Do not chmod/chown the lock by hand as an unprivileged user — fix the `sudo` helper or the
+    parent directory mode and retry.
   * Group membership is now recorded **before** `usermod` runs: the installer persists the
     original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
     the change fails with no earlier record, removes the record it just wrote. Uninstall

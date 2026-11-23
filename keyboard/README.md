@@ -105,17 +105,27 @@ bytes untouched. Non-absolute pseudo-targets such as the fingerprint
 `skipping manifest entry with non-absolute target` (Meson install-plan destinations must
 be absolute too), so the installer never writes a record its own validator would reject.
 
-**Manifest writes are serialized across processes:** every read-modify-write (the backup
-helpers in `lib/backup.sh` plus the keyd-link normalizer here) holds a root-controlled
-`flock -x -w` lock on `$MANIFEST_DIR/.install-manifest.lock` (fd 9, re-entrant depth). The
-wait is bounded by `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s); a missing `flock`
-or a timeout fails
-closed with the manifest bytes intact. The gate → re-read → decision → write sequence runs
-inside the critical section, so a parallel install/uninstall run cannot drop another's
-first-wins backup/service/group records. Each writer uses a unique
-`.install-manifest.*.tmp` (mkstemp + fsync + `chmod 0644` + `os.replace`) instead of a
-shared `.tmp`, so concurrent writers cannot clobber each other's temporary file. The lock
-file is created with noclobber — never `install` — so its inode is never replaced.
+**Whole component operations and manifest writes are serialized across processes:**
+`install_keyboard()`, `uninstall_keyboard()` and `install_keyd_step()` each take ONE
+operation-level lock via `run_manifest_operation()` (`lib/backup.sh`) covering
+backup/record → deploy → finish/rollback; nested helpers re-enter through
+`MANIFEST_LOCK_DEPTH` and `DRY_RUN` takes no lock. This prevents a parallel uninstall from
+consuming a just-written `was_existing=false` record while the target is absent and leaving
+a deployed file with no tracking record. Every read-modify-write (the backup helpers plus
+the keyd-link normalizer here) runs inside that lock, and `flock -x -w` waits on
+`$MANIFEST_DIR/.install-manifest.lock` (fd 9) for at most
+`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (default 10s); a missing `flock` or a timeout fails
+closed with the manifest bytes intact. The lock is a root-owned `0600` regular file, held by
+a short-lived `coproc sudo bash -c` root helper that owns fd 9, checks the fd/path `(dev,ino)`,
+owner `0`, mode `600` and file type via `/proc/$$/fd/9`, and releases the flock when the
+parent closes the pipe (no stale lock, no EXIT trap). Symlinks, non-regular files, inode
+swaps and a group/other-writable or third-party-owned parent directory all fail closed; keep
+`/var/lib/cros-enablement` at `0755`. Older `0644` locks are upgraded to `0600`. The
+gate → re-read → decision → write sequence runs inside the critical section, so a parallel
+run cannot drop another's first-wins backup/service/group records. Each writer uses a unique
+`.install-manifest.*.tmp` (mkstemp + fsync + `chmod 0644` + `os.replace`) instead of a shared
+`.tmp`, so concurrent writers cannot clobber each other's temporary file. Lock creation uses
+`umask 077` + `set -C` — never `install` — so its inode is never replaced.
 
 **Rollback is gated before any side effect:** `rollback_component()`,
 `uninstall_keyboard()` and `remove_group_membership()` validate the manifest first —
@@ -479,17 +489,18 @@ all state is in a temp dir. The daemon suite has 406 cases (write chain, re-prob
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
 `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1061 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1199 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
-that keep the target on a failed swap, missing-backup rc 1, the cross-process manifest
-lock, unique writer temps, checked `systemctl` restores and record-before-change group
-membership.
+that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
+lock with symlink/inode/parent-dir rejection, the whole-operation lock (OP1/OP2 FIFO-barrier
+regressions for deploy vs rollback, a real-installer barrier and fail-closed bodies), unique
+writer temps, checked `systemctl` restores and record-before-change group membership.
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 1061 cases (root)
+sudo bash tests/rollback-test.sh                       # 1199 cases (root)
 ```
 
 ---

@@ -323,13 +323,35 @@
     enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗），或有像找不到備份的紀錄
     被保留；這些紀錄會保留供重試，rollback 回傳 rc 1。修好根本問題後重跑 uninstall
     即可——成功的還原會記錄 `[RESTORED SERVICE]`。
-  * `Manifest lock wait failed (rc=... after ...s)` 或 `flock not found` 來自每次
-    manifest read-modify-write 前取得的跨程序鎖。等待上限為
-    `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒），鎖檔為 root 控管的
-    `$MANIFEST_DIR/.install-manifest.lock`（fd 9）；逾時或缺少 `flock` 都會 fail closed
-    且保持 manifest 位元組不變（回傳非 0）。每個 writer 會在 manifest 目錄寫入唯一的
-    `.install-manifest.*.tmp` 暫存檔，並以 fsync + `chmod 0644` + `os.replace` 套用，
-    因此平行的安裝/解除安裝不會互相遺失 first-wins 紀錄。等另一個程序結束後重試即可。
+  * `Manifest lock wait failed (rc=... after ...s) ... (holder: ...)` 或 `flock not found`
+    來自跨程序鎖。自第十次 re-review 起這是**操作級鎖**：`run_manifest_operation()` 在整個
+    元件安裝/解除安裝（備份/紀錄 → 部署檔案與服務 → 完成/回滾）期間持有它，因此平行程序
+    不會在目標檔缺席時消耗剛寫入的紀錄，留下沒有 manifest 紀錄的已部署檔案。等待上限為
+    `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒），鎖檔為 root 擁有的 `0600` 檔案
+    `$MANIFEST_DIR/.install-manifest.lock`（fd 9，由短暫的 `coproc sudo bash -c` root helper
+    持有）；逾時、缺少 `flock` 或任何驗證失敗都會 fail closed 且保持 manifest 位元組不變
+    （回傳非 0）。`flock not found` 代表未安裝 `util-linux`。每個 writer 使用唯一的
+    `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），平行程序不會
+    互相遺失 first-wins 紀錄。等另一程序結束後重試；若
+    `fingerprint/install-fingerprint.sh --source` 仍在建置並持鎖，請調高 timeout（例如 300）。
+  * `... (holder: FAILED:symlink)`、`FAILED:type`、`FAILED:open`、`FAILED:inode` 或
+    `FAILED:flock` 是 root helper 拒絕取鎖的原因。`FAILED:symlink` / `FAILED:type` /
+    `FAILED:inode` 代表鎖路徑是 symlink、非普通檔（例如目錄或 FIFO），或在 init 與 open
+    之間被替換：helper 會在**實際持有 fd 9 的行程內**以 `/proc/$$/fd/9` 比對路徑的
+    `(dev,ino)`，並檢查 owner 為 `0`、mode 為 `600` 與普通檔型別，因此非特權的 inode 替換
+    無法轉移 flock。`FAILED:flock` 是一般的鎖競爭。這些檢查若在 helper 啟動前就失敗，會記錄
+    `Manifest lock path ... is a symlink` / `is not a regular file` / `is not a root-owned 0600
+    regular file (uid=... mode=...)`。
+  * `Manifest lock parent ... is group/other-writable (mode ...)`（或 `is a symlink or not a
+    directory`、`is owned by uid ...`、`Cannot stat manifest lock parent ...`）代表 manifest
+    目錄本身不受信任，安裝器不會對鎖做任何特權 chmod/chown/open。請讓
+    `/var/lib/cros-enablement` 由 root（或目前使用者）擁有且權限為 `0755` — `0775`
+    群組可寫目錄現在會 fail closed，sticky bit 也不能豁免。
+  * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
+    代表鎖無法被設為 root 擁有的 `0600`（舊的 `0644` 鎖會自動升級），安裝器因此 fail closed。
+    peer 帳號直接開啟 `$MANIFEST_DIR/.install-manifest.lock` 時看到 `permission denied` 是
+    預期行為，正是 DoS 防護：只有短暫的 root holder（透過 passwordless `sudo`）會開啟 fd 9。
+    請勿以非特權使用者手動 chmod/chown 鎖檔——修正 `sudo` helper 或父目錄權限後重試。
   * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
     寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
     紀錄，就移除剛寫入的紀錄。uninstall 只有在 `gpasswd -d` 成功後才消耗群組紀錄

@@ -72,16 +72,42 @@ but the final exit code is non-zero and `finished!` is not printed:
   original `plugdev` membership first and only then checks `usermod` rc explicitly. If
   the change fails it removes the record it just wrote (unless an older one existed), so
   uninstall will not later drop a membership the user obtained on their own.
-* **Concurrent install/uninstall runs cannot lose tracking records.** Every manifest
-  read-modify-write is serialized with a root-controlled `flock -x -w` lock
-  (`$MANIFEST_DIR/.install-manifest.lock`, fd 9; the wait is bounded by
-  `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`, default 10s). The lock is acquired before the
-  fail-closed validation gate and held while the manifest is re-read, changed and durably
-  written, so one process's first-wins backup/service/group records cannot be overwritten
-  by another. Missing `flock` or a lock timeout fails closed with the bytes intact, and
-  each writer uses a unique `.install-manifest.*.tmp` file in the manifest directory
-  (fsync + `chmod 0644` + `os.replace`) so parallel writers cannot clobber each other's
-  temporary file.
+* **Concurrent install/uninstall runs cannot lose tracking records or leave untracked
+  deployments.** Each component installer takes ONE operation-level lock around its whole
+  transaction — backup/record → deploy files and services → finish or rollback — through
+  `run_manifest_operation()` in `lib/backup.sh`. Nested helpers (the backup gate, group
+  helpers, the keyd-link normalizer and `rollback_component()`) re-enter the same lock via
+  `MANIFEST_LOCK_DEPTH`, so a concurrent uninstall cannot consume a just-written
+  `was_existing=false` record while the target file is still absent — which would leave a
+  deployed file on disk with no manifest record and no way to remove it later. The lock is
+  acquired before the fail-closed validation gate and held through the final atomic replace,
+  and every manifest read-modify-write re-reads the document inside it, so one process's
+  first-wins backup/service/group records cannot be overwritten by another. Each writer uses
+  a unique `.install-manifest.*.tmp` file in the manifest directory (fsync + `chmod 0644` +
+  `os.replace`) so parallel writers cannot clobber each other's temporary file. `DRY_RUN`
+  takes no lock and creates no lock file.
+* **The lock file is root-only and safe against hostile paths.**
+  `$MANIFEST_DIR/.install-manifest.lock` is a root-owned `0600` regular file (an older `0644`
+  lock is upgraded on first use), so an unprivileged peer account cannot even open it, let
+  alone hold an exclusive `flock` and starve every installer for the whole wait window — a
+  non-root shell can still run an installer because acquisition is delegated to a short-lived
+  root helper started via passwordless `sudo`. That helper is launched with `coproc sudo bash
+  -c`: it owns fd 9, takes the bounded `flock -x -w` wait (`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`,
+  default 10s), prints `READY`, then blocks reading its stdin. Closing the parent's write fd
+  makes the helper see EOF, exit and let the kernel release the flock, so a crash or `kill -9`
+  cannot leave a stale lock (there is deliberately no EXIT/INT/TERM trap). Symlinks and
+  non-regular lock files are refused, the parent directory must be owned by root or the
+  current user and must not be group/other-writable (`mode & 022 == 0`, so keep
+  `/var/lib/cros-enablement` at `0755`), and the root helper compares the `(dev,ino)` of fd 9
+  (via `/proc/$$/fd/9`) with the lock path and checks fd owner `0`, mode `600` and regular-file
+  type — all inside the process that actually holds fd 9 — so an inode swap during init or
+  while waiting for `flock` fails closed. Missing `flock`, a timeout or any failed check
+  leaves the manifest bytes intact and returns rc 1.
+* **Long-running operations may need a larger lock timeout.**
+  `fingerprint/install-fingerprint.sh --source` holds the operation lock across the
+  `git clone`/build/compile steps, so a parallel install/uninstall can hit the default 10s
+  wait and fail closed. Raise `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (for example to `300`)
+  before starting a parallel operation in that window.
 
 ---
 

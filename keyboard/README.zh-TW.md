@@ -91,15 +91,23 @@ untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續
 `skipping manifest entry with non-absolute target`（Meson install plan 的目的路徑也必須
 是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
-**manifest 寫入跨程序序列化：** 每一次 read-modify-write（`lib/backup.sh` 的備份 helper
-加上此處的 keyd-link 正規化）都持有 root 控管的 `flock -x -w` 鎖
-（`$MANIFEST_DIR/.install-manifest.lock`、fd 9、可重入 depth）。等待上限為
-`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒）；缺少 `flock` 或等待逾時都會
-fail closed 且保持 manifest 位元組不變。gate → 重新讀取 → 決策 → 寫入全在 critical
-section 內，因此平行的安裝/解除安裝不會遺失另一程序 first-wins 的備份/服務/群組紀錄。
-每個 writer 使用唯一的 `.install-manifest.*.tmp`（mkstemp + fsync + `chmod 0644` +
-`os.replace`）而非共用 `.tmp`，避免平行 writer 覆寫彼此的暫存檔。鎖檔以 noclobber
-建立（絕不用 `install`），因此 inode 不會被替換。
+**整個元件操作與 manifest 寫入跨程序序列化：** `install_keyboard()`、
+`uninstall_keyboard()` 與 `install_keyd_step()` 各自透過 `run_manifest_operation()`
+（`lib/backup.sh`）在備份/紀錄 → 部署 → 完成/回滾期間只取得一把操作級鎖；巢狀 helper 以
+`MANIFEST_LOCK_DEPTH` 重入，`DRY_RUN` 則完全不取鎖。這可避免平行 uninstall 在目標檔缺席時
+消耗剛寫入的 `was_existing=false` 紀錄，留下沒有追蹤紀錄的已部署檔案。每一次
+read-modify-write（備份 helper 加上此處的 keyd-link 正規化）都在該鎖內執行，
+`flock -x -w` 等待 `$MANIFEST_DIR/.install-manifest.lock`（fd 9）最多
+`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒）；缺少 `flock` 或等待逾時都會 fail
+closed 且保持 manifest 位元組不變。鎖檔是 root 擁有的 `0600` 普通檔，由短暫的
+`coproc sudo bash -c` root helper 持有 fd 9，並以 `/proc/$$/fd/9` 檢查 fd/路徑
+`(dev,ino)`、owner `0`、mode `600` 與檔案型別；父行程關閉 pipe 即釋放 flock（無 stale
+lock、無 EXIT trap）。symlink、非普通檔、inode 替換，以及群組/其他可寫或第三方擁有的父目錄
+都會 fail closed；`/var/lib/cros-enablement` 請維持 `0755`。舊的 `0644` 鎖會升級為 `0600`。
+gate → 重新讀取 → 決策 → 寫入全在 critical section 內，因此平行程序不會遺失另一程序
+first-wins 的備份/服務/群組紀錄。每個 writer 使用唯一的 `.install-manifest.*.tmp`
+（mkstemp + fsync + `chmod 0644` + `os.replace`）而非共用 `.tmp`，避免平行 writer 覆寫彼此
+的暫存檔。鎖檔以 `umask 077` + `set -C` 建立（絕不用 `install`），因此 inode 不會被替換。
 
 **rollback 在任何副作用前先做 gate：** `rollback_component()`、`uninstall_keyboard()` 與
 `remove_group_membership()` 會先驗證 manifest——在 `systemctl disable keyd` / `gpasswd -d`
@@ -415,16 +423,17 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1061 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1199 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
-找不到備份回 rc 1、跨程序 manifest 鎖、唯一 writer 暫存檔、systemctl 還原檢查 rc 與
-先記錄後變更的群組 membership。
+找不到備份回 rc 1、root-only `0600` holder 鎖的 symlink/inode/父目錄拒絕、整個操作鎖
+（部署 vs rollback 的 OP1/OP2 FIFO barrier 回歸、真實安裝器 barrier 與 fail-closed body）、
+唯一 writer 暫存檔、systemctl 還原檢查 rc 與先記錄後變更的群組 membership。
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 1061 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1199 個案例（需 root）
 ```
 
 ---
