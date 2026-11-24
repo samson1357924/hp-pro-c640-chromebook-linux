@@ -680,7 +680,7 @@ EOF
     # sourced from the wrong DMI file (a bd* wildcard alone would not).
     make_scenario() {
         local name="$1" bvn="$2" svn="$3" pn="$4" with_kbd="$5" modalias="${6:-}" \
-              bios_date="${7:-01/01/2020}" bvr="${8:-TEST}" pvr="${9:-1.0}"
+            bios_date="${7:-01/01/2020}" bvr="${8:-TEST}" pvr="${9:-1.0}"
         local dir="$root/$name"
         mkdir -p "$dir/dmi" "$dir/input/input2/event2"
         printf '%s\n' "$bvn" > "$dir/dmi/bios_vendor"

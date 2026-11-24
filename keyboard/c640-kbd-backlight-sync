@@ -63,7 +63,7 @@ HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-/run/user/$(id -u 2> /dev/null || echo
 HOOK_RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 
 _warn_hook_side_handoff() {
-    local filename="$1" expected="$2" dir candidate explicit seen=" "
+    local filename="$1" expected="$2" candidate explicit seen=" "
     if [ -f "$expected" ]; then
         return 0
     fi

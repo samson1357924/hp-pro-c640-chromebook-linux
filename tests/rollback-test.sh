@@ -7927,16 +7927,31 @@ test_uninstall_success_log_is_rollback_conditional() {
     local comp fn success_msg src
     for comp in audio fingerprint ec keyboard power; do
         case "$comp" in
-            audio) fn='_uninstall_audio_body'; success_msg='Audio UCM profiles removed successfully.' ;;
-            fingerprint) fn='_uninstall_fp_body'; success_msg='Fingerprint driver uninstallation finished.' ;;
-            ec) fn='_uninstall_ec_tools_body'; success_msg='EC utilities removed.' ;;
-            keyboard) fn='_uninstall_keyboard_body'; success_msg='Keyboard mapping uninstallation completed.' ;;
-            power) fn='_uninstall_power_body'; success_msg='Power optimization profiles removed.' ;;
+            audio)
+                fn='_uninstall_audio_body'
+                success_msg='Audio UCM profiles removed successfully.'
+                ;;
+            fingerprint)
+                fn='_uninstall_fp_body'
+                success_msg='Fingerprint driver uninstallation finished.'
+                ;;
+            ec)
+                fn='_uninstall_ec_tools_body'
+                success_msg='EC utilities removed.'
+                ;;
+            keyboard)
+                fn='_uninstall_keyboard_body'
+                success_msg='Keyboard mapping uninstallation completed.'
+                ;;
+            power)
+                fn='_uninstall_power_body'
+                success_msg='Power optimization profiles removed.'
+                ;;
         esac
         src="$REPO_ROOT/$comp/install-$comp.sh"
         assert_contains "$success_msg" "$(cat "$src")" \
             "[$comp] original success message preserved in source"
-        if python3 - "$src" "$fn" "$success_msg" "$UNINSTALL_INCOMPLETE_MSG" << 'PY'
+        if python3 - "$src" "$fn" "$success_msg" "$UNINSTALL_INCOMPLETE_MSG" << 'PY'; then
 import sys
 
 path, fn, success_msg, err_msg = sys.argv[1:5]
@@ -7970,7 +7985,6 @@ actual = body[i - 1:i + 5]
 if len(actual) != len(expected) or any(got != want for got, want in zip(actual, expected)):
     sys.exit(1)
 PY
-        then
             ok
         else
             fail "[$comp] uninstall body lacks the exact guarded success/error structure"
@@ -7983,7 +7997,7 @@ PY
 # an early return or alter the pam_rc/group_rc folding order.
 test_fingerprint_uninstall_cleanup_order_unchanged() {
     local src="$REPO_ROOT/fingerprint/install-fingerprint.sh"
-    if python3 - "$src" << 'PY'
+    if python3 - "$src" << 'PY'; then
 import sys
 
 lines = open(sys.argv[1]).read().splitlines()
@@ -8018,7 +8032,6 @@ guard = next((i for i, line in enumerate(body)
 if guard < 0 or guard < pos[-1] - pos[0]:
     sys.exit(1)
 PY
-    then
         ok
     else
         fail "fingerprint uninstall cleanup/folding order changed or early return introduced"
@@ -11401,7 +11414,7 @@ pam_snapshot_fault_stub() {
     local s="$1" fault="$2"
     case "$fault" in
         tee)
-            cat > "$s/stub/tee" <<'EOF'
+            cat > "$s/stub/tee" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11412,7 +11425,7 @@ exec /usr/bin/tee "$@"
 EOF
             ;;
         chmod)
-            cat > "$s/stub/chmod" <<'EOF'
+            cat > "$s/stub/chmod" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11423,7 +11436,7 @@ exec /usr/bin/chmod "$@"
 EOF
             ;;
         find)
-            cat > "$s/stub/find" <<'EOF'
+            cat > "$s/stub/find" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11435,7 +11448,7 @@ exec /usr/bin/find "$@"
 EOF
             ;;
         cp)
-            cat > "$s/stub/cp" <<'EOF'
+            cat > "$s/stub/cp" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11447,7 +11460,7 @@ exec /bin/cp "$@"
 EOF
             ;;
         ln)
-            cat > "$s/stub/ln" <<'EOF'
+            cat > "$s/stub/ln" << 'EOF'
 #!/usr/bin/env bash
 _last="${@: -1}"
 if [ "$_last" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
@@ -11458,7 +11471,7 @@ exec /bin/ln "$@"
 EOF
             ;;
         mv)
-            cat > "$s/stub/mv" <<'EOF'
+            cat > "$s/stub/mv" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11652,7 +11665,7 @@ test_pam_31_saved_dir_restore_failures_keep_snapshot() {
         snapshot_hex="$(pam_saved_snapshot_hex "$s")"
         case "$case_name" in
             cp_fail)
-                cat > "$s/stub/cp" <<'EOF'
+                cat > "$s/stub/cp" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11663,7 +11676,7 @@ exec /bin/cp "$@"
 EOF
                 ;;
             cmp_mismatch)
-                cat > "$s/stub/cmp" <<'EOF'
+                cat > "$s/stub/cmp" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11676,7 +11689,7 @@ EOF
             wrong_bytes)
                 # cp exits 0 but writes DIFFERENT bytes: selection equality
                 # must never be enough to consume the sidecar.
-                cat > "$s/stub/cp" <<'EOF'
+                cat > "$s/stub/cp" << 'EOF'
 #!/usr/bin/env bash
 _args=("$@")
 _src=""
@@ -11730,12 +11743,12 @@ test_pam_32_tool_failure_with_verified_state_succeeds() {
     # then fails without writing anything, so verification is the only thing
     # that can justify consuming the snapshot.
     pam_write_selection "$s" "$snapshot_value"
-    cat > "$s/stub/debconf-set-selections" <<'EOF'
+    cat > "$s/stub/debconf-set-selections" << 'EOF'
 #!/usr/bin/env bash
 printf 'STUB: debconf-set-selections refused\n' >&2
 exit 1
 EOF
-    cat > "$s/stub/pam-auth-update" <<'EOF'
+    cat > "$s/stub/pam-auth-update" << 'EOF'
 #!/usr/bin/env bash
 printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
 exit 1
@@ -11773,7 +11786,7 @@ test_pam_33_retry_after_failed_restore_consumes_only_on_success() {
         "PAM-33: install fixture rc 0"
     snapshot_hex="$(pam_saved_snapshot_hex "$s")"
 
-    cat > "$s/stub/cp" <<'EOF'
+    cat > "$s/stub/cp" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11845,7 +11858,7 @@ pam_consume_fault_stub() {
     local s="$1" fault="$2"
     case "$fault" in
         rm_saved_fail)
-            cat > "$s/stub/rm" <<'EOF'
+            cat > "$s/stub/rm" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     case "$_a" in
@@ -11856,7 +11869,7 @@ exec /bin/rm "$@"
 EOF
             ;;
         rm_sidecar_fail)
-            cat > "$s/stub/rm" <<'EOF'
+            cat > "$s/stub/rm" << 'EOF'
 #!/usr/bin/env bash
 for _a in "$@"; do
     if [ "$_a" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
@@ -11999,7 +12012,7 @@ test_pam_38_fget_failure_is_hard_failure() {
         pam_write_selection "$s" 'unix, systemd, fprintd'
         before="$(pam_stack_fingerprint "$s")"
         if [ "$case_name" = fget_status ]; then
-            cat > "$s/stub/debconf-communicate" <<'EOF'
+            cat > "$s/stub/debconf-communicate" << 'EOF'
 #!/usr/bin/env bash
 _cmds="$(cat)"
 printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
@@ -12009,7 +12022,7 @@ case "$_cmds" in
 esac
 EOF
         else
-            cat > "$s/stub/debconf-communicate" <<'EOF'
+            cat > "$s/stub/debconf-communicate" << 'EOF'
 #!/usr/bin/env bash
 _cmds="$(cat)"
 printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
@@ -12098,7 +12111,7 @@ test_pam_40_rebuild_failure_logs_critical() {
     pam_install_for_restore_test "$s"
     snapshot_hex="$(pam_saved_snapshot_hex "$s")"
     pam_consume_fault_stub "$s" rm_saved_fail
-    cat > "$s/stub/ln" <<'EOF'
+    cat > "$s/stub/ln" << 'EOF'
 #!/usr/bin/env bash
 _last="${@: -1}"
 if [ "$_last" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
@@ -12141,7 +12154,7 @@ EOF
 # With no (or an empty) savedir snapshot there is no authoritative profile
 # state for --package to re-derive from; model it as a no-op tool.
 pam_noop_package_tool() {
-    cat > "$1/stub/pam-auth-update" <<'EOF'
+    cat > "$1/stub/pam-auth-update" << 'EOF'
 #!/usr/bin/env bash
 printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
 exit 0

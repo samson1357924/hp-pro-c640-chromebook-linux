@@ -135,7 +135,7 @@ _pam_read_selection() {
     # Fallback ONLY when debconf-communicate is genuinely unavailable.
     # Accept BOTH prefixes. A missing line is a hard failure, not an empty value
     # (the "V:" marker keeps an empty value distinguishable).
-    reply="$(sudo debconf-show libpam-runtime 2>/dev/null \
+    reply="$(sudo debconf-show libpam-runtime 2> /dev/null \
         | awk '/^(  |\* )libpam-runtime\/profiles:[[:space:]]*/ {
                   sub(/^(  |\* )libpam-runtime\/profiles:[[:space:]]*/, "")
                   print "V:" $0
@@ -155,7 +155,10 @@ _pam_read_selection_seen() {
             last="$(printf '%s\n' "$reply" | tail -n 1)"
             if value="$(_pam_debconf_reply_value "$last")"; then
                 case "$value" in
-                    true|false) printf '%s' "$value"; return 0 ;;
+                    true | false)
+                        printf '%s' "$value"
+                        return 0
+                        ;;
                 esac
             fi
             # A status-bearing reply means the seen field/question is absent.
@@ -206,6 +209,11 @@ _pam_enumerate_saved_files() {
     # $1=directory. Echoes the temp file path only on a SUCCESSFUL sudo find.
     local list
     list="$(_pam_tmp_file)" || return 1
+    # Intentionally redirect into a caller-owned (mktemp, 0600) file: this is a
+    # privilege boundary, not an accidental root-owned write. Using sudo tee
+    # would leave $list root-owned and break non-root uninstall readability
+    # (PAM-19/41).
+    # shellcheck disable=SC2024
     if ! sudo find "$1" -maxdepth 1 -type f -print0 > "$list" 2> /dev/null; then
         rm -f -- "$list"
         return 1
@@ -389,6 +397,11 @@ _pam_sidecar_fields() {
     local tmp awk_rc
     [ -f "$_PAM_SEL_SIDECAR" ] || return 1
     tmp="$(_pam_tmp_file)" || return 1
+    # Intentionally redirect into a caller-owned (mktemp, 0600) file: this is a
+    # privilege boundary, not an accidental root-owned write. Using sudo tee
+    # would leave $tmp root-owned and break non-root uninstall readability
+    # (PAM-19/41).
+    # shellcheck disable=SC2024
     if ! sudo cat -- "$_PAM_SEL_SIDECAR" > "$tmp" 2> /dev/null; then
         rm -f -- "$tmp"
         return 1
@@ -448,7 +461,7 @@ _pam_verify_sidecar_content() {
         return 1
     }
     mode="$(stat -c '%a' -- "$_PAM_SEL_SIDECAR" 2> /dev/null || echo 000)"
-    if ! (( (8#$mode & 044) != 0 )) 2> /dev/null; then
+    if ! (((8#$mode & 044) != 0)) 2> /dev/null; then
         log_error "PAM selection sidecar $_PAM_SEL_SIDECAR is not world-readable (mode $mode)."
         return 1
     fi
@@ -471,8 +484,12 @@ _pam_verify_sidecar_content() {
     done <<< "$fields"
     # Default every counter numerically so a truncated awk result can never be
     # compared as a string or silently classified as "legacy".
-    magic_n="${magic_n:-0}"; seen_n="${seen_n:-0}"; saved_n="${saved_n:-0}"
-    data_n="${data_n:-0}"; other="${other:-1}"; bad="${bad:-1}"
+    magic_n="${magic_n:-0}"
+    seen_n="${seen_n:-0}"
+    saved_n="${saved_n:-0}"
+    data_n="${data_n:-0}"
+    other="${other:-1}"
+    bad="${bad:-1}"
     if [ "$magic_n" -ne 1 ] || [ "$data_n" -ne 1 ] || [ "$other" -ne 0 ] \
         || [ "$bad" -ne 0 ] || [ "$seen_n" -gt 1 ] || [ "$saved_n" -gt 1 ]; then
         log_error "PAM selection sidecar $_PAM_SEL_SIDECAR is partial/corrupt; refusing to treat it as a valid snapshot."
@@ -729,7 +746,10 @@ _pam_selection_seen_from_sidecar() {
     v="$(sed -n 's/^# cros-enablement: selection-seen=\(true\|false\)$/\1/p' \
         "$_PAM_SEL_SIDECAR" | tail -n 1)"
     case "$v" in
-        true|false) printf '%s' "$v"; return 0 ;;
+        true | false)
+            printf '%s' "$v"
+            return 0
+            ;;
         *) return 1 ;;
     esac
 }
