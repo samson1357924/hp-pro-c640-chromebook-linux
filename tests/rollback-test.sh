@@ -9237,6 +9237,10 @@ setup_pam_sandbox() {
     mkdir -p "$s/pam" "$s/backups" "$s/manifest" "$s/stub" "$s/debconf" "$s/savedir"
     : > "$s/tool.log"
     : > "$s/sed.log"
+    # A readable debconf selection is part of a valid Debian fixture: the
+    # snapshot gate now fails closed when the key is absent (PAM-24c/27c/28).
+    # Cases that need "key absent" must call pam_unset_selection() explicitly.
+    printf 'unix, fprintd\n' > "$s/debconf/profiles"
 
     # sudo: pass through, but never let a /etc/pam.d path escape the sandbox.
     cat > "$s/stub/sudo" << 'EOF'
@@ -11160,6 +11164,883 @@ EOF
         "PAM-28b: no debconf-show fallback"
 }
 
+# ---------------------------------------------------------------------------
+# PAM-29..42 (Phase 3): the Debian snapshot/restore must be one durable,
+# verifiable transaction. Every fault path below must fail closed (or verify
+# EVERY managed state before tolerating a tool failure) and never consume the
+# only surviving copy of the original bytes.
+# ---------------------------------------------------------------------------
+
+# Install a narrowly-scoped PATH fault stub. Fixtures are written BEFORE the
+# stub, and the snapshot gate fails before any backup/sed/converge is reached.
+pam_snapshot_fault_stub() {
+    local s="$1" fault="$2"
+    case "$fault" in
+        tee)
+            cat > "$s/stub/tee" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.tmp.*) printf 'STUB: tee refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /usr/bin/tee "$@"
+EOF
+            ;;
+        chmod)
+            cat > "$s/stub/chmod" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.tmp.*) printf 'STUB: chmod refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /usr/bin/chmod "$@"
+EOF
+            ;;
+        find)
+            cat > "$s/stub/find" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        "$CROS_ENABLEMENT_PAM_SAVED_DIR")
+            printf 'STUB: find refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /usr/bin/find "$@"
+EOF
+            ;;
+        cp)
+            cat > "$s/stub/cp" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        "$CROS_ENABLEMENT_PAM_SAVED_DIR"/*)
+            printf 'STUB: saved-profile cp refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/cp "$@"
+EOF
+            ;;
+        ln)
+            cat > "$s/stub/ln" <<'EOF'
+#!/usr/bin/env bash
+_last="${@: -1}"
+if [ "$_last" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
+    printf 'STUB: sidecar ln refused\n' >&2
+    exit 1
+fi
+exec /bin/ln "$@"
+EOF
+            ;;
+        mv)
+            cat > "$s/stub/mv" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.saved.stage.*)
+            printf 'STUB: saved-snapshot mv refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/mv "$@"
+EOF
+            ;;
+    esac
+    chmod +x "$s/stub/$fault"
+}
+
+# PAM-29: tee / chmod / find / cp / ln / mv failures must make install return
+# non-zero BEFORE any PAM file or debconf value is touched, with no valid
+# sidecar (and no staging residue) left behind.
+test_pam_29_snapshot_faults_fail_closed() {
+    local fault s before
+    for fault in tee chmod find cp ln mv; do
+        s="$(setup_pam_sandbox "snapshot-fault-$fault")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        pam_snapshot_fault_stub "$s" "$fault"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-29/$fault: install rc 1 (snapshot is a mandatory gate)"
+        assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+            "PAM-29/$fault: PAM files, savedir and debconf untouched"
+        if [ -e "$s/manifest/pam-selection" ]; then
+            fail "PAM-29/$fault: no sidecar may be published"
+        else
+            ok
+        fi
+        assert_eq "0" "$(find "$s/manifest" -maxdepth 1 -name 'pam-selection.saved*' 2> /dev/null | wc -l | tr -d '[:space:]')" \
+            "PAM-29/$fault: no saved snapshot or stage residue"
+        assert_eq "0" "$(find /tmp -maxdepth 1 -name 'cros-pam-snapshot.*' 2> /dev/null | wc -l | tr -d '[:space:]')" \
+            "PAM-29/$fault: no leaked /tmp/cros-pam-snapshot.* temp files"
+        assert_contains "refusing to continue" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            "PAM-29/$fault: fail-closed reason logged"
+    done
+}
+
+# PAM-30: an EXISTING sidecar is authoritative only when complete and valid.
+# Magic-only / bad data / unknown metadata / inconsistent saved state must all
+# fail closed; a complete legacy sidecar stays compatible on a best-effort basis.
+test_pam_30_existing_sidecar_validation() {
+    local case_name s before sidecar saved_hex_before
+    for case_name in magic_only duplicate_data unknown_metadata bad_value \
+        saved_complete_missing_dir saved_absent_but_dir_present; do
+        s="$(setup_pam_sandbox "sidecar-invalid-$case_name")"
+        sidecar="$s/manifest/pam-selection"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        case "$case_name" in
+            magic_only)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    > "$sidecar"
+                ;;
+            duplicate_data)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    '# cros-enablement: saved-snapshot=complete' \
+                    'unix, systemd, fprintd' 'unix, systemd, fprintd' > "$sidecar"
+                ;;
+            unknown_metadata)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    '# cros-enablement: saved-snapshot=complete' '# cros-enablement: mystery=1' \
+                    'unix, systemd, fprintd' > "$sidecar"
+                ;;
+            bad_value)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    '# cros-enablement: saved-snapshot=complete' \
+                    'unix, systemd, fprintd; rm -rf /' > "$sidecar"
+                ;;
+            saved_complete_missing_dir)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    '# cros-enablement: saved-snapshot=complete' \
+                    'unix, systemd, fprintd' > "$sidecar"
+                # .saved deliberately absent
+                ;;
+            saved_absent_but_dir_present)
+                printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+                    '# cros-enablement: saved-snapshot=absent' \
+                    'unix, systemd, fprintd' > "$sidecar"
+                mkdir -p "$s/manifest/pam-selection.saved"
+                printf 'orphan\n' > "$s/manifest/pam-selection.saved/auth"
+                ;;
+        esac
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-30/$case_name: invalid/partial sidecar is a hard failure"
+        assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+            "PAM-30/$case_name: no PAM/debconf mutation after failed first-wins"
+        [ -e "$sidecar" ] && ok || fail "PAM-30/$case_name: invalid sidecar was destroyed"
+        if printf '%s' "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            | grep -qE 'partial/corrupt|failing closed'; then
+            ok
+        else
+            fail "PAM-30/$case_name: fail-closed reason logged"
+        fi
+    done
+
+    # Legacy sidecar (no saved-snapshot line): best-effort compatibility.
+    s="$(setup_pam_sandbox sidecar-legacy-valid)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-30/legacy: first install publishes a complete snapshot"
+    before="$(pam_stack_fingerprint "$s")"
+    sed -e '/^# cros-enablement: saved-snapshot=/d' \
+        -e '/^# cros-enablement: selection-seen=/d' "$s/manifest/pam-selection" \
+        > "$s/manifest/pam-selection.legacy"
+    cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+    rm -f "$s/manifest/pam-selection.legacy"
+    assert_not_contains 'saved-snapshot=' "$(cat "$s/manifest/pam-selection")" \
+        "PAM-30/legacy: saved metadata removed to model an older sidecar"
+    assert_not_contains 'selection-seen=' "$(cat "$s/manifest/pam-selection")" \
+        "PAM-30/legacy: seen metadata removed to model an older sidecar"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-30/legacy: legacy sidecar remains compatible (first-wins)"
+    assert_contains "best-effort compatibility" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-30/legacy: backward-compat note logged"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-30/legacy: keeping a sidecar never mutates the live stack"
+
+    # Legacy sidecar + missing .saved: repair the missing half or fail closed.
+    s="$(setup_pam_sandbox sidecar-legacy-repair)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    sed -e '/^# cros-enablement: saved-snapshot=/d' \
+        -e '/^# cros-enablement: selection-seen=/d' "$s/manifest/pam-selection" \
+        > "$s/manifest/pam-selection.legacy"
+    cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+    rm -f "$s/manifest/pam-selection.legacy"
+    saved_hex_before="$(pam_saved_snapshot_hex "$s")"
+    # Model a crash immediately after publish: .saved is lost but the LIVE
+    # savedir still holds the original bytes the repair helper can re-snapshot.
+    cp -a "$s/manifest/pam-selection.saved"/. "$s/savedir"/
+    rm -rf "$s/manifest/pam-selection.saved"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-30/legacy-repair: install repairs a missing .saved"
+    [ -f "$s/manifest/pam-selection.saved/auth" ] \
+        && ok || fail "PAM-30/legacy-repair: .saved was re-published"
+    assert_eq "$saved_hex_before" "$(pam_saved_snapshot_hex "$s")" \
+        "PAM-30/legacy-repair: all five saved profiles are byte-identical after repair"
+}
+
+# Hex of all snapshotted saved-profile files (independent of lib/pam.sh).
+pam_saved_snapshot_hex() {
+    local s="$1" t out=""
+    for t in auth account password session session-noninteractive; do
+        [ -f "$s/manifest/pam-selection.saved/$t" ] \
+            && out="$out $(file_hex "$s/manifest/pam-selection.saved/$t")"
+    done
+    printf '%s\n' "$out"
+}
+
+# Install a complete stack; fail the caller's assertion if the snapshot gate
+# itself fails (the fault cases below are all about the RESTORE half).
+pam_install_for_restore_test() {
+    local s="$1"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "restore fixture: install rc 0 for $s"
+}
+
+# PAM-31: a broken saved-dir restore (copy failure, byte mismatch, or a copy
+# that only LOOKS successful) must keep rc 1 and BOTH halves of the snapshot.
+test_pam_31_saved_dir_restore_failures_keep_snapshot() {
+    local case_name s before snapshot_hex
+    for case_name in cp_fail cmp_mismatch wrong_bytes; do
+        s="$(setup_pam_sandbox "restore-saved-$case_name")"
+        pam_install_for_restore_test "$s"
+        before="$(pam_stack_fingerprint "$s")"
+        snapshot_hex="$(pam_saved_snapshot_hex "$s")"
+        case "$case_name" in
+            cp_fail)
+                cat > "$s/stub/cp" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.saved/*) printf 'STUB: restore cp refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/cp "$@"
+EOF
+                ;;
+            cmp_mismatch)
+                cat > "$s/stub/cmp" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *savedir*|*pam-selection.saved*) exit 1 ;;
+    esac
+done
+exec /usr/bin/cmp "$@"
+EOF
+                ;;
+            wrong_bytes)
+                # cp exits 0 but writes DIFFERENT bytes: selection equality
+                # must never be enough to consume the sidecar.
+                cat > "$s/stub/cp" <<'EOF'
+#!/usr/bin/env bash
+_args=("$@")
+_src=""
+for _a in "${_args[@]}"; do
+    case "$_a" in
+        *pam-selection.saved/*) _src="$_a" ;;
+    esac
+done
+if [ -n "$_src" ]; then
+    /bin/cp "$@" || exit $?
+    printf 'WRONG-BYTES\n' > "${_args[${#_args[@]}-1]}"
+    exit 0
+fi
+exec /bin/cp "$@"
+EOF
+                # The live selection is ALREADY equal to the snapshot, so the
+                # only failing managed state is the saved-file bytes.
+                pam_write_selection "$s" 'unix, systemd, fprintd'
+                ;;
+        esac
+        chmod +x "$s/stub/cp" 2> /dev/null || true
+        chmod +x "$s/stub/cmp" 2> /dev/null || true
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian
+        assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-31/$case_name: disable rc 1 when saved files are not byte-identical"
+        [ -e "$s/manifest/pam-selection" ] \
+            && ok || fail "PAM-31/$case_name: sidecar must be retained"
+        [ -d "$s/manifest/pam-selection.saved" ] \
+            && ok || fail "PAM-31/$case_name: .saved must be retained"
+        assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+            "PAM-31/$case_name: snapshot bytes unchanged (never destroy the only copy)"
+        assert_contains "keeping $s/manifest/pam-selection" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            "PAM-31/$case_name: retry data explicitly retained in the log"
+        if [ "$case_name" = wrong_bytes ]; then
+            assert_eq 'unix, systemd, fprintd' "$(pam_selection "$s")" \
+                "PAM-31/wrong_bytes: selection WAS equal yet rc must still be 1"
+        fi
+    done
+}
+
+# PAM-32: a failing debconf-set-selections (or --package) is tolerated ONLY
+# when every managed state verifies identical; PAM-16/17 must not regress.
+test_pam_32_tool_failure_with_verified_state_succeeds() {
+    local s snapshot_value
+    s="$(setup_pam_sandbox tool-failure-verified)"
+    pam_install_for_restore_test "$s"
+    snapshot_value="$(sed '/^#/d' "$s/manifest/pam-selection" | tail -n 1)"
+    # Put the live selection into the EXACT snapshotted state first; the tool
+    # then fails without writing anything, so verification is the only thing
+    # that can justify consuming the snapshot.
+    pam_write_selection "$s" "$snapshot_value"
+    cat > "$s/stub/debconf-set-selections" <<'EOF'
+#!/usr/bin/env bash
+printf 'STUB: debconf-set-selections refused\n' >&2
+exit 1
+EOF
+    cat > "$s/stub/pam-auth-update" <<'EOF'
+#!/usr/bin/env bash
+printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 1
+EOF
+    chmod +x "$s/stub/debconf-set-selections" "$s/stub/pam-auth-update"
+    : > "$s/tool.log"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-32: tool failures tolerated when ALL managed state verifies equal"
+    assert_eq "$snapshot_value" "$(pam_selection "$s")" \
+        "PAM-32: live selection equals the snapshot"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-32: sidecar consumed after full verification"
+    [ ! -e "$s/manifest/pam-selection.saved" ] \
+        && ok || fail "PAM-32: .saved consumed after full verification"
+    assert_contains "every managed state was verified identical" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-32: tool-failure tolerance is explicit in the log"
+}
+
+# PAM-33: after a failed restore, a retry with the fault removed must restore
+# EVERYTHING and only then consume the retained snapshot.
+test_pam_33_retry_after_failed_restore_consumes_only_on_success() {
+    local s before snapshot_hex
+    s="$(setup_pam_sandbox restore-retry)"
+    # Capture the ORIGINAL bytes before install so the final assertion proves
+    # the retry actually restored them (not merely the installed state).
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    before="$(pam_stack_fingerprint "$s")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-33: install fixture rc 0"
+    snapshot_hex="$(pam_saved_snapshot_hex "$s")"
+
+    cat > "$s/stub/cp" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.saved/*) printf 'STUB: restore cp refused (first try)\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/cp "$@"
+EOF
+    chmod +x "$s/stub/cp"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-33: first restore attempt fails"
+    [ -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.saved" ] \
+        && ok || fail "PAM-33: retry data retained after the failed attempt"
+    assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+        "PAM-33: retained snapshot is still byte-identical"
+
+    rm -f "$s/stub/cp"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-33: retry succeeds"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-33: everything restored before the snapshot is consumed"
+    [ ! -e "$s/manifest/pam-selection" ] && [ ! -e "$s/manifest/pam-selection.saved" ] \
+        && ok || fail "PAM-33: snapshot consumed only after a fully verified restore"
+}
+
+# PAM-34: restore's OWN defensive rollback gate (not just disable's gate).
+test_pam_34_restore_checks_rollback_completeness() {
+    local s before
+    s="$(setup_pam_sandbox restore-rollback-gate)"
+    pam_install_for_restore_test "$s"
+    before="$(pam_stack_fingerprint "$s")"
+    # Simulate an incomplete rollback by keeping a manifest record for sudo.
+    python3 - "$s/manifest/install-manifest.json" "$s/pam/sudo" << 'PY'
+import json, sys
+mp, target = sys.argv[1:3]
+json.dump({"version": "2.0", "records": [
+    {"target": target, "component": "fingerprint", "was_existing": True}],
+    "services": [], "groups": []}, open(mp, "w"), indent=2)
+PY
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_sandboxed "$s" '
+            export PATH="$2/stub:/usr/bin:/bin"
+            export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+            export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+            export STUB_DEBCONF_SEEN="$2/debconf/seen"
+            source "$1/lib/pam.sh"
+            _pam_restore_debian_selection
+            printf "%s\n" "$?" > "$2/restore.rc"
+        '
+    assert_eq "1" "$(cat "$s/restore.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-34: restore itself refuses an incomplete rollback"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-34: no debconf/savedir mutation while a record survives"
+    [ -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.saved" ] \
+        && ok || fail "PAM-34: snapshot retained when rollback is incomplete"
+}
+
+# ---------------------------------------------------------------------------
+# Reviewer A follow-up (P1-1/P1-2/P2/P3): recoverable consume, orphan safety,
+# strict sidecar classification, FGET hard failure and bidirectional savedir
+# verification.
+# ---------------------------------------------------------------------------
+
+pam_consume_fault_stub() {
+    local s="$1" fault="$2"
+    case "$fault" in
+        rm_saved_fail)
+            cat > "$s/stub/rm" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.saved*) printf 'STUB: rm .saved refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/rm "$@"
+EOF
+            ;;
+        rm_sidecar_fail)
+            cat > "$s/stub/rm" <<'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    if [ "$_a" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
+        printf 'STUB: rm sidecar refused\n' >&2
+        exit 1
+    fi
+done
+exec /bin/rm "$@"
+EOF
+            ;;
+    esac
+    chmod +x "$s/stub/rm"
+}
+
+# PAM-35: consume is recoverable. Injecting a failure on either removal must
+# leave BOTH halves present and retryable; only a later full success consumes.
+test_pam_35_consume_failure_is_recoverable() {
+    local fault s before sidecar_hex snapshot_hex
+    for fault in rm_saved_fail rm_sidecar_fail; do
+        s="$(setup_pam_sandbox "consume-fault-$fault")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-35/$fault: install fixture rc 0"
+        sidecar_hex="$(file_hex "$s/manifest/pam-selection")"
+        snapshot_hex="$(pam_saved_snapshot_hex "$s")"
+        pam_consume_fault_stub "$s" "$fault"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian
+        assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-35/$fault: failed consume returns rc 1"
+        [ -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.saved" ] \
+            && ok || fail "PAM-35/$fault: both halves must remain present/retryable"
+        assert_eq "$sidecar_hex" "$(file_hex "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+            "PAM-35/$fault: sidecar bytes unchanged (rebuilt exactly if needed)"
+        assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+            "PAM-35/$fault: .saved bytes unchanged"
+        assert_not_contains "sidecar consumed" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            "PAM-35/$fault: no false success after a partial consume"
+
+        rm -f "$s/stub/rm"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian
+        assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-35/$fault: retry after removing the fault succeeds"
+        assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+            "PAM-35/$fault: retry restores every byte before consuming"
+        [ ! -e "$s/manifest/pam-selection" ] && [ ! -e "$s/manifest/pam-selection.saved" ] \
+            && ok || fail "PAM-35/$fault: both halves consumed only after full success"
+    done
+}
+
+# PAM-36: an orphaned .saved (no sidecar) is a unique original copy. Neither a
+# fresh install nor a failed-publication rollback may delete or overwrite it.
+test_pam_36_orphan_saved_snapshot_is_preserved() {
+    local s before orphan
+    s="$(setup_pam_sandbox orphan-at-install)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    before="$(pam_stack_fingerprint "$s")"
+    mkdir -p "$s/manifest/pam-selection.saved"
+    printf 'ORIGINAL-SENTINEL\n' > "$s/manifest/pam-selection.saved/orphan"
+    orphan="$(file_hex "$s/manifest/pam-selection.saved/orphan")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-36: install fails closed when .saved exists without a sidecar"
+    assert_eq "$orphan" "$(file_hex "$s/manifest/pam-selection.saved/orphan" 2> /dev/null || echo MISSING)" \
+        "PAM-36: orphan bytes untouched"
+    [ -d "$s/manifest/pam-selection.saved" ] && ok || fail "PAM-36: orphan directory not deleted"
+    if [ -e "$s/manifest/pam-selection" ]; then
+        fail "PAM-36: no sidecar may be published for an orphan-only snapshot"
+    else
+        ok
+    fi
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-36: PAM files and debconf untouched"
+
+    # Unit-level guard for the rollback helper: flag 0 must never touch .saved.
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_sandboxed "$s" '
+            export PATH="$2/stub:/usr/bin:/bin"
+            source "$1/lib/pam.sh"
+            _pam_rollback_own_snapshot 0
+        '
+    assert_eq "$orphan" "$(file_hex "$s/manifest/pam-selection.saved/orphan" 2> /dev/null || echo MISSING)" \
+        "PAM-36: _pam_rollback_own_snapshot 0 preserves the orphan"
+    assert_contains "Orphaned saved PAM profile snapshot" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-36: orphan refusal is explicit in the log"
+}
+
+# PAM-37: seen metadata WITHOUT saved metadata is truncation, not legacy.
+test_pam_37_seen_only_sidecar_fails_closed() {
+    local s before
+    s="$(setup_pam_sandbox seen-only-sidecar)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    before="$(pam_stack_fingerprint "$s")"
+    printf '%s\n' '# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)' \
+        '# cros-enablement: selection-seen=true' \
+        'unix, systemd, fprintd' > "$s/manifest/pam-selection"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-37/install: seen-only sidecar is a hard failure"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-37/install: no PAM/debconf mutation"
+    assert_contains "no saved-snapshot metadata" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-37/install: truncation reason logged"
+
+    # The same classification must hold on the restore side.
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_sandboxed "$s" '
+            export PATH="$2/stub:/usr/bin:/bin"
+            export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+            export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+            export STUB_DEBCONF_SEEN="$2/debconf/seen"
+            source "$1/lib/pam.sh"
+            _pam_restore_debian_selection
+            printf "%s\n" "$?" > "$2/restore.rc"
+        '
+    assert_eq "1" "$(cat "$s/restore.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-37/restore: seen-only sidecar fails closed"
+    [ -e "$s/manifest/pam-selection" ] && ok || fail "PAM-37/restore: sidecar retained"
+}
+
+# PAM-38: a PRESENT debconf-communicate that fails FGET (or returns a value
+# other than true/false) is a hard snapshot failure, not a legacy downgrade.
+test_pam_38_fget_failure_is_hard_failure() {
+    local case_name s before
+    for case_name in fget_status fget_invalid; do
+        s="$(setup_pam_sandbox "fget-$case_name")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        if [ "$case_name" = fget_status ]; then
+            cat > "$s/stub/debconf-communicate" <<'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
+case "$_cmds" in
+    *FGET*) printf '12 injected FGET failure\n'; exit 12 ;;
+    *) printf '0 unix, systemd, fprintd\n'; exit 0 ;;
+esac
+EOF
+        else
+            cat > "$s/stub/debconf-communicate" <<'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
+case "$_cmds" in
+    *FGET*) printf '0 maybe\n'; exit 0 ;;
+    *) printf '0 unix, systemd, fprintd\n'; exit 0 ;;
+esac
+EOF
+        fi
+        chmod +x "$s/stub/debconf-communicate"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-38/$case_name: FGET failure is a hard snapshot failure"
+        assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+            "PAM-38/$case_name: no PAM/debconf mutation"
+        if [ -e "$s/manifest/pam-selection" ]; then
+            fail "PAM-38/$case_name: no legacy sidecar from a failing FGET"
+        else
+            ok
+        fi
+        assert_contains "reading the seen flag failed" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            "PAM-38/$case_name: hard-failure reason logged"
+    done
+}
+
+# PAM-39: savedir verification is bidirectional and rejects an empty snapshot;
+# a genuinely empty live savedir is recorded as "absent" instead.
+test_pam_39_savedir_bidirectional_and_empty_checks() {
+    local s
+    # (a) extra LIVE saved file must be detected even when every snapshotted
+    #     file is byte-identical.
+    s="$(setup_pam_sandbox savedir-extra-live)"
+    pam_install_for_restore_test "$s"
+    printf 'EXTRA-LIVE\n' > "$s/savedir/extra.conf"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-39a: extra live saved profile fails the restore"
+    [ -e "$s/manifest/pam-selection" ] && ok || fail "PAM-39a: sidecar retained"
+    assert_contains "has no counterpart" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-39a: extra live file named in the log"
+
+    # (b) sidecar says complete but .saved was emptied: fail closed.
+    s="$(setup_pam_sandbox savedir-empty-snapshot)"
+    pam_install_for_restore_test "$s"
+    rm -f "$s/manifest/pam-selection.saved"/*
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-39b: empty .saved cannot satisfy saved-snapshot=complete"
+    [ -e "$s/manifest/pam-selection" ] && ok || fail "PAM-39b: sidecar retained"
+    assert_contains "empty" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-39b: empty snapshot reason logged"
+
+    # (c) an EMPTY live savedir is not "complete": install records absent and
+    #     uninstall still succeeds without a .saved half.
+    s="$(setup_pam_sandbox savedir-truly-empty)"
+    pam_write_initial_files "$s" none none
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-39c: install succeeds with an empty savedir"
+    assert_contains '# cros-enablement: saved-snapshot=absent' \
+        "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-39c: empty savedir is recorded as absent"
+    if [ -e "$s/manifest/pam-selection.saved" ]; then
+        fail "PAM-39c: no .saved published for an empty savedir"
+    else
+        ok
+    fi
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-39c: uninstall succeeds when the snapshot was absent"
+}
+
+# PAM-40: if BOTH .saved removal and the subsequent sidecar rebuild fail, the
+# original bytes still exist but the sidecar cannot be restored automatically.
+# That must be an explicit CRITICAL log (never a silent success or a false
+# "nothing to restore" on the next uninstall).
+test_pam_40_rebuild_failure_logs_critical() {
+    local s snapshot_hex
+    s="$(setup_pam_sandbox consume-rebuild-critical)"
+    pam_install_for_restore_test "$s"
+    snapshot_hex="$(pam_saved_snapshot_hex "$s")"
+    pam_consume_fault_stub "$s" rm_saved_fail
+    cat > "$s/stub/ln" <<'EOF'
+#!/usr/bin/env bash
+_last="${@: -1}"
+if [ "$_last" = "$CROS_ENABLEMENT_PAM_SELECTION_FILE" ]; then
+    printf 'STUB: sidecar rebuild ln refused\n' >&2
+    exit 1
+fi
+exec /bin/ln "$@"
+EOF
+    chmod +x "$s/stub/ln"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-40: rc 1 when consume and rebuild both fail"
+    if [ ! -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.saved" ]; then
+        ok
+    else
+        fail "PAM-40: unexpectedly recoverable state (sidecar present or .saved lost)"
+    fi
+    assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+        "PAM-40: original saved bytes remain intact"
+    assert_contains "CRITICAL" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-40: CRITICAL log emitted"
+    assert_contains "manual recovery is REQUIRED" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-40: log explicitly demands manual recovery"
+
+    # A retry in the SAME broken state must NOT claim success: restore must
+    # recognise the orphaned .saved and demand manual recovery (P2).
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_neq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-40/retry: orphaned .saved must not produce a false success"
+    assert_contains "Orphaned saved PAM profile snapshot" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-40/retry: orphan is explicitly reported"
+    assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+        "PAM-40/retry: orphan bytes still intact"
+}
+
+# With no (or an empty) savedir snapshot there is no authoritative profile
+# state for --package to re-derive from; model it as a no-op tool.
+pam_noop_package_tool() {
+    cat > "$1/stub/pam-auth-update" <<'EOF'
+#!/usr/bin/env bash
+printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 0
+EOF
+    chmod +x "$1/stub/pam-auth-update"
+}
+
+# PAM-41: a REAL previous-release sidecar (magic + value only, NO optional
+# metadata) published together with .saved must still install AND uninstall.
+# Restore infers complete/absent from .saved state and stays value-only.
+test_pam_41_legacy_sidecar_roundtrip() {
+    local case_name s before sel_before
+    for case_name in with_saved without_saved empty_saved empty_repair; do
+        s="$(setup_pam_sandbox "legacy-roundtrip-$case_name")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        sel_before="$(pam_selection "$s")"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-41/$case_name: install rc 0"
+
+        # Downgrade the published sidecar to the exact legacy shape.
+        sed -e '/^# cros-enablement: selection-seen=/d' \
+            -e '/^# cros-enablement: saved-snapshot=/d' \
+            "$s/manifest/pam-selection" > "$s/manifest/pam-selection.legacy"
+        cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+        rm -f "$s/manifest/pam-selection.legacy"
+        assert_not_contains 'selection-seen=' "$(cat "$s/manifest/pam-selection")" \
+            "PAM-41/$case_name: no seen metadata (legacy)"
+        assert_not_contains 'saved-snapshot=' "$(cat "$s/manifest/pam-selection")" \
+            "PAM-41/$case_name: no saved metadata (legacy)"
+
+        case "$case_name" in
+            without_saved)
+                rm -rf "$s/manifest/pam-selection.saved"
+                pam_noop_package_tool "$s"
+                ;;
+            empty_saved)
+                # The OLD installer published an EMPTY .saved when /var/lib/pam
+                # existed but held no profiles. A NEW install must accept it.
+                rm -f "$s/manifest/pam-selection.saved"/*
+                CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+                    run_pam_install "$s" debian
+                assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+                    "PAM-41/empty_saved: install rc 0 with a legacy empty .saved"
+                pam_noop_package_tool "$s"
+                ;;
+            empty_repair)
+                # Missing .saved + an empty live savedir: a new install must
+                # repair the half WITHOUT publishing an empty .saved.
+                rm -rf "$s/manifest/pam-selection.saved"
+                rm -f "$s/savedir"/*
+                CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+                    run_pam_install "$s" debian
+                assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+                    "PAM-41/empty_repair: install rc 0 with an empty live savedir"
+                if [ -e "$s/manifest/pam-selection.saved" ]; then
+                    fail "PAM-41/empty_repair: repair must not publish an empty .saved"
+                else
+                    ok
+                fi
+                pam_noop_package_tool "$s"
+                ;;
+        esac
+        : > "$s/tool.log"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian
+        assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-41/$case_name: legacy sidecar can be uninstalled"
+        assert_eq "$sel_before" "$(pam_selection "$s")" \
+            "PAM-41/$case_name: original selection restored"
+        [ ! -e "$s/manifest/pam-selection" ] \
+            && ok || fail "PAM-41/$case_name: legacy sidecar consumed"
+        assert_not_contains 'FSET' "$(cat "$s/tool.log" 2> /dev/null || echo '')" \
+            "PAM-41/$case_name: legacy restore stays value-only (no FSET)"
+        if [ "$case_name" = with_saved ]; then
+            assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+                "PAM-41/with_saved: every byte restored from the legacy .saved"
+            if [ ! -e "$s/manifest/pam-selection.saved" ]; then
+                ok
+            else
+                fail "PAM-41/with_saved: .saved consumed after verification"
+            fi
+            assert_contains "inferring saved-snapshot=complete" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                "PAM-41/with_saved: inference logged"
+        else
+            assert_contains "inferring saved-snapshot=absent" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                "PAM-41/$case_name: absent inference logged"
+        fi
+        if [ "$case_name" = empty_saved ]; then
+            assert_contains "is empty; treating it as saved-snapshot=absent" \
+                "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                "PAM-41/empty_saved: empty legacy .saved treated as absent on install"
+            assert_contains "Legacy PAM sidecar has an empty" \
+                "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                "PAM-41/empty_saved: empty legacy .saved treated as absent on restore"
+        fi
+    done
+}
+
+# PAM-42: restore must not report "nothing to restore" (rc 0) when .saved is
+# orphaned by a deleted sidecar; that is a manual-recovery state.
+test_pam_42_orphan_saved_at_restore_fails() {
+    local s snapshot_hex
+    s="$(setup_pam_sandbox orphan-at-restore)"
+    pam_install_for_restore_test "$s"
+    snapshot_hex="$(pam_saved_snapshot_hex "$s")"
+    rm -f "$s/manifest/pam-selection"
+    : > "$s/log.txt"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_neq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-42: orphaned .saved without a sidecar is rc != 0"
+    assert_contains "Orphaned saved PAM profile snapshot" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-42: orphan is explicitly reported, not a silent no-op"
+    assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
+        "PAM-42: orphan bytes untouched"
+}
+
 # Re-review #11/#12 finding #2 and #13 finding #1: original sudo/common PAM
 # bytes AND the Debian profile selection must survive install -> uninstall.
 test_pam_1_preexisting_exact_line_survives
@@ -11190,6 +12071,20 @@ test_pam_25_legacy_sidecar_restores_value_only
 test_pam_26_fset_failure_keeps_sidecar
 test_pam_27_debconf_show_fallback
 test_pam_28_process_rc_never_fails_open
+test_pam_29_snapshot_faults_fail_closed
+test_pam_30_existing_sidecar_validation
+test_pam_31_saved_dir_restore_failures_keep_snapshot
+test_pam_32_tool_failure_with_verified_state_succeeds
+test_pam_33_retry_after_failed_restore_consumes_only_on_success
+test_pam_34_restore_checks_rollback_completeness
+test_pam_35_consume_failure_is_recoverable
+test_pam_36_orphan_saved_snapshot_is_preserved
+test_pam_37_seen_only_sidecar_fails_closed
+test_pam_38_fget_failure_is_hard_failure
+test_pam_39_savedir_bidirectional_and_empty_checks
+test_pam_40_rebuild_failure_logs_critical
+test_pam_41_legacy_sidecar_roundtrip
+test_pam_42_orphan_saved_at_restore_fails
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
