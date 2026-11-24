@@ -380,13 +380,52 @@ bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume 
 重試；`unknown` → 只有目前亮度已等於已存值時才不寫入地收斂，否則延後。
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 可選擇在答案仍為 unknown 時還原——這等於接受
 點亮仍鎖定螢幕的風險，預設關閉。只要有 resume flag，`handle_unblank()` 就會路由到
-`handle_resume()`，避免雙重寫入。還原後 +0.3/+0.9s 的 guard 只有在能證明「還原後的
-使用者意願」時才放棄補寫：`LAST_USER_FILE` 不同於已存值**且** meta 帶有本次還原的
-generation 戳記，或 gsd/LED 與同一份還原後 cache 都同意另一個亮度。熄屏前的過期
-快取（例如 6 而已存值 8）因此不會阻止修復真正消失的還原。取捨：若使用者調整後，
-sampler 約 5 秒後的下次取樣才寫入帶戳記的 cache，該調整仍可能被 guard 覆蓋；
-還原本身已做讀回驗證。
-該戳記只證明快取值是在本次還原後寫入，並不保證取樣值本身正確。
+`handle_resume()`，避免雙重寫入。
+
+**實體寫入序列化與 generation gate（Tier 1）**：每次實體
+`SetBrightness`／gsd `Properties.Set` 都在 `WRITE_LOCK`（flock fd 209）內，包含
+熄屏、還原、重試與兩個 guard；路徑可用 `C640_KBD_WRITE_LOCK` 覆寫。鎖順序是
+`RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK`；持有 `WRITE_LOCK` 時不得再取外層鎖
+（finalize、verify 與 generation 維護都在釋放後做）。慢速 D-Bus 讀取（guard 的
+LED 讀回）在取得 `WRITE_LOCK` **之前**完成，因此 3 秒 gdbus timeout 不會拖住
+等待鎖的還原。`bump_restore_gen()` 在 `WRITE_LOCK` 內讀取、遞增並原子發佈
+generation，同時清除 guard marker，成功回 0；鎖取得失敗時**完全不發佈**
+（不在鎖外降級寫入）、回 1，所有呼叫端都轉為 DEFER 並保留 flag/handoff/state。
+`C640_KBD_GUARD_WRITTEN_GEN` 可覆寫 `c640-kbd-backlight.guard-written-gen`：
+該 marker 讓同一 generation 的兩個 guard 只有一個能重設亮度。
+
++0.3/+0.9s 的 unblank guard 與 +0.25/+1.0s 的 blank guard 會在 sleep 後以及
+`WRITE_LOCK` 內、寫入前再查一次 generation；過期 guard **完全不寫入**。
++0.5/+1.5/+3s 重試在取得 `WRITE_LOCK` 後也必須重查 generation：它先前的檢查是在
+`STATE_LOCK` 內做，等鎖時已釋放；若期間有新週期把 generation 往前推，重試會釋放鎖、
+用 `finalize_restore ... RC_DEFER` 把 `RESTORE_PENDING` 回滾到 `STATE_FILE`
+（不留 PENDING orphan），然後不寫入地結束。
+
+unblank guard 的決策表（依序）：
+
+| 狀態 | 行為 |
+| :--- | :--- |
+| sleep 後或 `WRITE_LOCK` 內（含寫入前最後一次）generation 已變 | 記錄取消；零寫入 |
+| LED 已等於已存值，或本 generation 已有 guard marker | 略過（不重複寫入） |
+| 單憑帶戳記 cache：`lu != saved` **且** `lu_gen == restore_gen` | 視為使用者意願，不寫入（不論 gsd 為何） |
+| 無此 cache，且 gsd pct 仍等於 `want_pct` | 真正的 restore 遺失；重設為已存值 |
+| 其他情況，例如 `gpct != want_pct`、gsd 查詢為空/失敗、cache 無戳記 | **模糊／fail-closed：不寫入** |
+
+`read_last_user_record()` 只 `cat` meta 檔**一次**，並從同一份快照解析 `value=` 與
+`restore=`；guard 使用這組成對資料，因此 sampler 在兩次讀取之間改寫 cache 不可能
+偽造出「舊值 + 新 generation」的證據。戳記只證明快取值是在本次還原後寫入，
+並不保證取樣值本身正確。**此規則的代價：**若 restore 遺失時 gsd 百分比已經跟著
+使用者新值改變（`gpct != want_pct`），現在會被視為模糊而**不再修復**——guard
+選擇 fail-closed，不覆蓋可能是使用者選擇的亮度。原本的「gsd/LED 與同一份 cache
+都同意」第三條款已移除。
+
+`WRITE_LOCK` 取得失敗在所有路徑都 fail-closed：`restore_state()` 與重試不寫入地
+DEFER（暫存值會回滾）；`handle_blank()` 在保存成功後保持 LED 亮著；
+`--test-blank` 回 1 並印出 `simulated blank: failed to set 0`；guard 記錄
+`WRITE_LOCK unavailable` 並略過。
+`C640_KBD_SELF_WRITE_SENTINEL` 是選用 **Tier 2 brightness-signal**（在
+`WRITE_LOCK` 內、`set_brightness` 前寫入 `value:gen`，避免自我寫入被當成使用者意圖）
+的保留欄位；**Tier 2 尚未實作**，該 sentinel 只由測試建立/清除，Tier 1 不會讀它。
 
 adopt、還原與 `verify_restore_applied()` 共用一組結果碼：
 `0 = RC_DONE`（寫入已驗證，`STATE`/`restore-pending` 已消耗）、`1 = RC_FAIL`（輸入無效
@@ -470,19 +509,23 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 **僅供測試的環境變數**（不碰系統檔案）：daemon 接受 `C640_KBD_SYSFS_BRIGHTNESS` /
 `C640_KBD_SYSFS_MAX` 指向假 LED 節點，以及 `C640_KBD_HANDOFF_SUSPEND` /
 `C640_KBD_HANDOFF_RESUME` / `C640_KBD_RESTORE_PENDING_FILE` /
-`C640_KBD_RESUME_LOCK` / `C640_KBD_LAST_USER_META_FILE` 覆寫暫存/handoff 路徑；
-sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
+`C640_KBD_RESUME_LOCK` / `C640_KBD_LAST_USER_META_FILE` 覆寫暫存/handoff 路徑，
+另有 `C640_KBD_WRITE_LOCK`、`C640_KBD_GUARD_WRITTEN_GEN` 與
+`C640_KBD_SELF_WRITE_SENTINEL` 覆寫 write lock／guard marker／保留的 Tier 2
+sentinel 路徑；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 `C640_KBD_HANDOFF_DIR` 與 `C640_KBD_RUN_USER_ROOT`；若有設定
 `C640_KBD_HANDOFF_DIR`，daemon 也用同一值作為 hook 端目錄來做不一致診斷，並用
 `C640_KBD_RUN_USER_ROOT` 做唯讀的跨 uid 掃描。舊的 `C640_KBD_SLEEP_USER` /
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 460 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 535 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
-跨 uid handoff 目錄不一致、gsd 確認的新鮮 manual0 adopt 與帶 generation 戳記的
-guard 使用者變更保護）；sleep hook 測試有 84 個案例（純 handoff、`0600`/`chown`/
+跨 uid handoff 目錄不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
+guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
+嚴格單調的 generation bump、fail-closed 鎖失敗與單次讀取的 last-user cache）；
+sleep hook 測試有 84 個案例（純 handoff、`0600`/`chown`/
 原子 `mv`、`C640_KBD_HANDOFF_DIR`、多 session 解析與 IDLE/CLASS 偏好及路徑 WARN、
 不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1981 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
@@ -497,7 +540,7 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、整個操�
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 460 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 535 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 個案例
 sudo bash tests/rollback-test.sh                       # 1981 個案例（需 root）
 ```

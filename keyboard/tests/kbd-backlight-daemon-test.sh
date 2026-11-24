@@ -24,6 +24,37 @@ DAEMON_ERR="$TMP_DIR/daemon.err"
 FLOCK_DIR="$TMP_DIR/flock"
 FLOCK_LOG="$TMP_DIR/flock.log"
 RECOVER_LOG="$TMP_DIR/recover.log"
+# Finding #4: dedicated write lock, guard marker and the reserved Tier-2
+# sentinel.  The daemon derives these from STATE_DIR at source time.
+WRITE_LOCK_FILE="$D_STATE_DIR/c640-kbd-backlight.write.lock"
+GUARD_WRITTEN_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.guard-written-gen"
+SELF_WRITE_SENTINEL_FILE="$D_STATE_DIR/c640-kbd-backlight.self-write"
+GUARD_ERR="$TMP_DIR/guard.err"
+# These three are derived by the daemon at SOURCE time from STATE_DIR, which
+# the test only overrides after sourcing.  Pass them in as env overrides so
+# the daemon never touches the real /run/user/<uid> runtime dir.
+export C640_KBD_WRITE_LOCK="$WRITE_LOCK_FILE"
+export C640_KBD_GUARD_WRITTEN_GEN="$GUARD_WRITTEN_GEN_FILE"
+export C640_KBD_SELF_WRITE_SENTINEL="$SELF_WRITE_SENTINEL_FILE"
+# Controllable sleep gate: fast (default) keeps every existing case instant;
+# gate blocks only the guard delays until STUB_SLEEP_RELEASE is created.
+STUB_SLEEP_STARTED="$TMP_DIR/sleep-started"
+STUB_SLEEP_RELEASE="$TMP_DIR/sleep-release"
+STUB_BUMP_FLAG="$TMP_DIR/bump-on-get"
+# Retry/interleaving gates.  The retry gate is deliberately SEPARATE from the
+# guard gate so a retry can be held in its sleep without wedging guard tests.
+STUB_RETRY_GATE="$TMP_DIR/retry-gate"
+STUB_RETRY_RELEASE="$TMP_DIR/retry-release"
+STUB_RETRY_STARTED="$TMP_DIR/retry-started"
+STUB_WLOCK_HELD="$TMP_DIR/write-lock-held"
+STUB_WLOCK_RELEASE="$TMP_DIR/write-lock-release"
+# Torn-meta injection: a stub cat alternates between an OLD and a NEW meta
+# snapshot for the last-user file only.  Old code (two cats) sees old value +
+# new generation; the fixed single-read code always sees one coherent record.
+STUB_TORN_META="$TMP_DIR/torn-meta"
+STUB_TORN_OLD="$TMP_DIR/torn-meta-old"
+STUB_TORN_NEW="$TMP_DIR/torn-meta-new"
+STUB_TORN_COUNTER="$TMP_DIR/torn-meta-counter"
 # P6-7/P6-8: records STATE_FILE's content at the moment set_brightness 0 runs,
 # proving the save happened before the LED was switched off.
 ORDER_FILE="$TMP_DIR/blank-order"
@@ -185,6 +216,18 @@ esac
 
 case "$*" in
     *GetBrightness*)
+        # Finding #4 "last check" injection: bump the generation on the FIRST
+        # brightness read after STUB_BUMP_FLAG is armed.  A guard that decides
+        # to write must notice this inside its WRITE_LOCK critical section.
+        if [ -f "${STUB_BUMP_FLAG:-/nonexistent}" ]; then
+            rm -f "${STUB_BUMP_FLAG}" 2> /dev/null || true
+            g="$(cat "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || echo 0)"
+            case "$g" in
+                '' | *[!0-9]*) g=0 ;;
+            esac
+            printf '%s\n' "$((g + 1))" > "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || true
+            printf 'BUMP-ON-GET %s\n' "$*" >> "$STUB_GDBUS_LOG"
+        fi
         printf '(%s,)\n' "$(cat "$STUB_RAW_FILE" 2> /dev/null || printf '%s' "${STUB_KBD_RAW:-42}")"
         exit 0
         ;;
@@ -315,9 +358,76 @@ case "$op" in
         ;;
 esac
 STUB
-# sleep is a no-op so retry/guard subshells finish at once.
-printf '#!/bin/sh\nexit 0\n' > "$STUB_DIR/sleep"
-chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/flock" "$STUB_DIR/sleep"
+# sleep is a no-op by default so retry/guard subshells finish at once.  In
+# "gate" mode only the four guard delays (0.25/0.3/0.9/1.0s) block until
+# $STUB_SLEEP_RELEASE exists, recording each start in $STUB_SLEEP_STARTED.
+# That is what makes the stale-guard-vs-new-restore interleaving testable.
+cat > "$STUB_DIR/sleep" << 'STUB'
+#!/bin/sh
+case "${STUB_SLEEP_MODE:-fast}" in
+    gate)
+        d="${1:-0}"
+        # P1 interleaving gate: retries (0.5/1.5/3s) can be held independently
+        # of the guard delays, recorded in STUB_RETRY_STARTED so it cannot
+        # inflate the guard-gate count used by start_gated_guard().
+        if [ -e "${STUB_RETRY_GATE:-/nonexistent}" ]; then
+            case "$d" in
+                0.5 | 1.5 | 3)
+                    printf '%s\n' "$d" >> "${STUB_RETRY_STARTED:-/dev/null}"
+                    n=0
+                    while [ ! -e "${STUB_RETRY_RELEASE:-/nonexistent}" ]; do
+                        /bin/sleep 0.02
+                        n=$((n + 1))
+                        [ "$n" -gt 2000 ] && exit 0
+                    done
+                    exit 0
+                    ;;
+            esac
+        fi
+        case "$d" in
+            0.25 | 0.3 | 0.9 | 1.0)
+                printf '%s\n' "$d" >> "${STUB_SLEEP_STARTED:-/dev/null}"
+                # Per-delay release files allow deterministic ordering of the
+                # two guards; the common release file still releases both.
+                # Re-evaluate on every poll: a per-delay file may be created
+                # after this subshell entered the gate.
+                n=0
+                while :; do
+                    release="${STUB_SLEEP_RELEASE}.${d}"
+                    [ -e "$release" ] || release="${STUB_SLEEP_RELEASE:-/nonexistent}"
+                    [ -e "$release" ] && break
+                    /bin/sleep 0.02
+                    n=$((n + 1))
+                    [ "$n" -gt 2000 ] && exit 0
+                done
+                exit 0
+                ;;
+        esac
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+STUB
+# P2-3: torn last-user meta read.  Only the exact LAST_USER_META_FILE path is
+# intercepted, and only while STUB_TORN_META_ON=1.  Even calls get the OLD
+# snapshot, odd calls the NEW one, so a guard that cats the meta twice sees
+# "old value + new generation" on BOTH of its two delays.
+cat > "$STUB_DIR/cat" << 'STUB'
+#!/bin/sh
+if [ "${STUB_TORN_META_ON:-0}" = "1" ] && [ "$#" -eq 1 ] &&
+   [ "$1" = "${LAST_USER_META_FILE:-/nonexistent}" ]; then
+    counter="${STUB_TORN_COUNTER:-/nonexistent}"
+    n="$(/bin/cat "$counter" 2> /dev/null || echo 0)"
+    case "$n" in '' | *[!0-9]*) n=0 ;; esac
+    printf '%s\n' "$((n + 1))" > "$counter" 2> /dev/null || true
+    if [ $((n % 2)) -eq 0 ]; then
+        exec /bin/cat "${STUB_TORN_OLD:-/nonexistent}"
+    fi
+    exec /bin/cat "${STUB_TORN_NEW:-/nonexistent}"
+fi
+exec /bin/cat "$@"
+STUB
+chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/flock" "$STUB_DIR/sleep" "$STUB_DIR/cat"
 
 # The stub directory MUST win before any daemon function runs: otherwise the
 # real session/system bus would be queried (and the real LED could be written).
@@ -367,6 +477,12 @@ export RESTORE_PENDING_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-pending"
 export HANDOFF_SUSPEND_FILE="$HANDOFF_SUSPEND_FILE"
 export HANDOFF_RESUME_FILE="$HANDOFF_RESUME_FILE"
 export RESUME_LOCK="$D_STATE_DIR/c640-kbd-backlight.resume.lock"
+# Belt-and-braces: override the derived globals too (the env overrides above
+# normally make this a no-op, but a future refactor must not write outside the
+# sandbox).
+export WRITE_LOCK="$WRITE_LOCK_FILE"
+export GUARD_WRITTEN_GEN_FILE="$GUARD_WRITTEN_GEN_FILE"
+export SELF_WRITE_SENTINEL="$SELF_WRITE_SENTINEL_FILE"
 export HAVE_GSD_KBD=""
 export HAVE_UPOWER_KBD=""
 
@@ -385,13 +501,32 @@ export STUB_GNOME_ACTIVE="false"
 export STUB_FDO_ACTIVE="false"
 export STUB_GSD_NOOP="0"
 export STUB_ECTOOL_FAIL="0"
+# Guard interleaving controls (fast by default: all legacy cases stay instant).
+export STUB_SLEEP_MODE=fast
+export STUB_SLEEP_STARTED="$STUB_SLEEP_STARTED"
+export STUB_SLEEP_RELEASE="$STUB_SLEEP_RELEASE"
+export STUB_BUMP_FLAG="$STUB_BUMP_FLAG"
+export STUB_RETRY_GATE="$STUB_RETRY_GATE"
+export STUB_RETRY_RELEASE="$STUB_RETRY_RELEASE"
+export STUB_RETRY_STARTED="$STUB_RETRY_STARTED"
+export STUB_TORN_META="$STUB_TORN_META"
+export STUB_TORN_OLD="$STUB_TORN_OLD"
+export STUB_TORN_NEW="$STUB_TORN_NEW"
+export STUB_TORN_COUNTER="$STUB_TORN_COUNTER"
+export STUB_TORN_META_ON=0
 
 reset_case() {
-    # Retire retry subshells from the previous case before removing their files.
+    # Open every gate BEFORE retiring retry/guard subshells from the previous
+    # case, otherwise a still-gated child would keep `wait` blocked.
+    : > "$STUB_SLEEP_RELEASE"
+    : > "${STUB_SLEEP_RELEASE}.0.25" "${STUB_SLEEP_RELEASE}.0.3" \
+        "${STUB_SLEEP_RELEASE}.0.9" "${STUB_SLEEP_RELEASE}.1.0"
+    : > "$STUB_RETRY_RELEASE"
     wait 2> /dev/null || true
     : > "$GDBUS_LOG"
     : > "$SET_LOG"
     : > "$DAEMON_ERR"
+    : > "$GUARD_ERR"
     : > "$RECOVER_LOG"
     : > "$STUB_ACTIVE_SEQ_FILE"
     : > "$TMP_DIR/ectool.log"
@@ -401,6 +536,17 @@ reset_case() {
         "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE" \
         "$HANDOFF_SUSPEND_FILE" "$HANDOFF_RESUME_FILE" "$HOOK_SUSPEND_FILE" \
         "$HOOK_HANDOFF_DIR"/c640-kbd-backlight.resume "$D_STATE_DIR"/*.resume.lock
+    # Finding #4 state: write lock, guard marker, Tier-2 sentinel and the
+    # controllable sleep gate.  Without this cleanup a gated guard from a
+    # previous case can wedge every later case.
+    rm -f "$WRITE_LOCK_FILE" "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL_FILE" \
+        "$STUB_SLEEP_STARTED" "$STUB_SLEEP_RELEASE" "$STUB_SLEEP_RELEASE".* \
+        "$STUB_BUMP_FLAG" \
+        "$STUB_RETRY_GATE" "$STUB_RETRY_RELEASE" "$STUB_RETRY_STARTED" \
+        "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE" \
+        "$STUB_TORN_META" "$STUB_TORN_OLD" "$STUB_TORN_NEW" "$STUB_TORN_COUNTER"
+    export STUB_TORN_META_ON=0
+    export STUB_SLEEP_MODE=fast
     rm -f "$HOOK_RUN_USER_ROOT"/[0-9]*/c640-kbd-backlight.* 2> /dev/null || true
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
@@ -457,6 +603,84 @@ run_fn_rc() {
     local rc=0
     "$@" 2> "$DAEMON_ERR" || rc=$?
     printf '%s' "$rc"
+}
+
+# Finding #4 helpers.  start_gated_guard forks a guard with the controllable
+# sleep stub and waits until BOTH of its subshells have entered the gate, so a
+# second restore can complete while the first generation's guards are pending.
+# Both delays are recorded in $GUARD_STARTED for an assertion that the gate
+# really armed.  Do NOT call this in a command substitution: the background
+# job must be a child of the main test shell so release_guards' `wait` sees it.
+start_gated_guard() {
+    local fn="$1" n=0
+    shift
+    : > "$STUB_SLEEP_STARTED"
+    rm -f "$STUB_SLEEP_RELEASE"
+    export STUB_SLEEP_MODE=gate
+    # The wrapper's own `wait` makes it exit only after BOTH guard subshells
+    # finish, so release_guards' `wait` cannot return before their logs land.
+    (
+        "$fn" "$@" 2> "$GUARD_ERR"
+        wait
+    ) &
+    while [ "$(sort -u "$STUB_SLEEP_STARTED" 2> /dev/null | wc -l)" -lt 2 ] && [ "$n" -lt 400 ]; do
+        # /bin/sleep, NOT the stub: the stub is deliberately blocked here.
+        /bin/sleep 0.02
+        n=$((n + 1))
+    done
+    GUARD_STARTED="$(sort -u "$STUB_SLEEP_STARTED" 2> /dev/null | tr '\n' ',' || true)"
+}
+
+release_guards() {
+    : > "$STUB_SLEEP_RELEASE"
+    # Let both guards finish their lock/verify/probe work before asserting.
+    /bin/sleep 0.4
+    wait 2> /dev/null || true
+    export STUB_SLEEP_MODE=fast
+}
+
+wait_for_file() {
+    local target="$1" n=0
+    while [ ! -e "$target" ] && [ "$n" -lt 300 ]; do
+        /bin/sleep 0.02
+        n=$((n + 1))
+    done
+    [ -e "$target" ]
+}
+
+wait_for_line() {
+    local target="$1" line="$2" n=0
+    while ! grep -Fqx "$line" "$target" 2> /dev/null && [ "$n" -lt 300 ]; do
+        /bin/sleep 0.02
+        n=$((n + 1))
+    done
+    grep -Fqx "$line" "$target" 2> /dev/null
+}
+
+# Hold the daemon's WRITE_LOCK (fd 209) from a separate process.  Used to park
+# a retry between staging PENDING and acquiring the write lock: the exact
+# window in which a newer generation can appear.
+hold_write_lock() {
+    rm -f "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE"
+    (
+        exec 209> "$WRITE_LOCK_FILE"
+        flock -n 209 || exit 1
+        : > "$STUB_WLOCK_HELD"
+        while [ ! -e "$STUB_WLOCK_RELEASE" ]; do
+            /bin/sleep 0.02
+        done
+        flock -u 209 2> /dev/null || true
+        exec 209>&-
+    ) &
+    if ! wait_for_file "$STUB_WLOCK_HELD"; then
+        bad "test harness: WRITE_LOCK holder failed to start"
+    fi
+}
+
+release_write_lock_holder() {
+    : > "$STUB_WLOCK_RELEASE"
+    # Also retires the retry subshell that was blocked on fd 209.
+    wait 2> /dev/null || true
 }
 
 # --- tests -----------------------------------------------------------------
@@ -2587,8 +2811,11 @@ else
     bad "P2-c: no stamped-cache log (stderr: $(cat "$DAEMON_ERR"))"
 fi
 
-# P2-c (c). gsd/LED agree on a new value but the last-user cache does NOT
-# support it (stale pre-restore cache): treat it as a lost restore and repair.
+# P2-c (c) -- EXPECTATION REVERSED BY FINDING #4.  gsd/LED moved to 50 while
+# the last-user cache (stamped with THIS restore's generation) still holds 30.
+# Inside the 5s sampler window that is genuinely AMBIGUOUS: it may be a user
+# change whose cache record has not landed yet.  Re-applying 30 would override
+# user intent, so the guard must leave the LED alone and only log.
 reset_case
 write_state 30
 printf '30\n' > "$RAW_FILE"
@@ -2596,14 +2823,30 @@ run_fn restore_state
 write_last_user 30 nonzero
 printf '50\n' > "$RAW_FILE"
 printf '50\n' > "$PCT_FILE"
+: > "$SET_LOG"
 run_fn guard_unblank 30
 wait 2> /dev/null || true
-assert_file "P2-c: gsd/LED alone does not license skipping the repair" "$RAW_FILE" "30"
-if grep -q 're-setting' "$DAEMON_ERR"; then
-    ok "P2-c: unsupported gsd/LED change is repaired"
+assert_file "P2-c: ambiguous change keeps the user's brightness 50" "$RAW_FILE" "50"
+assert_eq "P2-c: ambiguous change issues no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'ambiguous' "$DAEMON_ERR" && grep -q 'no write' "$DAEMON_ERR"; then
+    ok "P2-c: ambiguous change is logged as no-write"
 else
-    bad "P2-c: no re-set log (stderr: $(cat "$DAEMON_ERR"))"
+    bad "P2-c: no ambiguous/no-write log (stderr: $(cat "$DAEMON_ERR"))"
 fi
+
+# P2-c (c2). Same 5s ambiguity with NO last-user record at all: with no gsd
+# positive evidence (gsd moved to 50), the guard must fail closed as well.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+printf '50\n' > "$RAW_FILE"
+printf '50\n' > "$PCT_FILE"
+: > "$SET_LOG"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "P2-c: no-cache ambiguous change keeps brightness 50" "$RAW_FILE" "50"
+assert_eq "P2-c: no-cache ambiguous change issues no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 
 # P2-1 (reviewer A). A 6->8 change made <5s before blank leaves the sampler
 # cache at 6 while STATE_FILE holds 8.  That stale cache must NOT be mistaken
@@ -2638,6 +2881,369 @@ if grep -q 'Properties.Set' "$SET_LOG"; then
 else
     bad "P2-c: guard no longer repairs a lost restore (SET_LOG: $(cat "$SET_LOG"))"
 fi
+
+# --- Finding #4: generation is a real writer gate ---------------------------
+
+# F4-1. G1 unblank guard is pending in the controllable sleep gate; a second
+# blank/unblank cycle completes a G2 restore of 70.  When G1 wakes it must do
+# ZERO writes and leave the newer restore intact.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+g1="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+assert_eq "F4-1: first restore established G1" "1" "$g1"
+start_gated_guard guard_unblank 30
+assert_eq "F4-1: both unblank guard delays gated" "0.3,0.9," "$GUARD_STARTED"
+write_state 70
+printf '70\n' > "$RAW_FILE"
+run_fn restore_state
+g2="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+assert_eq "F4-1: second restore advanced G1 to G2" "2" "$g2"
+: > "$SET_LOG"
+release_guards
+assert_file "F4-1: G2 value survives stale G1 guard" "$RAW_FILE" "70"
+assert_eq "F4-1: stale G1 guard issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'generation superseded' "$GUARD_ERR"; then
+    ok "F4-1: superseded generation is logged"
+else
+    bad "F4-1: no generation-superseded log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# F4-2. Same interleaving, but the 5s sampler has already recorded the G2
+# value with a G2 stamp.  The G1 guard must not overwrite either the G2 cache
+# or the G2 restore, even though lu != saved would normally look like intent.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+g1="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+assert_eq "F4-2: first restore established G1" "1" "$g1"
+start_gated_guard guard_unblank 30
+assert_eq "F4-2: both unblank guard delays gated" "0.3,0.9," "$GUARD_STARTED"
+write_state 70
+printf '70\n' > "$RAW_FILE"
+run_fn restore_state
+write_last_user 70 nonzero
+g2="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+assert_eq "F4-2: sampler cache stamped with G2" "2" "$(last_user_restore_gen)"
+: > "$SET_LOG"
+release_guards
+assert_file "F4-2: G2 cache value survives stale G1 guard" "$RAW_FILE" "70"
+assert_eq "F4-2: stale G1 guard issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_eq "F4-2: G1 guard did not touch the G2 cache" "70" "$(read_last_user_brightness)"
+if grep -q 'generation superseded' "$GUARD_ERR"; then
+    ok "F4-2: superseded generation is logged"
+else
+    bad "F4-2: no generation-superseded log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# F4-3. Final in-lock check: arm the gdbus stub so the FIRST brightness read
+# after the guard wakes bumps the generation (before it reaches WRITE_LOCK).
+# The guard's last check inside the lock must still cancel the write.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+: > "$STUB_BUMP_FLAG"
+start_gated_guard guard_unblank 30
+assert_eq "F4-3: both unblank guard delays gated" "0.3,0.9," "$GUARD_STARTED"
+release_guards
+assert_file "F4-3: in-lock generation bump blocks the write" "$RAW_FILE" "10"
+assert_eq "F4-3: no write after in-lock bump" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_eq "F4-3: generation actually advanced" "2" "$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+if grep -q 'superseded inside WRITE_LOCK' "$GUARD_ERR"; then
+    ok "F4-3: in-lock cancellation is logged"
+else
+    bad "F4-3: no in-lock cancellation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# F4-4. G1 BLANK guard pending; a G2 restore completes while the screen is
+# still reported active (explicit RESUME_ALLOW_UNKNOWN opt-in).  The stale
+# blank guard must not force 0 over the newly restored 70.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+g1="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+assert_eq "F4-4: first restore established G1" "1" "$g1"
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+export C640_KBD_RESUME_ALLOW_UNKNOWN=1
+start_gated_guard guard_blank
+assert_eq "F4-4: both blank guard delays gated" "0.25,1.0," "$GUARD_STARTED"
+write_state 70
+printf '70\n' > "$RAW_FILE"
+run_fn restore_state 1
+: > "$SET_LOG"
+release_guards
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+export C640_KBD_RESUME_ALLOW_UNKNOWN=0
+assert_file "F4-4: G2 restore survives stale G1 blank guard" "$RAW_FILE" "70"
+assert_eq "F4-4: stale blank guard issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+# Exact post-sleep string: a generic 'generation superseded' would also match
+# the in-WRITE_LOCK log and could not detect removal of the post-sleep recheck.
+if grep -Fq 'blank guard +0.25s: generation superseded (1 -> 2); guard cancelled' "$GUARD_ERR"; then
+    ok "F4-4: stale blank guard cancellation is logged after sleep"
+else
+    bad "F4-4: no post-sleep blank-guard cancellation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# F4-5. bump_restore_gen() atomically publishes the generation and clears the
+# guard's "already wrote" marker so the NEW generation's guards can write.
+reset_case
+printf '1\n' > "$GUARD_WRITTEN_GEN_FILE"
+printf 'sentinel\n' > "$SELF_WRITE_SENTINEL_FILE"
+bump_restore_gen
+assert_file "F4-5: generation published atomically" "$RESTORE_GEN_FILE" "1"
+assert_absent "F4-5: bump clears the guard-written marker" "$GUARD_WRITTEN_GEN_FILE"
+assert_absent "F4-5: bump clears the Tier-2 sentinel" "$SELF_WRITE_SENTINEL_FILE"
+if _acquire_write_lock; then
+    _release_write_lock
+    ok "F4-5: WRITE_LOCK re-acquirable after bump (no stale lock)"
+else
+    bad "F4-5: WRITE_LOCK left stale after bump"
+fi
+
+# F4-6. A guard marker for the CURRENT generation suppresses a duplicate write
+# even when the LED still disagrees (the second 0.9s guard / a second event).
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+printf '1\n' > "$GUARD_WRITTEN_GEN_FILE"
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "F4-6: marker suppresses the duplicate re-set" "$RAW_FILE" "10"
+assert_eq "F4-6: marker case issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'already re-set' "$DAEMON_ERR"; then
+    ok "F4-6: duplicate suppression is logged"
+else
+    bad "F4-6: no duplicate-suppression log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# --- Phase D re-review fixes: generation gate, lock failures, torn cache ----
+
+# F4-X (P1). A G1 retry wakes, stages PENDING, then waits for WRITE_LOCK while
+# another cycle advances the generation to G2 (DONE with no write).  Acquiring
+# the lock must re-check the gate and roll PENDING back instead of writing the
+# stale G1 value over the user's current LED (10).
+reset_case
+printf '1\n' > "$RESTORE_GEN_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+: > "$STUB_RETRY_STARTED"
+: > "$STUB_RETRY_GATE"
+: > "$SET_LOG"
+export STUB_SLEEP_MODE=gate
+hold_write_lock
+run_fn schedule_restore_retries 1 0.5
+if wait_for_line "$STUB_RETRY_STARTED" "0.5"; then
+    ok "F4-X: retry +0.5s reached the controllable sleep gate"
+else
+    bad "F4-X: retry never reached the sleep gate"
+fi
+: > "$STUB_RETRY_RELEASE"
+if wait_for_file "$RESTORE_PENDING_FILE"; then
+    ok "F4-X: retry staged PENDING before waiting for WRITE_LOCK"
+else
+    bad "F4-X: retry did not stage PENDING"
+fi
+# The other resume publishes G2 while the retry is blocked on fd 209.
+printf '2\n' > "$RESTORE_GEN_FILE"
+: > "$SET_LOG"
+release_write_lock_holder
+assert_file "F4-X: expired retry left the LED at 10" "$RAW_FILE" "10"
+assert_eq "F4-X: expired retry issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "F4-X: staged value rolled back to STATE_FILE" "$STATE_FILE" "30"
+assert_absent "F4-X: no PENDING orphan after rollback" "$RESTORE_PENDING_FILE"
+if grep -Fq 'restore retry +0.5s (gen=1): generation superseded inside WRITE_LOCK (2); rolling staged value back' "$DAEMON_ERR"; then
+    ok "F4-X: in-lock generation recheck is logged"
+else
+    bad "F4-X: no in-lock generation recheck log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# F4-7 (P3-1). Functional counterpart of F4-4 for the unblank guard: when the
+# stale G1 guard wakes, gsd still asks for the G1 value (positive evidence).
+# The post-sleep generation gate must cancel it before that evidence is used.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+assert_eq "F4-7: first restore established G1" "1" "$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+start_gated_guard guard_unblank 30
+assert_eq "F4-7: both unblank guard delays gated" "0.3,0.9," "$GUARD_STARTED"
+write_state 70
+printf '70\n' > "$RAW_FILE"
+run_fn restore_state
+assert_eq "F4-7: second restore established G2" "2" "$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+release_guards
+assert_file "F4-7: G2 value survives with gsd still wanting G1" "$RAW_FILE" "70"
+assert_eq "F4-7: stale G1 guard issued zero writes" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'unblank guard +0.3s: generation superseded (1 -> 2); guard cancelled' "$GUARD_ERR"; then
+    ok "F4-7: stale unblank guard cancellation is logged after sleep"
+else
+    bad "F4-7: no post-sleep unblank cancellation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# F4-8 (P2-1). A bump waiting on WRITE_LOCK must read the generation AFTER it
+# acquires the lock.  G1 is published while the waiting bump is parked; the
+# bump must then publish G3, not re-stamp G2 from a pre-lock read.
+reset_case
+printf '1\n' > "$RESTORE_GEN_FILE"
+printf '9\n' > "$GUARD_WRITTEN_GEN_FILE"
+: > "$TMP_DIR/bump-start"
+hold_write_lock
+(
+    : > "$TMP_DIR/bump-start"
+    bump_restore_gen
+) 2> "$TMP_DIR/bump.err" &
+if wait_for_file "$TMP_DIR/bump-start"; then
+    ok "F4-8: bump is waiting for WRITE_LOCK"
+else
+    bad "F4-8: bump did not start"
+fi
+/bin/sleep 0.2
+# Another cycle publishes G2 while the bump is blocked (the test-side holder
+# stands in for that writer, which publishes under the same lock).
+printf '2\n' > "$RESTORE_GEN_FILE"
+release_write_lock_holder
+assert_file "F4-8: generation read inside the lock is 3" "$RESTORE_GEN_FILE" "3"
+assert_absent "F4-8: guard marker cleared by the bump" "$GUARD_WRITTEN_GEN_FILE"
+
+# P2-1 (fail-closed). A WRITE_LOCK failure must not publish the generation or
+# clear the guard markers outside the lock.
+reset_case
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '9\n' > "$GUARD_WRITTEN_GEN_FILE"
+export STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1
+bump_rc="$(run_fn_rc bump_restore_gen)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "P2-1: bump refuses to publish without WRITE_LOCK" "1" "$bump_rc"
+assert_file "P2-1: generation unchanged after lock failure" "$RESTORE_GEN_FILE" "5"
+assert_file "P2-1: guard marker kept after lock failure" "$GUARD_WRITTEN_GEN_FILE" "9"
+if grep -q 'not publishing' "$DAEMON_ERR"; then
+    ok "P2-1: degraded publishing is not used"
+else
+    bad "P2-1: no fail-closed bump log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-1 (callers). restore_state and handle_unblank must turn a bump failure
+# into DEFER with no write and no spawned guard, keeping state for later.
+reset_case
+write_state 30
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1
+restore_rc="$(run_fn_rc restore_state)"
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+assert_eq "P2-1: restore defers on generation-lock failure" "2" "$restore_rc"
+assert_file "P2-1: restore wrote nothing" "$RAW_FILE" "10"
+assert_file "P2-1: state kept for retry" "$STATE_FILE" "30"
+assert_absent "P2-1: no generation published on failure" "$RESTORE_GEN_FILE"
+assert_absent "P2-1: no PENDING staged on failure" "$RESTORE_PENDING_FILE"
+assert_eq "P2-1: no D-Bus write on generation-lock failure" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+reset_case
+write_state 30
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1
+run_fn handle_unblank
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+assert_file "P2-1: handle_unblank left LED alone" "$RAW_FILE" "10"
+assert_file "P2-1: handle_unblank kept state" "$STATE_FILE" "30"
+assert_eq "P2-1: handle_unblank spawned no guard write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'unblank guard' "$DAEMON_ERR"; then
+    bad "P2-1: a guard was armed despite the failed generation bump"
+else
+    ok "P2-1: no guard armed after failed generation bump"
+fi
+
+# P3-3. WRITE_LOCK failure paths of the remaining call sites: handle_blank
+# keeps the LED on, and the CLI --test-blank reports failure (state is saved).
+reset_case
+printf '30\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1
+run_fn handle_blank
+unset STUB_FLOCK_FAIL_FD STUB_FLOCK_FAIL_COUNT
+wait 2> /dev/null || true
+assert_file "P3-3: handle_blank left LED on" "$RAW_FILE" "30"
+assert_eq "P3-3: handle_blank issued no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'blank: WRITE_LOCK unavailable; leaving LED on' "$DAEMON_ERR"; then
+    ok "P3-3: blank lock failure is logged"
+else
+    bad "P3-3: blank lock failure not logged (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+reset_case
+printf '30\n' > "$RAW_FILE"
+cli_rc=0
+cli_out="$(
+    XDG_RUNTIME_DIR="$D_STATE_DIR" \
+        C640_KBD_SYSFS_BRIGHTNESS="$FAKE_SYSFS" \
+        C640_KBD_SYSFS_MAX="$FAKE_MAX" \
+        STUB_FLOCK_DIR="$FLOCK_DIR" STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1 \
+        STUB_FLOCK_LOG=/dev/null \
+        STUB_GDBUS_LOG="$GDBUS_LOG" STUB_SET_LOG="$SET_LOG" \
+        STUB_ECTOOL_LOG="$TMP_DIR/ectool.log" \
+        STUB_RAW_FILE="$RAW_FILE" STUB_PCT_FILE="$PCT_FILE" \
+        STUB_KBD_RAW=42 STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false \
+        "$DAEMON" --test-blank 2> "$DAEMON_ERR"
+)" || cli_rc=$?
+assert_eq "P3-3: CLI --test-blank reports WRITE_LOCK failure" "1" "$cli_rc"
+assert_file "P3-3: CLI left LED on" "$RAW_FILE" "30"
+assert_file "P3-3: CLI still saved brightness first" "$STATE_FILE" "30"
+if grep -q 'simulated blank: failed to set 0' "$DAEMON_ERR"; then
+    ok "P3-3: CLI error message names the write failure"
+else
+    bad "P3-3: CLI error message missing: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-3 (torn read). The meta file is replaced between two cats: an old value
+# (30) stamped G1 followed by a new value (70) stamped G2.  A single-read
+# guard sees one coherent snapshot and repairs the lost G2 restore; a guard
+# that cats twice would mistake "30@G2" for post-restore user intent.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+write_state 70
+printf '70\n' > "$RAW_FILE"
+run_fn restore_state
+assert_eq "P2-3: G2 established" "2" "$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo '')"
+printf 'value=30\nsource=nonzero\nts=1\nrestore=1\n' > "$STUB_TORN_OLD"
+printf 'value=70\nsource=nonzero\nts=2\nrestore=2\n' > "$STUB_TORN_NEW"
+: > "$STUB_TORN_COUNTER"
+export STUB_TORN_META_ON=1
+printf '70\n' > "$PCT_FILE"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+# Release the guards one at a time so the marker is published before the
+# second guard checks it (the flock stub is not an atomic kernel lock).
+start_gated_guard guard_unblank 70
+assert_eq "P2-3: both unblank guard delays gated" "0.3,0.9," "$GUARD_STARTED"
+: > "${STUB_SLEEP_RELEASE}.0.3"
+if wait_for_file "$GUARD_WRITTEN_GEN_FILE"; then
+    ok "P2-3: first guard published its written-generation marker"
+else
+    bad "P2-3: no guard marker after first guard"
+fi
+: > "${STUB_SLEEP_RELEASE}.0.9"
+wait 2> /dev/null || true
+export STUB_TORN_META_ON=0
+export STUB_SLEEP_MODE=fast
+assert_file "P2-3: coherent meta read repairs G2" "$RAW_FILE" "70"
+assert_eq "P2-3: exactly one re-set (second guard suppressed)" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

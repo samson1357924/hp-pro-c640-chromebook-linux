@@ -450,15 +450,58 @@ current brightness already equals the saved value, otherwise defer.
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring while the answer is still unknown
 — this accepts the risk of lighting a still-locked screen and is off by default.
 `handle_unblank()` routes through `handle_resume()` whenever a resume flag is present,
-avoiding a double write. The optional +0.3/+0.9s unblank guard re-applies the saved
-value unless a **post-restore** user choice is proven: `LAST_USER_FILE` differs from
-the saved value AND its meta carries this restore's generation stamp, or gsd/LED and
-that same post-restore cache all agree on a different value. A stale pre-blank cache
-(e.g. 6 while the saved value is 8) therefore cannot suppress repair of a genuinely
-lost restore. Trade-off: a user adjustment made before the sampler's next ~5s tick
-writes the stamped cache may still be overwritten by the guard; the restore itself
-already verifies the write. The stamp proves only that the cache was written after
-this restore; it cannot prove the sampled value itself was correct.
+avoiding a double write.
+
+**Physical write serialisation and generation gate (Tier 1):** every physical
+`SetBrightness`/gsd `Properties.Set` is wrapped in `WRITE_LOCK` (flock fd 209),
+including blank, restore, retries and both guards. `C640_KBD_WRITE_LOCK` overrides
+its path. The lock order is `RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK`; nothing inside
+`WRITE_LOCK` may take an outer lock (finalize, verify and generation bookkeeping all
+run after release). Slow D-Bus reads (the guard's LED readback) are done BEFORE taking
+`WRITE_LOCK`, so a 3s gdbus timeout cannot hold up a restore waiting for the lock.
+`bump_restore_gen()` reads, increments and atomically republishes the generation AND
+clears the guard markers inside `WRITE_LOCK`, then returns 0; on lock failure it
+publishes nothing (no degraded out-of-lock write), returns 1, and every caller
+converts that into DEFER while keeping flag/handoff/state. `C640_KBD_GUARD_WRITTEN_GEN`
+overrides `c640-kbd-backlight.guard-written-gen`, the marker that lets only one of
+the two guards of a generation re-set the value.
+
+The optional +0.3/+0.9s unblank guard and the +0.25/+1.0s blank guard re-check the
+generation after sleeping and again inside `WRITE_LOCK` before writing; a superseded
+guard does ZERO writes. The retry at +0.5/+1.5/+3s also re-checks the generation
+after acquiring `WRITE_LOCK`, because its earlier check was made under `STATE_LOCK`
+and released while waiting: if a newer cycle bumped the generation in that gap, the
+retry releases the lock, rolls `RESTORE_PENDING` back to `STATE_FILE` via
+`finalize_restore ... RC_DEFER` (never leaving a PENDING orphan) and exits without a
+write.
+
+The unblank guard's decision table, in order:
+
+| State | Action |
+| :--- | :--- |
+| Generation changed after sleep, or inside `WRITE_LOCK` (also final re-check before write) | Log cancellation; zero writes |
+| LED already equals the saved value, or this generation already has a guard marker | Skip (no duplicate write) |
+| Stamped cache alone: `lu != saved` **and** `lu_gen == restore_gen` | Treat as user intent; no write, regardless of gsd |
+| No such cache, gsd pct still equals `want_pct` | Genuine lost restore; re-apply the saved value |
+| Anything else, e.g. `gpct != want_pct`, empty/failed gsd query, unstamped cache | **Ambiguous / fail-closed: no write** |
+
+`read_last_user_record()` cats the meta file ONCE and parses `value=` and `restore=`
+from that same snapshot; the guard uses that pair, so a sampler rewrite between two
+reads cannot manufacture "old value + new generation" evidence. The stamp proves only
+that the cache was written after this restore, not that the sampled value is correct.
+**Cost of this rule:** a lost restore whose gsd percentage has *already followed* the
+user's new value (`gpct != want_pct`) is now ambiguous and is no longer repaired —
+the guard deliberately fails closed instead of overwriting a possible user choice.
+The earlier "gsd/LED and the same cache all agree" third clause has been removed.
+
+`WRITE_LOCK` acquisition failure is fail-closed everywhere: `restore_state()` and a
+retry defer without writing (the staged value is rolled back); `handle_blank()` leaves
+the LED on after the save succeeded; `--test-blank` exits 1 with
+`simulated blank: failed to set 0`; the guard logs `WRITE_LOCK unavailable` and skips.
+`C640_KBD_SELF_WRITE_SENTINEL` is reserved for the optional **Tier 2 brightness-signal**
+path (write `value:gen` under `WRITE_LOCK` before `set_brightness` so a self-write is
+not mistaken for user intent); **Tier 2 is NOT implemented** — the sentinel is only
+created/cleared by tests and never consulted by Tier 1.
 
 Adoption, restore and `verify_restore_applied()` share a result-code contract:
 `0 = RC_DONE` (write verified, `STATE`/`restore-pending` consumed), `1 = RC_FAIL` (bad
@@ -552,7 +595,10 @@ default 10s);
 accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node and
 `C640_KBD_HANDOFF_SUSPEND` / `C640_KBD_HANDOFF_RESUME` /
 `C640_KBD_RESTORE_PENDING_FILE` / `C640_KBD_RESUME_LOCK` /
-`C640_KBD_LAST_USER_META_FILE` for staging/handoff paths. The sleep hook accepts
+`C640_KBD_LAST_USER_META_FILE` for staging/handoff paths, plus
+`C640_KBD_WRITE_LOCK`, `C640_KBD_GUARD_WRITTEN_GEN` and
+`C640_KBD_SELF_WRITE_SENTINEL` for the write-lock / guard-marker / reserved
+Tier-2 sentinel paths. The sleep hook accepts
 `C640_KBD_SLEEP_SYSFS`, `C640_KBD_SLEEP_STATE_DIR`, `C640_KBD_HANDOFF_DIR` and
 `C640_KBD_RUN_USER_ROOT`; when `C640_KBD_HANDOFF_DIR` is set, the daemon uses the
 same value as the hook-side directory for its mismatch diagnostic, and also uses
@@ -561,11 +607,13 @@ same value as the hook-side directory for its mismatch diagnostic, and also uses
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 460 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 535 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
 zeros, wall-clock probe deadline, cross-uid handoff mismatch, gsd-confirmed
-fresh-manual0 adoption and generation-stamped guard user-change protection) and the
+fresh-manual0 adoption, generation-stamped guard user-change protection, expired-retry
+in-lock generation gate with PENDING rollback, strictly monotonic generation bumps,
+fail-closed lock failures and single-read last-user cache) and the
 sleep-hook suite has 84 cases (pure handoff, `0600`/`chown`/atomic `mv`,
 `C640_KBD_HANDOFF_DIR`, multi-session resolution with IDLE/CLASS preference and
 chosen-path warnings, no LED writes). The rollback suite
@@ -584,7 +632,7 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 460 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 535 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 cases
 sudo bash tests/rollback-test.sh                       # 1981 cases (root)
 ```

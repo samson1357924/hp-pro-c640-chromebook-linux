@@ -86,6 +86,20 @@ LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
 # Separate lock so the login1 monitor, the 5s sampler and the startup handler
 # cannot all enter handle_resume() at once (which would issue two gsd writes).
 RESUME_LOCK="${C640_KBD_RESUME_LOCK:-$STATE_DIR/c640-kbd-backlight.resume.lock}"
+# Every PHYSICAL brightness write is serialised on WRITE_LOCK (fd 209).  The
+# global lock order is RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK; no path may
+# take WRITE_LOCK and then acquire STATE_LOCK or RESUME_LOCK (finalize/verify
+# and the generation bookkeeping must run AFTER the write lock is released).
+# set_brightness() stays lock-free; each call site wraps it explicitly.
+WRITE_LOCK="${C640_KBD_WRITE_LOCK:-$STATE_DIR/c640-kbd-backlight.write.lock}"
+# Generation for which an unblank guard has already re-applied the restore.
+# Cleared by bump_restore_gen() under WRITE_LOCK, so only the guards of the
+# CURRENT generation can write (and only one of the two delays does).
+GUARD_WRITTEN_GEN_FILE="${C640_KBD_GUARD_WRITTEN_GEN:-$STATE_DIR/c640-kbd-backlight.guard-written-gen}"
+# Reserved for the optional brightness-signal Tier 2 (value:gen written under
+# WRITE_LOCK before set_brightness so a self-write is not read as user intent).
+# Tier 1 does not use it; reset_case() clears it so the file cannot leak.
+SELF_WRITE_SENTINEL="${C640_KBD_SELF_WRITE_SENTINEL:-$STATE_DIR/c640-kbd-backlight.self-write}"
 LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
 # Sidecar metadata for LAST_USER_FILE: how the value was recorded and when.
 # A "manual0" record means the sampler saw two consecutive on-screen zeros,
@@ -637,49 +651,70 @@ screensaver_is_active() {
     fi
 }
 
-read_last_user_brightness() {
-    local v
-    v="$(cat "$LAST_USER_FILE" 2> /dev/null || echo "")"
-    # 0 is a legitimate recorded value: the user deliberately switched the
-    # backlight off while the screen was on. It must reach save_state so a
-    # later blank does not restore an old non-zero brightness.
-    if [[ "$v" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$v"
+# Read the complete last-user record with ONE cat of the meta file.  Parsing
+# value and restore stamp from the SAME snapshot is what prevents the torn read
+# where two separate cats see an old value followed by a new generation (or
+# vice versa).  Output is "<value> <restore-gen>" with "-" for an absent field;
+# callers must use this pair whenever the value and its stamp are compared.
+read_last_user_record() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line v="" g=""
+    while IFS= read -r line; do
+        case "$line" in
+            value=*) v="${line#value=}" ;;
+            restore=*) g="${line#restore=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    # Legacy caches (and unit tests that write the file directly) carry no
+    # value= line; fall back to the bare-number file.  0 is a legitimate value:
+    # the user deliberately switched the light off while the screen was on.
+    if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+        v="$(cat "$LAST_USER_FILE" 2> /dev/null || echo "")"
+        [[ "$v" =~ ^[0-9]+$ ]] || v=""
     fi
+    [[ "$g" =~ ^[0-9]+$ ]] || g=""
+    printf '%s %s' "${v:--}" "${g:--}"
 }
 
-# Atomically persist both the last-user value and its metadata.  The value
-# file's format is unchanged (a bare number); the sidecar records the source
-# and a timestamp so save_state can tell an explicit manual off from a stale
-# sampler reading.  Failures are non-fatal: the cache is best-effort.
+read_last_user_brightness() {
+    local rec v
+    rec="$(read_last_user_record)"
+    v="${rec%% *}"
+    [ "$v" = "-" ] || printf '%s' "$v"
+}
+
+# Atomically publish the complete last-user record.  The sidecar is the
+# canonical copy (value + source + ts + restore generation in ONE rename);
+# LAST_USER_FILE stays a bare number for compatibility and is written second.
+# Failures are non-fatal: the cache is best-effort.
 write_last_user() {
     local v="$1" src="$2"
     local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
-    local tmp ts
-
-    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lu-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lu-XXXXXX" 2> /dev/null || echo "")"
-    if [ -n "$tmp" ]; then
-        printf '%s\n' "$v" > "$tmp" 2> /dev/null || true
-        chmod 600 "$tmp" 2> /dev/null || true
-        mv -f "$tmp" "$LAST_USER_FILE" 2> /dev/null || cp "$tmp" "$LAST_USER_FILE" 2> /dev/null || true
-        rm -f "$tmp" 2> /dev/null || true
-    fi
+    local tmp ts gen
 
     ts="$(date +%s 2> /dev/null || echo 0)"
     # Stamp the restore generation that was current when this observation was
     # made.  A later guard can then tell a user change made AFTER a restore
     # from a stale pre-restore cache that merely differs from the saved value.
-    local gen
     gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo "")"
     tmp="$(mktemp "$STATE_DIR/.c640-kbd-lum-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lum-XXXXXX" 2> /dev/null || echo "")"
     if [ -n "$tmp" ]; then
         {
+            printf 'value=%s\n' "$v"
             printf 'source=%s\n' "$src"
             printf 'ts=%s\n' "$ts"
             printf 'restore=%s\n' "$gen"
         } > "$tmp" 2> /dev/null || true
         chmod 600 "$tmp" 2> /dev/null || true
         mv -f "$tmp" "$meta" 2> /dev/null || cp "$tmp" "$meta" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+    fi
+
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lu-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lu-XXXXXX" 2> /dev/null || echo "")"
+    if [ -n "$tmp" ]; then
+        printf '%s\n' "$v" > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$LAST_USER_FILE" 2> /dev/null || cp "$tmp" "$LAST_USER_FILE" 2> /dev/null || true
         rm -f "$tmp" 2> /dev/null || true
     fi
 }
@@ -721,14 +756,10 @@ last_user_cache_age() {
 # Restore generation recorded by write_last_user() at observation time.  Empty
 # means an older cache with no generation stamp (or no restore yet).
 last_user_restore_gen() {
-    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
-    local line g=""
-    while IFS= read -r line; do
-        case "$line" in
-            restore=*) g="${line#restore=}" ;;
-        esac
-    done <<< "$(cat "$meta" 2> /dev/null || true)"
-    printf '%s' "$g"
+    local rec g
+    rec="$(read_last_user_record)"
+    g="${rec##* }"
+    [ "$g" = "-" ] || printf '%s' "$g"
 }
 
 current_restore_gen() {
@@ -975,14 +1006,73 @@ save_state() {
     ) 200> "$STATE_LOCK"
 }
 
+# Serialise every physical brightness write (fd 209).  Call points wrap
+# set_brightness(); the function itself remains lock-free.  Nothing inside a
+# WRITE_LOCK critical section may acquire STATE_LOCK or RESUME_LOCK, so
+# finalize/verify/gen bookkeeping always happen after _release_write_lock.
+_acquire_write_lock() {
+    if ! exec 209> "$WRITE_LOCK"; then
+        log_warn "cannot open write lock $WRITE_LOCK"
+        return 1
+    fi
+    if ! flock -w 5 209; then
+        exec 209>&-
+        log_warn "cannot take write lock $WRITE_LOCK"
+        return 1
+    fi
+    return 0
+}
+
+_release_write_lock() {
+    flock -u 209 2> /dev/null || true
+    exec 209>&-
+}
+
+# Cleared under WRITE_LOCK by bump_restore_gen(): a guard that already wrote
+# for generation N must not suppress generation N+1's guards.
+_clear_guard_markers() {
+    rm -f "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL" 2> /dev/null || true
+}
+
+# Atomic publish of the in-process $restore_gen.  Caller normally holds
+# WRITE_LOCK (see bump_restore_gen) so guards cannot miss the new generation
+# between the check and their own write.
+_publish_restore_gen() {
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-gen-XXXXXX" 2> /dev/null \
+        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-gen-XXXXXX" 2> /dev/null || echo "")"
+    if [ -z "$tmp" ]; then
+        return 0
+    fi
+    printf '%s\n' "$restore_gen" > "$tmp" 2> /dev/null || true
+    chmod 600 "$tmp" 2> /dev/null || true
+    mv -f "$tmp" "$RESTORE_GEN_FILE" 2> /dev/null || cp "$tmp" "$RESTORE_GEN_FILE" 2> /dev/null || true
+    rm -f "$tmp" 2> /dev/null || true
+}
+
+# Fail-closed generation bump.  The read-modify-publish of the generation and
+# the clearing of the guard markers happen INSIDE WRITE_LOCK -- the same lock
+# a guard holds during its final check -- so two concurrent bumps cannot stamp
+# the same generation and no guard can pass its check before the bump lands.
+# On lock failure NOTHING is published (no degraded write outside the lock):
+# callers must treat this as "cycle not settled", keep flag/state and defer.
+# Returns 0 on success, 1 on lock failure.
 bump_restore_gen() {
-    local g
+    if ! _acquire_write_lock; then
+        log_warn "cannot take write lock while bumping restore generation; not publishing"
+        return 1
+    fi
+    local g gen
     g="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
     if ! [[ "$g" =~ ^[0-9]+$ ]]; then
         g=0
     fi
-    restore_gen=$((g + 1))
-    printf '%s\n' "$restore_gen" > "$RESTORE_GEN_FILE" 2> /dev/null || true
+    gen=$((g + 1))
+    restore_gen="$gen"
+    _publish_restore_gen
+    _clear_guard_markers
+    _release_write_lock
+    return 0
 }
 
 # Crash recovery for the staging window: the value in PENDING is a restore
@@ -1170,7 +1260,29 @@ schedule_restore_retries() {
             exec 202>&-
             log "restore retry +${delay}s (gen=$gen): restoring brightness $saved"
             local rc=0
+            if ! _acquire_write_lock; then
+                log_warn "restore retry +${delay}s (gen=$gen): WRITE_LOCK unavailable; not writing"
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
+            # The earlier generation checks were made while holding STATE_LOCK,
+            # which was released before waiting for WRITE_LOCK.  A newer resume
+            # can bump the generation in that gap (e.g. a DONE-with-no-write
+            # cycle that never sees STATE_FILE because we staged it away), so
+            # the gate MUST be re-checked after acquiring the write lock.  On a
+            # mismatch, roll the staged value back to STATE_FILE before exiting;
+            # just `exit` here would orphan PENDING and strand the saved value.
+            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ]; then
+                log "restore retry +${delay}s (gen=$gen): generation superseded inside WRITE_LOCK ($cur_gen); rolling staged value back"
+                _release_write_lock
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
             if set_brightness "$saved"; then rc=0; else rc=$?; fi
+            # finalize/verify MUST follow the release: WRITE_LOCK -> STATE_LOCK
+            # would invert the global lock order.
+            _release_write_lock
             # No recursive re-schedule: a failing backend would otherwise
             # create a retry storm.  The state file is left in place for the
             # next unblank event.
@@ -1210,8 +1322,14 @@ restore_state() {
 
     # Bump the generation only after owning the lock: two concurrent restores
     # can no longer stamp the file with the same generation and let a stale
-    # scheduled retry through.
-    bump_restore_gen
+    # scheduled retry through.  If the lock is unavailable the cycle is NOT
+    # settled: keep state/handoff and defer instead of writing unguarded.
+    if ! bump_restore_gen; then
+        log_warn "restore: cannot bump generation without WRITE_LOCK; deferring"
+        flock -u 201
+        exec 201>&-
+        return "$RC_DEFER"
+    fi
     local gen="$restore_gen"
 
     local saved
@@ -1263,7 +1381,15 @@ restore_state() {
     exec 201>&-
 
     local rc=0
+    if ! _acquire_write_lock; then
+        log_warn "restore (gen=$gen): WRITE_LOCK unavailable; deferring without a write"
+        finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+        return "$RC_DEFER"
+    fi
     if set_brightness "$saved"; then rc=0; else rc=$?; fi
+    # Release BEFORE finalize/verify (both take STATE_LOCK): WRITE_LOCK is the
+    # innermost lock and must never wait on an outer one.
+    _release_write_lock
     if finalize_restore "$saved" "$rc" "$gen"; then :; else rc=$?; fi
 
     if [ "$rc" -ne 0 ]; then
@@ -1343,6 +1469,15 @@ _adopt_suspend_handoff_locked() {
                 log "ignoring suspend handoff 0: manual off not confirmed by gsd pct ('$pct'); keeping saved user brightness $((10#$existing))"
             else
                 log "ignoring blank-side suspend handoff 0; keeping saved user brightness $((10#$existing))"
+            fi
+            # This cycle settles DONE without any brightness write: cancel a
+            # guard still pending from the previous cycle so it cannot write
+            # over the (unchanged) user brightness later.  Fail closed: if the
+            # generation cannot be bumped under WRITE_LOCK, keep the handoff
+            # and defer instead of claiming a settled cycle.
+            if ! bump_restore_gen; then
+                log_warn "suspend handoff 0: generation bump failed; keeping handoff for retry"
+                return "$RC_DEFER"
             fi
             rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
             return 0
@@ -1480,6 +1615,14 @@ _handle_resume_locked() {
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
     if ! _is_brightness_value "$saved"; then
         # Nothing to restore: LED_CORE_SUSPENDRESUME normally kept the value.
+        # DONE with no write: a guard left over from the previous cycle must
+        # not re-write the brightness after this cycle has settled.  Fail
+        # closed: without the bump this cycle is not settled, so keep the
+        # resume flag and defer to a later sampler tick.
+        if ! bump_restore_gen; then
+            log_warn "resume: generation bump failed with no saved state; keeping resume flag"
+            return "$RC_DEFER"
+        fi
         rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
         log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
         return "$RC_DONE"
@@ -1544,7 +1687,12 @@ _handle_resume_locked() {
     case "$ss" in
         active)
             log "resume deferred: ScreenSaver still active (saved=$saved)"
-            bump_restore_gen
+            # A failed bump must not arm retries stamped with a stale/unchanged
+            # generation; the next sampler tick re-enters handle_resume.
+            if ! bump_restore_gen; then
+                log_warn "resume: generation bump failed while active; keeping flag for next tick"
+                return "$RC_DEFER"
+            fi
             schedule_restore_retries "$restore_gen" 0.5 1.5 3
             return "$RC_DEFER"
             ;;
@@ -1589,6 +1737,16 @@ _handle_resume_locked() {
                 fi
                 # Safe convergence: firmware already shows the saved value and
                 # STATE_FILE is unchanged, so consume it WITHOUT any write.
+                # Bump the generation BEFORE consuming anything: without the
+                # write lock the bump is refused and this cycle stays DEFER
+                # with flag/state intact (a pending guard must not outlive a
+                # cycle that claimed DONE).
+                if ! bump_restore_gen; then
+                    log_warn "resume: generation bump failed during convergence; keeping state"
+                    flock -u 207 2> /dev/null || true
+                    exec 207>&-
+                    return "$RC_DEFER"
+                fi
                 rm -f "$STATE_FILE" 2> /dev/null || true
                 rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
                 log "resume: ScreenSaver unknown but brightness already $saved; state consumed without writing"
@@ -1649,10 +1807,19 @@ startup_resume_handoff() {
 # --- Blank / unblank guards ----------------------------------------------
 
 guard_blank() {
-    local delay
+    local delay captured_gen
+    # A blank guard started in generation N must never force 0 after a newer
+    # resume cycle (N+1) has restored the user's brightness.
+    captured_gen="$(current_restore_gen)"
     for delay in 0.25 1.0; do
         (
             sleep "$delay"
+            local gen_now
+            gen_now="$(current_restore_gen)"
+            if [ "$gen_now" != "$captured_gen" ]; then
+                log "blank guard +${delay}s: generation superseded (${captured_gen:-none} -> ${gen_now:-none}); guard cancelled"
+                exit 0
+            fi
             # Only an explicit "true" counts as active; every other value
             # (including a future tristate "unknown") means inactive.
             if [ "$(screensaver_is_active)" = "true" ]; then
@@ -1664,8 +1831,22 @@ guard_blank() {
             cur="$(get_brightness)"
             if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ne 0 ]; then
                 log_warn "blank guard +${delay}s: brightness=$cur while ScreenSaver active; forcing 0"
+                if ! _acquire_write_lock; then
+                    log_warn "blank guard +${delay}s: WRITE_LOCK unavailable; not forcing 0"
+                    exit 0
+                fi
+                # Final check is inside the same lock bump_restore_gen() uses
+                # to publish a new generation: a writer cannot slip in between
+                # the check and the physical write.
+                gen_now="$(current_restore_gen)"
+                if [ "$gen_now" != "$captured_gen" ]; then
+                    log "blank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
                 local grc=0
                 if set_brightness 0; then grc=0; else grc=$?; fi
+                _release_write_lock
                 if [ "$grc" -ne 0 ]; then
                     log_warn "blank guard +${delay}s: failed to force 0 (rc=$grc)"
                 fi
@@ -1696,61 +1877,131 @@ guard_unblank() {
             # parent, but it does give this guard the freshest backend state.
             ensure_backends
             sleep "$delay"
+            # The generation captured before the fork is only a hint: a second
+            # blank/unblank/resume cycle may have completed during the sleep.
+            # Re-check immediately; a superseded guard does ZERO writes.
+            local gen_now
+            gen_now="$(current_restore_gen)"
+            if [ "$gen_now" != "$restore_gen_now" ]; then
+                log "unblank guard +${delay}s: generation superseded (${restore_gen_now:-none} -> ${gen_now:-none}); guard cancelled"
+                exit 0
+            fi
             # This guard can write a restored brightness, so it follows the
             # same fail-closed rule as restore_state: only inactive proceeds.
             if [ "$(screensaver_tristate)" != "inactive" ]; then
                 exit 0
             fi
-            # A guard must NEVER overwrite a brightness the user chose AFTER
-            # the restore, but a stale pre-restore cache is NOT such evidence:
-            # blanking right after a 6->8 change leaves LAST_USER_FILE=6 while
-            # STATE_FILE=8.  Demand a generation stamp from this restore too.
-            local lu lu_gen gpct implied_raw
-            lu="$(read_last_user_brightness)"
-            lu_gen="$(last_user_restore_gen)"
-            local ok=0
-            local raw
+            local lu lu_gen rec gpct raw gsd_positive=0 gsd_changed=0 write_it=0
+            # ONE read of the meta record: value and its generation stamp must
+            # come from the same snapshot, otherwise a sampler rewrite between
+            # two cats yields "old value + new gen" and can impersonate user
+            # intent (P2-3).  "-" means the field is absent.
+            rec="$(read_last_user_record)"
+            lu="${rec%% *}"
+            lu_gen="${rec##* }"
+            [ "$lu" = "-" ] && lu=""
+            [ "$lu_gen" = "-" ] && lu_gen=""
             raw="$(get_brightness)"
-            if [ "$raw" = "$saved" ]; then
-                ok=1
-            fi
             if [ "$HAVE_GSD_KBD" = "1" ]; then
                 gpct="$(gsd_get_pct || echo "")"
-                if [[ "$gpct" =~ ^[0-9]+$ ]] && [ "$gpct" -ne "$want_pct" ]; then
-                    implied_raw=$((gpct * max / 100))
-                    if [ "$raw" = "$implied_raw" ] && [ "$raw" != "$saved" ] \
-                        && [ -n "$lu" ] && [ "$lu" = "$raw" ] \
-                        && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
-                        # gsd-power, the LED AND a post-restore last-user
-                        # record agree on a DIFFERENT value: that is a user
-                        # adjustment, not a restore that failed to land.
-                        log "unblank guard +${delay}s: gsd=$gpct, LED=$raw and post-restore cache agree on $lu; treating as user intent, not re-setting"
-                        exit 0
+                if [[ "$gpct" =~ ^[0-9]+$ ]]; then
+                    if [ "$gpct" = "$want_pct" ]; then
+                        gsd_positive=1
+                    else
+                        gsd_changed=1
                     fi
-                    ok=0
-                elif [ "$gpct" != "$want_pct" ]; then
-                    ok=0
                 fi
             fi
-            # A plain post-restore last-user record is enough evidence even if
-            # gsd/LED currently disagree (e.g. a backend glitch mid-change).
-            if [ -n "$lu" ] && [ "$lu" != "$saved" ] && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
-                log "unblank guard +${delay}s: last-user brightness $lu recorded after restore (gen=$restore_gen_now); treating as a new user choice, not re-setting"
+            # A cache stamped with the CURRENT generation is the only proof of
+            # a user change made after this restore.  An empty/older stamp has
+            # no evidentiary power (it may be the stale pre-blank 6 vs 8).
+            local stamped=0
+            if [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
+                stamped=1
+            fi
+            if [ "$raw" = "$saved" ]; then
+                : # nothing to repair
+            elif [ "$stamped" -eq 1 ] && [ -n "$lu" ] && [ "$lu" != "$saved" ]; then
+                # Post-restore user change outranks gsd's cache: gsd may be the
+                # stale party when its pct still disagrees with the LED.
+                if [ "$gsd_changed" -eq 1 ] && [ -n "$gpct" ] && [ "$raw" != "$saved" ] && [ "$lu" = "$raw" ]; then
+                    log "unblank guard +${delay}s: gsd=$gpct, LED=$raw and post-restore cache agree on $lu; treating as user intent, not re-setting"
+                else
+                    log "unblank guard +${delay}s: last-user brightness $lu recorded after restore (gen=$restore_gen_now); treating as a new user choice, not re-setting"
+                fi
+                exit 0
+            elif [ "$gsd_positive" -eq 1 ]; then
+                # gsd still asks for the restored value and the LED is not
+                # there: a genuine lost restore.  This covers both a stamped
+                # cache that still equals $saved and an unstamped/stale cache.
+                write_it=1
+            else
+                # No positive gsd evidence.  A mismatch here is AMBIGUOUS: it
+                # may be a user change whose sampler record has not landed yet
+                # (the 5s window).  Blindly re-applying $saved would overwrite
+                # that user choice, so log and leave the brightness alone.
+                log "unblank guard +${delay}s: ambiguous post-restore change (raw=${raw:-unknown}, gsd=${gpct:-unknown}, want=$want_pct, cache=${lu:-none} gen=${lu_gen:-none}, restore gen=${restore_gen_now:-none}); no write"
                 exit 0
             fi
-            if [ "$ok" -ne 1 ]; then
+            if [ "$write_it" -eq 1 ]; then
+                # Slow D-Bus reads must NOT happen under WRITE_LOCK: bump and
+                # restore wait up to 5s for this lock, and a multi-second
+                # gdbus timeout here widens that degradation window.  Re-read
+                # the LED here, then keep the lock only for cheap local checks
+                # plus the physical write.
+                local raw_now
+                raw_now="$(get_brightness 2> /dev/null || echo "")"
+                if [ "$raw_now" = "$saved" ]; then
+                    log "unblank guard +${delay}s: brightness already $saved before write; skipping (gen=$restore_gen_now)"
+                    exit 0
+                fi
                 log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
+                if ! _acquire_write_lock; then
+                    log_warn "unblank guard +${delay}s: WRITE_LOCK unavailable; not re-setting"
+                    exit 0
+                fi
+                # The generation gate lives inside the lock bump_restore_gen()
+                # uses, so a writer cannot slip between the check and the
+                # physical write.
+                gen_now="$(current_restore_gen)"
+                if [ "$gen_now" != "$restore_gen_now" ]; then
+                    log "unblank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
+                local written_gen
+                written_gen="$(cat "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || echo "")"
+                if [ -n "$restore_gen_now" ] && [ "$written_gen" = "$restore_gen_now" ]; then
+                    log "unblank guard +${delay}s: generation $restore_gen_now already re-set; skipping duplicate write"
+                    _release_write_lock
+                    exit 0
+                fi
+                # Last-chance re-check immediately before set_brightness: a
+                # non-cooperative publisher cannot slip a new generation past
+                # the first check while the marker is being examined.
+                gen_now="$(current_restore_gen)"
+                if [ "$gen_now" != "$restore_gen_now" ]; then
+                    log "unblank guard +${delay}s: generation changed before write inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
                 local grc=0
                 if set_brightness "$saved"; then grc=0; else grc=$?; fi
+                if [ "$grc" -eq 0 ] && [ -n "$restore_gen_now" ]; then
+                    # Publish the marker while still holding the lock so the
+                    # later guard of the same generation cannot write twice.
+                    local mtmp
+                    mtmp="$(mktemp "$STATE_DIR/.c640-kbd-gw-XXXXXX" 2> /dev/null || echo "")"
+                    if [ -n "$mtmp" ]; then
+                        printf '%s\n' "$restore_gen_now" > "$mtmp" 2> /dev/null || true
+                        chmod 600 "$mtmp" 2> /dev/null || true
+                        mv -f "$mtmp" "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || cp "$mtmp" "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || true
+                        rm -f "$mtmp" 2> /dev/null || true
+                    fi
+                fi
+                _release_write_lock
                 if [ "$grc" -ne 0 ]; then
                     log_warn "unblank guard +${delay}s: re-set failed (rc=$grc)"
-                fi
-                # Re-read after the write for diagnostics only: never issue a
-                # second write in this guard (that would widen the race).
-                lu="$(read_last_user_brightness)"
-                lu_gen="$(last_user_restore_gen)"
-                if [ -n "$lu" ] && [ "$lu" != "$saved" ] && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
-                    log "unblank guard +${delay}s: user brightness changed to $lu during re-set; no further write"
                 fi
             fi
         ) &
@@ -1800,7 +2051,13 @@ handle_blank() {
         return "$src"
     fi
     local rc=0
-    if set_brightness 0; then rc=0; else rc=$?; fi
+    if ! _acquire_write_lock; then
+        rc=1
+        log_warn "blank: WRITE_LOCK unavailable; leaving LED on"
+    else
+        if set_brightness 0; then rc=0; else rc=$?; fi
+        _release_write_lock
+    fi
     if [ "$rc" -ne 0 ]; then
         log_warn "blank: failed to switch keyboard backlight off (rc=$rc)"
     fi
@@ -2054,7 +2311,12 @@ main() {
             exit 1
         fi
         local rc=0
-        if set_brightness 0; then rc=0; else rc=$?; fi
+        if _acquire_write_lock; then
+            if set_brightness 0; then rc=0; else rc=$?; fi
+            _release_write_lock
+        else
+            rc=1
+        fi
         if [ "$rc" -ne 0 ]; then
             echo "simulated blank: failed to set 0 (rc=$rc)" >&2
             exit 1
