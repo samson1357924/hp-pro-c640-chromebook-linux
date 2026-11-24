@@ -24,6 +24,33 @@ Lake-U platform):
 | **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Top-row + dual-role + backlight verified (2026-10-31)** | Top-row hwdb maps AT scancodes `0x3b`-`0x44` inferred from post-hwdb `EVIOCGKEY` against the standard AT table (not the ChromeOS action scancodes); `check-top-row-hwdb.py` confirmed all 11 `EVIOCGKEYCODE` entries on the real keyboard (kernel map only — raw `MSC_SCAN` was not captured; confirm with `--scan` after stopping keyd), and a real-key passive capture confirmed the presses reach the desktop as post-hwdb `EV_KEY`. keyd dual-role Search: virtual uinput test PASS for tap CapsLock (no Meta/guard), **lone hold** Super with no `LEFTCTRL` guard, Super+TopRow F1–F10 (all ten; the `[meta:M]` layer's `LEFTCTRL` chord guard is expected here) and each top-row key alone; real-key passive capture confirmed lone hold → GNOME overview and single presses → brightness/volume/mute. Backlight auto-off/restore on screen blank verified (`ScreenSaver.ActiveChanged` 2→0→2, no sudo) and sleep hook publishes S3 handoff files (thawed user daemon performs the restore) verified; sysfs `0660 root:plugdev`. Full S3 freeze/thaw verified 2026-11-22 (`rtcwake` + `systemctl suspend`); manual lid-close remains a supplementary pending test. **keyd version scope:** syntax validated in CI with 2.6.0 (`keyd check` only); tap/hold/guard behaviour validated on the device with 2.5.0-5 only; other versions unverified (upstream 2.6.x has known `overloadt2` behaviour differences). |
 | **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 lid cycle verified** | S3 `deep` default; real lid-close cycle tested 2026-08-18. **Key/fingerprint wake untested**; panel stays dark on lid open until a keypress (see [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)). |
 
+### Sleep-hook handoff support scope
+
+The root system-sleep hook publishes S3 handoff files only under these conditions:
+
+1. **Session selection.** It accepts **zero or exactly one** qualifying session — an active,
+   local, graphical user session confirmed by `loginctl show-session` (`Active=yes`,
+   `Remote=no`, `Class=user`, `Type=wayland|x11`, non-closing `State`, numeric `UID`) **and**
+   `show-seat ActiveSession`. Greeter, SSH, tty and background sessions never qualify. Zero
+   candidates, multiple candidates (including multi-seat ambiguity) or a missing `loginctl`
+   fail closed: no handoff is written, but the root `/run/c640-kbd-backlight/state` diagnostic
+   snapshot is still saved. The decision goes to the **root journal** as
+   `selected session ... for uid ...` or `session selection fail-closed: ...`; the daemon does
+   no cross-uid scan.
+2. **Runtime dir.** `/run/user/<uid>` must already exist, must not be a symlink, must be
+   exactly mode `0700` and owned by the selected uid. The hook **never** creates, chmods or
+   chowns it; a missing/insecure dir is fail-closed (no handoff).
+3. **Missing loginctl properties.** If `Active` / `Remote` / `Class` / `Type` / `State` /
+   `Seat` / `ActiveSession` is missing or unusable, that session is rejected; with no surviving
+   candidate the hook fails closed.
+4. **`C640_KBD_HANDOFF_DIR` override.** An explicit override bypasses loginctl selection and
+   uid pinning entirely. **Without an override**, `post` reuses the uid pinned by `pre`
+   (verification only, never re-selection). The daemon warns only for an explicit override
+   mismatch; it does not scan
+   other uids.
+5. **No `/tmp` fallback.** A runtime dir that disappears at `post` is fail-closed; the hook
+   never falls back to `/tmp` or any other directory.
+
 ---
 
 ## 🐧 Recommended Distros & Kernel Requirements

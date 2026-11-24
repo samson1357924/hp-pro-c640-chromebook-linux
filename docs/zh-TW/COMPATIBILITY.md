@@ -24,6 +24,29 @@ HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hat
 | **鍵盤頂排按鍵與背光同步** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync`（user service + system-sleep）+ `61-chromeos-kbd-backlight.rules` | 🟢 **頂排＋雙重角色＋背光皆已驗證（2026-10-31）** | 頂排 hwdb 映射的 AT 掃描碼 `0x3b`-`0x44` 是由 hwdb 轉換後 `EVIOCGKEY` 對照標準 AT 表推論（不是 ChromeOS action 掃描碼）；`check-top-row-hwdb.py` 在實體鍵盤上確認 11 條 `EVIOCGKEYCODE` 全數相符（只證明核心映射表 — 原始 `MSC_SCAN` 未捕獲，確認需停掉 keyd 後用 `--scan`），實體按鍵被動擷取也確認按鍵以 hwdb 轉換後的 `EV_KEY` 送達桌面。keyd 雙重角色 Search：虛擬 uinput 測試 PASS — 輕點 CapsLock（無 Meta、無防護）、**單獨長按** Super 無 `LEFTCTRL` 防護、Super+頂排 F1–F10（10 組全過，`[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護屬預期）、10 個頂排單按各自媒體鍵；實體被動擷取確認單獨長按會開 GNOME 總覽、單按可調亮度/音量/靜音。背光於螢幕熄滅自動關閉/恢復（`ScreenSaver.ActiveChanged` 2→0→2，無 sudo）與 sleep hook 發布 S3 handoff 檔（由解凍後的使用者 daemon 還原）皆已驗證；sysfs `0660 root:plugdev`。完整 S3 freeze/thaw 已於 2026-11-22 驗證（`rtcwake` + `systemctl suspend`）；手動盒蓋循環仍為補充待測。**keyd 版本範圍：**語法僅在 CI 以 2.6.0 驗證（`keyd check`）；tap/hold/防護行為只在實機以 2.5.0-5 驗證；其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知行為差異）。 |
 | **待機休眠** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 盒蓋週期已驗證** | 預設 S3 `deep`；2026-08-18 實測真實盒蓋週期。**按鍵/指紋喚醒未測試**；開蓋後螢幕需按鍵才亮（見 [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)）。 |
 
+### Sleep hook handoff 支援範圍
+
+root system-sleep hook 只在下列條件下發布 S3 handoff 檔：
+
+1. **Session 選擇。** 接受 **零個或恰好一個**合格 session — 由 `loginctl show-session` 確認的
+   active、local、graphical user session（`Active=yes`、`Remote=no`、`Class=user`、
+   `Type=wayland|x11`、非 closing 的 `State`、數字 `UID`），且 `show-seat ActiveSession`
+   一致。greeter、SSH、tty 與 background session 永遠不合格。零個、多個候選（包含 multi-seat
+   模糊情況）或缺少 `loginctl` 都 fail closed：不寫 handoff，但 root 的
+   `/run/c640-kbd-backlight/state` 診斷快照仍會保存。判斷寫入 **root journal**
+   （`selected session ... for uid ...` 或 `session selection fail-closed: ...`），daemon 不做
+   跨 uid 掃描。
+2. **Runtime dir。** `/run/user/<uid>` 必須已存在、不可為 symlink、mode 恰為 `0700` 且 owner
+   吻合該 uid。hook **絕不**建立、chmod 或 chown 它；不存在或不安全即 fail closed（不寫
+   handoff）。
+3. **loginctl 屬性缺漏。** `Active`／`Remote`／`Class`／`Type`／`State`／`Seat`／
+   `ActiveSession` 任一缺失或不可用即排除該 session；沒有合格候選時 hook fail closed。
+4. **`C640_KBD_HANDOFF_DIR` 覆寫。** explicit override 完全跳過 loginctl 選擇與 uid 釘住；
+   **未使用 override 時**，`post` 才會沿用 `pre` 釘住的 uid（僅供驗證，絕不重選）。daemon 只對 explicit override 不一致
+   發出 WARN，不掃描其他 uid。
+5. **無 `/tmp` 降級。** `post` 時 runtime dir 消失即 fail closed；hook 絕不退回 `/tmp` 或
+   任何其他目錄。
+
 ---
 
 ## 🐧 推薦發行版與內核版本需求

@@ -101,14 +101,20 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > **請勿自行執行 `pam-auth-update --remove fprintd`。** 該動作會直接刪除 debconf 的
 > `libpam-runtime/profiles` selection。Debian/Ubuntu 上安裝器會先把該 selection 與
 > `/var/lib/pam` 下每個已儲存的模組檔快照到 first-wins sidecar（`pam-selection` 檔案權限
-> `0644`；`pam-selection.saved` 是 root 擁有、`0700` 的檔案副本目錄），所有讀取/複製都
+> `0644`；`pam-selection.saved` 是 root 擁有、`0700` 的檔案副本目錄），並額外發布第三個
+> root 擁有 `0700` 的 `pam-selection.common` half，記錄每個 `common-*`／sudo 目標的位元組、
+> mode、owner、type、symlink target、absence 與 savedir 目錄中繼資料；所有讀取/複製都
 > 經由 `sudo`，因此搭配 passwordless `sudo` 的非 root 呼叫端也支援），再備份**所有**現有的 `common-*`
 > 位元組（不只含 fp 者）、只移除 fp 模組行，然後自行執行一次
 > `pam-auth-update --package`，讓 debconf 與 `/var/lib/pam` 收斂到穩定的「無
-> fprintd」狀態，日後套件觸發的執行即為 no-op。uninstall 時，在確認 manifest
-> rollback 完成後，會複回儲存的檔案、以 `debconf-set-selections` 寫回原始
-> selection、再跑一次 `--package` 並驗證 selection（精確或集合等價）後才消耗
-> sidecar；還原失敗會保留它並回 rc 1。**取捨**：安裝期間變更的 selection 會在
+> fprintd」狀態，日後套件觸發的執行即為 no-op。uninstall 時，所有工具呼叫先結束，
+> 才從 `.common` 重新套用原始 `common-*`／sudo 檔案，接著做最終驗證
+> （bytes/mode/owner/type/link/absence、savedir 與 selection/seen）；通過後才一次消耗
+> 三個 half——manifest record 已消耗加 selection 相等並不算成功。還原失敗保留全部 half
+> 並回 rc 1。沒有 `.common` 的 legacy sidecar 會明確 WARN 且不宣稱位元組保證；
+> `.saved` 缺失但 live savedir 非空則 fail closed（`manual recovery`）；對 `common-*`
+> 的語意變更（`External content change detected`）回 rc 1 並保留全部 half。
+> **取捨**：安裝期間變更的 selection 會在
 > uninstall 時被覆寫，而手動 `--enable fprintd` 會讓 GDM 競賽恢復，直到 uninstall
 > 為止。若舊安裝的 `common-auth` 仍有 fp 行，請只移除該行，或重跑
 > `./fingerprint/install-fingerprint.sh`（腳本會處理）：

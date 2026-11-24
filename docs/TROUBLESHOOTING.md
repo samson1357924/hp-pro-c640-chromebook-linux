@@ -240,10 +240,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > in the hook — that was the old second-writer bug. The root
   > `/run/c640-kbd-backlight/state` written by `pre` is only a **single-shot diagnostic
   > snapshot of the first suspend in a boot** (first-wins, kept until reboot); it is not
-  > consumed by the hook or the daemon and is never used for restore. If the hook writes to a
-  > different directory than the daemon reads, the daemon logs
-  > `[WARN] handoff directory mismatch` with the path and ignores that candidate; check
-  > `XDG_RUNTIME_DIR` / the session uid, or set `C640_KBD_HANDOFF_DIR` identically for both.
+  > consumed by the hook or the daemon and is never used for restore. The hook writes a
+  > handoff only for a **single active local graphical session**; 0 or multiple candidates
+  > fail closed in the **root journal** as `session selection fail-closed: ...`, while the
+  > chosen uid is logged as `selected session ... for uid ...` and pinned in a root-only
+  > `0600` file at `pre` (reused at `post`). It never creates, chmods or chowns
+  > `/run/user/<uid>`; a missing/insecure dir fails closed with no handoff. The daemon no
+  > longer scans other uids' runtime dirs: only an **explicit** `C640_KBD_HANDOFF_DIR`
+  > override that disagrees with its own file logs `[WARN] handoff directory mismatch`.
+  > For cross-uid diagnosis read the root journal, not a `/run/user` scan.
 
 * **Triage** (all gdbus queries below are read-only):
 
@@ -559,6 +564,19 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     change made during installation is overwritten on uninstall; manually enabling the
     fprintd profile during install (`pam-auth-update --enable fprintd`) writes fp back into
     `common-auth` and restores the GDM race until uninstall.
+  * `External content change detected in ... since the snapshot (added/removed/reordered
+    MODULE line); refusing to overwrite it - manual recovery required.` means an admin or a
+    tool made a semantic change to a `common-*` file; uninstall returns rc 1 and retains all
+    three snapshot halves. `PAM external tool calls complete; re-applying the original
+    common/sudo state.` is the expected ordering log — every tool call finishes **before**
+    the `.common` restore, and the final bytes/mode/owner/type/link/absence + savedir +
+    selection/seen verification runs before consumption. A legacy sidecar without `.common`
+    logs `Legacy PAM snapshot has no ... (best effort only)` / `No PAM common-state snapshot (...) ... (legacy best
+    effort)` and claims no byte guarantee; `saved-snapshot=absent` plus a populated live
+    savedir fails closed with `manual recovery required`. A consumed manifest record and an
+    equal selection alone are not success. If the last `.common` half cannot be removed
+    after the other two are gone, the sidecar is rebuilt but the state is **not retryable**
+    (`manual recovery is REQUIRED`); the retained files must be cleaned up by hand.
 
 ---
 

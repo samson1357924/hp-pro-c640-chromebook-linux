@@ -11525,15 +11525,30 @@ EOF
 # non-zero BEFORE any PAM file or debconf value is touched, with no valid
 # sidecar (and no staging residue) left behind.
 test_pam_29_snapshot_faults_fail_closed() {
+    # Parallel-suite false-positive fix: snapshot temps go to a PRIVATE TMPDIR
+    # per sandbox (lib/pam.sh's _pam_tmp_file honours TMPDIR). A mktemp stub
+    # records every requested template, so a regression to a hard-coded /tmp
+    # is still caught without globbing the shared /tmp namespace (final review
+    # P3). Detection of real leaks is unchanged: every temp this case creates
+    # must live in $s/tmp and none may survive.
     local fault s before
     for fault in tee chmod find cp ln mv; do
         s="$(setup_pam_sandbox "snapshot-fault-$fault")"
+        mkdir -p "$s/tmp"
+        : > "$s/tmp-templates.log"
+        cat > "$s/stub/mktemp" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${PAM_TMP_TEMPLATE_LOG:?}"
+exec /usr/bin/mktemp "$@"
+EOF
+        chmod +x "$s/stub/mktemp"
         pam_write_full_stack "$s"
         pam_write_selection "$s" 'unix, systemd, fprintd'
         before="$(pam_stack_fingerprint "$s")"
         pam_snapshot_fault_stub "$s" "$fault"
 
-        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        PAM_TMP_TEMPLATE_LOG="$s/tmp-templates.log" TMPDIR="$s/tmp" \
+            CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
             run_pam_install "$s" debian
         assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
             "PAM-29/$fault: install rc 1 (snapshot is a mandatory gate)"
@@ -11546,8 +11561,10 @@ test_pam_29_snapshot_faults_fail_closed() {
         fi
         assert_eq "0" "$(find "$s/manifest" -maxdepth 1 -name 'pam-selection.saved*' 2> /dev/null | wc -l | tr -d '[:space:]')" \
             "PAM-29/$fault: no saved snapshot or stage residue"
-        assert_eq "0" "$(find /tmp -maxdepth 1 -name 'cros-pam-snapshot.*' 2> /dev/null | wc -l | tr -d '[:space:]')" \
-            "PAM-29/$fault: no leaked /tmp/cros-pam-snapshot.* temp files"
+        assert_eq "0" "$(find "$s/tmp" -maxdepth 1 -name 'cros-pam-snapshot.*' 2> /dev/null | wc -l | tr -d '[:space:]')" \
+            "PAM-29/$fault: no leaked snapshot temp in the private TMPDIR"
+        assert_eq "0" "$(grep -vcF "$s/tmp/" "$s/tmp-templates.log" 2> /dev/null || true)" \
+            "PAM-29/$fault: every mktemp template used the private TMPDIR"
         assert_contains "refusing to continue" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
             "PAM-29/$fault: fail-closed reason logged"
     done
@@ -12960,6 +12977,174 @@ EOF
         "PAM-54: failed publish is explicit in the log"
 }
 
+# PAM-55: the PUBLISHED .common directory itself must be root:0700 -- the CI
+# smoke gate stats the directory, not just files/ (0700) and state (0600).
+# `install -d -m 700 -- "$stage/files"` used to leave the implicit $stage
+# parent at the caller's umask (0755 under CI's umask 0022), so the mv -T
+# published a 0755 .common (final re-review P1). Force umask 0022 to model CI.
+test_pam_55_common_snapshot_dir_is_root_only_0700() {
+    local s common
+    s="$(setup_pam_sandbox common-dir-mode-0700)"
+    common="$s/manifest/pam-selection.common"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    (
+        umask 0022
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" \
+            CROS_ENABLEMENT_PAM_DIR="$s/pam" run_pam_install "$s" debian
+    )
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-55: install rc 0"
+    assert_eq "700:0:0" "$(stat -c '%a:%u:%g' -- "$common" 2> /dev/null || echo MISSING)" \
+        "PAM-55: published .common directory is root:0700 (CI stat contract)"
+    assert_eq "700:0:0" "$(stat -c '%a:%u:%g' -- "$common/files" 2> /dev/null || echo MISSING)" \
+        "PAM-55: .common/files is root:0700"
+    assert_eq "600:0:0" "$(stat -c '%a:%u:%g' -- "$common/state" 2> /dev/null || echo MISSING)" \
+        "PAM-55: .common/state is root:0600"
+}
+
+# PAM-56: a failure removing the THIRD half (.common) happens AFTER .saved was
+# consumed, so it is NOT retryable -- the sidecar cannot bring back the saved
+# bytes. The log must demand manual recovery instead of falsely claiming that
+# all three halves stay retryable (final re-review P2). A retry must fail
+# closed, never report a false success.
+test_pam_56_common_consume_failure_is_manual_recovery() {
+    local s state_hex log
+    s="$(setup_pam_sandbox common-consume-fail)"
+    pam_install_for_restore_test "$s"
+    state_hex="$(file_hex "$s/manifest/pam-selection.common/state")"
+    cat > "$s/stub/rm" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *pam-selection.common*) printf 'STUB: rm .common refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/rm "$@"
+EOF
+    chmod +x "$s/stub/rm"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-56: .common consume failure returns rc 1"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "manual recovery is REQUIRED" "$log" \
+        "PAM-56: manual recovery is explicitly required"
+    assert_contains "NOT retryable" "$log" \
+        "PAM-56: log states this state is not retryable"
+    assert_not_contains "stay retryable" "$log" \
+        "PAM-56: no false claim that all halves stay retryable"
+    assert_not_contains "snapshot consumed" "$log" \
+        "PAM-56: no false success after a partial consume"
+    if [ -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.common" ] \
+        && [ ! -e "$s/manifest/pam-selection.saved" ]; then
+        ok
+    else
+        fail "PAM-56: rebuilt sidecar + .common retained, .saved already consumed"
+    fi
+    assert_eq "$state_hex" "$(file_hex "$s/manifest/pam-selection.common/state")" \
+        "PAM-56: original .common state bytes preserved"
+
+    # With the fault removed, the rebuilt sidecar still says
+    # saved-snapshot=complete while .saved is gone: this MUST fail closed.
+    rm -f "$s/stub/rm"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_neq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-56/retry: consumed .saved makes this state non-retryable"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "but it is missing; failing closed" "$log" \
+        "PAM-56/retry: fail-closed reason is explicit"
+    assert_eq "$state_hex" "$(file_hex "$s/manifest/pam-selection.common/state")" \
+        "PAM-56/retry: .common bytes intact for manual recovery"
+}
+
+# PAM-57: behavioural NEGATIVE test for the final fail-closed gate itself.
+# The existing PAM-43/50/51 cases only assert the SUCCESS log; a stealth
+# mutation that keeps every probe and log_error but overwrites rc=0 just before
+# the final `[ "$rc" -eq 0 ] || return 1` would still pass them. Call the
+# verifier directly and demand rc=1 for bytes / mode / owner / link / absence /
+# savedir metadata mismatches (final review P2).
+test_pam_57_final_verify_rejects_common_and_savedir_mismatches() {
+    local case_name s needle log
+    for case_name in bytes mode owner link absent savedir_mode savedir_missing; do
+        s="$(setup_pam_sandbox "final-verify-$case_name")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        # Snapshot the CURRENT live state: install itself rewrites common-*, so
+        # an install-time snapshot would legitimately mismatch before any
+        # injected fault and make the control meaningless.
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            CROS_ENABLEMENT_PAM_SELECTION_FILE="$s/manifest/pam-selection" \
+            CROS_ENABLEMENT_PAM_SAVED_DIR="$s/savedir" \
+            run_sandboxed "$s" '
+                export PATH="$2/stub:/usr/bin:/bin"
+                export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+                source "$1/lib/pam.sh"
+                rc=0
+                _pam_snapshot_common_state || rc=$?
+                printf "%s\n" "$rc" > "$2/snapshot.rc"
+            '
+        assert_eq "0" "$(cat "$s/snapshot.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-57/$case_name: live-state snapshot rc 0"
+
+        # Control: the same call MUST pass on the untouched snapshot.
+        : > "$s/log.txt"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            CROS_ENABLEMENT_PAM_SELECTION_FILE="$s/manifest/pam-selection" \
+            CROS_ENABLEMENT_PAM_SAVED_DIR="$s/savedir" \
+            run_sandboxed "$s" '
+                export PATH="$2/stub:/usr/bin:/bin"
+                export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+                source "$1/lib/pam.sh"
+                rc=0
+                _pam_verify_common_targets_against_snapshot || rc=$?
+                printf "%s\n" "$rc" > "$2/verify.rc"
+            '
+        assert_eq "0" "$(cat "$s/verify.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-57/$case_name: baseline verification rc 0"
+
+        case "$case_name" in
+            bytes) printf 'auth optional pam_permit.so\n' >> "$s/pam/common-auth" ;;
+            mode) chmod 0600 "$s/pam/common-auth" ;;
+            owner) chown 1000:1000 "$s/pam/common-auth" ;;
+            link)
+                rm -f "$s/pam/common-session"
+                ln -s "$s/no-such-target" "$s/pam/common-session"
+                ;;
+            absent) rm -f "$s/pam/common-password" ;;
+            savedir_mode) chmod 0700 "$s/savedir" ;;
+            savedir_missing) rm -rf "$s/savedir" ;;
+        esac
+        case "$case_name" in
+            savedir_*) needle="Final savedir" ;;
+            *) needle="Final PAM state mismatch" ;;
+        esac
+
+        : > "$s/log.txt"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            CROS_ENABLEMENT_PAM_SELECTION_FILE="$s/manifest/pam-selection" \
+            CROS_ENABLEMENT_PAM_SAVED_DIR="$s/savedir" \
+            run_sandboxed "$s" '
+                export PATH="$2/stub:/usr/bin:/bin"
+                export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+                source "$1/lib/pam.sh"
+                rc=0
+                _pam_verify_common_targets_against_snapshot || rc=$?
+                printf "%s\n" "$rc" > "$2/verify.rc"
+            '
+        assert_eq "1" "$(cat "$s/verify.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-57/$case_name: final verification fails closed (rc 1)"
+        log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+        assert_contains "$needle" "$log" \
+            "PAM-57/$case_name: mismatch reason logged"
+        assert_not_contains "Verified final common-*/sudo state" "$log" \
+            "PAM-57/$case_name: no success log after a mismatch"
+    done
+}
+
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -13014,6 +13199,9 @@ test_pam_51_savedir_mode_restored
 test_pam_52_dangling_common_symlink_tracked_and_restored
 test_pam_53_common_line_reorder_fails_closed
 test_pam_54_foreign_common_survives_failed_publish
+test_pam_55_common_snapshot_dir_is_root_only_0700
+test_pam_56_common_consume_failure_is_manual_recovery
+test_pam_57_final_verify_rejects_common_and_savedir_mismatches
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

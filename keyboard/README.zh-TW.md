@@ -362,11 +362,14 @@ daemon 只消費兩個 handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backli
 不同的非零已存值時，blank-side 的 handoff `0` 會被忽略，讓使用者亮度在「已熄屏時
 休眠」後仍保留——**除非**三者同時成立：新鮮的 last-user `source=manual0`（TTL 內）、
 cache 值為 `0`、且 gsd 明確回報 pct `0`。gsd 空值仍是「無法確認」，該 `0` 照樣視為
-blank-side 而忽略。若 handoff 存在於某個 `/run/user/<uid>` 而不在 daemon 的 runtime
-目錄，daemon 會唯讀掃描該 root，並以路徑記錄 `[WARN] handoff directory mismatch`
-（包含不同 session uid 的情況；絕不跨目錄 adopt 可能屬於其他使用者的檔案）。
-loginctl 回報多個 session 時，hook 的 WARN 會印出實際選用的目錄。hook 絕不消耗
-handoff 檔——由 daemon 在成功 adopt/還原後消耗。
+blank-side 而忽略。hook 只對**單一 active local graphical session** 寫 handoff
+（0 或多個候選會在 root journal 以 `session selection fail-closed: ...` fail closed），
+並記錄 `selected session ... for uid ...`，在 `pre` 把 uid 釘在 root-only `0600` 檔、
+`post` 沿用不重選。hook 絕不建立／chmod／chown `/run/user/<uid>`：不存在或權限不安全
+即 fail closed、不寫 handoff。daemon 不再掃描其他 uid 的 runtime dir；只有 explicit
+`C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
+跨 uid 問題請查 root journal，不要掃描 `/run/user`。hook 絕不消耗 handoff 檔——
+由 daemon 在成功 adopt/還原後消耗。
 
 **喚醒 handoff（thaw 後的 daemon 是唯一寫入者）**：`handle_resume()` 由 **system**
 bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume flag，或啟動
@@ -513,21 +516,22 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 另有 `C640_KBD_WRITE_LOCK`、`C640_KBD_GUARD_WRITTEN_GEN` 與
 `C640_KBD_SELF_WRITE_SENTINEL` 覆寫 write lock／guard marker／保留的 Tier 2
 sentinel 路徑；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
-`C640_KBD_HANDOFF_DIR` 與 `C640_KBD_RUN_USER_ROOT`；若有設定
-`C640_KBD_HANDOFF_DIR`，daemon 也用同一值作為 hook 端目錄來做不一致診斷，並用
-`C640_KBD_RUN_USER_ROOT` 做唯讀的跨 uid 掃描。舊的 `C640_KBD_SLEEP_USER` /
+`C640_KBD_HANDOFF_DIR` 與 `C640_KBD_RUN_USER_ROOT`；explicit
+`C640_KBD_HANDOFF_DIR` 會跳過 loginctl 選擇與 uid 釘住，daemon 只用同一值做
+覆寫不一致 WARN（不再有跨 uid 掃描）。舊的 `C640_KBD_SLEEP_USER` /
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 535 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 539 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
-跨 uid handoff 目錄不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
+explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
 guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
 嚴格單調的 generation bump、fail-closed 鎖失敗與單次讀取的 last-user cache）；
-sleep hook 測試有 84 個案例（純 handoff、`0600`/`chown`/
-原子 `mv`、`C640_KBD_HANDOFF_DIR`、多 session 解析與 IDLE/CLASS 偏好及路徑 WARN、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1981 個案例，包含損毀
+sleep hook 測試有 161 個案例（純 handoff、`0600`/`chown`/
+原子 `mv`、`C640_KBD_HANDOFF_DIR`、由 loginctl 屬性選出單一 active local graphical
+session 並在 root journal fail closed、uid 釘住與沿用、0700 runtime dir 檢查、不寫 LED）。
+rollback 測試（`tests/rollback-test.sh`，需 root）有 2137 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
@@ -540,9 +544,9 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、整個操�
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 535 個案例
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 個案例
-sudo bash tests/rollback-test.sh                       # 1981 個案例（需 root）
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 539 個案例
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 161 個案例
+sudo bash tests/rollback-test.sh                       # 2137 個案例（需 root）
 ```
 
 ---

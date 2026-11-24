@@ -114,28 +114,38 @@ above).` instead:
   debconf `libpam-runtime/profiles` selection and every saved module file under `/var/lib/pam`
   into a sidecar next to the manifest (`pam-selection` mode `0644`, `pam-selection.saved` a
   root-owned `0700` directory) — first-wins and atomic, with every read/copy through `sudo`
-  so a non-root uninstall can restore it and a root-only `/var/lib/pam` is captured;
+  so a non-root uninstall can restore it and a root-only `/var/lib/pam` is captured; it also
+  publishes a **third half**, root-owned `0700` `pam-selection.common`, recording every
+  `common-*` / sudo target's bytes, mode, lstat owner, type, symlink target and absence plus
+  the live savedir directory's presence/mode/owner. All three halves are first-wins.
   (2) backs up **all** existing `common-*` files, not just
   fp-containing ones, because `--package` can rewrite any of them; (3) removes only the fp
   module lines with a direct `sed -i '/pam_fprintd\.so/d'`, immediately closing the GDM race;
   (4) runs `pam-auth-update --package` itself so debconf and `/var/lib/pam` converge to a
   stable "no fprintd" state and a later package-triggered run is a no-op. It **never** calls
-  `pam-auth-update --remove`, which deletes the debconf selection outright. On uninstall,
-  after manifest rollback is confirmed complete (the sudo record and every `common-*`
-  record consumed), the saved snapshots are copied back, the original multiselect is written
-  with `debconf-set-selections`, `--package` runs again, and the live selection is compared
-  (exact or whitespace-insensitive set); only then is the sidecar consumed. A failed restore
-  keeps the sidecar and returns rc 1; a corrupt manifest or a surviving record skips all
-  debconf writes and keeps the snapshot for retry. Non-root installers with passwordless
+  `pam-auth-update --remove`, which deletes the debconf selection outright. On uninstall the
+  order is: all external tool calls finish, then the original `common-*` / sudo state is
+  re-applied from `.common`, then the **final verification** checks bytes/mode/owner/type/
+  link/absence, the savedir directory and the selection/seen values; only when all pass are
+  the selection, `.saved` and `.common` halves consumed together. A consumed manifest record
+  plus an equal selection is **not** sufficient for success. A failed restore keeps all three
+  halves and returns rc 1; a corrupt manifest or a surviving record skips all debconf writes
+  and keeps the snapshots for retry. If removal of the last `.common` half fails after the
+  other two are gone, the sidecar is rebuilt but the state is **not retryable** — the log says
+  `manual recovery is REQUIRED` and the retained files must be cleaned up by hand. Non-root installers with passwordless
   `sudo` are supported throughout. Trade-off: the snapshot is authoritative, so an
   administrator who deliberately changes the selection during installation has it overwritten
   on uninstall; manually re-enabling the fprintd profile during install (e.g.
   `pam-auth-update --enable fprintd`) writes the fp line back into `common-auth` and restores
-  the GDM race until uninstall. A read-only post-rollback check warns if a manifest record
-  still covers `/etc/pam.d/sudo` (manual cleanup may be needed) or if the manifest is corrupt —
-  it never modifies a file. Fedora `authselect` and openSUSE `pam-config` profile state is
-  outside the manifest: the tool calls remain but a warning asks you to restore any
-  pre-existing profile manually.
+  the GDM race until uninstall. A legacy sidecar with no `.common` emits an explicit
+  `Legacy PAM snapshot has no ... (best effort only)` WARN and claims **no** byte/metadata guarantee;
+  a missing `.saved` while the live savedir is non-empty fails closed and needs manual
+  recovery; a semantic edit to a `common-*` file (added/removed/reordered MODULE line, logged
+  as `External content change detected`) returns rc 1 and retains all three halves. A
+  read-only post-rollback check warns if a manifest record still covers `/etc/pam.d/sudo`
+  (manual cleanup may be needed) or if the manifest is corrupt — it never modifies a file.
+  Fedora `authselect` and openSUSE `pam-config` profile state is outside the manifest: the
+  tool calls remain but a warning asks you to restore any pre-existing profile manually.
 * **Concurrent install/uninstall runs cannot lose tracking records or leave untracked
   deployments.** Each component installer takes ONE operation-level lock around its whole
   transaction — backup/record → deploy files and services → finish or rollback — through

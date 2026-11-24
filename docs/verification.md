@@ -66,9 +66,9 @@ diagnostic bundle.
 | keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:45:37, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10` (the current test now expects the `[meta:M]` layer's `LEFTCTRL` chord guard), all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Syntax is checked in CI with keyd 2.6.0 (`keyd check`) only; behaviour is verified on this device with 2.5.0-5 only — other versions unverified (upstream 2.6.x has known `overloadt2` differences). Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI match (real modalias) | 🟢 | `udevadm test /sys/class/input/event2` applies `KEYBOARD_KEY_*` via the `evdev:atkbd:` lookup even with the firmware's extra `br0.0:efr0.0` fields; non-`atkbd` lookups printing `No entry found from hwdb` is expected |
 | kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
-| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 460 daemon cases pass after the re-review fixes (below); real S3 verified below |
+| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 539 daemon cases pass after the re-review fixes (below); real S3 verified below |
 | kbd backlight user service | 🟢 | `/etc/systemd/user/`, globally enabled and **active for uid 1000** (`systemctl --global is-enabled`, `systemctl --user is-active` both OK); `StandardError=journal` makes daemon log lines visible in `journalctl --user -u c640-kbd-backlight-sync.service` |
-| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + atomic `mv`; `C640_KBD_HANDOFF_DIR`); 84 hook cases pass. The root `/run/c640-kbd-backlight/state` is a **single-shot diagnostic snapshot of the first suspend in a boot** — first-wins, not consumed and never used for restore. **Real S3 freeze/thaw verified 2026-11-22** (details below) |
+| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + atomic `mv`; `C640_KBD_HANDOFF_DIR`); 161 hook cases pass. The hook now hands off only for a single active local graphical session (0 or multiple candidates fail closed in the root journal) and never creates/chmods/chowns the runtime dir. The root `/run/c640-kbd-backlight/state` is a **single-shot diagnostic snapshot of the first suspend in a boot** — first-wins, not consumed and never used for restore. **Real S3 freeze/thaw verified 2026-11-22** (details below) |
 
 #### Real S3 acceptance (2026-11-22, full systemd freeze/thaw)
 
@@ -89,13 +89,13 @@ brightness = `0` (screen already blank), ScreenSaver = `true`.
 > **manual lid-close cycle** was not part of this run and remains a supplementary
 > to-test item.
 
-#### Current status and unit-test totals (as of 2026-11-24)
+#### Current status and unit-test totals (as of 2026-11-25)
 
 | Suite | Result | Scope |
 | :--- | :--- | :--- |
-| `keyboard/tests/kbd-backlight-daemon-test.sh` | **460 passed, 0 failed** | stub-based unit suite |
-| `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **84 passed, 0 failed** | stub-based unit suite |
-| `tests/rollback-test.sh` | **1981 passed, 0 failed** | root required |
+| `keyboard/tests/kbd-backlight-daemon-test.sh` | **539 passed, 0 failed** | stub-based unit suite |
+| `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **161 passed, 0 failed** | stub-based unit suite |
+| `tests/rollback-test.sh` | **2137 passed, 0 failed** | root required |
 | `keyboard/tests/keyd-dualrole-uinput.py` | **22 PASS** | 2026-10-31 historical live run (22 PASS), real virtual uinput / not a stub — **not a current-HEAD live run**; after `acbc3b9` the chord-guard expectation changed and only the self-test was re-run on HEAD |
 
 Provenance: stub suites were re-run locally; the Python/diagnostic self-tests are synthetic
@@ -112,7 +112,7 @@ kernel map and there is still **no raw `MSC_SCAN` capture** — confirming the r
 requires `--scan` (or plain `evtest` without `--grab`) after stopping keyd.
 
 **No new real S3 run.** The 2026-11-22 (fifth-round) acceptance table above remains the
-authoritative hardware record; the sixth through fourteenth re-reviews below changed code
+authoritative hardware record; the sixth through fifteenth re-reviews below changed code
 and were validated with unit tests / CI only.
 
 #### Fourteenth re-review — hardening summary (2026-11-24)
@@ -133,6 +133,43 @@ Totals after these commits: rollback suite **1981**, daemon **460**, sleep hook 
 all 0 failures. Still **no new real S3 run** — the 2026-11-22 record is unchanged; the keyd
 chord test now acknowledges the `LEFTCTRL` guard as expected; `MSC_SCAN` is still inferred
 and needs `--scan` to confirm.
+
+#### Fifteenth re-review — hardening summary (2026-11-25)
+
+This fork adds five commits on top of the fourteenth re-review:
+
+* `2cbf5d1` — review follow-up: tighten the chord-guard self-test (34 cases) and remove two
+  unused handoff variables; the 22-PASS keyd live result stays a historical 2026-10-31 run.
+* `17a873b` — CI: restore the ShellCheck and shfmt gates to green; two independent reviewers
+  confirmed the gates green, and the 22 CI checks are expected to pass (Pages skipped).
+* `2f48bdc` — PAM: add a third, root-only `0700` `pam-selection.common` half recording every
+  `common-*` / sudo target's bytes, mode, lstat owner, type, symlink target and absence plus
+  savedir directory metadata; restore it only after every external tool call, then verify
+  bytes/mode/owner/type/link/absence, savedir and selection/seen before consuming all three
+  halves together. A consumed manifest record plus an equal selection is **not** success.
+  A legacy sidecar without `.common` logs an explicit `Legacy PAM snapshot has no ... (best effort only)` WARN and claims
+  no byte/metadata guarantee; a missing `.saved` with a populated live savedir fails closed
+  with `manual recovery`; a semantic edit to `common-*` returns rc 1 and retains all three
+  halves; if removal of the last `.common` half itself fails after the others are gone, the
+  sidecar is rebuilt but the state is **not retryable** (`manual recovery is REQUIRED`).
+* `530fc65` — backlight: serialize every write under one `WRITE_LOCK` (fd 209), bump the
+  restore generation atomically inside it, and re-check the generation after sleep and just
+  before writing; a superseded guard does zero writes. The unblank guard uses an explicit
+  decision table: a stamped user choice wins, a gsd-positive mismatch confirms a lost restore,
+  otherwise **ambiguous / fail-closed (no write)**. **Tier 2 is not implemented.**
+* `4620243` — sleep hook: select one active local graphical session from loginctl properties
+  plus `show-seat ActiveSession` (0 or multiple candidates fail closed in the root journal),
+  pin the uid in a root-only `0600` file at `pre` and reuse it at `post`, require an existing
+  `0700` owner-matching `/run/user/<uid>`, and drop the daemon's cross-uid scan; the daemon now
+  warns only for an explicit `C640_KBD_HANDOFF_DIR` override mismatch.
+
+Current totals: daemon **539 passed, 0 failed**, sleep hook **161 passed, 0 failed**, rollback
+**2137 passed, 0 failed**; keyd self-test **34 cases**, `check-top-row-hwdb.py` `SELF-TEST=PASS`,
+`detect-hardware.sh` **28 assertions**. Still **no new real S3 run** — the 2026-11-22
+fifth-round table above is unchanged; the **22 PASS** keyd virtual-uinput result is a
+2026-10-31 historical live run (only the self-test was re-run after `acbc3b9`); Tier 2 is not
+implemented. Handoff targets only the single active local graphical session (see
+[COMPATIBILITY.md](COMPATIBILITY.md)).
 
 #### Sixth re-review fixes (2026-11-23, unit-tested)
 
@@ -321,7 +358,7 @@ Commits: `751c609`, `6774033`, `69712a4`, `dab9436`.
   uninstall cannot inherit it. New **PAM-9** regression injects fail=1 first, then
   deliberately poisons the parent environment with fail=0 and verifies a clean
   rollback with byte-identical PAM files (+5 assertions, bringing the total to
-  **1392** at that point; the current rollback suite is **1981** cases).
+  **1392** at that point; the current rollback suite is **2137** cases).
 
 #### Twelfth re-review fixes (2026-11-24, unit-tested)
 
@@ -441,7 +478,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (460 daemon + 84 hook + 1981 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (539 daemon + 161 hook + 2137 rollback, the last as root); **full real S3 freeze/thaw verified 2026-11-22** (locked defer + unlocked restore, see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -522,7 +559,10 @@ cat /sys/power/mem_sleep
   real-tool Ubuntu 24.04 container E2E — current totals above — no new real-S3 run),
   2026-11-24 (fourteenth re-review — this fork: six commits summarized above; rollback suite
   1981 / daemon 460 / hook 84, 0 failures; still no new real-S3 run since 2026-11-22; keyd chord
-  `LEFTCTRL` guard now expected, `MSC_SCAN` still inferred)
+  `LEFTCTRL` guard now expected, `MSC_SCAN` still inferred),
+  2026-11-25 (fifteenth re-review — this fork: five commits summarized above; rollback suite
+  2137 / daemon 539 / hook 161, 0 failures; still no new real-S3 run since 2026-11-22; 22 PASS
+  keyd live run remains historical, `MSC_SCAN` still inferred, Tier 2 not implemented)
 * **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
   keyboard/backlight session, `7.0.0-29-generic` for the 2026-08 evidence bundle
 * **Firmware**: MrChromebox `2606.1`

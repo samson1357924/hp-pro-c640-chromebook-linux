@@ -204,9 +204,13 @@
   > 加回 hook——那就是當年第二寫入者的 bug。`pre` 寫入的 root
   > `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**
   > （first-wins，保留到重開機），hook 與 daemon 都不消耗它，也從不用於還原。若 hook
-  > 寫入的目錄與 daemon 讀取的不同，daemon 會記錄 `[WARN] handoff directory mismatch`
-  > 並附上路徑、忽略該候選檔；請檢查 `XDG_RUNTIME_DIR`／session uid，或讓兩端設定相同的
-  > `C640_KBD_HANDOFF_DIR`。
+  > handoff 只對**單一 active local graphical session** 寫入；0 或多個候選會在 **root journal**
+  > 以 `session selection fail-closed: ...` fail closed，選中的 uid 則記錄為
+  > `selected session ... for uid ...`，在 `pre` 釘在 root-only `0600` 檔、`post` 沿用。
+  > hook 絕不建立／chmod／chown `/run/user/<uid>`；不存在或不安全即 fail closed、不寫 handoff。
+  > daemon 不再掃描其他 uid 的 runtime dir：只有 explicit `C640_KBD_HANDOFF_DIR` 覆寫與自身
+  > 檔案不一致時才記錄 `[WARN] handoff directory mismatch`。跨 uid 診斷請查 root journal，
+  > 不要掃描 `/run/user`。
 
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
@@ -474,6 +478,17 @@
     **取捨**：快照具有最終權威，因此安裝期間變更 selection，會在 uninstall 時被覆寫；
     安裝期間手動啟用 fprintd profile（`pam-auth-update --enable fprintd`）會把 fp 行寫回
     `common-auth`，直至 uninstall 前都恢復 GDM 競賽。
+  * `External content change detected in ... since the snapshot (added/removed/reordered
+    MODULE line); refusing to overwrite it - manual recovery required.` 代表管理員或工具對
+    `common-*` 做了語意變更；uninstall 回 rc 1 並保留三個 snapshot half。預期順序日誌為
+    `PAM external tool calls complete; re-applying the original common/sudo state.`——所有工具
+    呼叫先結束才從 `.common` 還原，最後的 bytes/mode/owner/type/link/absence + savedir +
+    selection/seen 驗證全部通過才消耗。沒有 `.common` 的 legacy sidecar 會記錄
+    `Legacy PAM snapshot has no ... (best effort only)`／`No PAM common-state snapshot (...) ... (legacy best
+    effort)`，不宣稱位元組保證；`saved-snapshot=absent` 但 live savedir 非空則 fail closed
+    並要求 `manual recovery`。manifest record 已消耗加上 selection 相等並不算成功。
+    若最後一個 `.common` half 在其他兩半已消耗後無法刪除，sidecar 會重建但狀態**無法自動重試**
+    （`manual recovery is REQUIRED`），保留的檔案必須手動清理。
 
 ---
 

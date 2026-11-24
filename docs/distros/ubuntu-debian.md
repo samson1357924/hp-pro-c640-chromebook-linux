@@ -102,16 +102,23 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > debconf's `libpam-runtime/profiles` selection outright. On Debian/Ubuntu the
 > installer first snapshots that selection and every saved module file under
 > `/var/lib/pam` into a first-wins sidecar (`pam-selection` mode `0644`;
-> `pam-selection.saved` a root-owned `0700` directory of file copies), with all
-> reads/copies through `sudo` so a non-root caller with passwordless `sudo` is
-> supported. It backs up **all** existing
+> `pam-selection.saved` a root-owned `0700` directory of file copies), plus a third
+> root-owned `0700` `pam-selection.common` half recording every `common-*` / sudo
+> target's bytes, mode, owner, type, symlink target and absence and the savedir
+> directory metadata, with all reads/copies through `sudo` so a non-root caller
+> with passwordless `sudo` is supported. It backs up **all** existing
 > `common-*` bytes (not only fp-containing ones), strips only fp module lines,
 > then runs `pam-auth-update --package` itself so debconf and `/var/lib/pam`
 > converge to a stable "no fprintd" state and a later package-triggered run is a
-> no-op. On uninstall, once manifest rollback is confirmed complete, it copies the
-> saved files back, writes the original selection with `debconf-set-selections`,
-> runs `--package` again and verifies the selection (exact or set-equivalent)
-> before consuming the sidecar; a failed restore keeps it and returns rc 1.
+> no-op. On uninstall, every tool call finishes first; only then are the original
+> `common-*` / sudo files re-applied from `.common`, followed by final verification
+> of bytes/mode/owner/type/link/absence, savedir and selection/seen. All three
+> halves are consumed together only after that verification — a consumed manifest
+> record plus an equal selection alone is not success. A failed restore keeps all
+> halves and returns rc 1. A legacy sidecar with no `.common` warns explicitly and
+> claims no byte guarantee; a missing `.saved` with a populated live savedir fails
+> closed (`manual recovery`); a semantic edit to `common-*` returns rc 1 and retains
+> all halves (`External content change detected`).
 > Trade-off: a selection you change during installation is overwritten on
 > uninstall, and a manual `--enable fprintd` reintroduces the GDM race until
 > uninstall. If `common-auth` still has an fp line on an older install, remove

@@ -97,22 +97,31 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   (1) 把 debconf `libpam-runtime/profiles` selection 與 `/var/lib/pam` 下每個已儲存的模組檔
   快照到 manifest 旁的 sidecar（`pam-selection` 檔案 `0644`、`pam-selection.saved` 為 root
   擁有的 `0700` 目錄）——first-wins、原子，所有讀取/複製都經由 `sudo`，讓非 root uninstall
-  也能還原、root-only 的 `/var/lib/pam` 也能擷取；(2) 備份**所有**現有的 `common-*` 檔，不只含 fp 者，因為
+  也能還原、root-only 的 `/var/lib/pam` 也能擷取；並發布**第三個 half**——root 擁有 `0700` 的
+  `pam-selection.common`，記錄每個 `common-*`／sudo 目標的位元組、mode、lstat owner、type、
+  symlink target 與 absence，以及 live savedir 目錄的 presence/mode/owner。三個 half 都是
+  first-wins。(2) 備份**所有**現有的 `common-*` 檔，不只含 fp 者，因為
   `--package` 可能改寫任一個；(3) 直接以 `sed -i '/pam_fprintd\.so/d'` 只移除 fp 模組行，
   立即消除 GDM 競賽；(4) 自己先跑一次 `pam-auth-update --package`，讓 debconf 與
   `/var/lib/pam` 收斂到穩定的「無 fprintd」狀態，日後套件觸發的執行即為 no-op。它**絕不**
-  呼叫 `pam-auth-update --remove`（該動作會直接刪除 debconf selection）。uninstall 時，
-  在確認 manifest rollback 完成（sudo 與所有 `common-*` 紀錄皆已消耗）後，先複回已儲存的
-  快照，以 `debconf-set-selections` 寫回原始 multiselect，再跑一次 `--package`，並比對線上的
-  selection（精確比對或忽略空白的集合比對）；比對成功才消耗 sidecar。還原失敗會保留 sidecar
-  並回 rc 1；manifest 損毀或有紀錄殘留則完全不寫 debconf，保留快照供重試。非 root 安裝器搭配
+  呼叫 `pam-auth-update --remove`（該動作會直接刪除 debconf selection）。uninstall 時的順序
+  是：所有外部工具呼叫先結束，再從 `.common` 重新套用原始 `common-*`／sudo 狀態，接著做
+  **最終驗證**——檢查 bytes/mode/owner/type/link/absence、savedir 目錄與 selection/seen；
+  全部通過才一次消耗 selection、`.saved` 與 `.common` 三個 half。「manifest record 已消耗 +
+  selection 相等」**不算**成功。還原失敗保留三個 half 並回 rc 1；manifest 損毀或有紀錄殘留
+  則完全不寫 debconf，保留快照供重試。若最後一個 `.common` half 在其他兩半已消耗後刪除失敗，
+   sidecar 會重建但狀態**無法自動重試**——日誌會出現 `manual recovery is REQUIRED`，
+   保留的檔案必須手動清理。非 root 安裝器搭配
   passwordless `sudo` 全程皆支援。**取捨**：快照具有最終權威，因此管理員在安裝期間刻意變更
   selection，會在 uninstall 時被覆寫；安裝期間手動重新啟用 fprintd profile（例如
   `pam-auth-update --enable fprintd`）會把 fp 行寫回 `common-auth`，直至 uninstall 前都恢復
-  GDM 競賽。唯讀的 rollback 後檢查會在 manifest 仍記錄 `/etc/pam.d/sudo` 時警告（可能需要
-  手動清理），或在 manifest 損毀時警告——兩者都不修改檔案。Fedora 的 `authselect` 與 openSUSE
-  的 `pam-config` profile 狀態不在 manifest 內：工具呼叫仍保留，但會警告請手動還原原本的
-  profile。
+  GDM 競賽。沒有 `.common` 的 legacy sidecar 會明確發出 `Legacy PAM snapshot has no ... (best effort only)` WARN，且
+  **不**宣稱任何位元組／中繼資料保證（僅 best effort）；`.saved` 缺失但 live savedir 非空時
+  fail closed 並需要手動復原；對 `common-*` 的語意變更（新增／移除／調換 MODULE 行，記錄為
+  `External content change detected`）會回 rc 1 並保留三個 half。唯讀的 rollback 後檢查會在
+  manifest 仍記錄 `/etc/pam.d/sudo` 時警告（可能需要手動清理），或在 manifest 損毀時警告——
+  兩者都不修改檔案。Fedora 的 `authselect` 與 openSUSE 的 `pam-config` profile 狀態不在
+  manifest 內：工具呼叫仍保留，但會警告請手動還原原本的 profile。
 * **並行的安裝/解除安裝不會遺失追蹤紀錄，也不會留下未追蹤的部署。** 每個元件安裝器
   透過 `lib/backup.sh` 的 `run_manifest_operation()`，在**整個元件操作交易**——備份/紀錄 →
   部署檔案與服務 → 完成或回滾——只取得一把操作級鎖。巢狀 helper（備份 gate、群組 helper、

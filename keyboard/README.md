@@ -426,13 +426,16 @@ non-zero saved value, so the user's brightness survives a suspend started while
 the screen was blank — **except** when all three agree: a fresh last-user record
 `source=manual0` (within `C640_KBD_LAST_USER_TTL`), the cache value `0`, and an
 **explicit gsd pct 0**. An empty gsd reply is "cannot confirm", so the `0` is still
-treated as blank-side and ignored. If a handoff exists in a `/run/user/<uid>`
-directory but not in the daemon's runtime directory, the daemon scans that root
-read-only and logs `[WARN] handoff directory mismatch` with the path (including a
-different session uid); it never cross-adopts files that may belong to another
-user. The hook warns with the directory it chose when loginctl reports multiple
-sessions. The hook never consumes the handoff files — the daemon does that after a
-successful adoption/restore.
+treated as blank-side and ignored. The hook writes a handoff only for a **single
+active local graphical session** (0 or multiple candidates fail closed in the root
+journal as `session selection fail-closed: ...`); it logs `selected session ... for
+uid ...`, pins that uid in a root-only `0600` file at `pre` and reuses it at `post`.
+It never creates, chmods or chowns `/run/user/<uid>`: a missing or insecure dir
+fails closed with no handoff. The daemon no longer scans other uids' runtime dirs;
+only an **explicit** `C640_KBD_HANDOFF_DIR` override that disagrees with its own
+file logs `[WARN] handoff directory mismatch`. Diagnose cross-uid issues in the
+root journal, not by scanning `/run/user`. The hook never consumes the handoff
+files — the daemon does that after a successful adoption/restore.
 
 **Resume handoff (the thawed daemon is the only writer):** `handle_resume()` runs on
 `PrepareForSleep(false)` from the **system** bus (not frozen), on a resume flag picked
@@ -600,24 +603,25 @@ accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node a
 `C640_KBD_SELF_WRITE_SENTINEL` for the write-lock / guard-marker / reserved
 Tier-2 sentinel paths. The sleep hook accepts
 `C640_KBD_SLEEP_SYSFS`, `C640_KBD_SLEEP_STATE_DIR`, `C640_KBD_HANDOFF_DIR` and
-`C640_KBD_RUN_USER_ROOT`; when `C640_KBD_HANDOFF_DIR` is set, the daemon uses the
-same value as the hook-side directory for its mismatch diagnostic, and also uses
-`C640_KBD_RUN_USER_ROOT` for the read-only cross-uid scan. Its old
+`C640_KBD_RUN_USER_ROOT`; an explicit `C640_KBD_HANDOFF_DIR` bypasses loginctl
+selection and uid pinning, and the daemon uses the same value only for its
+explicit-override mismatch warning (there is no cross-uid scan any more). Its old
 `C640_KBD_SLEEP_USER` / `_UID` / `_BUS` /
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 535 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 539 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
-zeros, wall-clock probe deadline, cross-uid handoff mismatch, gsd-confirmed
+zeros, wall-clock probe deadline, explicit handoff directory override mismatch, gsd-confirmed
 fresh-manual0 adoption, generation-stamped guard user-change protection, expired-retry
 in-lock generation gate with PENDING rollback, strictly monotonic generation bumps,
 fail-closed lock failures and single-read last-user cache) and the
-sleep-hook suite has 84 cases (pure handoff, `0600`/`chown`/atomic `mv`,
-`C640_KBD_HANDOFF_DIR`, multi-session resolution with IDLE/CLASS preference and
-chosen-path warnings, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1981 cases, including corrupt and
+sleep-hook suite has 161 cases (pure handoff, `0600`/`chown`/atomic `mv`,
+`C640_KBD_HANDOFF_DIR`, single active local graphical session selection from
+loginctl properties with root-journal fail-closed warnings, uid pin and reuse,
+0700 runtime-dir gate, no LED writes). The rollback suite
+(`tests/rollback-test.sh`, run as root) has 2137 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -632,9 +636,9 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 535 cases
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 cases
-sudo bash tests/rollback-test.sh                       # 1981 cases (root)
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 539 cases
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 161 cases
+sudo bash tests/rollback-test.sh                       # 2137 cases (root)
 ```
 
 ---

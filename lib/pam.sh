@@ -731,7 +731,13 @@ _pam_snapshot_common_state() {
         return 1
     fi
     _pam_common_cleanup_stage "$stage"
-    if ! sudo install -d -m 700 -- "$stage/files"; then
+    # Create the STAGE itself root:0700 before /files. A bare
+    # `install -d -m 700 -- "$stage/files"` leaves the implicitly created
+    # parent at the caller's umask (0755 under CI's umask 0022); the published
+    # .common would then be 0755 despite the CI check and the docs (the
+    # .saved half already installs its stage explicitly at 0700).
+    if ! sudo install -d -m 700 -- "$stage" \
+        || ! sudo install -d -m 700 -- "$stage/files"; then
         log_error "Could not create the PAM common-state staging directory."
         return 1
     fi
@@ -1276,8 +1282,12 @@ _pam_rebuild_sidecar() {
 
 # Consume the snapshot with a recoverable order. We remove the sidecar FIRST
 # while .saved is still the only original copy; if .saved removal then fails,
-# the sidecar is rebuilt from the values still in memory. At every exit either
-# BOTH halves are present (retryable) or BOTH are gone (success) (review P1-1).
+# the sidecar is rebuilt from the values still in memory. For the first two
+# halves, every exit has BOTH halves present (retryable) or BOTH gone (success)
+# (review P1-1). EXCEPTION: the third (.common) half is consumed AFTER .saved;
+# if that final removal fails the saved bytes are gone and CANNOT be rebuilt
+# from memory, so the rebuilt sidecar is forensics only and MANUAL recovery is
+# REQUIRED -- never claim the three halves stay retryable (final review P2).
 _pam_consume_snapshot() {
     local value="$1" seen="$2" has_seen="$3" saved_state="$4" is_legacy="${5:-0}"
     if ! sudo rm -f -- "$_PAM_SEL_SIDECAR" \
@@ -1296,14 +1306,16 @@ _pam_consume_snapshot() {
         fi
         return 1
     fi
-    # Third half LAST: a failure here must rebuild the sidecar too, otherwise
-    # an orphaned .common could never be consumed/retried (three-half atomicity).
+    # Third half LAST: .saved is already gone here, so a failure is NOT
+    # retryable -- rebuilding the sidecar cannot recreate the consumed saved
+    # bytes (a retry would fail closed on saved-snapshot=complete). Keep the
+    # rebuilt sidecar for forensics and say so explicitly (final review P2).
     if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
         if ! sudo rm -rf -- "$_PAM_COMMON_SNAPSHOT_DIR" \
             || _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
-            log_error "Could not remove $_PAM_COMMON_SNAPSHOT_DIR; rebuilding the sidecar so all halves stay retryable."
+            log_error "Could not remove $_PAM_COMMON_SNAPSHOT_DIR; .saved was already consumed and cannot be rebuilt, so this state is NOT retryable."
             if _pam_rebuild_sidecar "$value" "$seen" "$has_seen" "$saved_state" "$is_legacy"; then
-                _pam_keep_retry_data
+                log_error "CRITICAL: PAM snapshot consume failed at the third half; the rebuilt sidecar and original common/sudo state remain at $_PAM_COMMON_SNAPSHOT_DIR but manual recovery is REQUIRED."
             else
                 log_error "CRITICAL: could not rebuild the PAM selection sidecar; the original common/sudo state remains at $_PAM_COMMON_SNAPSHOT_DIR but manual recovery is REQUIRED."
             fi
