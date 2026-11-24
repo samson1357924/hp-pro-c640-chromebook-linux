@@ -68,8 +68,9 @@ jobs:
           HWDB_OUT1=$(systemd-hwdb --root="${SANDBOX_DIR}" query "${QUERY_DMI1}")
           echo "Query Output for Dratini (Coreboot):"
           echo "${HWDB_OUT1}"
-          # Every scancode from the measured fixture must be present. The
-          # fixture records the real hardware scancodes (0x3b-0x44); asserting
+          # Every scancode from the inferred fixture must be present. The
+          # fixture records 0x3b-0x44 inferred from post-hwdb EVIOCGKEY key
+          # state against the AT table (no raw MSC_SCAN capture); asserting
           # only that *some* mapping exists is what let a dead 0xea-0xb0 block
           # ship unnoticed.
           while IFS=$'\t' read -r sc key name; do
@@ -180,6 +181,10 @@ jobs:
 
       - name: Validate keyd Configuration
         run: |
+          # 2.6.0 here is a SYNTAX check only (`keyd check` exists in >= 2.6).
+          # Tap/hold/chord-guard behaviour was validated on the device with
+          # 2.5.0-5; 2.6.x has known overloadt2 behaviour differences and is
+          # NOT behaviourally validated here (see keyboard/README.md).
           git clone --depth 1 --branch v2.6.0 https://github.com/rvaiya/keyd /tmp/keyd-src
           test "$(git -C /tmp/keyd-src rev-parse HEAD)" = "7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3"
           make -C /tmp/keyd-src

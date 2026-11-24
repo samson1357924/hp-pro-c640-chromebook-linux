@@ -26,12 +26,16 @@ kernel/hardware level using `systemd-hwdb` or at the input daemon level using
 | **Top 10 (F10)** | 🔊 (Volume Up) | `0x44` / `KEYBOARD_KEY_44` | `KEY_VOLUMEUP` | Increase Audio Volume |
 | **Search / Launcher** | 🔍 (Search) | `0xdb` / `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) or CapsLock |
 
-> **Scancodes measured on real Dratini hardware (2026-10-31).** This top row
-> emits the standard AT scancodes `0x3b`-`0x44` (`KEY_F1`-`KEY_F10`), **not** the
-> ChromeOS action scancodes (`0xea`, `0xe9`, `0xe7`, ...) that some other
-> Chromebooks use. hwdb must therefore map `0x3b`-`0x44`; mapping the action
-> scancodes has no effect on this machine. The measured table lives in
-> `keyboard/tests/hwdb-top-row-scancodes.tsv` and is asserted in CI.
+> **Scancodes inferred on real Dratini hardware (2026-10-31).** The `0x3b`-`0x44`
+> (`KEY_F1`-`KEY_F10`) values were inferred from post-hwdb `EVIOCGKEY` key state
+> against the standard AT scancode table, and `EVIOCGKEYCODE` confirmed the
+> kernel map — **not** ChromeOS action scancodes (`0xea`, `0xe9`, `0xe7`, ...)
+> that some other Chromebooks use. No raw `MSC_SCAN` capture is present in this
+> evidence: confirming it still requires `check-top-row-hwdb.py --scan` after
+> stopping keyd (or plain `evtest` without `--grab`). hwdb must map
+> `0x3b`-`0x44`; mapping the action scancodes has no effect on this machine. The
+> inferred table lives in `keyboard/tests/hwdb-top-row-scancodes.tsv` and is
+> asserted in CI.
 >
 > **Other Chromebooks / other Hatch boards:** this mapping applies **only** to
 > the Dratini / HP Pro c640 DMI entries explicitly listed in
@@ -212,7 +216,7 @@ If you want the **Search key** to act as **CapsLock on tap** and **Super/Meta
 on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 
 > **Prerequisite:** Option 1 `systemd-hwdb` must be installed first. `keyd` relies on
-> hwdb having translated the measured top-row scancodes `0x3b`-`0x44` to
+> hwdb having translated the inferred top-row scancodes `0x3b`-`0x44` to
 > `KEY_BACK`/`KEY_BRIGHTNESSDOWN`/... and `0xDB` to `KEY_LEFTMETA`; `cros.conf`
 > uses those names (`back`, `leftmeta`). Run
 > `sudo python3 keyboard/tests/check-top-row-hwdb.py` to confirm the kernel map.
@@ -221,7 +225,7 @@ on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
 > instead of claiming dual-role is active; use `--keyd-config-only` if you intentionally
 > want only the config deployed (e.g. CI containers).
 
-1. Install `keyd` (pinned to v2.6.0, hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3` in CI):
+1. Install `keyd` (CI pins v2.6.0 for syntax checks; on-device behaviour validated on 2.5.0-5):
 
    ```bash
    # Ubuntu 25.04+ / Debian 13+ (native)
@@ -251,7 +255,9 @@ on hold**, or want `Search + Top-Row` to produce classic `F1-F10`:
    > `/usr/bin/keyd`; the systemd unit is still called `keyd`. Use whichever
    > exists, e.g. `keyd.rvaiya --version`. The installer auto-detects it through
    > `keyd_bin()` in `lib/syscheck.sh`. Also, **`keyd check` only exists in
-   > keyd >= 2.6** - on 2.5.x it just prints usage and exits 0.
+   > keyd >= 2.6** - on 2.5.x it just prints usage and exits 0. CI pins v2.6.0
+   > for **syntax only**; all tap/hold/guard behaviour below was measured with
+   > 2.5.0-5 on the device (see §Real-hardware validation).
 
 2. Install configuration (via installer, recommended):
 
@@ -592,10 +598,12 @@ sudo bash tests/rollback-test.sh                       # 1642 cases (root)
 The hwdb can only work if it maps the scancodes the hardware actually emits.
 This read-only check compares the kernel's `EVIOCGKEYCODE` map with
 `keyboard/tests/hwdb-top-row-scancodes.tsv` (no grab, safe while keyd runs). It
-proves which mapping the kernel applied, not what the hardware emits: the raw
-scancodes were obtained separately, by reading `EV_MSC/MSC_SCAN` with plain
-`evtest` (no `--grab`) or `check-top-row-hwdb.py --scan` after stopping keyd,
-and inferring them against the standard AT table. The `--listen` mode only
+proves which mapping the kernel applied, not what the hardware emits. The
+`0x3b`-`0x44` table was inferred from post-hwdb `EVIOCGKEY` key state against
+the standard AT table, and `EVIOCGKEYCODE` confirms the kernel map; no raw
+`MSC_SCAN` capture is available in the evidence. To obtain one, stop keyd and
+use `check-top-row-hwdb.py --scan` or plain `evtest` (no `--grab`), then infer
+the value against the standard AT table. The `--listen` mode only
 observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`; before the fix every
 physical top-row press still arrived as `KEY_F1`-`KEY_F10` while the
 action-scancode hwdb did nothing.
@@ -629,7 +637,8 @@ asserts on what keyd's own virtual keyboard emits:
 sudo apt install -y python3-evdev
 sudo python3 keyboard/tests/keyd-dualrole-uinput.py
 # PASS: tap Search -> CAPSLOCK only (no META, no guard)
-# PASS: hold Search + <each top-row key> -> F1 ... F10 (all ten)
+# PASS: hold Search + <each top-row key> -> F1 ... F10 (all ten;
+#        LEFTCTRL chord guard from the [meta:M] layer is expected)
 # PASS: <each top-row key> alone -> its media key (all ten)
 # PASS: hold Search alone -> bare META release (no guard)
 # RESULT=PASS
@@ -681,6 +690,12 @@ matches (verified 2026-10-31).
 Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 (binary `/usr/bin/keyd.rvaiya`), `python3-evdev 1.9.3`, GNOME Wayland session.
 
+> **Evidence version scope:** syntax (`keyd check`) is validated in CI with
+> keyd **2.6.0**; the tap/hold/chord-guard behaviour below was validated on the
+> real machine with **2.5.0-5** only. Other versions are **unverified** —
+> upstream 2.6.x has known `overloadt2` behaviour differences, so do not read
+> the 2.6.0 CI syntax check as behavioural validation of 2.6.0.
+
 > Rows marked **uinput** use a virtual keyboard that injects keycodes *after*
 > hwdb; they prove the keyd configuration, not that the physical keyboard emits
 > those scancodes. Rows marked **passive capture** read keyd's virtual keyboard
@@ -706,10 +721,15 @@ Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 
 **History (fixed 2026-10-31):** the earlier passive captures at `12:49`, `13:25`
 and `13:26` showed `KEY_F1`/`KEY_F6` and were initially recorded as proof of the
-keyd meta layer. They were not: the top row was sending raw `F1`-`F10`, hwdb was
-mapping scancodes the hardware never emits, and single presses of the media keys
-did nothing. Those rows were removed after raw `EV_MSC/MSC_SCAN` readings proved
-the real scancodes, and the post-fix capture above replaced them.
+keyd meta layer. They were not: the post-hwdb `EVIOCGKEY` state showed plain
+`F1`-`F10`, hwdb was mapping ChromeOS action scancodes (`0xea`-`0xb0`) copied
+from other Chromebooks, which this hardware never emits, and single presses of
+the media keys did nothing. Those rows were removed after the post-hwdb
+evidence and AT-table inference led to the corrected hwdb map, and the post-fix
+capture above replaced them. The passive capture proves the presses reach the
+desktop as `EV_KEY`; there is no raw
+`MSC_SCAN` capture in the evidence — that still requires `--scan` after
+stopping keyd.
 
 **Pitfalls found on real hardware (now fixed in this repo):**
 
@@ -741,8 +761,10 @@ the real scancodes, and the post-fix capture above replaced them.
 8. `udevadm test` reports `No entry found from hwdb` for the generic `evdev:`
    lookups even when the mapping works; only the `evdev:atkbd:` lookup applies
    `KEYBOARD_KEY_*`.
-9. The top row on this machine sends standard AT scancodes `0x3b`-`0x44`
-   (`KEY_F1`-`KEY_F10`), not the ChromeOS action scancodes (`0xea`, `0xe9`,
+9. The top row on this machine is **inferred** to use standard AT scancodes
+   `0x3b`-`0x44` (`KEY_F1`-`KEY_F10`) from post-hwdb `EVIOCGKEY` state against
+   the AT table (kernel map confirmed via `EVIOCGKEYCODE`; raw `MSC_SCAN` not
+   captured), not ChromeOS action scancodes (`0xea`, `0xe9`,
    ...). A hwdb file copied from another Chromebook can look correct,
    `udevadm info` can show `KEYBOARD_KEY_ea=back`, and the keyd uinput test can
    still pass, while every physical press stays a plain `F` key. Verify with

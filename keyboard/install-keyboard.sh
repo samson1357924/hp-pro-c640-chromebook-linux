@@ -417,10 +417,14 @@ _keyd_restore_one() {
         log_warn "Could not read $kind_file; cannot restore $dst"
         return 1
     fi
+    # 'dir' is deliberately NOT a valid restore kind: snapshot creation above
+    # rejects directories, and install(1) cannot restore a directory .data
+    # anyway. A dir kind here means a tampered/legacy snapshot -> fail closed
+    # via the unknown-kind branch instead of attempting a doomed restore.
     case "$kind" in
-        absent | symlink | file | dir) ;;
+        absent | symlink | file) ;;
         *)
-            log_warn "Keyd snapshot has unknown kind '$kind' for $dst"
+            log_warn "Keyd snapshot has unknown kind '$kind' for $dst (only absent, symlink and file are restorable)"
             return 1
             ;;
     esac
@@ -466,7 +470,7 @@ _keyd_restore_one() {
                 return 1
             fi
             ;;
-        file | dir)
+        file)
             if ! mode="$(sudo cat "$d/$prefix.mode" 2> /dev/null)"; then
                 log_warn "Could not read $d/$prefix.mode; cannot restore $dst"
                 return 1

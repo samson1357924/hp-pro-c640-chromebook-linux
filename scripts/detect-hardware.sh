@@ -675,16 +675,20 @@ EOF
     KB_STUB_HWDB="$db"
     local query_stub="kb_hwdb_query_stub"
 
+    # Optional fields let a scenario pin every DMI value used by
+    # kb_compose_dmi_modalias, so an exact-string assertion catches a field
+    # sourced from the wrong DMI file (a bd* wildcard alone would not).
     make_scenario() {
-        local name="$1" bvn="$2" svn="$3" pn="$4" with_kbd="$5" modalias="${6:-}"
+        local name="$1" bvn="$2" svn="$3" pn="$4" with_kbd="$5" modalias="${6:-}" \
+              bios_date="${7:-01/01/2020}" bvr="${8:-TEST}" pvr="${9:-1.0}"
         local dir="$root/$name"
         mkdir -p "$dir/dmi" "$dir/input/input2/event2"
         printf '%s\n' "$bvn" > "$dir/dmi/bios_vendor"
-        printf 'TEST\n' > "$dir/dmi/bios_version"
-        printf '01/01/2020\n' > "$dir/dmi/bios_date"
+        printf '%s\n' "$bvr" > "$dir/dmi/bios_version"
+        printf '%s\n' "$bios_date" > "$dir/dmi/bios_date"
         printf '%s\n' "$svn" > "$dir/dmi/sys_vendor"
         printf '%s\n' "$pn" > "$dir/dmi/product_name"
-        printf '1.0\n' > "$dir/dmi/product_version"
+        printf '%s\n' "$pvr" > "$dir/dmi/product_version"
         if [ "$with_kbd" = 1 ]; then
             printf 'AT Translated Set 2 keyboard\n' > "$dir/input/input2/name"
             if [ -n "$modalias" ]; then
@@ -714,6 +718,24 @@ EOF
             printf '  PASS  %s\n' "$desc"
         else
             printf '  FAIL  %s (wanted %s: %s)\n' "$desc" "$should" "$needle"
+            sed 's/^/        /' "$out"
+            rc=1
+        fi
+    }
+
+    # Exact full-line assertion for the composed modalias. A plain substring
+    # match would still PASS if a suffix (:br0.0:efr0.0, :ZZLEAK, ...) leaked
+    # after pvr, leaving a seven-field composition undetected. logger writes
+    # ANSI-coloured "[LEVEL] " prefixes, so normalise those before comparing
+    # the message body as a whole line.
+    expect_line() {
+        local line="$1" desc="$2" normalized="$root/normalized-out.txt"
+        scenario=$((scenario + 1))
+        sed -E $'s/\x1b\[[0-9;]*m//g; s/^\[[A-Z-]+\] //' "$out" > "$normalized"
+        if grep -qxF -- "$line" "$normalized"; then
+            printf '  PASS  %s\n' "$desc"
+        else
+            printf '  FAIL  %s (wanted exact line: %s)\n' "$desc" "$line"
             sed 's/^/        /' "$out"
             rc=1
         fi
@@ -754,6 +776,32 @@ EOF
     run_scenario "$d"
     expect present "device not matched" "atkbd modalias + non-target DMI: not matched"
     expect absent "$KB_SUCCESS_MARKER" "atkbd modalias + non-target DMI: no false success"
+
+    # DMI modalias composition must be asserted EXACTLY, not with a bd*
+    # wildcard: a wildcard could span ':' and hide a field read from the wrong
+    # DMI file. All six fields are pinned to distinct values here.
+    local composed='evdev:atkbd:dmi:bvnGoogle:bvrBV-42:bd11/22/2026:svnGoogleCo:pnDratiniPro:pvrPV-9'
+    d="$(make_scenario dmi-compose Google GoogleCo DratiniPro 1 '' 11/22/2026 BV-42 PV-9)"
+    run_scenario "$d"
+    expect_line "  DMI-composed modalias : $composed" "DMI modalias: exact six-field composition from DMI files"
+    expect_line "  AT keyboard modalias  : $composed" "DMI modalias: composed value is the one queried against hwdb"
+    expect present "$KB_SUCCESS_MARKER" "DMI modalias: composite query still matches the target hwdb entry"
+
+    # Real firmware appends br/efr after pvr. The device modalias is used
+    # verbatim for the live query, while the DMI-composed string must stay at
+    # six fields and must not leak br/efr into the composition.
+    d="$(make_scenario atkbd-br-efr Google Google Dratini 1 'evdev:atkbd:dmi:bvnGoogle:bvrTEST:bd01/01/2020:svnGoogle:pnDratini:pvr1.0:br0.0:efr0.0')"
+    run_scenario "$d"
+    expect present "AT keyboard modalias  : evdev:atkbd:dmi:bvnGoogle:bvrTEST:bd01/01/2020:svnGoogle:pnDratini:pvr1.0:br0.0:efr0.0" "br/efr modalias: device verbatim value used for the live query"
+    expect_line "  DMI-composed modalias : evdev:atkbd:dmi:bvnGoogle:bvrTEST:bd01/01/2020:svnGoogle:pnDratini:pvr1.0" "br/efr modalias: DMI composition stays six fields"
+    expect present "$KB_SUCCESS_MARKER" "br/efr modalias: still matches the target hwdb entry"
+
+    # bd must come from bios_date (kernel dmi-id.c uses bvn/bvr/bd from the
+    # BIOS vendor/version/date), not from a hardcoded value or another file.
+    d="$(make_scenario dmi-bios-date Google Google Dratini 1 '' 12/31/2025 BY-77 PV-8)"
+    run_scenario "$d"
+    expect_line "  DMI-composed modalias : evdev:atkbd:dmi:bvnGoogle:bvrBY-77:bd12/31/2025:svnGoogle:pnDratini:pvrPV-8" "DMI modalias: bd/bvr/pvr track their DMI files"
+    expect absent 'bd01/01/2020:svnGoogle:pnDratini:pvrPV-8' "DMI modalias: no stale default bios_date leaks into composition"
 
     # No udevadm -> explicit inconclusive (warn), never a full-success claim.
     KB_UDEVADM_BIN="$root/bin/no-such-udevadm"

@@ -24,10 +24,13 @@ AT `F1`-`F10`）。在標準 Linux 下，這些按鍵可透過核心/硬體層�
 | **頂排 10 (F10)** | 🔊 (提高音量) | `0x44` / `KEYBOARD_KEY_44` | `KEY_VOLUMEUP` | 提高音量 |
 | **Search / Launcher** | 🔍 (搜尋) | `0xdb` / `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) 或 CapsLock |
 
-> **掃描碼已於 2026-10-31 在實機 Dratini 上量測。** 這台頂排送出的是標準 AT
-> 掃描碼 `0x3b`-`0x44`（`KEY_F1`-`KEY_F10`），**不是**部分 Chromebook 使用的
-> ChromeOS action 掃描碼（`0xea`、`0xe9`、`0xe7`…）。因此 hwdb 必須映射
-> `0x3b`-`0x44`；映射 action 掃描碼在這台機器上完全無效。量測表存於
+> **掃描碼是 2026-10-31 在實機 Dratini 上推論而來。** `0x3b`-`0x44`
+> （`KEY_F1`-`KEY_F10`）是由 hwdb 轉換後的 `EVIOCGKEY` 按鍵狀態對照標準 AT
+> 掃描碼表推論，`EVIOCGKEYCODE` 只確認核心映射表；**不是**部分 Chromebook
+> 使用的 ChromeOS action 掃描碼（`0xea`、`0xe9`、`0xe7`…）。目前證據中沒有
+> 原始 `MSC_SCAN` 捕獲，要確認仍需停掉 keyd 後用
+> `check-top-row-hwdb.py --scan` 或不加 `--grab` 的 `evtest` 擷取。因此 hwdb
+> 必須映射 `0x3b`-`0x44`；映射 action 掃描碼在這台機器上完全無效。推論表存於
 > `keyboard/tests/hwdb-top-row-scancodes.tsv`，CI 會逐條斷言。
 >
 > **其他 Chromebook／其他 Hatch 機板：** 這份映射**只**套用於
@@ -181,14 +184,14 @@ rollback 失敗時提前中止收尾。
 
 若希望 **Search 鍵** 呈現 **輕點為 CapsLock、長按為 Super/Meta**，或希望 `Search + 頂排` 輸出傳統 `F1-F10`：
 
-> **前置條件：** 需先安裝選項 1 `systemd-hwdb`。`keyd` 依賴 hwdb 已將實測的
+> **前置條件：** 需先安裝選項 1 `systemd-hwdb`。`keyd` 依賴 hwdb 已將推論的
 > 頂排掃描碼 `0x3b`-`0x44` 轉為 `KEY_BACK`/`KEY_BRIGHTNESSDOWN`…，以及
 > `0xDB`→`KEY_LEFTMETA`；`cros.conf` 使用這些名稱（`back`、`leftmeta`）。
 > 可用 `sudo python3 keyboard/tests/check-top-row-hwdb.py` 確認核心映射。
 > 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。若系統尚未安裝 keyd，此指令現在會回傳
 > rc 3，而不會宣稱雙重角色已生效；若刻意只想部署設定檔（例如 CI 容器），請改用 `--keyd-config-only`。
 
-1. 安裝 `keyd`（CI 固定 `v2.6.0`，hash `7c0aecb8bfd34dc8642bf4eefd2e59c89e61cec3`）：
+1. 安裝 `keyd`（CI 固定 `v2.6.0` 只做語法檢查；實機行為驗證於 `2.5.0-5`）：
 
    ```bash
    # Ubuntu 25.04+ / Debian 13+（原生）
@@ -217,7 +220,8 @@ rollback 失敗時提前中止收尾。
    > **`/usr/bin/keyd.rvaiya`**（2.5.0-5），而非 `/usr/bin/keyd`（`$PATH` 中沒有 `keyd`）；systemd 服務名稱
    > 仍是 `keyd`。請用實際存在的名稱，例如 `keyd.rvaiya --version`；安裝器會透過
    > `lib/syscheck.sh` 的 `keyd_bin()` 自動偵測。另外 **`keyd check` 僅存在於 keyd ≥ 2.6**，
-   > 2.5.x 會直接印出用法並回傳 0。
+   > 2.5.x 會直接印出用法並回傳 0。CI 固定 v2.6.0 只驗證**語法**；下方所有
+   > tap/hold/防護行為都是在實機以 2.5.0-5 測得（見「實機驗證記錄」）。
 
 2. 安裝設定檔（建議走安裝器）：
 
@@ -507,8 +511,10 @@ sudo bash tests/rollback-test.sh                       # 1642 個案例（需 ro
 hwdb 只有在映射到硬體真正送出的掃描碼時才有效。這支唯讀腳本會比對核心的
 `EVIOCGKEYCODE` 映射與 `keyboard/tests/hwdb-top-row-scancodes.tsv`（不下 grab，
 keyd 執行中也能跑）。它證明的是核心套用了哪份映射，不是硬體實際送什麼：
-原始掃描碼是另外取得的——先停掉 keyd，再用不加 `--grab` 的 `evtest` 或
-`check-top-row-hwdb.py --scan` 讀 `EV_MSC/MSC_SCAN`，並對照標準 AT 表推論。
+`0x3b`-`0x44` 是由 hwdb 轉換後的 `EVIOCGKEY` 按鍵狀態對照標準 AT 表推論，
+`EVIOCGKEYCODE` 只確認核心映射表；目前證據中沒有原始 `MSC_SCAN` 捕獲。
+要取得原始值，請先停掉 keyd，再用 `check-top-row-hwdb.py --scan` 或不加
+`--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，並對照標準 AT 表推論。
 `--listen` 模式只透過 `EVIOCGKEY` 觀察 hwdb 轉換後的 `KEY_*` 按鍵事件；
 修正前每次實體按鍵都仍以 `KEY_F1`-`KEY_F10` 抵達，而 action 掃描碼的
 hwdb 完全沒作用。
@@ -540,7 +546,8 @@ sudo python3 keyboard/tests/check-top-row-hwdb.py
 sudo apt install -y python3-evdev
 sudo python3 keyboard/tests/keyd-dualrole-uinput.py
 # PASS: tap Search -> CAPSLOCK only (no META, no guard)
-# PASS: hold Search + <每個頂排鍵> -> F1 ... F10（共 10 個）
+# PASS: hold Search + <每個頂排鍵> -> F1 ... F10（共 10 個；
+#        [meta:M] 圖層的 LEFTCTRL 組合鍵防護屬預期）
 # PASS: <每個頂排鍵> 單按 -> 對應媒體鍵（共 10 個）
 # PASS: hold Search alone -> bare META release (no guard)
 # RESULT=PASS
@@ -587,6 +594,11 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 環境：Ubuntu 26.04 LTS、kernel `7.0.0-38-generic`、`keyd 2.5.0-5`
 （執行檔 `/usr/bin/keyd.rvaiya`）、`python3-evdev 1.9.3`、GNOME Wayland。
 
+> **證據版本範圍：**語法（`keyd check`）在 CI 以 keyd **2.6.0** 驗證；下列
+> tap/hold/組合鍵防護行為只在實機以 **2.5.0-5** 驗證。其它版本**未驗證** —
+> 上游 2.6.x 對 `overloadt2` 有已知行為差異，不要把 2.6.0 的語法檢查當成
+> 2.6.0 的行為驗證。
+
 > 標示 **uinput** 的列使用虛擬鍵盤、注入的是 hwdb **之後**的鍵碼，只能證明 keyd
 > 設定正確，不能證明實體鍵盤送出那些掃描碼。標示 **被動擷取** 的列是實際按下
 > 實體鍵時，唯讀側錄 keyd 虛擬鍵盤的輸出。
@@ -610,9 +622,12 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 | `--check` | 🟢 | 全綠，含「backlight node writable by group plugdev (mode 660)」 |
 
 **沿革（2026-10-31 已修）：** 先前 `12:49`、`13:25`、`13:26` 的被動擷取出現
-`KEY_F1`／`KEY_F6`，一度被當成 keyd meta 層有效的證據。事實並非如此：當時頂排送的是
-原始 `F1`-`F10`，hwdb 映射的是硬體不會送的掃描碼，單按媒體鍵完全沒作用。
-以 `EV_MSC/MSC_SCAN` 讀到真實掃描碼後，已移除那些列，並以上方修正後的擷取取代。
+`KEY_F1`／`KEY_F6`，一度被當成 keyd meta 層有效的證據。事實並非如此：當時
+hwdb 轉換後的 `EVIOCGKEY` 狀態顯示單純 `F1`-`F10`，hwdb 映射的是從其他
+Chromebook 抄來的 ChromeOS action 掃描碼（`0xea`-`0xb0`），這台硬體從不送出，
+單按媒體鍵完全沒作用。根據轉換後狀態與 AT 表推論修正
+映射後已移除那些列，並以上方修正後的擷取取代。被動擷取只證明按鍵以 `EV_KEY`
+送達桌面；證據中沒有原始 `MSC_SCAN` 捕獲，確認仍需停掉 keyd 後用 `--scan`。
 
 **實機發現的坑（repo 已修）：**
 
@@ -637,7 +652,9 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
    讀 keyd 虛擬鍵盤。
 8. `udevadm test` 對泛用 `evdev:` 查詢印 `No entry found from hwdb` 是正常現象；
    只有 `evdev:atkbd:` 那條會套用 `KEYBOARD_KEY_*`。
-9. 這台頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`（`KEY_F1`-`KEY_F10`），不是
+9. 這台頂排**推論**使用標準 AT 掃描碼 `0x3b`-`0x44`（`KEY_F1`-`KEY_F10`）
+   （由 hwdb 轉換後 `EVIOCGKEY` 對照 AT 表而來，`EVIOCGKEYCODE` 只確認核心映射；
+   原始 `MSC_SCAN` 未捕獲），不是
    ChromeOS action 掃描碼（`0xea`、`0xe9`…）。從別台 Chromebook 抄來的 hwdb
    可能看起來正確、`udevadm info` 也顯示 `KEYBOARD_KEY_ea=back`，但每顆實體鍵
    仍是單純的 `F` 鍵。請用 `check-top-row-hwdb.py` 驗證，不要只看映射表。

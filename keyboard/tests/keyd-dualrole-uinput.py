@@ -7,7 +7,8 @@ This injects events through a virtual keyboard instead of requiring a human to
 press the real one, then reads what keyd's virtual keyboard emits. It verifies:
 
   1. tap Search                       -> CAPSLOCK only (no META, no guard)
-  2. hold Search + each top-row key   -> F1 ... F10 (all ten)
+  2. hold Search + each top-row key   -> F1 ... F10 (all ten; the layer's
+                                          LEFTCTRL chord guard is expected)
   3. each top-row key alone           -> its media key (pass-through)
   4. hold Search, release alone       -> lone META down/up, NO LEFTCTRL guard
                                           (this is what lets Mutter open the
@@ -210,8 +211,11 @@ def check_tap(events):
 def check_hold(events, expected):
     """hold Search + key -> one down/up of `expected`, no unexpected modifier.
 
-    The `[meta:M]` layer legitimately holds LEFTMETA while active, so that one
-    modifier is allowed; a clear_mod() CTRL guard (or RIGHTMETA) is not.
+    The `[meta:M]` layer legitimately holds LEFTMETA while active, and its
+    clear_mod() guard emits an expected LEFTCTRL down/META up/LEFTCTRL up
+    around each chord press. Both are therefore allowed here; RIGHTCTRL,
+    RIGHTMETA and any other modifier are still forbidden (check_lone() keeps
+    forbidding LEFTCTRL on the lone-hold path, where it would break Mutter).
     """
     held = names(events)
     exp_values = values_for(events, expected)
@@ -221,7 +225,7 @@ def check_hold(events, expected):
     ok = (
         clean_press(exp_values)
         and set(held_non_mods) == {expected}
-        and not unexpected_mods(events, allowed=("KEY_LEFTMETA",))
+        and not unexpected_mods(events, allowed=("KEY_LEFTMETA", "KEY_LEFTCTRL"))
     )
     return ok, {"values": exp_values, "names": held}
 
@@ -417,16 +421,22 @@ def run_self_test():
            seq("KEY_CAPSLOCK", [1, 2, 0]) + [("KEY_BACK", 0)], True)
 
     # 2. hold Search + top-row key -> expected F-key. The meta layer holds
-    # LEFTMETA, so that modifier is allowed but a CTRL guard is not.
+    # LEFTMETA and its clear_mod() guard inserts LEFTCTRL around chord presses;
+    # both are expected, while RIGHTCTRL/RIGHTMETA guards are still forbidden.
     hold_f1 = lambda ev: check_hold(ev, "KEY_F1")
     expect("hold [1] only down", hold_f1, seq("KEY_F1", [1]), False)
     expect("hold [1,2,0]", hold_f1, seq("KEY_F1", [1, 2, 0]), True)
     expect("hold with LEFTMETA layer down", hold_f1,
            seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTMETA", [1, 0]), True)
-    expect("hold with LEFTCTRL guard", hold_f1,
-           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), False)
+    expect("hold with expected LEFTCTRL chord guard", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), True)
     expect("hold with RIGHTMETA guard", hold_f1,
            seq("KEY_F1", [1, 2, 0]) + seq("KEY_RIGHTMETA", [1, 0]), False)
+    expect("hold with RIGHTCTRL guard", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_RIGHTCTRL", [1, 0]), False)
+    expect("hold with LEFTCTRL + stray RIGHTMETA", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0])
+           + seq("KEY_RIGHTMETA", [1, 0]), False)
     expect("hold with non-target reset 0", hold_f1,
            seq("KEY_F1", [1, 2, 0]) + [("KEY_BACK", 0)], True)
 
@@ -563,7 +573,8 @@ def run_checks(ui, kd, failures):
             collect_checked(kd, 0.7, f"hold Search + {label}", failures), expected
         )
         if ok:
-            print(f"PASS: hold Search + {label} -> {expected} {detail}")
+            print(f"PASS: hold Search + {label} -> {expected} "
+                  f"(LEFTCTRL chord guard allowed) {detail}")
         else:
             print(f"FAIL: hold Search + {label} expected only {expected} (one down/up), got {detail}")
             failures.append(f"hold-{expected.lower()}")

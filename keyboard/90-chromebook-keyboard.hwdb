@@ -20,7 +20,7 @@
 # 0x3b-0x44 is therefore what actually changes the behaviour here; the old
 # 0xea-0xb0 block never matched a real key press and was dead code.
 #
-# These scancodes were measured on this Dratini only. The mapping is applied
+# These inferred scancodes are used on this Dratini only. The mapping is applied
 # exclusively via the explicit DMI entries listed below (Dratini and the HP
 # Pro c640); it is NOT verified for any other Hatch-based board. On real
 # Dratini, "Hatch" appears in the product family (pfa), not the product name

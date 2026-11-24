@@ -29,7 +29,9 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   ```bash
   sudo systemd-hwdb update
   sudo udevadm trigger --subsystem-match=input
-  # Read-only: compares EVIOCGKEYCODE with the measured scancode fixture.
+  # Read-only: compares EVIOCGKEYCODE with the inferred scancode fixture
+  # (0x3b-0x44 inferred from post-hwdb EVIOCGKEY against the AT table;
+  # no raw MSC_SCAN capture in the evidence).
   sudo python3 keyboard/tests/check-top-row-hwdb.py
   # Live presses: post-hwdb KEY_* events via EVIOCGKEY, no grab:
   sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 30

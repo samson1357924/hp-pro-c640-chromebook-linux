@@ -60,8 +60,8 @@
 | 檢查項目 | 結果 | 證據 |
 | :--- | :---: | :--- |
 | hwdb 已安裝 | 🟢 | `/etc/udev/hwdb.d/90-chromebook-keyboard.hwdb` 存在；與 repo 檔 `diff` 為空 |
-| hwdb 掃描碼映射（實機） | 🟢 | `keyboard/tests/check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 `OK` — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA`。這證明的是核心映射，不是按鍵實際送出的掃描碼；實體送出的部分另以 `18:14:47-18:15:18` 的被動擷取驗證。頂排送出的是標準 AT 掃描碼 `0x3b`-`0x44`，不是 ChromeOS action 掃描碼。 |
-| keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
+| hwdb 掃描碼映射（實機） | 🟢 | `keyboard/tests/check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 `OK` — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA`。這證明的是核心映射，不是按鍵實際送出的掃描碼。`0x3b`-`0x44` 是由 hwdb 轉換後 `EVIOCGKEY` 按鍵狀態對照標準 AT 表推論；證據中沒有原始 `MSC_SCAN` 捕獲，確認仍需停掉 keyd 後用 `--scan`。`18:14:47-18:15:18` 的實體按鍵被動擷取只證明按鍵以 hwdb 轉換後的 `EV_KEY` 送達桌面，不是 `MSC_SCAN`。 |
+| keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`（`[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護屬預期）、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。語法僅在 CI 以 keyd 2.6.0 驗證（`keyd check`）；行為只在本機以 2.5.0-5 驗證，其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知差異）。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
 | 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——各次 re-review 修復後 406 個 daemon 案例全過（見下）；真實 S3 驗證見下 |
@@ -434,8 +434,9 @@ cat /sys/power/mem_sleep
   （EC 90% 電池守護服務 + `c640-ec-sleep.sh` 零空窗喚醒鉤子 + standalone `ectool` LPC
   通訊已實機驗證；打包迭代 2 `1.94.10-2` 中繼資料已備妥，驅動原始碼未異動）、
   2026-08-29（鍵盤背光同步已安裝——當時僅設定、CI smoke 通過，已被下方 2026-10-31 條目取代），
-  2026-10-31（鍵盤頂排重新量測：hwdb 改映射真實 AT 掃描碼 `0x3b`-`0x44`；
-  keyd `overloadt2` 雙重角色 Search 以 uinput 測試與實體按鍵被動擷取驗證；
+  2026-10-31（依據 hwdb 轉換後 `EVIOCGKEY` 對照標準 AT 表修正鍵盤頂排映射：
+  hwdb 改映射 `0x3b`-`0x44`，`EVIOCGKEYCODE` 只確認核心映射表，原始 `MSC_SCAN`
+  未捕獲；keyd `overloadt2` 雙重角色 Search 以 uinput 測試與實體按鍵被動擷取驗證；
   背光同步以 `--test-blank`、`ScreenSaver.ActiveChanged`、sleep hook 端到端驗證），
   2026-11-22（Phase 6 鍵盤背光 handoff 真實 S3 驗收：systemd 259 /
   gnome-settings-daemon 50 上以 `rtcwake -m no -s 20` + `systemctl suspend`；

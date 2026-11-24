@@ -166,8 +166,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   ./setup.sh --keyboard
   ```
 
-  > This file maps the scancodes measured on a Dratini: AT `0x3b`-`0x44`, and
-  > applies only to the explicit Dratini / HP Pro c640 DMI entries in
+  > This file maps the scancodes inferred from post-hwdb `EVIOCGKEY` key state
+  > against the AT table on a Dratini: AT `0x3b`-`0x44`; no raw `MSC_SCAN`
+  > capture is present in the evidence. It applies only to the explicit
+  > Dratini / HP Pro c640 DMI entries in
   > `keyboard/90-chromebook-keyboard.hwdb` — it does **not** match other Hatch
   > boards. Other Chromebooks may emit the ChromeOS action scancodes (`0xea`,
   > `0xe9`, ...) instead and need their own hwdb entry. `--listen` only shows

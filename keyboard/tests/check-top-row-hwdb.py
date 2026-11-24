@@ -99,7 +99,6 @@ MSC_SCAN = 4
 EV_SYN = 0       # 0x00 (== e.EV_SYN); 3 is EV_ABS, NOT EV_SYN
 EV_ABS = 3       # 0x03; used by --self-test to prove code=3 alone is not SYN_DROPPED
 SYN_DROPPED = 3  # 0x03 SYN_* code value, only meaningful when type == EV_SYN
-KEY_BACK = 158
 # Stable Linux input-event-code numbers (linux/input-event-codes.h). They let
 # the pure EVIOCGKEYCODE table check run without python3-evdev installed, which
 # is the mode detect-hardware.sh delegates to. Keep in sync with evdev.ecodes.
@@ -311,22 +310,31 @@ def scan(dev, seconds):
 
 
 def run_self_test():
-    """Verify --scan shows raw 0xea while --listen only shows KEY_BACK.
+    """Verify --scan shows the fixture's raw scancode, --listen only post-hwdb.
 
-    Synthetic events: a physical press first emits EV_MSC/MSC_SCAN=0xea, then
-    the hwdb-translated EV_KEY=KEY_BACK. No real device (or evdev) needed.
-    Also synthesize a real EV_SYN/SYN_DROPPED (must warn) and an EV_ABS/code=3
-    (must NOT warn), because the SYN_DROPPED code (3) collides with EV_ABS (3)
-    and only the event *type* tells them apart.
+    The synthetic events are derived from the FIRST row of read_fixture(), so
+    editing the TSV (currently 0x3b / KEY_BACK) updates this test instead of
+    letting it drift to an obsolete value such as 0xea. A press emits
+    EV_MSC/MSC_SCAN=<first scancode>, then the hwdb-translated EV_KEY=<first
+    key>. No real device (or evdev) needed. Also synthesize a real
+    EV_SYN/SYN_DROPPED (must warn) and an EV_ABS/code=3 (must NOT warn), because
+    the SYN_DROPPED code (3) collides with EV_ABS (3) and only the event *type*
+    tells them apart.
     """
     class _Event:
         def __init__(self, etype, code, value):
             self.type, self.code, self.value = etype, code, value
 
+    first_scan, first_key, _first_label = read_fixture(FIXTURE)[0]
+    first_code = expected_keycode(first_key)
+    scan_token = f"MSC_SCAN=0x{first_scan:02x}"
+    down_token = f"{key_name(first_code)} down"
+    up_token = f"{key_name(first_code)} up"
+
     events = [
-        _Event(EV_MSC, MSC_SCAN, 0xea),   # raw scancode from the hardware
-        _Event(EV_KEY, KEY_BACK, 1),      # post-hwdb keycode seen by EVIOCGKEY
-        _Event(EV_KEY, KEY_BACK, 0),
+        _Event(EV_MSC, MSC_SCAN, first_scan),  # raw scancode from the fixture
+        _Event(EV_KEY, first_code, 1),        # post-hwdb keycode seen by EVIOCGKEY
+        _Event(EV_KEY, first_code, 0),
         _Event(EV_SYN, SYN_DROPPED, 0),   # type=0, code=3: real SYN_DROPPED
         _Event(EV_ABS, 3, 0),             # type=3, code=3: must NOT be misreported
     ]
@@ -335,24 +343,25 @@ def run_self_test():
         line = format_scan_event(ev)
         if line is not None:
             scan_lines.append(line)
-    listen_lines = [format_listen_state(KEY_BACK, True), format_listen_state(KEY_BACK, False)]
+    listen_lines = [format_listen_state(first_code, True),
+                    format_listen_state(first_code, False)]
 
     failures = []
-    if not any("MSC_SCAN=0xea" in line for line in scan_lines):
-        failures.append("--scan must print the raw MSC_SCAN=0xea")
-    if not any("KEY_BACK down" in line for line in scan_lines):
-        failures.append("--scan must print the post-hwdb KEY_BACK down")
-    if "KEY_BACK up" not in scan_lines:
-        failures.append("--scan must print the KEY_BACK up transition")
+    if not any(scan_token in line for line in scan_lines):
+        failures.append(f"--scan must print the raw {scan_token}")
+    if not any(down_token in line for line in scan_lines):
+        failures.append(f"--scan must print the post-hwdb {down_token}")
+    if up_token not in scan_lines:
+        failures.append(f"--scan must print the {up_token} transition")
     if not any("SYN_DROPPED" in line for line in scan_lines):
         failures.append("--scan must warn on EV_SYN/SYN_DROPPED (type=0, code=3)")
     if sum("SYN_DROPPED" in line for line in scan_lines) != 1:
         failures.append("--scan must warn exactly once (EV_ABS/code=3 must not false-positive)")
     if format_scan_event(_Event(EV_ABS, 3, 0)) is not None:
         failures.append("EV_ABS/code=3 must be ignored, not reported as SYN_DROPPED")
-    if any("MSC_SCAN" in line or "0xea" in line for line in listen_lines):
+    if any("MSC_SCAN" in line or f"0x{first_scan:02x}" in line for line in listen_lines):
         failures.append("--listen must NOT print raw scancodes")
-    if "KEY_BACK down" not in listen_lines or "KEY_BACK up" not in listen_lines:
+    if down_token not in listen_lines or up_token not in listen_lines:
         failures.append("--listen prints only post-hwdb KEY_* transitions")
     if keyd_hint(False) != KEYD_HINT or keyd_hint(True) is not None:
         failures.append("keyd hint must appear only when no MSC_SCAN was observed")
@@ -395,7 +404,8 @@ def run_self_test():
                 failures.append(f"final_verdict({status}) missing {token!r}: {v_lines}")
 
     # --scan-only: exercise scan() itself (not just format_scan_event) with a
-    # pipe-backed fake device; it must return saw_scan=True and print 0xea.
+    # pipe-backed fake device; it must return saw_scan=True and print the
+    # fixture's raw scancode token.
     read_fd, write_fd = os.pipe()
     os.write(write_fd, b"x")  # make select() report the fake fd as readable
     os.close(write_fd)
@@ -417,8 +427,8 @@ def run_self_test():
     os.close(read_fd)
     if saw_scan is not True:
         failures.append("scan() must return saw_scan=True after a synthetic MSC_SCAN")
-    if "MSC_SCAN=0xea" not in captured_scan.getvalue():
-        failures.append("scan() must print MSC_SCAN=0xea for --scan-only raw capture")
+    if scan_token not in captured_scan.getvalue():
+        failures.append(f"scan() must print {scan_token} for --scan-only raw capture")
 
     # --scan-only argument validation and mutual exclusion.
     try:
@@ -442,7 +452,7 @@ def run_self_test():
     except SystemExit:
         pass
 
-    print("self-test: synthetic 0xea press -> hwdb KEY_BACK")
+    print(f"self-test: synthetic {scan_token} press -> hwdb {first_key}")
     for line in scan_lines:
         print(f"  --scan   {line}")
     for line in listen_lines:
@@ -452,8 +462,8 @@ def run_self_test():
             print(f"FAIL: {msg}")
         print("SELF-TEST=FAIL")
         return 1
-    print("SELF-TEST=PASS (scan shows raw 0xea; listen shows only KEY_BACK; "
-          "--scan-only survives ioctl failure)")
+    print(f"SELF-TEST=PASS (scan shows raw {scan_token}; listen shows only "
+          f"{first_key}; --scan-only survives ioctl failure)")
     return 0
 
 

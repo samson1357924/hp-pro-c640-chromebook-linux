@@ -140,7 +140,8 @@
   ./setup.sh --keyboard
   ```
 
-  > 本檔映射的是 Dratini 實測的 AT 掃描碼 `0x3b`-`0x44`，且只套用於
+  > 本檔映射的是由 Dratini 的 post-hwdb `EVIOCGKEY` 按鍵狀態對照 AT 表推論的
+  > AT 掃描碼 `0x3b`-`0x44`（證據中沒有原始 `MSC_SCAN` 捕獲），且只套用於
   > `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
   > DMI 條目——**不匹配**其他 Hatch 機板。其他 Chromebook 可能送 ChromeOS
   > action 掃描碼（`0xea`、`0xe9`…），需要建立自己的 hwdb 條目。`--listen`

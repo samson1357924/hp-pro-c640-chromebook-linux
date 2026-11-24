@@ -76,11 +76,12 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. Keyboard top-row mapping (udev hwdb)
-  #    These are the scancodes measured on a Dratini (HP Pro c640) and apply
-  #    only to the explicit Dratini / HP Pro c640 DMI entries below — other
-  #    Hatch boards are NOT matched. Other models emit their own scancodes:
-  #    capture them with `evtest` (no --grab) or `--scan` and write your own
-  #    hwdb stanza before copying this block.
+  #    These scancodes were inferred from post-hwdb EVIOCGKEY key state against
+  #    the AT table on a Dratini (HP Pro c640); the evidence has no raw MSC_SCAN
+  #    capture. They apply only to the explicit Dratini / HP Pro c640 DMI
+  #    entries below — other Hatch boards are NOT matched. Other models emit
+  #    their own scancodes: capture them with `evtest` (no --grab) or `--scan`
+  #    and write your own hwdb stanza before copying this block.
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*

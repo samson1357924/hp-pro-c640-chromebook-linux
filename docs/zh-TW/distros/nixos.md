@@ -76,10 +76,11 @@ in
   security.pam.services.sudo.fprintAuth = true;
 
   # 6. 鍵盤頂排映射 (udev hwdb)
-  #    以下是 Dratini（HP Pro c640）實測的掃描碼，且只套用於下方明確列出的
-  #    Dratini / HP Pro c640 DMI 條目——不匹配其他 Hatch 機板。其他機型會送
-  #    各自的掃描碼：直接複製此區塊前，請用不加 --grab 的 `evtest` 或 `--scan`
-  #    自行擷取並建立自己的 hwdb 條目。
+  #    以下的 Dratini（HP Pro c640）掃描碼是由 post-hwdb EVIOCGKEY 按鍵狀態
+  #    對照 AT 表推論而來（證據中沒有原始 MSC_SCAN 捕獲），且只套用於下方明確
+  #    列出的 Dratini / HP Pro c640 DMI 條目——不匹配其他 Hatch 機板。其他機型
+  #    會送各自的掃描碼：直接複製此區塊前，請用不加 --grab 的 `evtest` 或
+  #    `--scan` 自行擷取並建立自己的 hwdb 條目。
   services.udev.extraHwdb = ''
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*Dratini*:pvr*
     evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGoogle*:pn*dratini*:pvr*
