@@ -7843,6 +7843,13 @@ grp_was_member_at() {
     python3 -c 'import json,sys; g=json.load(open(sys.argv[1]))["groups"]; print(g[int(sys.argv[2])]["was_member"])' "$1" "$2"
 }
 
+# Re-review #13 (P2): per-install added_by_project evidence. Missing field
+# defaults to False (legacy semantics); present-but-wrong-type is rejected by
+# the validator and never reaches a writer.
+grp_added_at() {
+    python3 -c 'import json,sys; g=json.load(open(sys.argv[1]))["groups"]; print(g[int(sys.argv[2])].get("added_by_project", False))' "$1" "$2"
+}
+
 # R1 — the exact reviewer scenario: keyboard first, fingerprint second.
 test_plugdev_full_install_uninstall_keyboard_first() {
     local sandbox="/tmp/rollback-test-plugdev-kbd-fp"
@@ -8006,9 +8013,12 @@ test_plugdev_preexisting_member_kept_across_all_uninstalls() {
         printf 'GROUP="plugdev"\n' > "$sandbox/udev/rule-$comp.rules"
     done
     # Snapshot the records BEFORE the final uninstall consumes them.
-    local r3_was0 r3_was1
+    # R17: a normal pre-existing member must never gain an added flag.
+    local r3_was0 r3_was1 r3_added0 r3_added1
     r3_was0="$(grp_was_member_at "$mp" 0)"
     r3_was1="$(grp_was_member_at "$mp" 1)"
+    r3_added0="$(grp_added_at "$mp" 0)"
+    r3_added1="$(grp_added_at "$mp" 1)"
 
     for comp in keyboard fingerprint; do
         rm -f "$sandbox/udev/rule-$comp.rules"
@@ -8033,6 +8043,8 @@ test_plugdev_preexisting_member_kept_across_all_uninstalls() {
     assert_eq "0" "$(usermod_calls "$sandbox/usermod.log")" "R3: pre-existing member never usermod'ed"
     assert_eq "True" "$r3_was0" "R3: keyboard recorded was_member=true"
     assert_eq "True" "$r3_was1" "R3: fingerprint recorded was_member=true"
+    assert_eq "False" "$r3_added0" "R17: keyboard added_by_project stays false for a pre-existing member"
+    assert_eq "False" "$r3_added1" "R17: fingerprint added_by_project stays false for a pre-existing member"
     assert_eq "0" "$(usermod_calls "$sandbox/gpasswd.log")" "R3: never gpasswd a pre-existing member"
     assert_contains "plugdev" "$(cat "$sandbox/group-state")" "R3: membership preserved"
     assert_eq "0" "$(group_count "$mp")" "R3: all-true records consumed once no component needs the group"
@@ -8613,6 +8625,391 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# Re-review #13 (P2 CONDITIONAL PERMISSION LIFECYCLE): per-install
+# added_by_project evidence. The original was_member snapshot stays first-wins
+# forever; a reinstall that re-adds an admin-removed membership leaves a bool
+# flag which the ownership probe folds into its rc-0 "we added it" evidence.
+# Every side effect stays inside the /tmp sandbox via setup_group_state_stubs.
+# ---------------------------------------------------------------------------
+
+# R15 — core regression: pre-existing true -> admin removes WHILE INSTALLED ->
+# reinstall (first-wins keeps true, flag is set) -> uninstall must revoke the
+# membership we just re-added.
+test_plugdev_admin_removed_while_installed_reinstall_can_rollback() {
+    local sandbox="/tmp/rollback-test-plugdev-lifecycle-added"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    printf 'plugdev\n' > "$sandbox/group-state" # pre-existing member
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    # round 1: pre-existing member -> true snapshot, no usermod, no flag
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod1.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i1.rc"
+    '
+    printf 'GROUP="plugdev"\n' > "$sandbox/udev/61-kbd.rules" # still installed
+
+    # external admin removes the membership while the component is installed
+    printf 'audio\n' > "$sandbox/group-state"
+
+    # round 2: current membership false, first-wins snapshot true -> flag set
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i2.rc"
+    '
+    local r15_was r15_added r15_state
+    r15_was="$(grp_was_member_at "$mp" 0)"
+    r15_added="$(grp_added_at "$mp" 0)"
+    r15_state="$(cat "$sandbox/group-state")"
+
+    rm -f "$sandbox/udev/61-kbd.rules" # our rule gone; no third-party rule
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u.rc"
+    '
+
+    assert_eq "0" "$(cat "$sandbox/i1.rc")" "R15: round-1 install rc"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod1.log")" "R15: pre-existing member never usermod'ed"
+    assert_eq "0" "$(cat "$sandbox/i2.rc")" "R15: round-2 install rc"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod2.log")" "R15: user re-added after admin removal"
+    assert_contains "plugdev" "$r15_state" "R15: membership present after reinstall"
+    assert_eq "True" "$r15_was" "R15: first-wins was_member=true never overwritten"
+    assert_eq "True" "$r15_added" "R15: per-install added flag persisted"
+    assert_eq "0" "$(cat "$sandbox/u.rc")" "R15: uninstall rc"
+    assert_eq "1" "$(usermod_calls "$sandbox/gpasswd.log")" "R15: gpasswd -d exactly once"
+    assert_not_contains "plugdev" "$(cat "$sandbox/group-state")" "R15: new membership revoked"
+    assert_eq "0" "$(group_count "$mp")" "R15: all group records consumed"
+}
+
+# R16 — third-party udev rule variant: the flag authorises removal but the
+# udev gate keeps membership (and the flag) until EVERY rule disappears.
+test_plugdev_reinstall_added_kept_while_third_party_rule() {
+    local sandbox="/tmp/rollback-test-plugdev-lifecycle-added-udev"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    printf 'plugdev\n' > "$sandbox/group-state"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod1.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i1.rc"
+    '
+    printf 'GROUP="plugdev"\n' > "$sandbox/udev/61-kbd.rules"
+    printf 'audio\n' > "$sandbox/group-state"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i2.rc"
+    '
+
+    # our rule is gone, but a third-party rule still references plugdev
+    rm -f "$sandbox/udev/61-kbd.rules"
+    printf 'GROUP="plugdev"\n' > "$sandbox/udev/99-third-party.rules"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd1.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u1.rc"
+    '
+    local r16_added
+    r16_added="$(grp_added_at "$mp" 0)"
+
+    assert_contains "udev rules still reference" "$(cat "$sandbox/log.txt")" "R16: udev gate logged"
+    assert_eq "0" "$(cat "$sandbox/u1.rc")" "R16: gated uninstall rc"
+    assert_eq "0" "$(usermod_calls "$sandbox/gpasswd1.log")" "R16: no gpasswd while third-party rule remains"
+    assert_contains "plugdev" "$(cat "$sandbox/group-state")" "R16: membership kept while third-party rule remains"
+    assert_eq "1" "$(group_count "$mp")" "R16: record (with flag) kept while rule remains"
+    assert_eq "True" "$r16_added" "R16: added flag survives the gated uninstall"
+
+    rm -f "$sandbox/udev/99-third-party.rules"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd2.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u2.rc"
+    '
+    assert_eq "0" "$(cat "$sandbox/u2.rc")" "R16: final uninstall rc"
+    assert_eq "1" "$(usermod_calls "$sandbox/gpasswd2.log")" "R16: gpasswd once after last rule gone"
+    assert_not_contains "plugdev" "$(cat "$sandbox/group-state")" "R16: membership removed"
+    assert_eq "0" "$(group_count "$mp")" "R16: record consumed"
+}
+
+# Fault injection for R18b: refuse ONLY the new added-flag clear writer.
+# argc=6 (python3 -c SCRIPT mp group user comp), script contains
+# atomic_write_json AND the unique GROUP_ADDED_FLAG_CLEAR marker; it mentions
+# neither was_member (add writer, argc=8) nor GROUP_CONSUME_ALL (consume, argc=5).
+block_group_added_clear_stub() {
+    local sandbox="$1"
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -ge 6 ] && \
+   printf '%s' "${2:-}" | grep -q 'atomic_write_json' && \
+   printf '%s' "${2:-}" | grep -q 'GROUP_ADDED_FLAG_CLEAR'; then
+    printf 'STUB: group added-flag clear refused\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/python3"
+}
+
+# R18 — a failed usermod must clear ONLY the flag, never the first-wins record.
+test_plugdev_reinstall_usermod_failure_clears_added_flag() {
+    local sandbox="/tmp/rollback-test-plugdev-added-usermod-fail"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    printf 'plugdev\n' > "$sandbox/group-state"
+    local mp="$sandbox/manifest/install-manifest.json"
+
+    # round 1: normal pre-existing install -> true snapshot, no flag
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod1.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i1.rc"
+    '
+    printf 'audio\n' > "$sandbox/group-state"
+
+    # round 2: re-add FAILS -> flag must be cleared, original record kept (T6)
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log" STUB_USERMOD_RC=1
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i2.rc"
+    '
+    local r18_was r18_added
+    r18_was="$(grp_was_member_at "$mp" 0)"
+    r18_added="$(grp_added_at "$mp" 0)"
+
+    assert_eq "0" "$(cat "$sandbox/i1.rc")" "R18: round-1 install rc"
+    assert_eq "1" "$(cat "$sandbox/i2.rc")" "R18: usermod failure propagates"
+    assert_eq "1" "$(usermod_calls "$sandbox/usermod2.log")" "R18: usermod attempted once"
+    assert_eq "True" "$r18_was" "R18: original was_member=true preserved"
+    assert_eq "False" "$r18_added" "R18: added flag cleared after failed usermod"
+    assert_eq "1" "$(group_count "$mp")" "R18: original record not removed (T6)"
+    assert_not_contains "plugdev" "$(cat "$sandbox/group-state")" "R18: no membership granted"
+    assert_not_contains "Could not clear added-by-project evidence" "$(cat "$sandbox/log.txt")" "R18: clear succeeded"
+
+    # R18b (optional fault injection): clear writer fails -> flag kept for
+    # manual cleanup (fail closed) and the failure is logged loudly.
+    local s2="/tmp/rollback-test-plugdev-added-clear-fail"
+    rm -rf "$s2"
+    mkdir -p "$s2/backups" "$s2/manifest"
+    setup_group_state_stubs "$s2"
+    printf 'plugdev\n' > "$s2/group-state"
+    block_group_added_clear_stub "$s2"
+    local mp2="$s2/manifest/install-manifest.json"
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod1.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i1.rc"
+    '
+    printf 'audio\n' > "$s2/group-state"
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod2.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log" STUB_USERMOD_RC=1
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i2.rc"
+    '
+    local r18b_added
+    r18b_added="$(grp_added_at "$mp2" 0)"
+    assert_eq "1" "$(cat "$s2/i2.rc")" "R18b: usermod failure still propagates"
+    assert_eq "True" "$r18b_added" "R18b: flag kept when clear writer fails (fail closed)"
+    assert_contains "Could not clear added-by-project evidence" "$(cat "$s2/log.txt")" "R18b: failure logged loudly"
+}
+
+# R19 — wrong type fails closed; a legacy manifest with no flag is accepted.
+test_plugdev_added_flag_wrong_type_fails_closed_legacy_accepted() {
+    local sandbox="/tmp/rollback-test-plugdev-added-wrongtype"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    printf 'plugdev\n' > "$sandbox/group-state"
+    local mp="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"testuser","component":"keyboard","was_member":true,"added_by_project":"true"}]}' > "$mp"
+    local before
+    before="$(file_hex "$mp")"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i.rc"
+    '
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u.rc"
+    '
+
+    assert_eq "1" "$(cat "$sandbox/i.rc")" "R19: wrong-type manifest blocks install"
+    assert_eq "1" "$(cat "$sandbox/u.rc")" "R19: wrong-type manifest blocks uninstall"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod.log")" "R19: no usermod on invalid manifest"
+    assert_eq "0" "$(usermod_calls "$sandbox/gpasswd.log")" "R19: no gpasswd on invalid manifest"
+    assert_eq "$before" "$(file_hex "$mp")" "R19: invalid manifest bytes unchanged"
+    assert_contains "plugdev" "$(cat "$sandbox/group-state")" "R19: membership untouched"
+    assert_contains "added_by_project must be a boolean" "$(cat "$sandbox/log.txt")" "R19: type error diagnosed"
+
+    # legacy manifest with no added_by_project: default false, old semantics
+    local s2="/tmp/rollback-test-plugdev-added-legacy"
+    rm -rf "$s2"
+    mkdir -p "$s2/backups" "$s2/manifest"
+    setup_group_state_stubs "$s2"
+    printf 'plugdev\n' > "$s2/group-state"
+    local mp2="$s2/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"testuser","component":"keyboard","was_member":true}]}' > "$mp2"
+
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i.rc"
+    '
+    local r19_was r19_added r19_install_groups
+    r19_was="$(grp_was_member_at "$mp2" 0)"
+    r19_added="$(grp_added_at "$mp2" 0)"
+    r19_install_groups="$(group_count "$mp2")"
+    run_sandboxed "$s2" '
+        export PATH="$2/stub:$PATH" STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u.rc"
+    '
+
+    assert_eq "0" "$(cat "$s2/i.rc")" "R19: legacy manifest accepted"
+    assert_eq "True" "$r19_was" "R19: legacy was_member preserved"
+    assert_eq "False" "$r19_added" "R19: missing field defaults to false"
+    assert_eq "1" "$r19_install_groups" "R19: legacy record survives first-wins install"
+    assert_eq "0" "$(usermod_calls "$s2/usermod.log")" "R19: no usermod for legacy pre-existing member"
+    assert_eq "0" "$(cat "$s2/u.rc")" "R19: legacy uninstall rc"
+    assert_eq "0" "$(usermod_calls "$s2/gpasswd.log")" "R19: legacy all-true path never gpasswd"
+    assert_eq "0" "$(group_count "$mp2")" "R19: legacy record consumed via rc3"
+    assert_contains "plugdev" "$(cat "$s2/group-state")" "R19: legacy membership preserved"
+}
+
+# R20 — DRY_RUN with an added flag is side-effect free for BOTH directions.
+test_plugdev_dry_run_added_flag_no_side_effects() {
+    local sandbox="/tmp/rollback-test-plugdev-dryrun-added"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    printf 'audio\n' > "$sandbox/group-state" # admin removed; reinstall would re-add
+    local mp="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"testuser","component":"keyboard","was_member":true,"added_by_project":true}]}' > "$mp"
+    local before
+    before="$(file_hex "$mp")"
+
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" DRY_RUN=1 STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; remove_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/u.rc"
+    '
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" DRY_RUN=1 STUB_GROUP_STATE="$2/group-state" \
+            STUB_UDEV_DIR="$2/udev" STUB_USERMOD_LOG="$2/usermod.log" \
+            STUB_GPASSWD_LOG="$2/gpasswd.log"
+        source "$1/lib/backup.sh"
+        rc=0; ensure_group_membership plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/i.rc"
+    '
+
+    assert_eq "0" "$(cat "$sandbox/u.rc")" "R20: dry-run remove rc"
+    assert_eq "0" "$(cat "$sandbox/i.rc")" "R20: dry-run install rc"
+    assert_eq "0" "$(usermod_calls "$sandbox/gpasswd.log")" "R20: no gpasswd in dry run"
+    assert_eq "0" "$(usermod_calls "$sandbox/usermod.log")" "R20: no usermod in dry run"
+    assert_eq "1" "$(group_count "$mp")" "R20: record not consumed"
+    assert_eq "$before" "$(file_hex "$mp")" "R20: manifest bytes unchanged"
+    if [ -e "$sandbox/manifest/.install-manifest.lock" ]; then
+        fail "R20: dry run must not create a lock file"
+    else
+        ok
+    fi
+}
+
+# Stub-contract regression: the new clear writer (argc=6, unique marker, no
+# was_member / GROUP_CONSUME_ALL) passes both existing writer stubs, while the
+# add writer (argc=8 + was_member) is still refused by block_group_manifest_write.
+test_plugdev_added_writer_stub_contract() {
+    local sandbox="/tmp/rollback-test-plugdev-added-stub-contract"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest"
+    setup_group_state_stubs "$sandbox"
+    local mp="$sandbox/manifest/install-manifest.json"
+    printf '%s' '{"version":"2.0","records":[],"services":[],"groups":[{"group":"plugdev","user":"testuser","component":"keyboard","was_member":true,"added_by_project":true}]}' > "$mp"
+
+    # the consume-all stub must NOT intercept the new clear writer
+    block_group_consume_stub "$sandbox"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_clear_group_added plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/clear.rc"
+    '
+    assert_eq "0" "$(cat "$sandbox/clear.rc")" "stub-contract: clear writer passes consume-all stub"
+    assert_eq "False" "$(grp_added_at "$mp" 0)" "stub-contract: flag cleared"
+
+    # the add-write stub must NOT intercept the clear writer but MUST block add
+    block_group_manifest_write "$sandbox"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_USERMOD_LOG="$2/usermod.log"
+        source "$1/lib/backup.sh"
+        rc=0; manifest_clear_group_added plugdev testuser keyboard || rc=$?
+        printf "%s\n" "$rc" > "$2/clear2.rc"
+        rc=0; manifest_add_group plugdev testuser keyboard 1 1 || rc=$?
+        printf "%s\n" "$rc" > "$2/add.rc"
+    '
+    assert_eq "0" "$(cat "$sandbox/clear2.rc")" "stub-contract: clear writer passes add-write stub"
+    assert_eq "1" "$(cat "$sandbox/add.rc")" "stub-contract: add writer still refused"
+}
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 test_restore_existing
@@ -8811,6 +9208,13 @@ test_plugdev_preexisting_three_components_consume_only_after_last
 test_plugdev_preexisting_member_udev_rule_keeps_record_then_consumes
 test_plugdev_preexisting_consume_failure_keeps_record
 test_plugdev_dry_run_all_true_no_side_effects
+# Re-review #13 (P2 CONDITIONAL): per-install added_by_project lifecycle
+test_plugdev_admin_removed_while_installed_reinstall_can_rollback
+test_plugdev_reinstall_added_kept_while_third_party_rule
+test_plugdev_reinstall_usermod_failure_clears_added_flag
+test_plugdev_added_flag_wrong_type_fails_closed_legacy_accepted
+test_plugdev_dry_run_added_flag_no_side_effects
+test_plugdev_added_writer_stub_contract
 
 # ---------------------------------------------------------------------------
 # Re-review #11/#12 finding #2 (P2 DATA SAFETY / STATE RESTORATION, PAM-1..12):

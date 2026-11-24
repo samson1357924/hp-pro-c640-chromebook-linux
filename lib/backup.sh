@@ -544,10 +544,13 @@ def atomic_write_json(mp, data):
 # A full install records keyboard:was_member=false then
 # fingerprint:was_member=true (same pair); each component's own record alone
 # cannot answer "did we add this membership?", so uninstall must aggregate.
-# rc 0 = at least one component recorded was_member=false => we added it
+# rc 0 = at least one component recorded was_member=false, OR any record has
+#        added_by_project=true (per-install evidence that we re-added the user
+#        after an earlier true snapshot) => we added it
 # rc 1 = NO record for this (group,user) => nothing to roll back
-# rc 3 = every record was_member=true => pre-existing; metadata is stale once
-#        no component/udev rule needs the group (consume it, NO gpasswd)
+# rc 3 = every record was_member=true AND no added_by_project flag =>
+#        pre-existing; metadata is stale once no component/udev rule needs the
+#        group (consume it, NO gpasswd)
 # rc 2 = unreadable / wrong safety-field type => caller fails closed
 # argc = 6 (python3 -c SCRIPT mp group user): below every writer-stub threshold
 # used by the test suite, and it does not contain any rollback-fault marker.
@@ -569,10 +572,12 @@ for g in matches:
     w = g.get("was_member")
     if not isinstance(w, bool):
         sys.exit(2)          # defence in depth; the validator gate rejects this too
+    if "added_by_project" in g and not isinstance(g["added_by_project"], bool):
+        sys.exit(2)          # defence in depth; wrong type is never permission evidence
 for g in matches:
-    if g["was_member"] is False:
-        sys.exit(0)          # explicit bool false is the only proof we added it
-sys.exit(3)                  # all true: pre-existing, safe to drop stale metadata
+    if g["was_member"] is False or g.get("added_by_project") is True:
+        sys.exit(0)          # explicit false OR a per-install added flag proves we added it
+sys.exit(3)                  # all true, no added flag: pre-existing, safe to drop stale metadata
 '
 
 # Single validation source for all manifest readers/writers. Reads the path
@@ -587,7 +592,10 @@ sys.exit(3)                  # all true: pre-existing, safe to drop stale metada
 # let rollback delete a user's file / disable a user's service / drop a group
 # membership without evidence. Truly optional legacy fields (component, scope,
 # installed_at, top-level services/groups arrays) stay optional and are
-# normalised/defaulted.
+# normalised/defaulted. groups[*].added_by_project is OPTIONAL per-install
+# evidence (missing = legacy false, meaning "no extra evidence"): a present
+# field with the wrong type is still invalid and fails closed. Canonical output
+# never injects it into existing records (first-wins byte semantics).
 _MANIFEST_VALIDATE_PY='
 import json, sys, os
 
@@ -663,10 +671,11 @@ for i, svc in enumerate(data.get("services", [])):
 
 for i, grp in enumerate(data.get("groups", [])):
     where = "groups[%d]" % i
-    check(grp, "group",      "str",  where, required=True)
-    check(grp, "user",       "str",  where, required=True)
-    check(grp, "component",  "str",  where, required=True)
-    check(grp, "was_member", "bool", where, required=True)
+    check(grp, "group",             "str",  where, required=True)
+    check(grp, "user",              "str",  where, required=True)
+    check(grp, "component",         "str",  where, required=True)
+    check(grp, "was_member",        "bool", where, required=True)
+    check(grp, "added_by_project",  "bool", where)   # optional; wrong type -> invalid
 
 # Canonical output (unchanged): defaults are only added at the top level;
 # record-level fields are never injected/reordered, preserving first-wins.
@@ -958,32 +967,55 @@ _manifest_add_group_body() {
     if [ "$was_member" != "0" ] && [ "$was_member" != "1" ]; then
         id -nG "$2" 2> /dev/null | tr ' ' '\n' | grep -qx "$1" && was_member=1 || was_member=0
     fi
+    # $5=mark_added (0/1): per-install evidence that THIS attempt re-added the
+    # user after an earlier true snapshot (admin removed membership while the
+    # component was still installed). Anything else is treated as 0.
+    local mark_added="${5:-0}"
+    case "$mark_added" in
+        0 | 1) ;;
+        *) mark_added=0 ;;
+    esac
     sudo mkdir -p "$MANIFEST_DIR"
     local write_rc=0
+    # argc=8 (python3 -c SCRIPT mp group user comp member mark): still matches
+    # block_group_manifest_write (argc>=7 + was_member marker) for T1/T6.
     printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'import json, sys, os
-mp, group, user, comp, member = sys.argv[1:6]
+mp, group, user, comp, member, mark = sys.argv[1:7]
 data = json.load(sys.stdin)
 data.setdefault("version", "2.0")
 data.setdefault("records", [])
 data.setdefault("services", [])
 data.setdefault("groups", [])
-if not any(g.get("group") == group and g.get("user") == user and g.get("component") == comp for g in data["groups"]):
+existing = [g for g in data["groups"]
+            if g.get("group") == group and g.get("user") == user and g.get("component") == comp]
+if existing:
+    # first-wins: was_member and any existing value are NEVER changed. Only ADD
+    # the new evidence when the original snapshot was true and this attempt
+    # really re-added the user; an original false is already proof by itself.
+    if mark == "1" and all(g.get("was_member") is True for g in existing):
+        for g in existing:
+            g["added_by_project"] = True
+else:
     data["groups"].append({
         "group": group, "user": user, "component": comp,
-        "was_member": member == "1"
+        "was_member": member == "1",
+        "added_by_project": mark == "1",
     })
 atomic_write_json(mp, data)
-' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member" || write_rc=$?
+' "$MANIFEST_FILE" "$1" "$2" "$3" "$was_member" "$mark_added" || write_rc=$?
     [ "$write_rc" -le 1 ] || write_rc=1
     return "$write_rc"
 }
 
 manifest_add_group() {
-    # $1=group $2=user $3=component [$4=was_member override: 0/1] — record
-    # whether the user was already a member of the group BEFORE we added
-    # them (snapshot it before usermod), so uninstall only removes
-    # memberships we created. First record wins: a reinstall must not
-    # overwrite the membership state captured at the original install.
+    # $1=group $2=user $3=component [$4=was_member override: 0/1]
+    # [$5=mark_added override: 0/1] — record whether the user was already a
+    # member of the group BEFORE we added them (snapshot it before usermod), so
+    # uninstall only removes memberships we created. First record wins: a
+    # reinstall must not overwrite the membership state captured at the
+    # original install. mark_added stores per-install evidence (only when the
+    # original was_member is true); it is cleared by manifest_clear_group_added
+    # if this attempt's usermod fails.
     [ -z "$2" ] || [ "$2" = "root" ] && return 0
     [ "${DRY_RUN:-0}" = "1" ] && {
         log_dryrun "Would record group: $2@$1"
@@ -992,6 +1024,45 @@ manifest_add_group() {
     manifest_lock || return 1
     local rc=0
     _manifest_add_group_body "$@" || rc=$?
+    manifest_unlock
+    return "$rc"
+}
+
+# Re-review #13 (P2 CONDITIONAL PERMISSION LIFECYCLE): if usermod -aG fails
+# AFTER we persisted an added_by_project flag, clear ONLY that flag. The
+# original first-wins record (and its was_member) is never removed here (T6).
+# The script carries the unique # GROUP_ADDED_FLAG_CLEAR marker for precise
+# fault injection; argc=6 and neither was_member nor GROUP_CONSUME_ALL appears
+# in the script, so no existing writer-fault stub intercepts it.
+_clear_group_added_body() {
+    if ! manifest_load; then
+        log_error "Manifest at $MANIFEST_FILE is corrupt/invalid; refusing to clear group-added evidence for $2@$1"
+        return 1
+    fi
+    printf '%s' "$MANIFEST_JSON" | sudo python3 -c "$_MANIFEST_ATOMIC_WRITE_PY"'# GROUP_ADDED_FLAG_CLEAR
+import json, sys, os
+mp, group, user, comp = sys.argv[1:5]
+data = json.load(sys.stdin)
+data.setdefault("groups", [])
+changed = False
+for g in data["groups"]:
+    if (g.get("group") == group and g.get("user") == user and g.get("component") == comp
+            and g.get("added_by_project") is True):
+        g["added_by_project"] = False
+        changed = True
+if changed:
+    atomic_write_json(mp, data)
+' "$MANIFEST_FILE" "$1" "$2" "$3"
+}
+
+manifest_clear_group_added() {
+    # $1=group $2=user $3=component — clear per-install added evidence only
+    # after a FAILED usermod. DRY_RUN and a missing manifest are no-ops.
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    [ -f "$MANIFEST_FILE" ] || return 0
+    manifest_lock || return 1
+    local rc=0
+    _clear_group_added_body "$@" || rc=$?
     manifest_unlock
     return "$rc"
 }
@@ -1100,9 +1171,19 @@ _ensure_group_membership_body() {
             ;;
     esac
 
+    # (2b) Re-review #13 (P2): an existing record whose was_member=true, but
+    # whose CURRENT membership is false, means THIS install is about to re-add
+    # a membership an administrator removed while the component was installed.
+    # First-wins keeps the old true snapshot, so persist per-install evidence.
+    # The writer only sets the flag when every existing snapshot is true.
+    local mark_added=0
+    if [ "$was_member" = "0" ] && [ "$had_record" = "1" ]; then
+        mark_added=1
+    fi
+
     # (3) Persist the original state first. If the write fails we do not even
     # attempt usermod: an untracked privilege change is worse than no change.
-    if ! manifest_add_group "$group" "$user" "$component" "$was_member"; then
+    if ! manifest_add_group "$group" "$user" "$component" "$was_member" "$mark_added"; then
         log_error "Group manifest write failed for $user@$group; refusing to change membership (uninstall could not undo it)"
         return 1
     fi
@@ -1112,6 +1193,15 @@ _ensure_group_membership_body() {
     if [ "$was_member" = "0" ]; then
         if ! sudo usermod -aG "$group" "$user"; then
             log_error "Failed to add '$user' to group '$group'"
+            if [ "$mark_added" = "1" ]; then
+                # We persisted added evidence before usermod; undo ONLY that
+                # evidence so a later uninstall cannot gpasswd a user who is
+                # not actually in the group. The original first-wins record
+                # (and its was_member) is never removed here.
+                if ! manifest_clear_group_added "$group" "$user" "$component"; then
+                    log_error "Could not clear added-by-project evidence for $user@$group; kept for manual cleanup"
+                fi
+            fi
             if [ "$had_record" = "0" ]; then
                 # We just wrote the record for THIS attempt; undo it so a
                 # later uninstall cannot remove a membership the user
@@ -1169,6 +1259,8 @@ _remove_group_membership_body() {
     # Aggregate across ALL components for (group,user). A sibling component's
     # was_member=false is proof that WE added the membership, even when this
     # component's own record says true (keyboard-then-fingerprint full install).
+    # An added_by_project=true flag is equivalent per-install proof even when
+    # every was_member is true (admin removed + reinstall while still installed).
     local own_rc=0
     python3 -c "$_GROUP_OWNERSHIP_PY" "$MANIFEST_FILE" "$group" "$user" \
         > /dev/null 2>&1 || own_rc=$?
@@ -1178,8 +1270,9 @@ _remove_group_membership_body() {
             return 0
             ;;
         3)
-            # ALL records say was_member=true: we never added this membership,
-            # so NO gpasswd is ever authorised here. Two sub-cases:
+            # ALL records say was_member=true AND none carries an
+            # added_by_project flag: we never added this membership, so NO
+            # gpasswd is ever authorised here. Two sub-cases:
             #  (a) a udev rule still references the group => a component is
             #      still installed/managing it: keep the first-wins snapshot;
             #  (b) no rule => every module that could add the user is gone.
@@ -1202,7 +1295,8 @@ _remove_group_membership_body() {
             return 1
             ;;
     esac
-    # rc 0: some component recorded was_member=false => WE added the membership.
+    # rc 0: some component recorded was_member=false, or a record carries an
+    # added_by_project=true flag => WE added the membership in this generation.
     # Keep it while ANY udev rule (ours from a sibling, or third-party) needs it.
     if _group_udev_rule_references "$group"; then
         log_info "udev rules still reference group '$group'; keeping '$user' in it."
