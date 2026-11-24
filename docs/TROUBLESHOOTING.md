@@ -348,8 +348,11 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     missing one means unknown, never `false`; the string `"false"` and number `1` are
     rejected, not coerced). Service `name`/`component` and group `group`/`user`/
     `component` are required; other optional fields may be absent (legacy v1) and unknown
-    keys ignored. Repair or deliberately remove it before reinstalling; never treat an
-    invalid manifest as an empty one.
+    keys ignored. `groups[*].added_by_project` is an **optional** per-install boolean
+    (absent = legacy `false`, "no extra evidence"); a present field of the wrong type is
+    also `MANIFEST_INVALID` and fails closed — it is never read as permission evidence.
+    Repair or deliberately remove it before reinstalling; never treat an invalid manifest
+    as an empty one.
   * `skipping manifest entry with non-absolute target` means the installer skipped a
     pseudo-target (such as the fingerprint `package:libfprint-crfpmoc`) that cannot be a
     record `target`; it is not an error.
@@ -453,9 +456,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * Group membership is now recorded **before** `usermod` runs: the installer persists the
     original `plugdev` membership, checks `usermod` rc explicitly (no `|| true`) and, if
     the change fails with no earlier record, removes the record it just wrote. The shared
-    ownership probe returns rc 0 when some record is explicitly `was_member=false` (we added
-    it), rc 1 for **no record** (`No group record for '<user>'@'<group>'; nothing to roll
-    back.`), rc 3 when **all** records are `was_member=true` (pre-existing), rc 2 for a bad
+    ownership probe returns rc 0 when some record is explicitly `was_member=false` **or a
+    record carries `added_by_project=true`** (both prove we added it), rc 1 for **no record**
+    (`No group record for '<user>'@'<group>'; nothing to roll back.`), rc 3 when **all**
+    records are `was_member=true` and none carries the flag (pre-existing), rc 2 for a bad
     field type (`Cannot determine original membership of <user>@<group>; refusing to change
     it`, rc 1). first-wins is unchanged: rc 0 runs `gpasswd -d`, and a udev rule that still
     references the group keeps the membership. On **rc 3** no `gpasswd` ever runs: if a udev
@@ -468,7 +472,14 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     admin changed it). A consume failure logs `Could not consume stale group records for
     '<user>'@'<group>'; keeping them for retry.` (rc 1). With rc 0, uninstall consumes all
     component records only after `gpasswd -d` succeeds (`manifest_remove_group_all`), so the
-    module uninstall order cannot leave a stale `was_member` record behind.
+    module uninstall order cannot leave a stale `was_member` record behind. On a reinstall
+    where the original `was_member=true` but the user is currently **not** a member (an admin
+    removed it while the component stayed installed), the writer records
+    `added_by_project=true` beside the untouched first-wins snapshot; the probe then returns
+    rc 0 so uninstall removes the membership granted in this generation. If `usermod -aG`
+    fails, `manifest_clear_group_added` clears **only** that flag
+    (`Could not clear added-by-project evidence for <user>@<group>; kept for manual cleanup`
+    means that clear itself failed); consume-all removes the whole row, flag included.
   * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
     means `gpasswd -d` failed. This is now a **real failure** (log_error, rc 1) — the three
     component uninstallers capture it and fold it into their exit code, so a full
@@ -478,21 +489,61 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     the same rc-1/retry meaning when the manifest write after a successful removal fails.
   * `Manifest still records /etc/pam.d/sudo: rollback did not restore it. Uninstall did NOT
     modify this file; remove the project line manually if needed.` is the read-only
-    post-rollback PAM check: uninstall never sed-edits sudo PAM (all restoration comes from
-    `rollback_component("fingerprint")`), so a pre-existing exact `pam_fprintd` line is not
-    deleted. If the manifest is corrupt it instead warns `Manifest at ... is corrupt/invalid;
-    cannot confirm rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.` — either
-    way it only warns. On Debian/Ubuntu the original `common-*` bytes are backed up (Tier 2)
-    and restored by rollback. Install removes fp lines with a **direct**
-    `sed -i '/pam_fprintd\.so/d'` (log `Removed pam_fprintd.so line(s) from ...`), **never**
-    `pam-auth-update --remove fprintd` — that action deletes debconf's
-    `libpam-runtime/profiles` selection, which rollback cannot restore. The selection is
-    therefore untouched: uninstall calls no profile tool, and a later `pam-auth-update`
-    regenerates the original stack. Trade-off: an administrator running
-    `pam-auth-update --force` during install can let the still-enabled selection write the
-    fp line back (briefly restoring the GDM race) — non-persistent, and rollback restores
-    the files. Fedora `authselect` and openSUSE `pam-config` profile state is outside the
-    manifest, so restore any pre-existing profile manually as the warning says.
+    post-rollback PAM check: uninstall never sed-edits sudo PAM (all file restoration comes
+    from `rollback_component("fingerprint")`), so a pre-existing exact `pam_fprintd` line is
+    not deleted. If the manifest is corrupt it instead warns `Manifest at ... is corrupt/invalid;
+    cannot confirm rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.`
+    — either way it only warns. On Debian/Ubuntu the original `common-*` bytes are backed up
+    (**all** existing ones, not just fp-containing ones) and restored by rollback. Install
+    removes fp lines with a **direct** `sed -i '/pam_fprintd\.so/d'` (log `Removed
+    pam_fprintd.so line(s) from ...`), **never** `pam-auth-update --remove fprintd` — that
+    action deletes debconf's `libpam-runtime/profiles` selection outright. Since a later
+    `pam-auth-update --package` derives the profile list from the current `common-*` content
+    and would otherwise lose fprintd permanently, install snapshots the selection and
+    `/var/lib/pam/*` into a first-wins sidecar and runs `pam-auth-update --package` itself to
+    converge to a stable "no fprintd" state (a package-triggered rerun is then a no-op).
+    Uninstall restores from that snapshot only after rollback is complete. Fedora `authselect`
+    and openSUSE `pam-config` profile state is outside the manifest, so restore any
+    pre-existing profile manually as the warning says.
+  * `Snapshotted the PAM profile selection to <path>` / `Keeping the existing PAM selection
+    snapshot at <path> (first-wins).` are the install-time sidecar logs. The sidecar
+    (`<manifest-dir>/pam-selection`) stores the original debconf `libpam-runtime/profiles`
+    multiselect (mode `0644`); `<manifest-dir>/pam-selection.saved` is a root-owned `0700`
+    directory holding copies of every file under `/var/lib/pam`. Both are published once,
+    first-wins, and all reads/copies go through `sudo` so a non-root uninstall with
+    passwordless `sudo` can restore them; `Could not read debconf
+    libpam-runtime/profiles; ... will be empty.`, `Could not write the PAM selection snapshot;
+    ...` and `Could not snapshot every saved PAM profile file; ...` mean the snapshot is
+    incomplete — uninstall then cannot fully restore the original state, so check those
+    files by hand. `pam-auth-update --package converged the debconf selection and saved
+    profiles (no fprintd).` is the expected self-convergence log; `pam-auth-update --package
+    failed; keeping the selection snapshot for uninstall convergence.` keeps the sidecar.
+  * `No PAM selection snapshot at <path>; nothing to restore.` means no fprintd-capable
+    install left a sidecar, so there is nothing to converge back. `Original PAM profile
+    selection restored; snapshot consumed.` is the success path: after rollback is confirmed
+    complete, the `.saved` files are copied back, the multiselect is written with
+    `debconf-set-selections`, `--package` runs again and the live selection is verified.
+    `Manifest still records <path>: rollback is incomplete, leaving the PAM selection
+    snapshot for retry.` or `Manifest at ... is corrupt/invalid; leaving the PAM selection
+    snapshot for retry.` means debconf was deliberately **not** touched; finish rollback
+    (or repair the manifest) and re-run uninstall.
+  * `debconf-set-selections is unavailable; keeping <path> for retry.` and
+    `debconf-set-selections failed; keeping <path> for retry.` mean the selection could not
+    be written — the sidecar and `.saved` snapshot stay for a later uninstall; install
+    `debconf` (or fix the `sudo` helper) and retry. `The PAM selection snapshot is empty;
+    cannot restore the debconf selection.` means only the `.saved` files were restored.
+    `Could not restore every saved PAM profile file from the snapshot.` means some
+    `/var/lib/pam` files may still be in the converged no-fprintd state; reinstall them or
+    restore by hand.
+  * `PAM selection restore verification failed: expected '<a>', got '<b>'. Keeping <path> for
+    retry.` is a fail-closed mismatch (rc 1, sidecar retained). The comparison accepts an
+    exact match **or** a whitespace/order-insensitive set: `pam-auth-update` canonicalizes
+    the multiselect to "a, b, c", so a different order or spacing in your original value is
+    fine, but a different **set** of profiles is not (an admin's later deliberate change is
+    not silently accepted). Trade-off: because the snapshot is authoritative, a selection
+    change made during installation is overwritten on uninstall; manually enabling the
+    fprintd profile during install (`pam-auth-update --enable fprintd`) writes fp back into
+    `common-auth` and restores the GDM race until uninstall.
 
 ---
 

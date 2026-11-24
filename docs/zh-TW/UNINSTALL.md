@@ -79,24 +79,39 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   管理員變更後的成員資格。消耗失敗會 fail closed 並保留紀錄供重試。`gpasswd -d` 失敗
   會記錄 error 並回 rc 1（三個 uninstaller 會把它折進結束碼），不再謊報移除成功，
   紀錄留待日後重試。
-* **PAM 設定只由 rollback 還原；uninstall 絕不刪除既有行。**
+* **每次安裝重新授予的成員資格會被逐次記錄。** group record 可選填布林 `added_by_project`
+  （缺席＝legacy `false`，代表「沒有額外證據」；出現但型別錯誤是 `MANIFEST_INVALID` 並
+  fail closed）。`was_member` 仍是 first-wins，重裝絕不覆寫。若原始快照為 `true` 但使用者
+  現在**不是**成員——表示管理員在元件仍安裝時移除了成員資格——本次安裝即將重新加入，
+  writer 便在未變動的 `true` 快照旁設 `added_by_project=true`。歸屬探測因此把該 flag 當作
+  明確的 `was_member=false`（rc 0），uninstall 便執行 `gpasswd -d`，移除本次所授予的成員資格。
+  若 `usermod -aG` 失敗，`manifest_clear_group_added` 只清除 **該 flag**（first-wins 紀錄保留）；
+  consume-all 則連整列（含 flag）一起移除。沒有 flag 時，全 `true` 快照仍是 rc 3（「我們從未
+  加入」：零次 gpasswd，只有沒有 udev rule 需要該 group 時才消耗過期紀錄）——flag 不會因為
+  原始快照為 `true` 就被丟棄。
+* **PAM 檔案位元組由 rollback 還原；debconf selection 則快照、收斂後還原。**
   `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
   或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，
-  因此安裝前就已存在的精確 `pam_fprintd` 行會被保留。Debian/Ubuntu 上，Tier 2 會先備份
-  確實含 `pam_fprintd.so` 的每個 `common-*` 檔，再**直接以
-  `sed -i '/pam_fprintd\.so/d'` 只移除那些模組行**。安裝器**不呼叫** `pam-auth-update
-  --remove fprintd`：該動作也會刪除 debconf 的 `libpam-runtime/profiles` selection，
-  這是 manifest 無法還原的持久狀態。直接行移除可達成相同目的（`common-auth` 不再含 fp
-  行，GDM 的 `gdm-password` include 故無法搶到裝置），同時讓 selection 完全不變——日後
-  重跑 `pam-auth-update` 會生成**原始**堆疊。uninstall 不呼叫任何 profile 工具；
-  原始 `common-*` 位元組由 rollback 還原。**取捨**：若管理員在安裝期間自行執行
-  `pam-auth-update --force`，仍啟用的 selection 可能把 fp 行寫回 `common-auth`
-  （短暫恢復 GDM 競賽），但這不是持久狀態且 rollback 會還原檔案。解除安裝後 selection
-  回復原始狀態——若原本就啟用 fprintd，日後重跑工具會還原原始含 fp 的堆疊，
-  這正是原始狀態。唯讀的 rollback 後檢查會在 manifest 仍記錄 `/etc/pam.d/sudo` 時警告
-  （可能需要手動清理），或在 manifest 損毀時警告——兩者都不修改檔案。Fedora 的
-  `authselect` 與 openSUSE 的 `pam-config` profile 狀態不在 manifest 內：工具呼叫仍保留，
-  但會警告請手動還原原本的 profile。
+  因此安裝前就已存在的精確 `pam_fprintd` 行會被保留。Debian/Ubuntu 上安裝器現在會：
+  (1) 把 debconf `libpam-runtime/profiles` selection 與 `/var/lib/pam` 下每個已儲存的模組檔
+  快照到 manifest 旁的 sidecar（`pam-selection` 檔案 `0644`、`pam-selection.saved` 為 root
+  擁有的 `0700` 目錄）——first-wins、原子，所有讀取/複製都經由 `sudo`，讓非 root uninstall
+  也能還原、root-only 的 `/var/lib/pam` 也能擷取；(2) 備份**所有**現有的 `common-*` 檔，不只含 fp 者，因為
+  `--package` 可能改寫任一個；(3) 直接以 `sed -i '/pam_fprintd\.so/d'` 只移除 fp 模組行，
+  立即消除 GDM 競賽；(4) 自己先跑一次 `pam-auth-update --package`，讓 debconf 與
+  `/var/lib/pam` 收斂到穩定的「無 fprintd」狀態，日後套件觸發的執行即為 no-op。它**絕不**
+  呼叫 `pam-auth-update --remove`（該動作會直接刪除 debconf selection）。uninstall 時，
+  在確認 manifest rollback 完成（sudo 與所有 `common-*` 紀錄皆已消耗）後，先複回已儲存的
+  快照，以 `debconf-set-selections` 寫回原始 multiselect，再跑一次 `--package`，並比對線上的
+  selection（精確比對或忽略空白的集合比對）；比對成功才消耗 sidecar。還原失敗會保留 sidecar
+  並回 rc 1；manifest 損毀或有紀錄殘留則完全不寫 debconf，保留快照供重試。非 root 安裝器搭配
+  passwordless `sudo` 全程皆支援。**取捨**：快照具有最終權威，因此管理員在安裝期間刻意變更
+  selection，會在 uninstall 時被覆寫；安裝期間手動重新啟用 fprintd profile（例如
+  `pam-auth-update --enable fprintd`）會把 fp 行寫回 `common-auth`，直至 uninstall 前都恢復
+  GDM 競賽。唯讀的 rollback 後檢查會在 manifest 仍記錄 `/etc/pam.d/sudo` 時警告（可能需要
+  手動清理），或在 manifest 損毀時警告——兩者都不修改檔案。Fedora 的 `authselect` 與 openSUSE
+  的 `pam-config` profile 狀態不在 manifest 內：工具呼叫仍保留，但會警告請手動還原原本的
+  profile。
 * **並行的安裝/解除安裝不會遺失追蹤紀錄，也不會留下未追蹤的部署。** 每個元件安裝器
   透過 `lib/backup.sh` 的 `run_manifest_operation()`，在**整個元件操作交易**——備份/紀錄 →
   部署檔案與服務 → 完成或回滾——只取得一把操作級鎖。巢狀 helper（備份 gate、群組 helper、
@@ -160,9 +175,11 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 
   *（會透過 manifest rollback 還原備份的 `libfprint` 函式庫、`60-cros-fp.rules`
   與 sudo/`common-*` PAM 位元組——uninstall 絕不對 `/etc/pam.d/sudo` 執行 sed，
-  安裝前已存在的 `pam_fprintd` 行會被保留。並移除 `fprintd-sleep.sh`
-  system-sleep hook 與 `/var/lib/fprint/crfpmoc.key`、移除安裝器新增的
-  plugdev 成員資格（歸屬由所有元件共同判定），並還原服務狀態。）*
+  安裝前已存在的 `pam_fprintd` 行會被保留。rollback 確認完成後，也會以
+  `debconf-set-selections` + `pam-auth-update --package` 還原快照的 debconf profile
+  selection 與 `/var/lib/pam` 檔案。並移除 `fprintd-sleep.sh` system-sleep hook
+  與 `/var/lib/fprint/crfpmoc.key`、移除安裝器新增的 plugdev 成員資格（歸屬由所有
+  元件共同判定，含逐次安裝的 `added_by_project` 證據），並還原服務狀態。）*
 
 * **僅移除鍵盤頂排映射與背光同步**（上述 5 項）：
 

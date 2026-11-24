@@ -91,28 +91,49 @@ but the final exit code is non-zero and `finished!` is not printed:
   fails closed and keeps the records for retry. `gpasswd -d` failure logs an error and
   returns rc 1 (the three uninstallers fold it into their exit code); no "removed" success
   is reported, and the records stay for a later retry.
-* **PAM files are restored by rollback only; uninstall never deletes a pre-existing line.**
-  `disable_pam_fingerprint()` performs **no sed and no direct edit** of `/etc/pam.d/sudo`
-  (or any distro PAM file). All bytes come from the first backup via
-  `rollback_component("fingerprint")`, so an exact `pam_fprintd` line that was already
-  present before installation is preserved. On Debian/Ubuntu, Tier 2 backs up every
-  `common-*` file that actually contains `pam_fprintd.so`, then removes **only those module
-  lines with a direct `sed -i '/pam_fprintd\.so/d'`**. The installer never calls
-  `pam-auth-update --remove fprintd`: that action also deletes debconf's
-  `libpam-runtime/profiles` selection, a persistent state the manifest cannot restore.
-  Direct line removal reaches the same goal (`common-auth` has no fp line, so GDM's
-  `gdm-password` include cannot win the device claim) while leaving the selection intact —
-  a later `pam-auth-update` regenerates the **original** stack. Uninstall calls no profile
-  tool at all; the original `common-*` bytes come back from rollback. Trade-off: if an
-  administrator runs `pam-auth-update --force` during installation, the still-enabled
-  selection can write the fp line back into `common-auth` (briefly restoring the GDM race);
-  that is non-persistent and rollback restores the files. After uninstall the selection is
-  the original one — if fprintd was originally enabled, later tool runs regenerate the
-  original fp-containing stack, which is by definition the original state. A read-only
-  post-rollback check warns if a manifest record still covers `/etc/pam.d/sudo` (manual
-  cleanup may be needed) or if the manifest is corrupt — it never modifies a file. Fedora
-  `authselect` and openSUSE `pam-config` profile state is outside the manifest: the tool
-  calls remain but a warning asks you to restore any pre-existing profile manually.
+* **A re-granted membership is tracked per install generation.** A group record may carry
+  an optional boolean `added_by_project` (absent = legacy `false`, i.e. "no extra evidence";
+  a present field of the wrong type is `MANIFEST_INVALID` and fails closed). `was_member`
+  stays first-wins and is never rewritten by a reinstall. If the original snapshot was
+  `true` but the user is **not** a member now — an administrator removed the membership
+  while the component remained installed — this install is about to re-add it, so the
+  writer sets `added_by_project=true` next to the untouched `true` snapshot. The ownership
+  probe then treats that flag like an explicit `was_member=false` (rc 0), so uninstall runs
+  `gpasswd -d` and removes exactly the membership this generation granted. If `usermod -aG`
+  fails, `manifest_clear_group_added` clears **only** the flag (the first-wins record stays);
+  consume-all removes the whole row, flag included. With no flag, an all-true snapshot still
+  returns rc 3 ("never added by us": zero `gpasswd`, stale records consumed only when no udev
+  rule needs the group) — the flag is never discarded just because the original was `true`.
+* **PAM file bytes come from rollback; the debconf selection is snapshotted, converged and
+  restored.** `disable_pam_fingerprint()` performs **no sed and no direct edit** of
+  `/etc/pam.d/sudo` (or any distro PAM file). All bytes come from the first backup via
+  `rollback_component("fingerprint")`, so an exact `pam_fprintd` line that was already present
+  before installation is preserved. On Debian/Ubuntu the installer now: (1) snapshots the
+  debconf `libpam-runtime/profiles` selection and every saved module file under `/var/lib/pam`
+  into a sidecar next to the manifest (`pam-selection` mode `0644`, `pam-selection.saved` a
+  root-owned `0700` directory) — first-wins and atomic, with every read/copy through `sudo`
+  so a non-root uninstall can restore it and a root-only `/var/lib/pam` is captured;
+  (2) backs up **all** existing `common-*` files, not just
+  fp-containing ones, because `--package` can rewrite any of them; (3) removes only the fp
+  module lines with a direct `sed -i '/pam_fprintd\.so/d'`, immediately closing the GDM race;
+  (4) runs `pam-auth-update --package` itself so debconf and `/var/lib/pam` converge to a
+  stable "no fprintd" state and a later package-triggered run is a no-op. It **never** calls
+  `pam-auth-update --remove`, which deletes the debconf selection outright. On uninstall,
+  after manifest rollback is confirmed complete (the sudo record and every `common-*`
+  record consumed), the saved snapshots are copied back, the original multiselect is written
+  with `debconf-set-selections`, `--package` runs again, and the live selection is compared
+  (exact or whitespace-insensitive set); only then is the sidecar consumed. A failed restore
+  keeps the sidecar and returns rc 1; a corrupt manifest or a surviving record skips all
+  debconf writes and keeps the snapshot for retry. Non-root installers with passwordless
+  `sudo` are supported throughout. Trade-off: the snapshot is authoritative, so an
+  administrator who deliberately changes the selection during installation has it overwritten
+  on uninstall; manually re-enabling the fprintd profile during install (e.g.
+  `pam-auth-update --enable fprintd`) writes the fp line back into `common-auth` and restores
+  the GDM race until uninstall. A read-only post-rollback check warns if a manifest record
+  still covers `/etc/pam.d/sudo` (manual cleanup may be needed) or if the manifest is corrupt —
+  it never modifies a file. Fedora `authselect` and openSUSE `pam-config` profile state is
+  outside the manifest: the tool calls remain but a warning asks you to restore any
+  pre-existing profile manually.
 * **Concurrent install/uninstall runs cannot lose tracking records or leave untracked
   deployments.** Each component installer takes ONE operation-level lock around its whole
   transaction — backup/record → deploy files and services → finish or rollback — through
@@ -189,10 +210,13 @@ but the final exit code is non-zero and `finished!` is not printed:
 
   *(This restores the backed-up `libfprint` libraries, `60-cros-fp.rules` and
   sudo/`common-*` PAM bytes via manifest rollback — uninstall never sed-edits
-  `/etc/pam.d/sudo`, and a `pam_fprintd` line already present is kept. It removes
-  the `fprintd-sleep.sh` system-sleep hook and `/var/lib/fprint/crfpmoc.key`,
+  `/etc/pam.d/sudo`, and a `pam_fprintd` line already present is kept. It also
+  restores the snapshotted debconf profile selection and `/var/lib/pam` files with
+  `debconf-set-selections` + `pam-auth-update --package` once rollback is confirmed.
+  It removes the `fprintd-sleep.sh` system-sleep hook and `/var/lib/fprint/crfpmoc.key`,
   drops the installer-added plugdev membership (ownership decided across all
-  components), and rolls the service states back.)*
+  components, including per-install `added_by_project` evidence), and rolls the
+  service states back.)*
 
 * **Remove only the keyboard top-row mapping & backlight sync** (5 artifacts above):
 

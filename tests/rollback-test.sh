@@ -769,8 +769,9 @@ EOF
 }
 
 block_group_manifest_write() {
-    # Refuse ONLY manifest_add_group (argc=7, script mentions was_member).
-    # argc=6 (manifest_remove_group / rollback) and argc=3 (validator) pass.
+    # Refuse ONLY the group add writer manifest_add_group (argc=8, script mentions
+    # was_member); the clear writer (argc=6) passes. Stub threshold is argc>=7.
+    # manifest_remove_group / rollback (argc=6) and validator (argc=3) pass.
     local sandbox="$1"
     cat > "$sandbox/stub/python3" << 'EOF'
 #!/usr/bin/env bash
@@ -8342,8 +8343,9 @@ PY
 # Refuse ONLY manifest_remove_group_all()'s python writer: argc=5
 # (python3 -c SCRIPT mp group user), script contains atomic_write_json AND the
 # # GROUP_CONSUME_ALL marker. The ownership probe (argc=5, no
-# atomic_write_json), the validator (argc=3) and manifest_add_group (argc=7,
-# no marker) all pass through to the real python3.
+# atomic_write_json), the validator (argc=3), the group add writer (argc=8, no
+# marker) and the clear writer (argc=6, no marker) all pass through to the real
+# python3. The add-writer stub threshold is argc>=7.
 block_group_consume_stub() {
     local sandbox="$1"
     cat > "$sandbox/stub/python3" << 'EOF'

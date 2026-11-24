@@ -193,10 +193,13 @@ remain for retry)` and returns rc 1 instead of claiming success.
   `/etc/pam.d/sudo`; the original bytes come from `rollback_component("fingerprint")`, so a
   pre-existing exact `pam_fprintd` line is preserved. On Debian/Ubuntu, install removes fp
   lines from `common-*` with a direct `sed -i '/pam_fprintd\.so/d'` — never
-  `pam-auth-update --remove fprintd`, which would destroy the debconf profile selection
-  that rollback cannot restore; uninstall calls no profile tool. See
-  [UNINSTALL.md](../docs/UNINSTALL.md) for the Tier 2 backup, the selection-preservation
-  trade-off, the read-only stale-record check and the authselect/pam-config limits.
+  `pam-auth-update --remove fprintd`, which would delete the debconf profile selection
+  outright. Install snapshots that selection plus `/var/lib/pam/*` (first-wins sidecar) and
+  runs `pam-auth-update --package` itself to converge; uninstall restores them with
+  `debconf-set-selections` + `--package` after rollback completes, and verifies the
+  selection before consuming the snapshot. See [UNINSTALL.md](../docs/UNINSTALL.md) for the
+  Tier 2 backup, the admin-override trade-off, the read-only stale-record check and the
+  authselect/pam-config limits.
 
 All install callers save the rollback rc, complete their remaining cleanup and return
 that rc last, so `set -e` cannot abort cleanup when a rollback fails.
@@ -523,21 +526,24 @@ all state is in a temp dir. The daemon suite has 406 cases (write chain, re-prob
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
 `0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1509 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1642 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
 lock with absolute-path/canonical/literal-symlink/inode/ancestor/parent-dir rejection and fd
-8 pin, cross-component plugdev ownership including stale all-true record consumption with
-zero gpasswd and gpasswd failure rc 1, PAM original-line protection and profile-selection
-preservation, the whole-operation lock (OP1/OP2 FIFO-barrier regressions for deploy vs
-rollback, a real-installer barrier and fail-closed bodies), unique writer temps and checked
-`systemctl` restores.
+8 pin, cross-component plugdev ownership with optional per-install `added_by_project`
+evidence (R15-R20), stale all-true record consumption with zero gpasswd and gpasswd failure
+rc 1, PAM original-line protection plus first-wins debconf selection / `/var/lib/pam`
+snapshot, `pam-auth-update --package` convergence and verified uninstall restoration
+(including a non-root/passwordless-`sudo` case), the whole-operation lock (OP1/OP2
+FIFO-barrier regressions for deploy vs rollback, a real-installer barrier and fail-closed
+bodies), unique writer temps and checked `systemctl` restores. CI also runs a real-tool
+Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
-sudo bash tests/rollback-test.sh                       # 1509 cases (root)
+sudo bash tests/rollback-test.sh                       # 1642 cases (root)
 ```
 
 ---

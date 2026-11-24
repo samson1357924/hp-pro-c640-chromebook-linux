@@ -297,8 +297,10 @@
     `was_existing`/`was_enabled`/`was_active`/`was_member` 為**必填布林**（缺失代表
     未知，絕非 `false`；字串 `"false"` 與數字 `1` 會被拒絕，不轉換）。service 的
     `name`/`component` 與 group 的 `group`/`user`/`component` 為必填，其他選用欄位可
-    缺席（legacy v1），未知 key 忽略。重裝前請修復或明確移除它；切勿把無效的 manifest
-    當成空 manifest。
+    缺席（legacy v1），未知 key 忽略。`groups[*].added_by_project` 是**選用**的逐次安裝
+    布林（缺席＝legacy `false`，代表「沒有額外證據」）；出現但型別錯誤同樣是
+    `MANIFEST_INVALID` 並 fail closed，絕不會被當成權限證據。重裝前請修復或明確移除它；
+    切勿把無效的 manifest 當成空 manifest。
   * `skipping manifest entry with non-absolute target` 代表安裝器略過了無法作為 record
     `target` 的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`），這不是錯誤。
     `rollback of <component> failed; service/file state may be partial (retained records
@@ -384,9 +386,10 @@
     請勿以非特權使用者手動 chmod/chown 鎖檔——修正 `sudo` helper 或父目錄權限後重試。
   * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
     寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
-    紀錄，就移除剛寫入的紀錄。共用的歸屬探測在至少一筆明確為 `was_member=false` 時回 rc 0
-    （是我們加入的），**沒有紀錄**回 rc 1（`No group record for '<user>'@'<group>'; nothing
-    to roll back.`），**全部皆為 `was_member=true`** 回 rc 3（原本就存在），欄位型別錯誤
+    紀錄，就移除剛寫入的紀錄。共用的歸屬探測在至少一筆明確為 `was_member=false`，**或任一
+    紀錄帶有 `added_by_project=true`** 時回 rc 0（兩者都證明是我們加入的），**沒有紀錄**
+    回 rc 1（`No group record for '<user>'@'<group>'; nothing to roll back.`），**全部皆為
+    `was_member=true` 且沒有該 flag** 回 rc 3（原本就存在），欄位型別錯誤
     回 rc 2（`Cannot determine original membership of <user>@<group>; refusing to change it`，
     rc 1）。first-wins 不變：rc 0 才執行 `gpasswd -d`，而仍引用該 group 的 udev rule 會
     保留成員資格。**rc 3 時完全不呼叫 gpasswd**：若仍有 udev rule 引用該 group，會記錄
@@ -398,6 +401,11 @@
     `Could not consume stale group records for '<user>'@'<group>'; keeping them for retry.`
     （rc 1）。rc 0 時，uninstall 只有在 `gpasswd -d` 成功後才消耗該組的所有元件紀錄
     （`manifest_remove_group_all`），因此模組解除安裝順序不會留下過期的 `was_member` 紀錄。
+    若重裝時原始 `was_member=true` 但使用者目前**不是**成員（管理員在元件仍安裝時移除了），
+    writer 會在未變動的 first-wins 快照旁記錄 `added_by_project=true`，探測因此回 rc 0，讓
+    uninstall 移除本次授予的成員資格。若 `usermod -aG` 失敗，`manifest_clear_group_added` 只清除
+    **該 flag**（`Could not clear added-by-project evidence for <user>@<group>; kept for
+    manual cleanup` 代表清除本身失敗）；consume-all 則連整列（含 flag）一起移除。
   * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
     代表 `gpasswd -d` 失敗。現在這是**真正的失敗**（log_error、rc 1）：三個元件 uninstaller
     會捕捉它並折進結束碼，因此完整的 `./setup.sh --uninstall` 不會在成員資格仍存在時回報
@@ -406,19 +414,53 @@
     retry.` 有相同的 rc 1／重試語意。
   * `Manifest still records /etc/pam.d/sudo: rollback did not restore it. Uninstall did NOT
     modify this file; remove the project line manually if needed.` 來自唯讀的 rollback 後
-    PAM 檢查：uninstall 絕不對 sudo PAM 執行 sed（所有還原都由
+    PAM 檢查：uninstall 絕不對 sudo PAM 執行 sed（所有檔案還原都由
     `rollback_component("fingerprint")` 負責），因此原本就存在的精確 `pam_fprintd` 行不會
     被刪除。若 manifest 損毀，則改為警告 `Manifest at ... is corrupt/invalid; cannot confirm
     rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.`——兩種情況都只警告。
-    Debian/Ubuntu 上，原始 `common-*` 位元組會先備份（Tier 2）並由 rollback 還原。
-    安裝時**直接**以 `sed -i '/pam_fprintd\.so/d'` 移除 fp 行（記錄
+    Debian/Ubuntu 上，原始 `common-*` 位元組會先備份（**所有**現有的檔，不只含 fp 者）並由
+    rollback 還原。安裝時**直接**以 `sed -i '/pam_fprintd\.so/d'` 移除 fp 行（記錄
     `Removed pam_fprintd.so line(s) from ...`），**絕不呼叫** `pam-auth-update --remove
-    fprintd`——該動作會刪除 debconf 的 `libpam-runtime/profiles` selection，而 rollback
-    無法還原它。因此 selection 全程不變：uninstall 不呼叫任何 profile 工具，日後重跑
-    `pam-auth-update` 會生成原始堆疊。**取捨**：管理員若在安裝期間執行
-    `pam-auth-update --force`，仍啟用的 selection 可能把 fp 行寫回（短暫恢復 GDM 競賽）
-    ——這不是持久狀態，且 rollback 會還原檔案。Fedora 的 `authselect` 與 openSUSE 的
-    `pam-config` profile 狀態不在 manifest 內，請依警告手動還原原本的 profile。
+    fprintd`——該動作會直接刪除 debconf 的 `libpam-runtime/profiles` selection。由於日後
+    `pam-auth-update --package` 會從當前的 `common-*` 內容推導 profile 清單，若不處理便會
+    永久丟失 fprintd，安裝時會把 selection 與 `/var/lib/pam/*` 快照到 first-wins sidecar，
+    並自行執行一次 `pam-auth-update --package` 收斂到穩定的「無 fprintd」狀態（日後套件
+    觸發的執行即為 no-op）。uninstall 只有在 rollback 完成後才從該快照還原。Fedora 的
+    `authselect` 與 openSUSE 的 `pam-config` profile 狀態不在 manifest 內，請依警告手動
+    還原原本的 profile。
+  * `Snapshotted the PAM profile selection to <path>` / `Keeping the existing PAM selection
+    snapshot at <path> (first-wins).` 是安裝時的 sidecar 日誌。sidecar
+    （`<manifest-dir>/pam-selection`）存放原始 debconf `libpam-runtime/profiles` multiselect；
+    `<manifest-dir>/pam-selection.saved` 則是 root 擁有、`0700` 的目錄，存放 `/var/lib/pam`
+    下每個檔案的副本。兩者都以 `sudo` 一次性、first-wins 發佈（`pam-selection` 檔為 `0644`），
+    所有讀取/複製都經由 `sudo`，讓搭配 passwordless `sudo` 的非 root uninstall 也能還原；
+    `Could not read debconf libpam-runtime/profiles; ... will be empty.`、
+    `Could not write the PAM selection snapshot; ...` 與 `Could not snapshot every saved PAM
+    profile file; ...` 代表快照不完整——uninstall 將無法完整還原原始狀態，請手動檢查這些檔案。
+    `pam-auth-update --package converged the debconf selection and saved profiles (no
+    fprintd).` 是預期的自我收斂日誌；`pam-auth-update --package failed; keeping the selection
+    snapshot for uninstall convergence.` 則保留 sidecar。
+  * `No PAM selection snapshot at <path>; nothing to restore.` 代表沒有支援 fprintd 的安裝
+    留下 sidecar，因此沒有需要收斂回去的狀態。`Original PAM profile selection restored;
+    snapshot consumed.` 是成功路徑：rollback 確認完成後，先複回 `.saved` 檔案，再以
+    `debconf-set-selections` 寫入 multiselect、重跑 `--package` 並驗證線上 selection。
+    `Manifest still records <path>: rollback is incomplete, leaving the PAM selection snapshot
+    for retry.` 或 `Manifest at ... is corrupt/invalid; leaving the PAM selection snapshot
+    for retry.` 代表刻意**沒有**更動 debconf；請完成 rollback（或修復 manifest）後重跑 uninstall。
+  * `debconf-set-selections is unavailable; keeping <path> for retry.` 與
+    `debconf-set-selections failed; keeping <path> for retry.` 代表 selection 無法寫入——
+    sidecar 與 `.saved` 快照會保留供日後 uninstall；請安裝 `debconf`（或修好 `sudo` helper）
+    後重試。`The PAM selection snapshot is empty; cannot restore the debconf selection.` 代表
+    只有 `.saved` 檔案被還原。`Could not restore every saved PAM profile file from the
+    snapshot.` 代表部分 `/var/lib/pam` 檔案可能仍停留在收斂後的無 fprintd 狀態；請重裝或
+    手動還原。
+  * `PAM selection restore verification failed: expected '<a>', got '<b>'. Keeping <path> for
+    retry.` 是 fail closed 的比對失敗（rc 1，保留 sidecar）。比對接受**精確比對或忽略空白／
+    順序的集合比對**：`pam-auth-update` 會把 multiselect 正規化為 "a, b, c"，因此原始值順序
+    或空白不同沒關係，但 profile **集合**不同則不接受（管理員日後刻意的變更不會被悄悄接受）。
+    **取捨**：快照具有最終權威，因此安裝期間變更 selection，會在 uninstall 時被覆寫；
+    安裝期間手動啟用 fprintd profile（`pam-auth-update --enable fprintd`）會把 fp 行寫回
+    `common-auth`，直至 uninstall 前都恢復 GDM 競賽。
 
 ---
 

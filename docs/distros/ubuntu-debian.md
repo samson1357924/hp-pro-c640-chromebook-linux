@@ -90,20 +90,32 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 > [!IMPORTANT]
-> Do **not** run `pam-auth-update --enable fprintd`. That profile injects
-> `pam_fprintd` into `common-auth`, which `gdm-password` includes — on
-> unlock GDM forks the `gdm-password` and `gdm-fingerprint` workers
-> concurrently and both try to Claim the single fprintd device, so the lock
-> screen shows no fingerprint prompt (GNOME/gdm#1071). The installer keeps
-> fingerprint **only in `/etc/pam.d/sudo`** and removes fp lines from `common-*`
-> with a direct `sed -i '/pam_fprintd\.so/d'` during installation.
+> Do **not** run `pam-auth-update --enable fprintd` yourself. That profile injects
+> `pam_fprintd` into `common-auth`, which `gdm-password` includes — on unlock GDM
+> forks the `gdm-password` and `gdm-fingerprint` workers concurrently and both try
+> to Claim the single fprintd device, so the lock screen shows no fingerprint
+> prompt (GNOME/gdm#1071). The installer keeps fingerprint **only in
+> `/etc/pam.d/sudo`** and removes fp lines from `common-*` with a direct
+> `sed -i '/pam_fprintd\.so/d'` during installation.
 >
-> **Do not run `pam-auth-update --remove fprintd` yourself.** That action also
-> deletes debconf's `libpam-runtime/profiles` selection — persistent state the
-> installer deliberately preserves (rollback restores file bytes, not debconf):
-> deleting it would stop a later `pam-auth-update` from regenerating your original
-> stack. If `common-auth` still has an fp line on an older install, remove only
-> that line, or re-run `./fingerprint/install-fingerprint.sh`, which handles it:
+> **Do not run `pam-auth-update --remove fprintd` yourself.** That action deletes
+> debconf's `libpam-runtime/profiles` selection outright. On Debian/Ubuntu the
+> installer first snapshots that selection and every saved module file under
+> `/var/lib/pam` into a first-wins sidecar (`pam-selection` mode `0644`;
+> `pam-selection.saved` a root-owned `0700` directory of file copies), with all
+> reads/copies through `sudo` so a non-root caller with passwordless `sudo` is
+> supported. It backs up **all** existing
+> `common-*` bytes (not only fp-containing ones), strips only fp module lines,
+> then runs `pam-auth-update --package` itself so debconf and `/var/lib/pam`
+> converge to a stable "no fprintd" state and a later package-triggered run is a
+> no-op. On uninstall, once manifest rollback is confirmed complete, it copies the
+> saved files back, writes the original selection with `debconf-set-selections`,
+> runs `--package` again and verifies the selection (exact or set-equivalent)
+> before consuming the sidecar; a failed restore keeps it and returns rc 1.
+> Trade-off: a selection you change during installation is overwritten on
+> uninstall, and a manual `--enable fprintd` reintroduces the GDM race until
+> uninstall. If `common-auth` still has an fp line on an older install, remove
+> only that line, or re-run `./fingerprint/install-fingerprint.sh`, which handles it:
 
 ```bash
 sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth

@@ -165,10 +165,12 @@ remain for retry)` 並回傳 rc 1，而不是謊稱成功。
   原始位元組由 `rollback_component("fingerprint")` 還原，因此原本就存在的精確
   `pam_fprintd` 行會被保留。Debian/Ubuntu 安裝時**直接**以
   `sed -i '/pam_fprintd\.so/d'` 移除 `common-*` 中的 fp 行，絕不呼叫
-  `pam-auth-update --remove fprintd`（那會摧毀 rollback 無法還原的 debconf profile
-  selection）；uninstall 不呼叫任何 profile 工具。Debian 的 Tier 2 備份、selection 保留
-  取捨、唯讀的 stale-record 檢查與 authselect/pam-config 限制見
-  [UNINSTALL.md](../docs/UNINSTALL.md)。
+  `pam-auth-update --remove fprintd`（那會直接刪除 debconf profile selection）。安裝時
+  會把 selection 與 `/var/lib/pam/*` 快照到 first-wins sidecar，並自行執行
+  `pam-auth-update --package` 收斂；uninstall 在 rollback 完成後以
+  `debconf-set-selections` + `--package` 還原並驗證 selection 後才消耗快照。
+  Debian 的 Tier 2 備份、管理員覆寫取捨、唯讀的 stale-record 檢查與 authselect/pam-config
+  限制見 [UNINSTALL.md](../docs/UNINSTALL.md)。
 
 所有安裝 caller 會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e` 在
 rollback 失敗時提前中止收尾。
@@ -453,19 +455,22 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 所有狀態都在暫存目錄。daemon 測試有 406 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅與無效 state 自我修復）；sleep hook
 測試有 73 個案例（純 handoff、`0600`/`chown`/原子 `mv`、`C640_KBD_HANDOFF_DIR`、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1509 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1642 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
-祖先/父目錄拒絕與 fd 8 釘住、跨元件 plugdev 歸屬（含 all-true 過期紀錄零 gpasswd 消耗）
-與 gpasswd 失敗回 rc 1、PAM 原始行保護與 profile selection 保留、整個操作鎖
+祖先/父目錄拒絕與 fd 8 釘住、跨元件 plugdev 歸屬（含選用的逐次安裝 `added_by_project`
+證據 R15–R20、all-true 過期紀錄零 gpasswd 消耗）與 gpasswd 失敗回 rc 1、PAM 原始行保護
+與 first-wins debconf selection／`/var/lib/pam` 快照、`pam-auth-update --package` 收斂及
+uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、整個操作鎖
 （部署 vs rollback 的 OP1/OP2 FIFO barrier 回歸、真實安裝器 barrier 與 fail-closed body）、
-唯一 writer 暫存檔與 systemctl 還原檢查 rc。
+唯一 writer 暫存檔與 systemctl 還原檢查 rc。CI 另以真實工具在 Ubuntu 24.04 container
+執行 PAM 來回 E2E。
 
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 個案例
-sudo bash tests/rollback-test.sh                       # 1509 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1642 個案例（需 root）
 ```
 
 ---
