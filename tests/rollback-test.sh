@@ -9667,6 +9667,19 @@ _reconcile() {
     fi
 }
 
+# STUB_PAM_REWRITE_COMMON models the REAL tool's write_profiles(): canonicalise
+# whitespace and publish through a .pam-new rename with umask 0022, which
+# silently turns a 0600 original into 0644. Opt-in so all older cases keep the
+# no-rewrite stub (PAM-43 uses it as a sensitivity control).
+if [ "${STUB_PAM_REWRITE_COMMON:-0}" = "1" ]; then
+    for _f in "$_dir"/common-*; do
+        [ -f "$_f" ] || continue
+        _tmp="${_f}.pam-new.$$"
+        (umask 0022; /usr/bin/sed -e 's/[[:space:]][[:space:]]*/ /g' "$_f" > "$_tmp")
+        /bin/mv -f -- "$_tmp" "$_f"
+    done
+fi
+
 # STUB_PAM_PACKAGE_REPEAT models extra --package invocations (package upgrade
 # plus an administrator rerun) arriving in the same install window.
 _repeats="${STUB_PAM_PACKAGE_REPEAT:-1}"
@@ -9943,8 +9956,11 @@ pam_record_count() {
 # explicit argument into the sandbox and exported THERE, never from the parent
 # shell: exporting it in the parent would let a fail=1 call leak into every
 # later install/uninstall in the same shell (the CI PAM-8 failure).
+# $4 = per-call STUB_PAM_REWRITE_COMMON flag (default 0), same isolation reason
+# as PAM-9: do not rely on a prefix assignment that a future `export` could
+# leak into later cases.
 run_pam_install() {
-    local sandbox="$1" distro="$2" fail_rollback="${3:-0}"
+    local sandbox="$1" distro="$2" fail_rollback="${3:-0}" rewrite_common="${4:-0}"
     export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     export CROS_ENABLEMENT_PAM_SAVED_DIR="$sandbox/savedir"
     export CROS_ENABLEMENT_PAM_SELECTION_FILE="$sandbox/manifest/pam-selection"
@@ -9956,20 +9972,21 @@ run_pam_install() {
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_DEBCONF_SEEN="$2/debconf/seen"
-        export STUB_FAIL_ROLLBACK_PY="$4"
+        export STUB_FAIL_ROLLBACK_PY="$4" STUB_PAM_REWRITE_COMMON="$5"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         configure_pam_fingerprint
         printf "%s\n" "$?" > "$2/install.rc"
-    ' "$distro" "$fail_rollback"
+    ' "$distro" "$fail_rollback" "$rewrite_common"
 }
 
 # Uninstall step: mirror _uninstall_fp_body() ordering — rollback FIRST, then
 # disable_pam_fingerprint(). No sed or tool call may be injected in between.
 # $3 is the per-call fault flag; see run_pam_install() for why it is scoped to
 # the sandbox snippet instead of the parent environment.
+# $5 is the per-call STUB_PAM_REWRITE_COMMON flag ($4 remains the hook).
 run_pam_uninstall() {
-    local sandbox="$1" distro="$2" fail_rollback="${3:-0}" hook="${4:-}"
+    local sandbox="$1" distro="$2" fail_rollback="${3:-0}" hook="${4:-}" rewrite_common="${5:-0}"
     export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     export CROS_ENABLEMENT_PAM_SAVED_DIR="$sandbox/savedir"
     export CROS_ENABLEMENT_PAM_SELECTION_FILE="$sandbox/manifest/pam-selection"
@@ -9980,7 +9997,7 @@ run_pam_uninstall() {
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_DEBCONF_SEEN="$2/debconf/seen"
-        export STUB_FAIL_ROLLBACK_PY="$4"
+        export STUB_FAIL_ROLLBACK_PY="$4" STUB_PAM_REWRITE_COMMON="$6"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         rc=0
@@ -9991,7 +10008,7 @@ run_pam_uninstall() {
         fi
         disable_pam_fingerprint
         printf "%s\n" "$?" > "$2/disable.rc"
-    ' "$distro" "$fail_rollback" "$hook"
+    ' "$distro" "$fail_rollback" "$hook" "$rewrite_common"
 }
 
 # --- PAM-19: a REAL non-root caller with passwordless sudo -------------------
@@ -10200,7 +10217,9 @@ test_pam_4_failed_rollback_keeps_record_and_warns() {
         run_pam_uninstall "$s" debian 1
 
     assert_eq "1" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" "PAM-4: rollback rc 1"
-    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-4: disable rc 0"
+    # Re-review #15 finding #3: a surviving record now propagates as a real
+    # failure, not a warning-only rc 0.
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-4: disable rc 1"
     assert_eq "1" "$(pam_record_count "$s")" "PAM-4: manifest record retained"
     assert_eq "$after_install" "$(file_hex "$s/pam/sudo")" \
         "PAM-4: uninstall did not change the file after failed rollback"
@@ -10251,7 +10270,7 @@ test_pam_6_dry_run_no_side_effects() {
 # PAM-7: static source guard. The disable function body must contain no sed at
 # all, and the stubs must refuse a host PAM path if a seam is misconfigured.
 test_pam_7_disable_body_has_no_sed() {
-    local s body install_body converge_body rc=0
+    local s body install_body converge_body restore_body rc=0
     body="$(sed -n '/^disable_pam_fingerprint()/,/^}/p' "$REPO_ROOT/lib/pam.sh")"
     assert_not_contains "pam_fprintd.so/d" "$body" \
         "PAM-7: disable_pam_fingerprint has no unconditional pam_fprintd sed"
@@ -10274,6 +10293,11 @@ test_pam_7_disable_body_has_no_sed() {
         "PAM-7: install body uses the direct strip helper"
     assert_contains "_pam_snapshot_selection" "$install_body" \
         "PAM-7: install body snapshots the selection before mutating files"
+
+    # Re-review #15: the post-tool common-state restore must never sed.
+    restore_body="$(sed -n '/^_pam_restore_common_state_from_snapshot()/,/^}/p' "$REPO_ROOT/lib/pam.sh")"
+    assert_not_contains "sed -i" "$restore_body" \
+        "PAM-7: final common-state restore uses no sed"
 
     s="$(setup_pam_sandbox seam-guard)"
     PATH="$s/stub:$PATH" STUB_SED_LOG="$s/sed.log" \
@@ -10670,14 +10694,25 @@ EOF
         run_pam_uninstall "$s" debian 0 "$s/admin-edit.sh"
     assert_contains "local modification" "$(cat "$s/tool.log" 2> /dev/null || echo '')" \
         "PAM-17: content-driven diff-fail really fired (not an env shortcut)"
-    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
-        "PAM-17: disable rc 0 despite the tool's diff failure"
+    # Re-review #15: the admin edit is EXTERNAL state. The new final common-*
+    # verification must not silently overwrite it: fail closed and retain the
+    # three snapshots for manual recovery instead of claiming success.
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-17: disable rc 1 on an admin's semantic edit"
+    [ -e "$s/manifest/pam-selection" ] && [ -e "$s/manifest/pam-selection.saved" ] \
+        && [ -e "$s/manifest/pam-selection.common" ] \
+        && ok || fail "PAM-17: all three snapshots retained after fail-closed restore"
     assert_eq "$sel_before" "$(pam_selection "$s")" \
-        "PAM-17: original selection restored even when --package refuses to derive it"
-    # The admin edit is external state, not part of the project's footprint.
+        "PAM-17: selection was restored before the common-state guard fired"
+    assert_contains "External content change detected" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-17: explicit reason for refusing to overwrite the admin edit"
+    assert_contains "keeping $s/manifest/pam-selection" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-17: retry data explicitly retained"
+    # Saved profiles + selection were restored before the common-state guard
+    # fired, so removing ONLY the admin edit yields the original stack bytes.
     /usr/bin/sed -i '/pam_admin_custom\.so/d' "$s/pam/common-auth"
     assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
-        "PAM-17: rollback still restores every PAM byte"
+        "PAM-17: rollback restored every managed byte (minus the admin edit)"
 }
 
 # PAM-18: first-wins snapshot. An external selection change followed by a
@@ -11606,7 +11641,8 @@ test_pam_30_existing_sidecar_validation() {
     assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
         "PAM-30/legacy: keeping a sidecar never mutates the live stack"
 
-    # Legacy sidecar + missing .saved: repair the missing half or fail closed.
+    # Re-review #15 finding #3: a legacy sidecar with a MISSING .saved must
+    # never be "repaired" from a possibly already-modified live savedir.
     s="$(setup_pam_sandbox sidecar-legacy-repair)"
     pam_write_full_stack "$s"
     pam_write_selection "$s" 'unix, systemd, fprintd'
@@ -11618,18 +11654,32 @@ test_pam_30_existing_sidecar_validation() {
     cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
     rm -f "$s/manifest/pam-selection.legacy"
     saved_hex_before="$(pam_saved_snapshot_hex "$s")"
-    # Model a crash immediately after publish: .saved is lost but the LIVE
-    # savedir still holds the original bytes the repair helper can re-snapshot.
+    # Model a crash immediately after publish: .saved is lost, but the LIVE
+    # savedir still holds (possibly tool-modified) profile files. Re-snapshotting
+    # them would silently bless modified bytes, so install MUST fail closed.
     cp -a "$s/manifest/pam-selection.saved"/. "$s/savedir"/
     rm -rf "$s/manifest/pam-selection.saved"
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
         run_pam_install "$s" debian
-    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
-        "PAM-30/legacy-repair: install repairs a missing .saved"
-    [ -f "$s/manifest/pam-selection.saved/auth" ] \
-        && ok || fail "PAM-30/legacy-repair: .saved was re-published"
-    assert_eq "$saved_hex_before" "$(pam_saved_snapshot_hex "$s")" \
-        "PAM-30/legacy-repair: all five saved profiles are byte-identical after repair"
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-30/legacy-repair: install fails closed on a missing .saved"
+    if [ -e "$s/manifest/pam-selection.saved" ]; then
+        fail "PAM-30/legacy-repair: no .saved may be re-published from live state"
+    else
+        ok
+    fi
+    assert_contains "manual recovery required" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-30/legacy-repair: manual-recovery reason logged"
+    [ -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-30/legacy-repair: legacy sidecar preserved"
+    # Live savedir files were copied there from the snapshot before install;
+    # they must still hold those exact bytes (never re-snapshotted, never lost).
+    local live_hex=""
+    for t in auth account password session session-noninteractive; do
+        live_hex="$live_hex $(file_hex "$s/savedir/$t")"
+    done
+    assert_eq "$saved_hex_before" "$live_hex" \
+        "PAM-30/legacy-repair: live savedir bytes untouched, no snapshot invented"
 }
 
 # Hex of all snapshotted saved-profile files (independent of lib/pam.sh).
@@ -11766,6 +11816,8 @@ EOF
         && ok || fail "PAM-32: sidecar consumed after full verification"
     [ ! -e "$s/manifest/pam-selection.saved" ] \
         && ok || fail "PAM-32: .saved consumed after full verification"
+    [ ! -e "$s/manifest/pam-selection.common" ] \
+        && ok || fail "PAM-32: .common consumed after full verification"
     assert_contains "every managed state was verified identical" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
         "PAM-32: tool-failure tolerance is explicit in the log"
 }
@@ -12145,7 +12197,7 @@ EOF
         run_pam_uninstall "$s" debian
     assert_neq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
         "PAM-40/retry: orphaned .saved must not produce a false success"
-    assert_contains "Orphaned saved PAM profile snapshot" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+    assert_contains "Orphaned PAM snapshot half" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
         "PAM-40/retry: orphan is explicitly reported"
     assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
         "PAM-40/retry: orphan bytes still intact"
@@ -12167,7 +12219,7 @@ EOF
 # Restore infers complete/absent from .saved state and stays value-only.
 test_pam_41_legacy_sidecar_roundtrip() {
     local case_name s before sel_before
-    for case_name in with_saved without_saved empty_saved empty_repair; do
+    for case_name in with_saved without_saved empty_saved empty_repair no_savedir; do
         s="$(setup_pam_sandbox "legacy-roundtrip-$case_name")"
         pam_write_full_stack "$s"
         pam_write_selection "$s" 'unix, systemd, fprintd'
@@ -12191,7 +12243,11 @@ test_pam_41_legacy_sidecar_roundtrip() {
 
         case "$case_name" in
             without_saved)
+                # A missing legacy .saved may ONLY be classified as absent when
+                # the live savedir is empty; populated live state requires
+                # manual recovery (re-review #15 finding #3).
                 rm -rf "$s/manifest/pam-selection.saved"
+                rm -f "$s/savedir"/*
                 pam_noop_package_tool "$s"
                 ;;
             empty_saved)
@@ -12206,7 +12262,7 @@ test_pam_41_legacy_sidecar_roundtrip() {
                 ;;
             empty_repair)
                 # Missing .saved + an empty live savedir: a new install must
-                # repair the half WITHOUT publishing an empty .saved.
+                # classify it as absent WITHOUT publishing an empty .saved.
                 rm -rf "$s/manifest/pam-selection.saved"
                 rm -f "$s/savedir"/*
                 CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
@@ -12214,7 +12270,31 @@ test_pam_41_legacy_sidecar_roundtrip() {
                 assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
                     "PAM-41/empty_repair: install rc 0 with an empty live savedir"
                 if [ -e "$s/manifest/pam-selection.saved" ]; then
-                    fail "PAM-41/empty_repair: repair must not publish an empty .saved"
+                    fail "PAM-41/empty_repair: absent classification must not publish an empty .saved"
+                else
+                    ok
+                fi
+                pam_noop_package_tool "$s"
+                ;;
+            no_savedir)
+                # Reviewer P2-1: a legacy sidecar with no .saved AND no live
+                # savedir directory must also classify as absent. `sudo find`
+                # on a missing dir returns rc 1; that must not hard-fail install.
+                rm -rf "$s/manifest/pam-selection.saved"
+                rm -rf "$s/savedir"
+                : > "$s/log.txt"
+                CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+                    run_pam_install "$s" debian
+                assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+                    "PAM-41/no_savedir: install rc 0 with no live savedir directory"
+                assert_contains "does not exist; treating it as saved-snapshot=absent" \
+                    "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                    "PAM-41/no_savedir: missing live dir classified as absent"
+                assert_not_contains "Could not inspect $s/savedir" \
+                    "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+                    "PAM-41/no_savedir: no find failure escalated to hard failure"
+                if [ -e "$s/manifest/pam-selection.saved" ]; then
+                    fail "PAM-41/no_savedir: absent classification must not publish an empty .saved"
                 else
                     ok
                 fi
@@ -12272,14 +12352,614 @@ test_pam_42_orphan_saved_at_restore_fails() {
         run_pam_uninstall "$s" debian
     assert_neq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
         "PAM-42: orphaned .saved without a sidecar is rc != 0"
-    assert_contains "Orphaned saved PAM profile snapshot" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+    assert_contains "Orphaned PAM snapshot half" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
         "PAM-42: orphan is explicitly reported, not a silent no-op"
     assert_eq "$snapshot_hex" "$(pam_saved_snapshot_hex "$s")" \
         "PAM-42: orphan bytes untouched"
 }
 
-# Re-review #11/#12 finding #2 and #13 finding #1: original sudo/common PAM
-# bytes AND the Debian profile selection must survive install -> uninstall.
+# ---------------------------------------------------------------------------
+# Re-review #15 findings #2/#3 (PAM-43..52): final common-*/sudo state must be
+# verified from an independent .common snapshot AFTER every external tool call;
+# rollback's gate must not skip missing files with surviving records.
+# ---------------------------------------------------------------------------
+
+# Independent oracle for every managed common/sudo target. For regular files
+# sha256 covers bytes; for symlinks it covers the readlink() target string,
+# matching the .common snapshot format. mode/owner come from lstat.
+pam_common_state() { # $1=sandbox -> one tab-separated line per canonical target
+    local s="$1" base f type mode owner link sha
+    for base in sudo common-auth common-account common-session common-session-noninteractive common-password; do
+        f="$s/pam/$base"
+        if [ -L "$f" ]; then
+            type='link'
+            link="$(readlink -- "$f")"
+            sha="$(printf '%s' "$link" | sha256sum | awk '{print $1}')"
+        elif [ -f "$f" ]; then
+            type='file'
+            link='-'
+            sha="$(sha256sum -- "$f" | awk '{print $1}')"
+        else
+            printf '%s\tabsent\t-\t-\t-\t-\n' "$base"
+            continue
+        fi
+        mode="$(stat -c '%a' -- "$f")"
+        owner="$(stat -c '%u:%g' -- "$f")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$base" "$type" "$mode" "$owner" "$link" "$sha"
+    done
+}
+
+# Hex of every file in all three snapshot halves (independent of lib/pam.sh).
+pam_all_halves_hex() { # $1=sandbox
+    local s="$1" f out=""
+    for f in "$s/manifest/pam-selection" \
+        "$s/manifest/pam-selection.saved"/* \
+        "$s/manifest/pam-selection.common/state" \
+        "$s/manifest/pam-selection.common/files"/*; do
+        [ -f "$f" ] || continue
+        out="$out ${f##*/}=$(sha256sum -- "$f" | awk '{print $1}')"
+    done
+    printf '%s\n' "$out"
+}
+
+# PAM-43: the exact re-review #2 reproduction at stub fidelity. A baseline
+# common-auth with equivalent-but-different spacing and mode 0600 must come
+# back BYTE- and MODE-identical even when the tool rewrites it after uninstall.
+# The sensitivity control proves the stub really performs that rewrite.
+test_pam_43_tool_rewrite_restores_original_bytes_and_mode() {
+    local s before control_before control_after state_before state_after
+    local s_iso iso_before had_rewrite saved_rewrite
+    s="$(setup_pam_sandbox tool-rewrite-bytes)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    /usr/bin/sed -i 's/pam_unix\.so nullok/pam_unix.so    nullok/' "$s/pam/common-auth"
+    chmod 0600 "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/common.baseline"
+    before="$(pam_stack_fingerprint "$s")"
+    state_before="$(pam_common_state "$s")"
+
+    # CONTROL: the faithful tool stub really normalises whitespace and changes
+    # 0600 -> 0644 by writing through .pam-new with umask 0022.
+    control_before="$(stat -c '%a' -- "$s/pam/common-auth")-$(sha256sum "$s/pam/common-auth" | awk '{print $1}')"
+    STUB_PAM_REWRITE_COMMON=1 PATH="$s/stub:$PATH" \
+        STUB_TOOL_LOG="$s/control.log" STUB_DEBCONF_PROFILES="$s/debconf/profiles" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" CROS_ENABLEMENT_PAM_SAVED_DIR="$s/savedir" \
+        "$s/stub/pam-auth-update" --package
+    control_after="$(stat -c '%a' -- "$s/pam/common-auth")-$(sha256sum "$s/pam/common-auth" | awk '{print $1}')"
+    assert_neq "$control_before" "$control_after" \
+        "PAM-43/control: tool really rewrites common-auth bytes+mode (sensitivity)"
+    assert_eq "644" "$(stat -c '%a' -- "$s/pam/common-auth")" \
+        "PAM-43/control: real-tool model turns 0600 into 0644"
+    cp -a "$s/common.baseline" "$s/pam/common-auth"
+    : > "$s/tool.log"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" run_pam_install "$s" debian 0 1
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" "PAM-43: install rc 0"
+    # External package operation after install, THEN uninstall: the tool must
+    # rewrite the files once more before the product's final restore.
+    STUB_PAM_REWRITE_COMMON=1 PATH="$s/stub:$PATH" STUB_TOOL_LOG="$s/tool.log" \
+        STUB_DEBCONF_PROFILES="$s/debconf/profiles" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        CROS_ENABLEMENT_PAM_SAVED_DIR="$s/savedir" "$s/stub/pam-auth-update" --package
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" \
+        CROS_ENABLEMENT_PAM_DIR="$s/pam" run_pam_uninstall "$s" debian 0 "" 1
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-43: uninstall rc 0 after the tool rewrote the restored files"
+    state_after="$(pam_common_state "$s")"
+    assert_eq "$state_before" "$state_after" \
+        "PAM-43: common/sudo bytes, mode, owner, type and link targets identical to baseline"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-43: full stack + selection byte-identical to baseline"
+    assert_contains "Verified final common-*/sudo state" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-43: final verification ran after the tool calls"
+
+    # P3-2: the rewrite flag is a per-call argument exported INSIDE the sandbox.
+    # Poison the parent env and call with the default 0, PAM-9 style: a later
+    # case must not inherit the previous case's rewrite behaviour.
+    s_iso="$(setup_pam_sandbox rewrite-flag-isolation)"
+    pam_write_initial_files "$s_iso" none none
+    printf 'auth required pam_unix.so\n' > "$s_iso/pam/common-auth"
+    chmod 0600 "$s_iso/pam/common-auth"
+    iso_before="$(file_hex "$s_iso/pam/common-auth")"
+    had_rewrite="${STUB_PAM_REWRITE_COMMON+x}"
+    saved_rewrite="${STUB_PAM_REWRITE_COMMON-}"
+    export STUB_PAM_REWRITE_COMMON=1
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s_iso/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s_iso/pam" \
+        run_pam_install "$s_iso" debian
+    if [ -n "$had_rewrite" ]; then
+        export STUB_PAM_REWRITE_COMMON="$saved_rewrite"
+    else
+        unset STUB_PAM_REWRITE_COMMON
+    fi
+    assert_eq "0" "$(cat "$s_iso/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-43/rewrite-isolation: install rc 0 with a poisoned parent env"
+    assert_eq "$iso_before" "$(file_hex "$s_iso/pam/common-auth")" \
+        "PAM-43/rewrite-isolation: per-call default 0 overrides the inherited flag"
+    assert_eq "600" "$(stat -c '%a' -- "$s_iso/pam/common-auth")" \
+        "PAM-43/rewrite-isolation: mode was not rewritten to 0644"
+}
+
+# PAM-44: absent / symlink / ownership variants must all be restored exactly.
+test_pam_44_type_and_absence_variants() {
+    local s before state_before state_after
+    s="$(setup_pam_sandbox type-variants)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    # common-auth becomes a symlink to a regular file with the ORIGINAL bytes.
+    cp -a "$s/pam/common-auth" "$s/common-auth.target"
+    ln -sfn "$s/common-auth.target" "$s/pam/common-auth"
+    # common-session becomes a DANGLING symlink (covered again in PAM-52).
+    ln -sfn "$s/no-such-target" "$s/pam/common-session"
+    # sudo was never present (was_existing=0) and must stay absent.
+    rm -f "$s/pam/sudo"
+    state_before="$(pam_common_state "$s")"
+    before="$(pam_stack_fingerprint "$s")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" "PAM-44: install rc 0"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-44: disable rc 0"
+    state_after="$(pam_common_state "$s")"
+    assert_eq "$state_before" "$state_after" \
+        "PAM-44: symlink, dangling link, regular file and sudo absence all restored"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" "PAM-44: savedir/selection bytes restored"
+    [ ! -e "$s/pam/sudo" ] && [ ! -L "$s/pam/sudo" ] \
+        && ok || fail "PAM-44: sudo must stay absent (was_existing=0)"
+}
+
+# PAM-45: an injected .common restore failure must never be reported as success.
+test_pam_45_common_restore_failure_keeps_all_halves() {
+    local s halves
+    s="$(setup_pam_sandbox common-restore-fail)"
+    pam_install_for_restore_test "$s"
+    halves="$(pam_all_halves_hex "$s")"
+    cat > "$s/stub/mv" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *cros-common-restore*) printf 'STUB: common restore mv refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/mv "$@"
+EOF
+    chmod +x "$s/stub/mv"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-45: common restore failure returns rc 1"
+    assert_contains "Could not atomically restore PAM file" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-45: restore failure explicitly logged"
+    assert_not_contains "snapshot consumed" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-45: no false success after a partial restore"
+    [ -e "$s/manifest/pam-selection" ] && [ -d "$s/manifest/pam-selection.saved" ] \
+        && [ -d "$s/manifest/pam-selection.common" ] \
+        && ok || fail "PAM-45: all three halves retained"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-45: every snapshot byte preserved for retry"
+
+    rm -f "$s/stub/mv"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-45: retry after removing the fault succeeds"
+    if [ ! -e "$s/manifest/pam-selection" ] && [ ! -e "$s/manifest/pam-selection.saved" ] \
+        && [ ! -e "$s/manifest/pam-selection.common" ]; then
+        ok
+    else
+        fail "PAM-45: all three halves consumed only after success"
+    fi
+}
+
+# PAM-46: finding #3's exact timeline - an ORIGINALLY present common-auth is
+# missing, its first backup was lost, so rollback keeps the record. The old
+# live-file `[ -f ] || continue` gate skipped it and consumed the sidecar.
+test_pam_46_missing_common_auth_surviving_record_fails_closed() {
+    local s halves backup keep
+    s="$(setup_pam_sandbox missing-common-surviving)"
+    pam_install_for_restore_test "$s"
+    halves="$(pam_all_halves_hex "$s")"
+    backup="$(find "$s/backups" -path '*/pam/common-auth' -type f | head -n 1)"
+    keep="$s/common-auth.first-backup"
+    cp -a "$backup" "$keep"
+    # Live file gone AND first backup unusable: rollback MUST retain the record.
+    rm -f "$s/pam/common-auth" "$backup"
+    cat > "$s/stub/mv" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *cros-common-restore*) printf 'STUB: common restore mv refused\n' >&2; exit 1 ;;
+    esac
+done
+exec /bin/mv "$@"
+EOF
+    chmod +x "$s/stub/mv"
+    : > "$s/tool.log"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-46: rollback rc 1 (missing backup keeps the record)"
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-46: disable rc 1 (surviving record is not skipped)"
+    assert_eq "1" "$(python3 -c 'import json,sys; print(int(any(r.get("target")==sys.argv[2] for r in json.load(open(sys.argv[1])).get("records",[]))))' \
+        "$s/manifest/install-manifest.json" "$s/pam/common-auth")" \
+        "PAM-46: common-auth record still present in the manifest"
+    assert_eq "0" "$(grep -cF 'debconf-set-selections' "$s/tool.log" || true)" \
+        "PAM-46: zero debconf-set-selections calls while a record survives"
+    assert_eq "0" "$(grep -cF -- '--package' "$s/tool.log" || true)" \
+        "PAM-46: zero --package calls while a record survives"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-46: all three snapshots intact for retry"
+    assert_contains "Manifest still records $s/pam/common-auth" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-46: surviving missing-file record is explicitly named"
+
+    # Repair the original backup and remove the injected fault; only NOW may
+    # the retry consume the snapshots.
+    mkdir -p "$(dirname "$backup")"
+    cp -a "$keep" "$backup"
+    rm -f "$s/stub/mv"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-46: retry succeeds after the backup is repaired"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-46: all records consumed on retry"
+    if [ ! -e "$s/manifest/pam-selection" ] && [ ! -e "$s/manifest/pam-selection.saved" ] \
+        && [ ! -e "$s/manifest/pam-selection.common" ]; then
+        ok
+    else
+        fail "PAM-46: snapshots consumed only after the fully verified retry"
+    fi
+}
+
+# PAM-47: disable_pam_fingerprint propagates the probe rc (1 = surviving
+# record, 2 = untrustworthy manifest) instead of downgrading to a warning.
+test_pam_47_disable_propagates_probe_rc() {
+    local s
+    s="$(setup_pam_sandbox disable-probe-rc)"
+    pam_install_for_restore_test "$s"
+    python3 - "$s/manifest/install-manifest.json" "$s/pam/common-auth" << 'PY'
+import json, sys
+mp, target = sys.argv[1:3]
+d = json.load(open(mp))
+d["records"].append({"target": target, "component": "fingerprint",
+                     "was_existing": True})
+json.dump(d, open(mp, "w"), indent=2)
+PY
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_sandboxed "$s" '
+            export PATH="$2/stub:/usr/bin:/bin"
+            export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+            export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+            export STUB_DEBCONF_SEEN="$2/debconf/seen"
+            source "$1/lib/pam.sh"
+            disable_pam_fingerprint
+            printf "%s\n" "$?" > "$2/rc"
+        '
+    assert_eq "1" "$(cat "$s/rc" 2> /dev/null || echo MISSING)" \
+        "PAM-47: surviving common-auth record -> disable rc 1"
+
+    s="$(setup_pam_sandbox disable-corrupt-manifest)"
+    printf '{not-json' > "$s/manifest/install-manifest.json"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_sandboxed "$s" '
+            export PATH="$2/stub:/usr/bin:/bin"
+            source "$1/lib/pam.sh"
+            disable_pam_fingerprint
+            printf "%s\n" "$?" > "$2/rc"
+        '
+    assert_eq "2" "$(cat "$s/rc" 2> /dev/null || echo MISSING)" \
+        "PAM-47: manifest corrupt -> disable rc 2 (not 0/1)"
+    assert_eq "" "$(cat "$s/tool.log" 2> /dev/null || echo '')" \
+        "PAM-47: corrupt manifest never triggers a tool call"
+}
+
+# PAM-48: a legacy sidecar with a missing .saved may NOT be repaired from a
+# populated (possibly modified) live savedir; an EMPTY live savedir remains a
+# legal absent case (PAM-41 compatibility).
+test_pam_48_legacy_missing_saved_fail_closed() {
+    local s modified_before auth_hex
+    s="$(setup_pam_sandbox legacy-missing-saved-modified)"
+    pam_install_for_restore_test "$s"
+    sed -e '/^# cros-enablement: selection-seen=/d' \
+        -e '/^# cros-enablement: saved-snapshot=/d' \
+        "$s/manifest/pam-selection" > "$s/manifest/pam-selection.legacy"
+    cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+    rm -f "$s/manifest/pam-selection.legacy"
+    rm -rf "$s/manifest/pam-selection.saved"
+    printf 'ADMIN-MODIFIED\n' >> "$s/savedir/auth"
+    auth_hex="$(file_hex "$s/savedir/auth")"
+    modified_before="$(pam_common_state "$s")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-48: populated live savedir without .saved is a hard failure"
+    assert_eq "$auth_hex" "$(file_hex "$s/savedir/auth")" \
+        "PAM-48: modified live savedir file untouched"
+    assert_eq "$modified_before" "$(pam_common_state "$s")" \
+        "PAM-48: no PAM file mutation after failed first-wins"
+    [ -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-48: sidecar retained on fail-closed repair"
+    if [ -e "$s/manifest/pam-selection.saved" ]; then
+        fail "PAM-48: no .saved may be invented from live state"
+    else
+        ok
+    fi
+    assert_contains "manual recovery required" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-48: fail-closed reason logged"
+
+    # Empty live savedir is explicitly compatible (the old empty .saved case).
+    s="$(setup_pam_sandbox legacy-missing-saved-empty)"
+    pam_install_for_restore_test "$s"
+    sed -e '/^# cros-enablement: selection-seen=/d' \
+        -e '/^# cros-enablement: saved-snapshot=/d' \
+        "$s/manifest/pam-selection" > "$s/manifest/pam-selection.legacy"
+    cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+    rm -f "$s/manifest/pam-selection.legacy"
+    rm -rf "$s/manifest/pam-selection.saved"
+    rm -f "$s/savedir"/*
+    pam_noop_package_tool "$s"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-48/empty: empty live savedir keeps legacy compatibility"
+    assert_contains "treating it as saved-snapshot=absent" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-48/empty: absent classification logged"
+}
+
+# PAM-49: a REAL uid-1000 caller must probe a root-only live savedir through
+# sudo (plain `[ -f ]` silently misses it), and still reject extra live files.
+test_pam_49_root_only_savedir_nonroot() {
+    local s before
+    s="$(setup_pam_sandbox root-only-savedir)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    before="$(pam_stack_fingerprint "$s")"
+    _pam_nonroot_prepare "$s"
+    _pam_nonroot_script "$s" install
+    _pam_nonroot_script "$s" uninstall
+    chmod 0700 "$s/savedir"
+    chmod 0600 "$s/savedir"/*
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install_nonroot "$s" debian
+    assert_eq "0" "$(cat "$s/userout/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-49: non-root install with a root-only savedir rc 0"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall_nonroot "$s" debian
+    assert_eq "0" "$(cat "$s/userout/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-49: non-root uninstall probes the root-only savedir via sudo"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-49: root-only savedir and PAM files restored byte-for-byte"
+
+    # A file the snapshot never saw must still be rejected from the non-root
+    # caller (the live-side existence probe must be privileged too).
+    s="$(setup_pam_sandbox root-only-extra-live)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    _pam_nonroot_prepare "$s"
+    _pam_nonroot_script "$s" install
+    _pam_nonroot_script "$s" uninstall
+    chmod 0700 "$s/savedir"
+    chmod 0600 "$s/savedir"/*
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install_nonroot "$s" debian
+    printf 'EXTRA\n' > "$s/savedir/extra.conf"
+    chmod 0600 "$s/savedir/extra.conf"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall_nonroot "$s" debian
+    assert_eq "1" "$(cat "$s/userout/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-49/extra: extra live saved file fails the non-root restore"
+    [ -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-49/extra: snapshots retained for retry"
+}
+
+# PAM-50: prove the exact ordering --package -> .common restore -> final
+# verification -> consume with ONE shared marker log.
+test_pam_50_tool_order_markers() {
+    local s log
+    s="$(setup_pam_sandbox tool-order-markers)"
+    pam_install_for_restore_test "$s"
+    cp "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << 'EOF'
+#!/usr/bin/env bash
+"$(dirname "$0")/pam-auth-update.orig" "$@"
+_rc=$?
+printf 'MARK_EXTERNAL_PACKAGE_DONE %s\n' "$*" >> "${LOG_FILE:?}"
+exit "$_rc"
+EOF
+    cat > "$s/stub/rm" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    if [ "$_a" = "${CROS_ENABLEMENT_PAM_SELECTION_FILE:-}" ]; then
+        printf 'MARK_CONSUME_SIDECAR\n' >> "${LOG_FILE:?}"
+    fi
+done
+exec /bin/rm "$@"
+EOF
+    chmod +x "$s/stub/pam-auth-update" "$s/stub/rm"
+    : > "$s/log.txt"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-50: uninstall rc 0 with ordering markers"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "MARK_EXTERNAL_PACKAGE_DONE --package" "$log" \
+        "PAM-50: external --package really ran and was marked"
+    assert_contains "re-applying the original common/sudo state" "$log" \
+        "PAM-50: .common restore marker present"
+    assert_contains "Verified final common-*/sudo state" "$log" \
+        "PAM-50: final verification marker present"
+    assert_contains "MARK_CONSUME_SIDECAR" "$log" \
+        "PAM-50: sidecar consume marker present"
+    marker_line() {
+        printf '%s\n' "$log" | grep -nF -- "$1" | head -n 1 | cut -d: -f1 \
+            | tr -cd '0-9'
+    }
+    local l_package l_restore l_verify l_consume
+    l_package="$(marker_line 'MARK_EXTERNAL_PACKAGE_DONE --package')"
+    l_restore="$(marker_line 're-applying the original common/sudo state')"
+    l_verify="$(marker_line 'Verified final common-*/sudo state')"
+    l_consume="$(marker_line 'MARK_CONSUME_SIDECAR')"
+    if [ -n "$l_package" ] && [ -n "$l_restore" ] && [ -n "$l_verify" ] \
+        && [ -n "$l_consume" ] \
+        && [ "$l_package" -lt "$l_restore" ] && [ "$l_restore" -lt "$l_verify" ] \
+        && [ "$l_verify" -lt "$l_consume" ]; then
+        ok
+    else
+        fail "PAM-50: --package($l_package) -> restore($l_restore) -> verify($l_verify) -> consume($l_consume) ordering violated"
+    fi
+}
+
+# PAM-51: savedir directory metadata (0700) must survive restore; the old
+# unconditional `install -d -m 755` destroyed it on every uninstall.
+test_pam_51_savedir_mode_restored() {
+    local s hook
+    s="$(setup_pam_sandbox savedir-mode-0700)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    chmod 0700 "$s/savedir"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" "PAM-51: install rc 0"
+    assert_contains 'savedir-mode=700' "$(cat "$s/manifest/pam-selection.common/state" 2> /dev/null || echo '')" \
+        "PAM-51: .common records savedir mode 0700"
+
+    # After manifest rollback, mutate the savedir mode before PAM disable.
+    hook="$s/savedir-mode-hook.sh"
+    printf '#!/usr/bin/env bash\nchmod 0755 "$1/savedir"\n' > "$hook"
+    chmod +x "$hook"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian 0 "$hook"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-51: disable rc 0 after savedir mode was tampered"
+    assert_eq "700" "$(stat -c '%a' -- "$s/savedir")" \
+        "PAM-51: savedir 0700 restored (not 0755)"
+    assert_contains "Verified final common-*/sudo state" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-51: final metadata verification passed"
+}
+
+# PAM-52: a DANGLING common-* symlink must be rollback-tracked and restored as
+# a symlink (the old `[ -f ]` backup gate skipped it entirely).
+test_pam_52_dangling_common_symlink_tracked_and_restored() {
+    local s target
+    s="$(setup_pam_sandbox dangling-common-link)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    target="$s/pam/common-session-noninteractive.target-does-not-exist"
+    rm -f "$s/pam/common-session-noninteractive"
+    ln -s "$target" "$s/pam/common-session-noninteractive"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" "PAM-52: install rc 0"
+    assert_eq "6" "$(pam_record_count "$s")" \
+        "PAM-52: dangling symlink is rollback-tracked with the other five targets"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" "PAM-52: disable rc 0"
+    [ -L "$s/pam/common-session-noninteractive" ] \
+        && ok || fail "PAM-52: restored target is a symlink, not a regular file"
+    assert_eq "$target" "$(readlink -- "$s/pam/common-session-noninteractive")" \
+        "PAM-52: dangling symlink target preserved"
+    assert_eq "0" "$(pam_record_count "$s")" "PAM-52: all records consumed"
+}
+
+# PAM-53: a whitespace-insensitive digest MUST still be order-sensitive. The
+# real tool may canonicalise spacing (PAM-43), but swapping two MODULE lines is
+# an admin edit: fail closed, keep all three halves, and name the reason.
+test_pam_53_common_line_reorder_fails_closed() {
+    local s halves hook
+    s="$(setup_pam_sandbox common-auth-reorder)"
+    pam_write_full_stack "$s"
+    # Two fprintd-free lines survive install's direct strip; a line swap is
+    # therefore a pure reorder, not an added/removed line.
+    printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\n' \
+        > "$s/pam/common-auth"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-53: install rc 0"
+    halves="$(pam_all_halves_hex "$s")"
+
+    # Inject AFTER rollback: rollback_component would otherwise restore the
+    # original bytes and erase the edit (same seam as PAM-17).
+    cat > "$s/reorder.sh" << 'EOF'
+#!/usr/bin/env bash
+/usr/bin/python3 - "$1/pam/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    lines = fh.readlines()
+if len(lines) >= 2:
+    lines[0], lines[1] = lines[1], lines[0]
+with open(p, 'w') as fh:
+    fh.writelines(lines)
+PY
+EOF
+    chmod +x "$s/reorder.sh"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian 0 "$s/reorder.sh"
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-53: reordered common-auth fails closed (rc 1)"
+    assert_eq "auth requisite pam_deny.so" "$(head -n 1 "$s/pam/common-auth")" \
+        "PAM-53: the two MODULE lines really were swapped"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-53: all three halves retained byte-identically for manual recovery"
+    assert_contains "External content change detected" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-53: external content change explicitly logged"
+    assert_contains "reordered MODULE line" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-53: reorder named as the fail-closed reason"
+}
+
+# PAM-54: first-wins for the THIRD half. A foreign installer publishing
+# .common while our stage exists must keep its bytes even though our mv loses
+# the race and install fails. Existence is not ownership (reviewer P2-3).
+test_pam_54_foreign_common_survives_failed_publish() {
+    local s
+    s="$(setup_pam_sandbox common-first-wins-race-regression)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    cat > "$s/stub/mv" << 'EOF'
+#!/usr/bin/env bash
+for _a in "$@"; do
+    case "$_a" in
+        *.common.stage.*)
+            mkdir -p "${CROS_ENABLEMENT_PAM_SELECTION_FILE}.common/files"
+            printf 'FOREIGN FIRST-WINS COPY\n' > "${CROS_ENABLEMENT_PAM_SELECTION_FILE}.common/state"
+            printf 'STUB: a foreign installer published .common first\n' >&2
+            exit 1
+            ;;
+    esac
+done
+exec /bin/mv "$@"
+EOF
+    chmod +x "$s/stub/mv"
+    : > "$s/log.txt"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-54: install fails when our .common publish loses the race"
+    assert_eq "FOREIGN FIRST-WINS COPY" \
+        "$(cat "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)" \
+        "PAM-54: foreign .common/state bytes untouched"
+    if [ -e "$s/manifest/pam-selection" ]; then
+        fail "PAM-54: our failing install must still consume its own sidecar"
+    else
+        ok
+    fi
+    assert_contains "Could not publish the PAM common/sudo state snapshot" \
+        "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-54: failed publish is explicit in the log"
+}
+
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -12322,6 +13002,18 @@ test_pam_39_savedir_bidirectional_and_empty_checks
 test_pam_40_rebuild_failure_logs_critical
 test_pam_41_legacy_sidecar_roundtrip
 test_pam_42_orphan_saved_at_restore_fails
+test_pam_43_tool_rewrite_restores_original_bytes_and_mode
+test_pam_44_type_and_absence_variants
+test_pam_45_common_restore_failure_keeps_all_halves
+test_pam_46_missing_common_auth_surviving_record_fails_closed
+test_pam_47_disable_propagates_probe_rc
+test_pam_48_legacy_missing_saved_fail_closed
+test_pam_49_root_only_savedir_nonroot
+test_pam_50_tool_order_markers
+test_pam_51_savedir_mode_restored
+test_pam_52_dangling_common_symlink_tracked_and_restored
+test_pam_53_common_line_reorder_fails_closed
+test_pam_54_foreign_common_survives_failed_publish
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

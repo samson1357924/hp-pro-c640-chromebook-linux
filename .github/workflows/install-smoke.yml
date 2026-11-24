@@ -469,6 +469,12 @@ jobs:
             for f in "${common_files[@]}" /etc/pam.d/sudo; do
               cmp -s "$f" "/root/baseline/etc/pam.d/${f##*/}" \
                 || { echo "MISMATCH: $f"; return 1; }
+              # Re-review #15 finding #2: --package rewrites common-* with
+              # umask 0022 + .pam-new, so bytes alone cannot prove rollback.
+              # Mode/lstat owner must match the ORIGINAL files too.
+              [ "$(stat -c '%a:%u:%g' "$f")" \
+                = "$(stat -c '%a:%u:%g' "/root/baseline/etc/pam.d/${f##*/}")" ] \
+                || { echo "MISMATCH: metadata $f"; return 1; }
             done
             for f in "${saved_files[@]}"; do
               # Drive the check from the BASELINE: skipping a file that vanished
@@ -536,6 +542,11 @@ jobs:
           export DISTRO_FAMILY DISTRO_ID
           configure_pam_fingerprint
           test -f /var/lib/cros-enablement/pam-selection
+          # Third half: root:0700 common-*/sudo state snapshot (finding #2).
+          test -d /var/lib/cros-enablement/pam-selection.common
+          [ "$(stat -c '%a:%u' /var/lib/cros-enablement/pam-selection.common)" = "700:0" ] \
+            || { echo "common-state snapshot is not root:0700"; exit 1; }
+          test -f /var/lib/cros-enablement/pam-selection.common/state
           if grep -q fprintd <<< "$(read_selection)"; then
             echo "::error::install did not converge the real debconf selection"
             exit 1
@@ -547,6 +558,7 @@ jobs:
           disable_pam_fingerprint
           compare_with_baseline
           test ! -e /var/lib/cros-enablement/pam-selection
+          test ! -e /var/lib/cros-enablement/pam-selection.common
           echo "PAM lib helper E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
 
           # Re-review P1 #2: BOTH seen baselines must survive a full real-tool
@@ -578,6 +590,7 @@ jobs:
             disable_pam_fingerprint
             compare_with_baseline
             test ! -e /var/lib/cros-enablement/pam-selection
+            test ! -e /var/lib/cros-enablement/pam-selection.common
             echo "real-tool seen=$baseline round-trip OK: value + seen byte-identical"
           }
           seen_roundtrip true
@@ -682,7 +695,8 @@ jobs:
           compare_with_baseline
           test ! -e /var/lib/cros-enablement/pam-selection
           test ! -e /var/lib/cros-enablement/pam-selection.saved
-          echo "non-root PAM lib helper E2E OK: root-only sidecar + /var/lib/pam snapshot consumed by uid 1000"
+          test ! -e /var/lib/cros-enablement/pam-selection.common
+          echo "non-root PAM lib helper E2E OK: root-only sidecar + /var/lib/pam + .common snapshots consumed by uid 1000"
 
           # Sentinel: everything above must have passed before this file
           # appears on the host-mounted artifact dir.

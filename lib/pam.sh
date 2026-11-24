@@ -43,6 +43,14 @@ _PAM_DIR="${CROS_ENABLEMENT_PAM_DIR:-/etc/pam.d}"
 #  4. on uninstall, after manifest rollback restores common-*/sudo bytes, write
 #     the snapshotted selection back, restore the saved snapshots, run --package
 #     again and verify the selection equals the snapshot before consuming it.
+# Re-review #15 finding #2: `pam-auth-update --package` in step 4 REWRITES the
+# files rollback just restored (umask 0022 + .pam-new rename: 0600 -> 0644,
+# whitespace canonicalised, symlink -> regular file). Manifest-record consumption
+# cannot prove their final state. A THIRD root:0700 snapshot next to the sidecar
+# records every common-*/sudo target (bytes, mode, lstat owner, type, link target
+# and ABSENCE) plus the live savedir's directory metadata. After ALL external
+# tool calls it is idempotently re-applied, then verified byte-for-byte before
+# all three halves are consumed together.
 # We still NEVER call `pam-auth-update --remove`: that action deletes the
 # debconf profile selection outright.
 _PAM_COMMON_BASES=(common-auth common-account common-session common-session-noninteractive common-password)
@@ -50,18 +58,26 @@ _PAM_COMMON_FP_FOUND=0
 _PAM_SAVED_DIR="${CROS_ENABLEMENT_PAM_SAVED_DIR:-/var/lib/pam}"
 _PAM_SEL_SIDECAR="${CROS_ENABLEMENT_PAM_SELECTION_FILE:-${MANIFEST_FILE%/*}/pam-selection}"
 _PAM_SAVED_SNAPSHOT_DIR="${_PAM_SEL_SIDECAR}.saved"
+_PAM_COMMON_SNAPSHOT_DIR="${_PAM_SEL_SIDECAR}.common"
 _PAM_SEL_MAGIC='# cros-enablement: PAM profile selection snapshot (first-wins; do not edit)'
+_PAM_COMMON_MAGIC='# cros-enablement: PAM common/sudo state snapshot (first-wins; do not edit)'
+# Set ONLY after our own .common publish succeeds. Rollback must use THIS flag,
+# never "the dir exists now": during staging a foreign installer may win the
+# race, and its snapshot must survive even though our install fails (P2-3).
+_PAM_COMMON_PUBLISHED=0
 
 _pam_backup_common_files() {
     local base file
     _PAM_COMMON_FP_FOUND=0
     for base in "${_PAM_COMMON_BASES[@]}"; do
         file="$_PAM_DIR/$base"
-        [ -f "$file" ] || continue
+        # A dangling symlink is still an original target: use the same
+        # lstat-style existence test as backup_file()/manifest (PAM-52).
+        [ -e "$file" ] || [ -L "$file" ] || continue
         # Every common-* can be rewritten by --package, so every existing one
         # must be rollback-tracked byte-for-byte, not only those with fp lines.
         backup_file_manifest_aware "$file" "fingerprint" || return $?
-        if grep -qF -- 'pam_fprintd.so' "$file"; then
+        if [ ! -L "$file" ] && grep -qF -- 'pam_fprintd.so' "$file"; then
             _PAM_COMMON_FP_FOUND=1
         fi
     done
@@ -205,6 +221,30 @@ _pam_tmp_file() {
     mktemp "${TMPDIR:-/tmp}/cros-pam-snapshot.XXXXXX"
 }
 
+# Existence probe for root-owned 0700 snapshot dirs. Privileged ONLY for a
+# non-root caller: a root caller uses the shell's own test, so a restricted
+# sudo stub that does not implement `test` cannot fake "snapshot present".
+# $1=d|e|f|l, $2=path. stat/sha256sum/readlink/cat always go through sudo.
+_pam_fs_probe() {
+    if [ "$(id -u)" -eq 0 ]; then
+        case "$1" in
+            d) [ -d "$2" ] ;;
+            e) [ -e "$2" ] || [ -L "$2" ] ;;
+            f) [ -f "$2" ] ;;
+            l) [ -L "$2" ] ;;
+            *) return 2 ;;
+        esac
+    else
+        case "$1" in
+            d) sudo test -d "$2" 2> /dev/null ;;
+            e) sudo test -e "$2" 2> /dev/null || sudo test -L "$2" 2> /dev/null ;;
+            f) sudo test -f "$2" 2> /dev/null ;;
+            l) sudo test -L "$2" 2> /dev/null ;;
+            *) return 2 ;;
+        esac
+    fi
+}
+
 _pam_enumerate_saved_files() {
     # $1=directory. Echoes the temp file path only on a SUCCESSFUL sudo find.
     local list
@@ -301,30 +341,6 @@ _pam_publish_saved_dir() {
     return 0
 }
 
-_pam_snapshot_saved_dir() {
-    # Repair entry point: a LEGACY sidecar may exist while .saved is missing
-    # (crash between the two publishes). Never skip that case forever.
-    [ -e "$_PAM_SAVED_SNAPSHOT_DIR" ] && return 0
-    [ -d "$_PAM_SAVED_DIR" ] || return 0
-    _pam_stage_saved_dir || return 1
-    local list count
-    list="$(_pam_enumerate_saved_files "$_PAM_SAVED_SNAPSHOT_STAGE")" || {
-        _pam_snapshot_cleanup_stage
-        return 1
-    }
-    count="$(_pam_count_enumerated_files "$list")"
-    rm -f -- "$list"
-    if [ "$count" -eq 0 ]; then
-        # Never publish an empty .saved: it cannot satisfy saved-snapshot=complete
-        # and would strand a legacy sidecar on uninstall. Treat "nothing to
-        # snapshot" as absent instead (the old installer published an empty dir).
-        log_info "$_PAM_SAVED_DIR holds no profiles; leaving $_PAM_SAVED_SNAPSHOT_DIR absent instead of publishing an empty snapshot."
-        _pam_snapshot_cleanup_stage
-        return 0
-    fi
-    _pam_publish_saved_dir
-}
-
 # True when .saved is absent OR contains no regular files. Enumeration failure
 # is NOT "empty": callers must fail closed on an unreadable snapshot.
 _pam_saved_snapshot_is_empty() {
@@ -374,7 +390,7 @@ _pam_saved_snapshot_matches_live() {
     fi
     while IFS= read -r -d '' f; do
         base="${f##*/}"
-        if [ ! -f "$_PAM_SAVED_DIR/$base" ] \
+        if ! sudo test -f "$_PAM_SAVED_DIR/$base" \
             || ! sudo cmp -s -- "$f" "$_PAM_SAVED_DIR/$base"; then
             log_error "Saved PAM profile '$base' is not byte-identical to its snapshot."
             rc=1
@@ -513,12 +529,287 @@ _pam_verify_sidecar_content() {
     return 0
 }
 
+# --- common-*/sudo original state snapshot (third, root:0700 half) -----------
+#
+# Layout of $_PAM_COMMON_SNAPSHOT_DIR:
+#   state           root:0600; magic, four savedir-* lines, six target rows
+#   files/<base>    verbatim copy of each regular-file target (never a symlink)
+#
+# A target row is TAB separated:
+#   base, absolute path, present(0|1), type(file|link|absent),
+#   mode(octal|-), owner(uid:gid|-), link target(-), sha256(-)
+# For a regular file sha256 is over its bytes; for a symlink it is over the
+# readlink() output, which also works for DANGLING links. Every read goes
+# through sudo (non-root uninstall must see root-only live files/dirs), while
+# the buffer we parse stays caller-owned via _pam_tmp_file() (no root-owned
+# redirect target).
+_pam_common_snapshot_fields() {
+    # $1 = snapshot dir (defaults to the published one). Prints validated
+    # savedir-* metadata lines followed by validated target rows.
+    local dir="${1:-$_PAM_COMMON_SNAPSHOT_DIR}" tmp rc
+    _pam_fs_probe d "$dir" || return 1
+    tmp="$(_pam_tmp_file)" || return 1
+    # shellcheck disable=SC2024 # caller-owned buffer: sudo tee would make the read-back file root-owned
+    if ! sudo cat -- "$dir/state" > "$tmp" 2> /dev/null; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    awk -v magic="$_PAM_COMMON_MAGIC" -v expected="$((${#_PAM_COMMON_BASES[@]} + 1))" '
+        BEGIN { magic_n=0; other=0; bad=0; rows=0 }
+        $0 == magic { magic_n++; next }
+        /^# cros-enablement: savedir-path=\// { saved_path++; print; next }
+        /^# cros-enablement: savedir-present=[01]$/ { saved_present++; print; next }
+        /^# cros-enablement: savedir-mode=([0-7]+|-)$/ { saved_mode++; print; next }
+        /^# cros-enablement: savedir-owner=[0-9]+:[0-9]+$/ || /^# cros-enablement: savedir-owner=-$/ {
+            saved_owner++; print; next
+        }
+        /^#/ { other=1; next }
+        {
+            n = split($0, f, "\t")
+            if (n != 8 || f[1] !~ /^[A-Za-z0-9-]+$/ || f[2] !~ /^\// || f[3] !~ /^[01]$/) {
+                bad=1; next
+            }
+            if (seen[f[1]]++) bad=1
+            if (f[3] == "0") {
+                if (f[4] != "absent" || f[5] != "-" || f[6] != "-" || f[7] != "-" || f[8] != "-") bad=1
+            } else if (f[4] == "file") {
+                if (f[5] !~ /^[0-7]+$/ || length(f[5]) < 3 || length(f[5]) > 4 \
+                    || f[6] !~ /^[0-9]+:[0-9]+$/ || f[7] != "-" \
+                    || length(f[8]) != 64 || f[8] !~ /^[0-9a-f]+$/) bad=1
+            } else if (f[4] == "link") {
+                if (f[5] !~ /^[0-7]+$/ || length(f[5]) < 3 || length(f[5]) > 4 \
+                    || f[6] !~ /^[0-9]+:[0-9]+$/ || f[7] == "" \
+                    || length(f[8]) != 64 || f[8] !~ /^[0-9a-f]+$/) bad=1
+            } else bad=1
+            rows++
+            print
+        }
+        END {
+            if (magic_n != 1 || other || bad || rows != expected \
+                || saved_path != 1 || saved_present != 1 || saved_mode != 1 || saved_owner != 1) exit 1
+        }
+    ' "$tmp"
+    rc=$?
+    rm -f -- "$tmp"
+    return "$rc"
+}
+
+_pam_common_normalized_hash() {
+    # Whitespace-insensitive but ORDER-SENSITIVE digest. The real
+    # pam-auth-update may canonicalise spacing when it rewrites common-*; that
+    # is NOT an admin edit and stays equivalent (PAM-43 control). An added,
+    # removed or REORDERED MODULE line IS an admin edit: sorting the lines here
+    # would erase exactly that ordering information, so keep the file order and
+    # fail closed instead of silently overwriting it (PAM-17/PAM-53).
+    local path="$1"
+    if ! _pam_fs_probe f "$path"; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    sudo cat -- "$path" 2> /dev/null \
+        | awk '{ $1 = $1; if (NF) print }' \
+        | sha256sum | awk '{print $1}'
+}
+
+_pam_probe_common_target() {
+    # $1=absolute path -> present, type, mode, owner, link target, sha256.
+    # type=unsupported is a fail-closed signal (directory / special file).
+    local path="$1" present=0 type=absent mode="-" owner="-" link="-" sha="-"
+    if _pam_fs_probe l "$path"; then
+        present=1
+        type='link'
+        link="$(sudo readlink -- "$path")" || return 1
+        sha="$(printf '%s' "$link" | sha256sum | awk '{print $1}')"
+    elif _pam_fs_probe e "$path"; then
+        if _pam_fs_probe d "$path" || ! _pam_fs_probe f "$path"; then
+            printf '1\tunsupported\t-\t-\t-\t-\n'
+            return 0
+        fi
+        present=1
+        type='file'
+        sha="$(sudo sha256sum -- "$path" | awk '{print $1}')"
+    fi
+    if [ "$present" -eq 1 ]; then
+        mode="$(sudo stat -c '%a' -- "$path")" || return 1
+        owner="$(sudo stat -c '%u:%g' -- "$path")" || return 1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$present" "$type" "$mode" "$owner" "$link" "$sha"
+}
+
+_pam_common_snapshot_row() {
+    # $1=base $2=absolute path $3=files dir. Copies regular-file bytes and
+    # prints the eight-field state row on stdout.
+    local base="$1" path="$2" files="$3" probe present type mode owner link sha
+    probe="$(_pam_probe_common_target "$path")" || return 1
+    IFS=$'\t' read -r present type mode owner link sha <<< "$probe"
+    case "$type" in
+        unsupported)
+            log_error "Unsupported PAM target at $path (directory or special file); refusing to snapshot it."
+            return 1
+            ;;
+        file)
+            if ! sudo cp -a -- "$path" "$files/$base" \
+                || ! sudo cmp -s -- "$path" "$files/$base"; then
+                log_error "Could not snapshot $path byte-for-byte into the common state snapshot."
+                return 1
+            fi
+            ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$base" "$path" "$present" "$type" "$mode" "$owner" "$link" "$sha"
+}
+
+_pam_common_cleanup_stage() {
+    # $1=stage dir; ours, but report (never silently swallow) cleanup failures.
+    if ! sudo rm -rf -- "$1" 2> /dev/null; then
+        log_error "Could not clean the PAM common-state staging directory $1."
+    fi
+    return 0
+}
+
+_pam_common_snapshot_readable() {
+    # $1=snapshot dir (published or staged). Read back the state file AND every
+    # copied byte so a half-published/truncated snapshot can never be accepted.
+    local dir="${1:-$_PAM_COMMON_SNAPSHOT_DIR}" fields line base path present type mode owner link sha
+    local saved_present saved_mode saved_owner sum
+    fields="$(_pam_common_snapshot_fields "$dir")" || {
+        log_error "$dir has a missing/corrupt PAM common-state manifest; failing closed."
+        return 1
+    }
+    saved_present="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-present=//p')"
+    saved_mode="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-mode=//p')"
+    saved_owner="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-owner=//p')"
+    case "$saved_present" in
+        0) [ "$saved_mode" = "-" ] && [ "$saved_owner" = "-" ] || return 1 ;;
+        1)
+            case "$saved_mode" in
+                [0-7] | [0-7][0-7] | [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+                *)
+                    log_error "Invalid savedir mode in $dir/state."
+                    return 1
+                    ;;
+            esac
+            case "$saved_owner" in
+                *:*) ;;
+                *)
+                    log_error "Invalid savedir owner in $dir/state."
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            log_error "Invalid savedir presence in $dir/state."
+            return 1
+            ;;
+    esac
+    while IFS=$'\t' read -r base path present type mode owner link sha; do
+        case "$base" in \#*) continue ;; esac
+        [ "$type" = "file" ] || continue
+        # The staged/published dir is root:0700: a non-root caller must probe
+        # through sudo or every copy would look "missing" (PAM-19).
+        if ! _pam_fs_probe f "$dir/files/$base"; then
+            log_error "$dir/files/$base is missing; refusing an incomplete PAM common-state snapshot."
+            return 1
+        fi
+        sum="$(sudo sha256sum -- "$dir/files/$base" | awk '{print $1}')" || return 1
+        [ "$sum" = "$sha" ] || {
+            log_error "$dir/files/$base does not match its recorded checksum; refusing an incomplete snapshot."
+            return 1
+        }
+    done <<< "$fields"
+    return 0
+}
+
+_pam_snapshot_common_state() {
+    # Publish the third half AFTER sidecar + .saved. First-wins: an existing
+    # .common is validated and never overwritten.
+    local stage="${_PAM_COMMON_SNAPSHOT_DIR}.stage.$$" tmp="" base file
+    local saved_present=1 saved_mode="-" saved_owner="-" rc=0
+    _PAM_COMMON_PUBLISHED=0
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_error "Orphaned $_PAM_COMMON_SNAPSHOT_DIR has no sidecar published by this invocation; preserving it."
+        return 1
+    fi
+    _pam_common_cleanup_stage "$stage"
+    if ! sudo install -d -m 700 -- "$stage/files"; then
+        log_error "Could not create the PAM common-state staging directory."
+        return 1
+    fi
+    tmp="$(_pam_tmp_file)" || {
+        _pam_common_cleanup_stage "$stage"
+        return 1
+    }
+    if _pam_fs_probe d "$_PAM_SAVED_DIR"; then
+        saved_present=1
+        saved_mode="$(sudo stat -c '%a' -- "$_PAM_SAVED_DIR")" || rc=1
+        saved_owner="$(sudo stat -c '%u:%g' -- "$_PAM_SAVED_DIR")" || rc=1
+    else
+        saved_present=0
+    fi
+    {
+        printf '%s\n' "$_PAM_COMMON_MAGIC"
+        printf '# cros-enablement: savedir-path=%s\n' "$_PAM_SAVED_DIR"
+        printf '# cros-enablement: savedir-present=%s\n' "$saved_present"
+        printf '# cros-enablement: savedir-mode=%s\n' "$saved_mode"
+        printf '# cros-enablement: savedir-owner=%s\n' "$saved_owner"
+        for base in "${_PAM_COMMON_BASES[@]}"; do
+            _pam_common_snapshot_row "$base" "$_PAM_DIR/$base" "$stage/files" || printf 'SNAPSHOT_ROW_FAILED\n'
+        done
+        _pam_common_snapshot_row sudo "$_PAM_SUDO_PATH" "$stage/files" || printf 'SNAPSHOT_ROW_FAILED\n'
+    } >> "$tmp"
+    # A row helper's failure is observable as an invalid extra line; never
+    # publish a snapshot built from partial metadata.
+    if [ "$rc" -ne 0 ] || grep -qF 'SNAPSHOT_ROW_FAILED' "$tmp" \
+        || ! sudo install -m 600 -- "$tmp" "$stage/state" \
+        || ! _pam_common_snapshot_readable "$stage"; then
+        log_error "Could not build a complete PAM common/sudo state snapshot; refusing to publish it."
+        rm -f -- "$tmp"
+        _pam_common_cleanup_stage "$stage"
+        return 1
+    fi
+    rm -f -- "$tmp"
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_error "$_PAM_COMMON_SNAPSHOT_DIR appeared while staging; preserving it and refusing to publish."
+        _pam_common_cleanup_stage "$stage"
+        return 1
+    fi
+    # -T refuses a destination that appeared between the probe above and this
+    # rename: a plain `mv dir dir` would nest OUR stage INSIDE the foreign
+    # snapshot and even report success (P2-3 first-wins race).
+    if ! sudo mv -T -- "$stage" "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_error "Could not publish the PAM common/sudo state snapshot."
+        _pam_common_cleanup_stage "$stage"
+        return 1
+    fi
+    _PAM_COMMON_PUBLISHED=1
+    _pam_common_snapshot_readable || {
+        log_error "Published PAM common/sudo state snapshot failed its read-back; refusing to continue."
+        return 1
+    }
+    return 0
+}
+
+_pam_check_existing_common_snapshot() {
+    # Called when an EXISTING sidecar won first-wins. A legacy sidecar predates
+    # .common: degrade explicitly instead of claiming byte/metadata guarantees.
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        _pam_common_snapshot_readable || return 1
+        return 0
+    fi
+    if [ "${_PAM_VERIFY_LEGACY:-0}" -eq 1 ]; then
+        log_warn "Legacy PAM snapshot has no $_PAM_COMMON_SNAPSHOT_DIR; common-*/sudo byte and metadata guarantees are unavailable for this install (best effort only)."
+        return 0
+    fi
+    log_error "PAM sidecar carries metadata but $_PAM_COMMON_SNAPSHOT_DIR is missing; refusing a truncated three-half snapshot."
+    return 1
+}
+
 # First-wins gate for an EXISTING sidecar. Invalid/partial metadata is never
 # mistaken for "another installer published a complete snapshot". Legacy
 # sidecars without saved-snapshot metadata stay compatible on a best-effort
 # basis (they may predate the metadata line entirely).
 _pam_validate_existing_snapshot() {
-    local empty_rc=0
+    local empty_rc=0 live_list count
     _pam_verify_sidecar_content || return 1
     case "$_PAM_VERIFY_SAVED" in
         complete)
@@ -562,10 +853,31 @@ _pam_validate_existing_snapshot() {
                         ;;
                 esac
             else
-                _pam_snapshot_saved_dir || {
-                    log_error "Could not repair the missing saved PAM profile snapshot; refusing to continue."
-                    return 1
-                }
+                # Re-review #15 finding #3: NEVER re-snapshot the LIVE savedir to
+                # repair a missing legacy .saved. install's --package may already
+                # have changed those files, so a copy made now would silently
+                # bless modified bytes as "original". Only an ABSENT/empty live
+                # savedir can honestly be classified as saved-snapshot=absent;
+                # a populated one needs manual recovery (PAM-41 empty case stays
+                # compatible). Reviewer P2-1: a missing savedir makes sudo find
+                # return 1, which must NOT become an install hard failure - the
+                # old `[ -d ] || return 0` probe allowed that upgrade path. Only
+                # an EXISTING but unreadable savedir fails closed.
+                if ! _pam_fs_probe d "$_PAM_SAVED_DIR"; then
+                    log_info "Legacy PAM sidecar has no .saved and $_PAM_SAVED_DIR does not exist; treating it as saved-snapshot=absent."
+                else
+                    live_list="$(_pam_enumerate_saved_files "$_PAM_SAVED_DIR")" || {
+                        log_error "Could not inspect $_PAM_SAVED_DIR for the missing legacy saved snapshot; failing closed."
+                        return 1
+                    }
+                    count="$(_pam_count_enumerated_files "$live_list")"
+                    rm -f -- "$live_list"
+                    if [ "$count" -gt 0 ]; then
+                        log_error "Legacy PAM sidecar has no .saved while $_PAM_SAVED_DIR holds profile files (possibly modified by --package); refusing to re-snapshot live state - manual recovery required."
+                        return 1
+                    fi
+                    log_info "Legacy PAM sidecar has no .saved and $_PAM_SAVED_DIR is empty; treating it as saved-snapshot=absent."
+                fi
             fi
             ;;
     esac
@@ -577,12 +889,16 @@ _pam_validate_existing_snapshot() {
 # $1=1. An orphaned .saved from a previous crash/admin action is the sole copy
 # of the original bytes and must NEVER be destroyed here (review P1-2).
 _pam_rollback_own_snapshot() {
-    local published_saved="${1:-0}"
+    local published_saved="${1:-0}" published_common="${2:-0}"
     sudo rm -f -- "$_PAM_SEL_SIDECAR" 2> /dev/null \
         || log_error "Could not remove the sidecar published by this invocation."
     if [ "$published_saved" -eq 1 ]; then
         sudo rm -rf -- "$_PAM_SAVED_SNAPSHOT_DIR" 2> /dev/null \
             || log_error "Could not remove the saved snapshot published by this invocation."
+    fi
+    if [ "$published_common" -eq 1 ]; then
+        sudo rm -rf -- "$_PAM_COMMON_SNAPSHOT_DIR" 2> /dev/null \
+            || log_error "Could not remove the common state snapshot published by this invocation."
     fi
     _pam_snapshot_cleanup_stage
 }
@@ -592,10 +908,11 @@ _pam_snapshot_selection() {
     # and verified, or nothing is published and this function returns non-zero.
     # Any failure is a hard gate failure for the Debian installer.
     local sel="" sel_rc=0 seen="" seen_line="" saved_line="" saved_state="absent"
-    local tmp="" won=0 staged=0 published_saved=0 list count
+    local tmp="" won=0 staged=0 published_saved=0 published_common=0 list count
     if [ -e "$_PAM_SEL_SIDECAR" ]; then
         log_info "Keeping the existing PAM selection snapshot at $_PAM_SEL_SIDECAR (first-wins)."
         _pam_validate_existing_snapshot || return 1
+        _pam_check_existing_common_snapshot || return 1
         return 0
     fi
     # P1-2: a .saved without a sidecar may be the ONLY surviving original copy
@@ -603,6 +920,13 @@ _pam_snapshot_selection() {
     # the sidecar). Never delete or overwrite it; fail closed and preserve it.
     if [ -e "$_PAM_SAVED_SNAPSHOT_DIR" ]; then
         log_error "Orphaned saved PAM profile snapshot $_PAM_SAVED_SNAPSHOT_DIR has no selection sidecar; preserving it and refusing to publish a new snapshot."
+        return 1
+    fi
+    # Same rule for the third half: an orphaned .common is the only surviving
+    # copy of the ORIGINAL common-*/sudo bytes/metadata (which the tool has
+    # already rewritten), so it must never be replaced or removed here.
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_error "Orphaned PAM common-state snapshot $_PAM_COMMON_SNAPSHOT_DIR has no selection sidecar; preserving it and refusing to publish a new snapshot."
         return 1
     fi
     # rc 0 + empty stdout is a LEGAL empty selection. rc 1 means the key is
@@ -687,6 +1011,7 @@ _pam_snapshot_selection() {
         if [ -e "$_PAM_SEL_SIDECAR" ]; then
             log_info "Another installer published $_PAM_SEL_SIDECAR first; validating its snapshot."
             _pam_validate_existing_snapshot || return 1
+            _pam_check_existing_common_snapshot || return 1
             return 0
         fi
         log_error "Could not publish the PAM selection snapshot; refusing to continue."
@@ -712,23 +1037,41 @@ _pam_snapshot_selection() {
         _pam_snapshot_cleanup_stage
     fi
 
-    # Read back the published sidecar AND the published .saved before allowing
-    # any common-* / debconf mutation. A failure unwinds our own publication.
+    # Third half: the ORIGINAL common-*/sudo state must be captured before any
+    # sed/--package mutation. If it cannot be built and verified, unwind all
+    # three halves published by THIS invocation (orphans are never touched).
+    if ! _pam_snapshot_common_state; then
+        log_error "Could not publish the PAM common/sudo state snapshot; refusing to continue."
+        # P2-3: existence is NOT ownership. If a foreign installer published
+        # .common before our mv (or our mv lost the race), it is its ONLY copy:
+        # _PAM_COMMON_PUBLISHED stays 0 and rollback preserves it byte-for-byte.
+        _pam_rollback_own_snapshot "$published_saved" "$_PAM_COMMON_PUBLISHED"
+        return 1
+    fi
+    published_common=1
+
+    # Read back all THREE published halves before allowing any common-* /
+    # debconf mutation. A failure unwinds our own publication.
     if ! _pam_verify_sidecar_content \
         || [ "$_PAM_VERIFY_VALUE" != "$sel" ] \
         || [ "$_PAM_VERIFY_SEEN" != "$seen" ] \
         || [ "$_PAM_VERIFY_SAVED" != "$saved_state" ]; then
         log_error "PAM selection snapshot failed its read-back verification; refusing to continue."
-        _pam_rollback_own_snapshot "$published_saved"
+        _pam_rollback_own_snapshot "$published_saved" "$published_common"
         return 1
     fi
     if [ "$saved_state" = "complete" ] \
         && { ! _pam_saved_snapshot_readable || ! _pam_saved_snapshot_matches_live; }; then
         log_error "Saved PAM profile snapshot failed its read-back verification; refusing to continue."
-        _pam_rollback_own_snapshot "$published_saved"
+        _pam_rollback_own_snapshot "$published_saved" "$published_common"
         return 1
     fi
-    log_info "Snapshotted the PAM profile selection to $_PAM_SEL_SIDECAR (saved-snapshot=$saved_state)."
+    if ! _pam_common_snapshot_readable; then
+        log_error "PAM common/sudo state snapshot failed its read-back verification; refusing to continue."
+        _pam_rollback_own_snapshot "$published_saved" "$published_common"
+        return 1
+    fi
+    log_info "Snapshotted the PAM profile selection to $_PAM_SEL_SIDECAR (saved-snapshot=$saved_state; common-state=complete)."
     return 0
 }
 
@@ -772,13 +1115,70 @@ _pam_selection_equal() {
     [ -n "$e" ] && [ "$e" = "$a" ]
 }
 
+_pam_restore_savedir_metadata() {
+    # Restore the LIVE savedir's own mode/owner/presence from .common. Called
+    # both before copying saved files back and again after all external tool
+    # calls (so a tool that chmods the directory cannot go unnoticed).
+    local fields line path present mode owner saved_path rc=0
+    fields="$(_pam_common_snapshot_fields)" || {
+        log_error "Could not read the PAM common-state manifest for the savedir metadata restore."
+        return 1
+    }
+    while IFS=$'\t' read -r line; do
+        case "$line" in
+            \#\ cros-enablement:\ savedir-path=*) saved_path="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-present=*) present="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-mode=*) mode="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-owner=*) owner="${line#*=}" ;;
+        esac
+    done <<< "$fields"
+    if [ "$saved_path" != "$_PAM_SAVED_DIR" ]; then
+        log_error "Saved PAM profile directory changed from '$saved_path' to '$_PAM_SAVED_DIR'; refusing to restore into a different location."
+        return 1
+    fi
+    if [ "$present" = "1" ]; then
+        if _pam_fs_probe d "$_PAM_SAVED_DIR" && ! _pam_fs_probe l "$_PAM_SAVED_DIR"; then
+            :
+        elif ! sudo install -d -m "$mode" -- "$_PAM_SAVED_DIR"; then
+            log_error "Could not recreate $_PAM_SAVED_DIR with its original mode."
+            return 1
+        fi
+        # chown first: changing ownership can clear setuid/setgid bits.
+        if ! sudo chown "$owner" -- "$_PAM_SAVED_DIR" \
+            || ! sudo chmod "$mode" -- "$_PAM_SAVED_DIR"; then
+            log_error "Could not restore the original mode/owner of $_PAM_SAVED_DIR."
+            return 1
+        fi
+    elif [ "$present" = "0" ]; then
+        if _pam_fs_probe d "$_PAM_SAVED_DIR" && ! _pam_fs_probe l "$_PAM_SAVED_DIR"; then
+            if ! sudo rmdir -- "$_PAM_SAVED_DIR" 2> /dev/null; then
+                log_error "$_PAM_SAVED_DIR was originally absent but is now a non-empty directory; refusing to delete live state - manual recovery required."
+                return 1
+            fi
+        fi
+    else
+        log_error "Invalid savedir presence in the PAM common-state manifest."
+        return 1
+    fi
+    return "$rc"
+}
+
 _pam_restore_saved_dir_snapshot() {
     local f base rc=0 list
     [ -d "$_PAM_SAVED_SNAPSHOT_DIR" ] || return 0
-    if [ ! -d "$_PAM_SAVED_DIR" ]; then
-        if ! sudo install -d -m 755 -- "$_PAM_SAVED_DIR"; then
-            log_error "Could not recreate $_PAM_SAVED_DIR for the saved PAM profile restore."
-            return 1
+    # Restore the directory's ORIGINAL mode/owner before writing into it; the
+    # old unconditional `install -d -m 755` silently destroyed a root:0700
+    # savedir (finding #3). Legacy snapshots have no .common: keep the old
+    # fallback and say so explicitly.
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        _pam_restore_savedir_metadata || return 1
+    else
+        log_warn "No PAM common-state snapshot; $_PAM_SAVED_DIR directory metadata is restored on a best-effort basis only."
+        if [ ! -d "$_PAM_SAVED_DIR" ]; then
+            if ! sudo install -d -m 755 -- "$_PAM_SAVED_DIR"; then
+                log_error "Could not recreate $_PAM_SAVED_DIR for the saved PAM profile restore."
+                return 1
+            fi
         fi
     fi
     # The snapshot dir is root:0700. A plain user glob matches nothing for a
@@ -815,7 +1215,7 @@ _pam_converge_profiles() {
 }
 
 _pam_keep_retry_data() {
-    log_error "PAM snapshot restore FAILED; keeping $_PAM_SEL_SIDECAR and $_PAM_SAVED_SNAPSHOT_DIR (if present) intact for retry."
+    log_error "PAM snapshot restore FAILED; keeping $_PAM_SEL_SIDECAR, $_PAM_SAVED_SNAPSHOT_DIR and $_PAM_COMMON_SNAPSHOT_DIR (if present) intact for retry."
 }
 
 # Rebuild the EXACT sidecar from the values still held in variables after a
@@ -896,12 +1296,187 @@ _pam_consume_snapshot() {
         fi
         return 1
     fi
+    # Third half LAST: a failure here must rebuild the sidecar too, otherwise
+    # an orphaned .common could never be consumed/retried (three-half atomicity).
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        if ! sudo rm -rf -- "$_PAM_COMMON_SNAPSHOT_DIR" \
+            || _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+            log_error "Could not remove $_PAM_COMMON_SNAPSHOT_DIR; rebuilding the sidecar so all halves stay retryable."
+            if _pam_rebuild_sidecar "$value" "$seen" "$has_seen" "$saved_state" "$is_legacy"; then
+                _pam_keep_retry_data
+            else
+                log_error "CRITICAL: could not rebuild the PAM selection sidecar; the original common/sudo state remains at $_PAM_COMMON_SNAPSHOT_DIR but manual recovery is REQUIRED."
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Re-apply the ORIGINAL common-*/sudo state AFTER every external tool call.
+# This is deliberately idempotent: stage -> verify -> atomic mv (regular file),
+# ln -sfn (symlink), rm -f (was absent). A directory at any target is a hard
+# failure - rm -rf would destroy live state. No sed is used here (PAM-7).
+_pam_restore_common_state_from_snapshot() {
+    local fields base path present type mode owner link sha stage probe live
+    local live_norm snap_norm rc=0
+    fields="$(_pam_common_snapshot_fields)" || {
+        log_error "Could not read $_PAM_COMMON_SNAPSHOT_DIR/state for the final common/sudo restore."
+        return 1
+    }
+    while IFS=$'\t' read -r base path present type mode owner link sha; do
+        case "$base" in \#*) continue ;; esac
+        if _pam_fs_probe d "$path" && ! _pam_fs_probe l "$path"; then
+            log_error "Refusing to restore PAM target $path: a directory occupies it (manual recovery required)."
+            rc=1
+            continue
+        fi
+        case "$type" in
+            absent)
+                if ! sudo rm -f -- "$path" || _pam_fs_probe e "$path" || _pam_fs_probe l "$path"; then
+                    log_error "Could not remove PAM target $path recorded as originally absent."
+                    rc=1
+                fi
+                ;;
+            link)
+                if ! sudo rm -f -- "$path" || ! sudo ln -sfn -- "$link" "$path"; then
+                    log_error "Could not restore PAM symlink $path -> $link."
+                    rc=1
+                fi
+                ;;
+            file)
+                # Re-applying over an ADMIN's semantic edit would destroy data
+                # that is not ours. A tool rewriting whitespace/mode is benign
+                # (its normalised line sequence is unchanged) and IS repaired here.
+                live_norm="$(_pam_common_normalized_hash "$path")"
+                snap_norm="$(_pam_common_normalized_hash "$_PAM_COMMON_SNAPSHOT_DIR/files/$base")"
+                if [ "$live_norm" != "$snap_norm" ]; then
+                    log_error "External content change detected in $path since the snapshot (added/removed/reordered MODULE line); refusing to overwrite it - manual recovery required."
+                    rc=1
+                    continue
+                fi
+                stage="${path}.cros-common-restore.$$"
+                sudo rm -f -- "$stage" 2> /dev/null
+                if ! sudo install -m 600 -- "$_PAM_COMMON_SNAPSHOT_DIR/files/$base" "$stage" \
+                    || ! sudo chown "$owner" -- "$stage" \
+                    || ! sudo chmod "$mode" -- "$stage" \
+                    || ! sudo cmp -s -- "$_PAM_COMMON_SNAPSHOT_DIR/files/$base" "$stage" \
+                    || ! sudo mv -f -- "$stage" "$path"; then
+                    log_error "Could not atomically restore PAM file $path from the common-state snapshot."
+                    sudo rm -f -- "$stage" 2> /dev/null
+                    rc=1
+                fi
+                ;;
+            *)
+                log_error "Unsupported PAM target type '$type' for $path in the common-state snapshot."
+                rc=1
+                ;;
+        esac
+    done <<< "$fields"
+    if ! _pam_restore_savedir_metadata; then
+        rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        return 1
+    fi
+    # Independent post-restore read-back (the authoritative final verification
+    # below repeats it after selection/seen checks).
+    while IFS=$'\t' read -r base path present type mode owner link sha; do
+        case "$base" in \#*) continue ;; esac
+        probe="$(_pam_probe_common_target "$path")" || {
+            rc=1
+            continue
+        }
+        live="$(printf '%s' "$probe" | cut -f2-)"
+        if [ "$live" != "$(printf '%s\t%s\t%s\t%s\t%s' "$type" "$mode" "$owner" "$link" "$sha")" ]; then
+            log_error "Post-restore read-back of $path does not match its original snapshot ($live)."
+            rc=1
+        fi
+    done <<< "$fields"
+    [ "$rc" -eq 0 ] || return 1
+    log_info "PAM common/sudo state re-applied from $_PAM_COMMON_SNAPSHOT_DIR after all external tool calls."
+    return 0
+}
+
+# Final authority for common-*/sudo and the savedir directory itself.
+# rc 0 = strict verification passed, 1 = mismatch/failure, 2 = no .common
+# (legacy degradation; callers must WARN and must NOT claim byte guarantees).
+_pam_verify_common_targets_against_snapshot() {
+    local fields base path present type mode owner link sha probe live mode_live owner_live
+    local link_live sha_live type_live present_live rc=0
+    local saved_path saved_present saved_mode saved_owner line
+    if ! _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_warn "No PAM common-state snapshot ($_PAM_COMMON_SNAPSHOT_DIR); final common-*/sudo byte/metadata verification is unavailable (legacy best effort)."
+        return 2
+    fi
+    fields="$(_pam_common_snapshot_fields)" || {
+        log_error "Could not read $_PAM_COMMON_SNAPSHOT_DIR/state for final verification."
+        return 1
+    }
+    while IFS=$'\t' read -r base path present type mode owner link sha; do
+        case "$base" in \#*) continue ;; esac
+        probe="$(_pam_probe_common_target "$path")" || {
+            rc=1
+            continue
+        }
+        IFS=$'\t' read -r present_live type_live mode_live owner_live link_live sha_live <<< "$probe"
+        if [ "$type_live" != "$type" ] || [ "$present_live" != "$present" ]; then
+            log_error "Final PAM state mismatch for $base ($path): expected $present/$type, got $present_live/$type_live."
+            rc=1
+            continue
+        fi
+        if [ "$type" = "absent" ]; then
+            continue
+        fi
+        if [ "$mode_live" != "$mode" ] || [ "$owner_live" != "$owner" ] \
+            || [ "$link_live" != "$link" ] || [ "$sha_live" != "$sha" ]; then
+            log_error "Final PAM state mismatch for $base ($path): expected mode=$mode owner=$owner link=$link sha=$sha, got mode=$mode_live owner=$owner_live link=$link_live sha=$sha_live."
+            rc=1
+        fi
+    done <<< "$fields"
+    saved_path=""
+    while IFS=$'\t' read -r line; do
+        case "$line" in
+            \#\ cros-enablement:\ savedir-path=*) saved_path="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-present=*) saved_present="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-mode=*) saved_mode="${line#*=}" ;;
+            \#\ cros-enablement:\ savedir-owner=*) saved_owner="${line#*=}" ;;
+        esac
+    done <<< "$fields"
+    if [ "$saved_path" != "$_PAM_SAVED_DIR" ]; then
+        log_error "Final savedir path mismatch: snapshot '$saved_path', live '$_PAM_SAVED_DIR'."
+        rc=1
+    fi
+    if [ "$saved_present" = "1" ]; then
+        if ! _pam_fs_probe d "$_PAM_SAVED_DIR" || _pam_fs_probe l "$_PAM_SAVED_DIR"; then
+            log_error "Final savedir state mismatch: originally a directory, now absent or a symlink."
+            rc=1
+        else
+            [ "$(sudo stat -c '%a' -- "$_PAM_SAVED_DIR")" = "$saved_mode" ] \
+                || {
+                    log_error "Final savedir mode mismatch (expected $saved_mode)."
+                    rc=1
+                }
+            [ "$(sudo stat -c '%u:%g' -- "$_PAM_SAVED_DIR")" = "$saved_owner" ] \
+                || {
+                    log_error "Final savedir owner mismatch (expected $saved_owner)."
+                    rc=1
+                }
+        fi
+    elif [ "$saved_present" = "0" ]; then
+        if _pam_fs_probe e "$_PAM_SAVED_DIR" || _pam_fs_probe l "$_PAM_SAVED_DIR"; then
+            log_error "Final savedir state mismatch: originally absent but still present."
+            rc=1
+        fi
+    fi
+    [ "$rc" -eq 0 ] || return 1
+    log_info "Verified final common-*/sudo state (bytes, mode, owner, type, link target, absence) and savedir metadata against $_PAM_COMMON_SNAPSHOT_DIR."
     return 0
 }
 
 _pam_restore_debian_selection() {
     local snapshot="" seen="" restore_seen=0 current="" current_seen="" current_rc=0
-    local tool_failed=0 is_legacy=0 empty_rc=0
+    local tool_failed=0 is_legacy=0 empty_rc=0 has_common=0 common_rc=0
     # Defensive second gate: even if a caller forgot the disable-side check,
     # touching debconf/savedir while manifest records survive would diverge
     # from common-* and make a later --package refuse to reconcile.
@@ -913,14 +1488,30 @@ _pam_restore_debian_selection() {
     if [ ! -f "$_PAM_SEL_SIDECAR" ]; then
         # P2: an orphaned .saved without its sidecar cannot identify which
         # selection/profile set it belongs to. This is NOT "nothing to do".
-        if [ -e "$_PAM_SAVED_SNAPSHOT_DIR" ]; then
-            log_error "Orphaned saved PAM profile snapshot $_PAM_SAVED_SNAPSHOT_DIR has no selection sidecar; restore is impossible and requires manual recovery."
+        if [ -e "$_PAM_SAVED_SNAPSHOT_DIR" ] || _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+            log_error "Orphaned PAM snapshot half ($_PAM_SAVED_SNAPSHOT_DIR / $_PAM_COMMON_SNAPSHOT_DIR) has no selection sidecar; restore is impossible and requires manual recovery."
             return 1
         fi
         log_info "No PAM selection snapshot at $_PAM_SEL_SIDECAR; nothing to restore."
         return 0
     fi
     if ! _pam_verify_sidecar_content; then
+        _pam_keep_retry_data
+        return 1
+    fi
+    # The third half is strict whenever it exists. A genuine LEGACY sidecar
+    # predates it: degrade openly instead of silently claiming byte guarantees.
+    if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        if ! _pam_common_snapshot_readable; then
+            log_error "PAM common/sudo state snapshot is missing/corrupt; refusing to consume the selection snapshot."
+            _pam_keep_retry_data
+            return 1
+        fi
+        has_common=1
+    elif [ "$_PAM_VERIFY_LEGACY" -eq 1 ]; then
+        log_warn "Legacy PAM snapshot has no $_PAM_COMMON_SNAPSHOT_DIR; uninstall falls back to manifest bytes only (no final mode/owner/type guarantee)."
+    else
+        log_error "PAM sidecar carries metadata but $_PAM_COMMON_SNAPSHOT_DIR is missing; refusing a truncated three-half restore."
         _pam_keep_retry_data
         return 1
     fi
@@ -1018,6 +1609,15 @@ _pam_restore_debian_selection() {
         _pam_keep_retry_data
         return 1
     fi
+    # FINDING #2: every external PAM tool call is now DONE. Only now may we
+    # re-apply the original common-*/sudo state; doing this before --package
+    # would let the tool rewrite it again and still pass a record-only check.
+    log_info "PAM external tool calls complete; re-applying the original common/sudo state."
+    if [ "$has_common" -eq 1 ] \
+        && ! _pam_restore_common_state_from_snapshot; then
+        _pam_keep_retry_data
+        return 1
+    fi
     current="$(_pam_read_selection)" || current_rc=$?
     if [ "$current_rc" -ne 0 ]; then
         log_error "Could not read the debconf selection after restore."
@@ -1028,9 +1628,17 @@ _pam_restore_debian_selection() {
         current_seen="$(_pam_read_selection_seen)" || current_seen="UNREADABLE"
     fi
 
-    # (a)/(d) rollback complete again after the tool calls; (b) every saved
-    # module byte-identical; (c) debconf value AND seen equal the snapshot.
+    # (a)/(d) rollback complete again after the tool calls; (e) final common-*/
+    # sudo bytes/metadata/type/absence; (b) every saved module byte-identical;
+    # (c) debconf value AND seen equal the snapshot. Manifest consumption is
+    # checked but is NEVER used as a proxy for final file state.
+    log_info "Verifying final PAM state before consuming the snapshot..."
     if ! _pam_rollback_complete; then
+        _pam_keep_retry_data
+        return 1
+    fi
+    _pam_verify_common_targets_against_snapshot || common_rc=$?
+    if [ "$common_rc" -ne 0 ] && [ "$common_rc" -ne 2 ]; then
         _pam_keep_retry_data
         return 1
     fi
@@ -1067,8 +1675,12 @@ _pam_strip_fprintd_from_common_files() {
     local base file
     for base in "${_PAM_COMMON_BASES[@]}"; do
         file="$_PAM_DIR/$base"
-        [ -f "$file" ] || continue
-        grep -qF -- 'pam_fprintd.so' "$file" || continue
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        grep -qF -- 'pam_fprintd.so' "$file" 2> /dev/null || continue
+        if [ -L "$file" ]; then
+            log_error "Refusing to sed a symlinked $file (would replace the link); original bytes are rollback-tracked and the file must be edited manually."
+            return 1
+        fi
         if ! sudo sed -i "$_PAM_COMMON_FP_SED_EXPR" "$file"; then
             log_error "Could not strip pam_fprintd.so from $file; original backup stays tracked for rollback"
             return 1
@@ -1274,7 +1886,9 @@ _pam_rollback_complete() {
     esac
     for base in "${_PAM_COMMON_BASES[@]}"; do
         path="$_PAM_DIR/$base"
-        [ -f "$path" ] || continue
+        # FINDING #3: NEVER skip the manifest probe because the live file is
+        # missing. "Originally present, currently gone, restore failed" leaves
+        # a surviving record - exactly the case a live-file check hides.
         rc=0
         manifest_has_target "$path" || rc=$?
         case "$rc" in
@@ -1292,6 +1906,7 @@ _pam_rollback_complete() {
 }
 
 disable_pam_fingerprint() {
+    local rc=0
     log_info "Disabling PAM fingerprint authentication on $DISTRO_FAMILY ($DISTRO_ID)..."
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -1309,8 +1924,10 @@ disable_pam_fingerprint() {
             local probe_rc=0
             _pam_rollback_complete || probe_rc=$?
             case "$probe_rc" in
-                0) _pam_restore_debian_selection || return $? ;;
-                *) ;; # warning logged by _pam_rollback_complete; keep the snapshot for retry
+                0) _pam_restore_debian_selection || rc=$? ;;
+                # FINDING #3: propagate the probe rc (including rc 2 for a
+                # corrupt manifest) instead of warning and returning success.
+                *) rc="$probe_rc" ;; # warning logged by _pam_rollback_complete
             esac
             ;;
         fedora)
@@ -1347,8 +1964,10 @@ disable_pam_fingerprint() {
     esac
 
     # One check for every distro: silent when the record was consumed, explicit
-    # warning when rollback failed or the manifest cannot be trusted.
+    # warning when rollback failed or the manifest cannot be trusted. It stays
+    # read-only and is ALWAYS called, but its own rc never masks the real rc.
     _pam_sudo_post_rollback_check
+    return "$rc"
 }
 
 # PAM backup/record -> sed mutation is one operation; DRY_RUN is handled by the
