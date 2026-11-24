@@ -364,8 +364,9 @@ round-trip, and a non-root/passwordless-`sudo` uninstall case).
   now snapshots debconf `libpam-runtime/profiles` and every `/var/lib/pam/*` saved module file
   into a first-wins sidecar (`pam-selection` mode `0644`, `pam-selection.saved` a root-owned
   `0700` directory) before touching any file — atomic, with every read/copy mediated by `sudo`
-  so a non-root caller with passwordless `sudo` can restore them. **All** existing `common-*` files are rollback-tracked (not only fp-containing
-  ones, because `--package` rewrites any of them). Direct `sed -i '/pam_fprintd\.so/d'` still
+  so a non-root caller with passwordless `sudo` can restore them. **All** existing `common-*`
+  files are rollback-tracked (not only fp-containing ones, because `--package` rewrites any
+  of them). Direct `sed -i '/pam_fprintd\.so/d'` still
   closes the GDM race immediately; then the installer itself runs `pam-auth-update --package`
   so debconf and `/var/lib/pam` converge to a stable "no fprintd" state and a later
   package-triggered run is a no-op. `--remove` is still never used. On uninstall, after a
