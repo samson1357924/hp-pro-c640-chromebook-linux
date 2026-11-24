@@ -29,9 +29,11 @@ LOGINCTL_LOG="$TMP_DIR/loginctl.log"
 HOOK_ERR="$TMP_DIR/hook.err"
 CHMOD_LOG="$TMP_DIR/chmod.log"
 CHOWN_LOG="$TMP_DIR/chown.log"
+MKTEMP_LOG="$TMP_DIR/mktemp.log"
+FALLBACK_DIR="$TMP_DIR/tmp-fallback"
 SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
-mkdir -p "$STUB_DIR" "$STATE_DIR" "$HANDOFF_DIR" "$RUN_USER_ROOT"
+mkdir -p "$STUB_DIR" "$STATE_DIR" "$HANDOFF_DIR" "$RUN_USER_ROOT" "$FALLBACK_DIR"
 
 passed=0
 failed=0
@@ -151,30 +153,107 @@ fi
 exec "$@"
 STUB
 
-# `loginctl list-sessions --no-legend` with the REAL column layout:
-# SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE (USER is field 3).
+# loginctl stub.  `list-sessions --no-legend` supplies only SESSION IDs; the
+# real properties come from `show-session <id>` and the seat's active session
+# from `show-seat <seat> -p ActiveSession` (Key=Value, no --value).  Each mode
+# models a realistic host; an idle SSH session is Active=no/Remote=yes and a
+# greeter is Class=greeter, neither of which may own the handoff.
 cat > "$STUB_DIR/loginctl" << 'STUB'
 #!/bin/sh
 printf 'loginctl %s\n' "$*" >> "${STUB_LOGINCTL_LOG:-/dev/null}"
-# SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE.  The first row is always
-# "nobody" so a wrong resolution is visible in the handoff directory.
-case "${STUB_LOGINCTL_MODE:-none}" in
-    multi | prefer-idle | prefer-class)
-        _class=user
-        _idle=no
-        case "${STUB_LOGINCTL_MODE}" in
-            prefer-idle) _idle=yes ;;
-            prefer-class) _class=active ;;
-        esac
-        printf '1 %s nobody seat0 100 user tty2 no 2026-11-22 08:00\n' "$(id -u nobody)"
-        printf '2 %s %s seat0 101 %s tty7 %s 2026-11-22 09:00\n' \
-            "${STUB_LOGINCTL_UID:-0}" "${STUB_LOGINCTL_USER:-root}" "$_class" "$_idle"
-        ;;
-esac
-if [ "${STUB_LOGINCTL_OUTPUT:-none}" = "real" ]; then
-    printf '3 %s %s seat0 4242 user tty2 no 2026-11-22 09:00\n' \
-        "${STUB_LOGINCTL_UID:-0}" "${STUB_LOGINCTL_USER:-root}"
+_mode="${STUB_LOGINCTL_MODE:-none}"
+_me="$(id -u)"
+_nobody="$(id -u nobody)"
+
+_graphical() { # id uid seat type state
+    printf 'Id=%s\nName=%s\nUID=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=user\nActive=yes\nRemote=no\nState=%s\n' \
+        "$1" "$1" "$2" "$3" "$4" "$5"
+}
+# Single-property override helper for the load-bearing gate cases: every
+# property except the one under test stays in the PASS state, and the session
+# IS its seat's ActiveSession.  That makes exactly one gate responsible for
+# exclusion, so removing that gate must change the outcome.
+_props() { # id uid seat type class active remote state
+    printf 'Id=%s\nName=%s\nUID=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=%s\nActive=%s\nRemote=%s\nState=%s\n' \
+        "$1" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+_idle_ssh() { # id uid
+    printf 'Id=%s\nName=%s\nUID=%s\nSeat=seat0\nTTY=pts/0\nType=tty\nClass=user\nActive=no\nRemote=yes\nState=idle\n' "$1" "$1" "$2"
+}
+_greeter() { # id uid
+    printf 'Id=%s\nName=%s\nUID=%s\nSeat=seat0\nTTY=tty2\nType=x11\nClass=greeter\nActive=yes\nRemote=no\nState=active\n' "$1" "$1" "$2"
+}
+
+_cmd="${1:-}"
+if [ "$_cmd" = "show-session" ]; then
+    case "$_mode:$2" in
+        real:3 | idle-ssh:3 | pre-post-other:3 | bad-dir-mode:3)
+            _graphical 3 "$_me" seat0 wayland active ;;
+        closing:3) _graphical 3 "$_me" seat0 wayland closing ;;
+        pre-post-other:7 | bad-dir-missing:3 | bad-dir-owner:3)
+            _graphical "${2:-3}" "$_nobody" seat0 wayland active ;;
+        idle-ssh:4) _idle_ssh 4 "$_nobody" ;;
+        greeter-user:5) _greeter 5 "$_nobody" ;;
+        greeter-user:6) _graphical 6 "$_me" seat0 x11 active ;;
+        ambiguous:10) _graphical 10 "$_me" seat0 wayland active ;;
+        ambiguous:11) _graphical 11 "$_nobody" seat1 x11 active ;;
+        active-no:20) _props 20 "$_me" seat0 wayland user no no active ;;
+        remote-yes:30) _props 30 "$_me" seat0 x11 user yes yes active ;;
+        seat-active:41) _graphical 41 "$_me" seat0 wayland active ;;
+        seat-active:42) _graphical 42 "$_me" seat0 x11 active ;;
+        greeter-active:50) _greeter 50 "$_me" ;;
+        greeter-active:51) _graphical 51 "$_me" seat0 x11 active ;;
+        type-tty:60) _props 60 "$_me" seat0 tty user yes no active ;;
+    esac
+    exit 0
 fi
+if [ "$_cmd" = "show-seat" ]; then
+    case "$_mode:$2" in
+        real:seat0 | idle-ssh:seat0 | bad-dir-*:seat0 | closing:seat0)
+            printf 'Name=seat0\nActiveSession=3\n' ;;
+        pre-post-other:seat0) printf 'Name=seat0\nActiveSession=7\n' ;;
+        greeter-user:seat0) printf 'Name=seat0\nActiveSession=6\n' ;;
+        ambiguous:seat0) printf 'Name=seat0\nActiveSession=10\n' ;;
+        ambiguous:seat1) printf 'Name=seat1\nActiveSession=11\n' ;;
+        active-no:seat0) printf 'Name=seat0\nActiveSession=20\n' ;;
+        remote-yes:seat0) printf 'Name=seat0\nActiveSession=30\n' ;;
+        seat-active:seat0) printf 'Name=seat0\nActiveSession=41\n' ;;
+        greeter-active:seat0) printf 'Name=seat0\nActiveSession=50\n' ;;
+        type-tty:seat0) printf 'Name=seat0\nActiveSession=60\n' ;;
+    esac
+    exit 0
+fi
+
+# SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE (real column layout).
+case "$_mode" in
+    real | bad-dir-mode | closing)
+        printf '3 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    bad-dir-missing | bad-dir-owner)
+        printf '3 %s nobody seat0 %s user tty7 no 2026-11-25 08:00\n' "$_nobody" "$_nobody" ;;
+    idle-ssh)
+        printf '3 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf '4 %s nobody seat0 %s user pts/0 yes 2026-11-25 09:00\n' "$_nobody" "$_nobody" ;;
+    pre-post-other)
+        printf '7 %s nobody seat0 %s user tty7 no 2026-11-25 08:00\n' "$_nobody" "$_nobody" ;;
+    greeter-user)
+        printf '5 %s nobody seat0 %s greeter tty2 no 2026-11-25 07:00\n' "$_nobody" "$_nobody"
+        printf '6 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    ambiguous)
+        printf '10 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf '11 %s nobody seat1 %s user tty7 no 2026-11-25 08:00\n' "$_nobody" "$_nobody" ;;
+    active-no)
+        printf '20 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    remote-yes)
+        printf '30 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    seat-active)
+        printf '41 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf '42 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    greeter-active)
+        printf '50 %s %s seat0 %s greeter tty2 no 2026-11-25 07:00\n' "$_me" "$(id -nu)" "$_me"
+        printf '51 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    type-tty)
+        printf '60 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+esac
 exit 0
 STUB
 
@@ -201,20 +280,26 @@ cat > "$STUB_DIR/chown" << 'STUB'
 printf 'chown %s\n' "$*" >> "$STUB_CHOWN_LOG"
 exec /bin/chown "$@"
 STUB
+# Record every mktemp template so the no-/tmp-fallback case can prove that a
+# missing runtime dir never triggers _atomic_write's /tmp stand-in.
+cat > "$STUB_DIR/mktemp" << 'STUB'
+#!/bin/sh
+printf 'mktemp %s\n' "$*" >> "$STUB_MKTEMP_LOG"
+exec /usr/bin/mktemp "$@"
+STUB
 chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/loginctl" \
-    "$STUB_DIR/chmod" "$STUB_DIR/chown"
+    "$STUB_DIR/chmod" "$STUB_DIR/chown" "$STUB_DIR/mktemp"
 
 # --- harness ----------------------------------------------------------------
 # Empty HOOK_HANDOFF_DIR means "unset": the hook must resolve /run/user/<uid>
 # itself (used by the loginctl-resolution and no-user cases).
 HOOK_HANDOFF_DIR="$HANDOFF_DIR"
+HOOK_SUDO_USER=""
+HOOK_TMPDIR=""
 STUB_FROZEN=0
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
-STUB_LOGINCTL_OUTPUT=none
 STUB_LOGINCTL_MODE=none
-STUB_LOGINCTL_USER="$(id -nu)"
-STUB_LOGINCTL_UID="$(id -u)"
 
 reset_case() {
     : > "$HOOK_ERR"
@@ -224,7 +309,9 @@ reset_case() {
     : > "$LOGINCTL_LOG"
     : > "$CHMOD_LOG"
     : > "$CHOWN_LOG"
-    rm -f "$STATE_DIR/state" "$STATE_DIR"/.state.* "$FAKE_SYSFS" "$FAKE_MAX"
+    : > "$MKTEMP_LOG"
+    rm -f "$STATE_DIR/state" "$STATE_DIR"/.state.* "$STATE_DIR/session-uid" \
+        "$STATE_DIR"/.session-uid.* "$FAKE_SYSFS" "$FAKE_MAX"
     rm -f "$SUSPEND_FILE" "$RESUME_FILE" "$HANDOFF_DIR"/.c640-kbd-handoff.*
     rm -rf "$RUN_USER_ROOT"
     mkdir -p "$RUN_USER_ROOT/$(id -u)"
@@ -232,13 +319,12 @@ reset_case() {
     printf '7\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
     HOOK_HANDOFF_DIR="$HANDOFF_DIR"
+    HOOK_SUDO_USER=""
+    HOOK_TMPDIR=""
     STUB_FROZEN=0
     STUB_GNOME_ACTIVE=false
     STUB_FDO_ACTIVE=false
-    STUB_LOGINCTL_OUTPUT=none
     STUB_LOGINCTL_MODE=none
-    STUB_LOGINCTL_USER="$(id -nu)"
-    STUB_LOGINCTL_UID="$(id -u)"
 }
 
 run_hook() {
@@ -250,10 +336,8 @@ run_hook() {
         "STUB_LOGINCTL_LOG=$LOGINCTL_LOG"
         "STUB_CHMOD_LOG=$CHMOD_LOG"
         "STUB_CHOWN_LOG=$CHOWN_LOG"
-        "STUB_LOGINCTL_OUTPUT=$STUB_LOGINCTL_OUTPUT"
+        "STUB_MKTEMP_LOG=$MKTEMP_LOG"
         "STUB_LOGINCTL_MODE=$STUB_LOGINCTL_MODE"
-        "STUB_LOGINCTL_USER=$STUB_LOGINCTL_USER"
-        "STUB_LOGINCTL_UID=$STUB_LOGINCTL_UID"
         "STUB_GNOME_ACTIVE=$STUB_GNOME_ACTIVE"
         "STUB_FDO_ACTIVE=$STUB_FDO_ACTIVE"
         "STUB_FROZEN=$STUB_FROZEN"
@@ -262,8 +346,15 @@ run_hook() {
         "C640_KBD_HANDOFF_DIR=$HOOK_HANDOFF_DIR"
         "C640_KBD_RUN_USER_ROOT=$RUN_USER_ROOT"
     )
-    # SUDO_USER and the old D-Bus knobs are removed so resolution is
-    # deterministic and we can prove they are no longer consulted.
+    # SUDO_USER is unset by default (no stale hint from the test runner).  A
+    # case may set HOOK_SUDO_USER to prove the hint cannot override loginctl.
+    if [ -n "$HOOK_SUDO_USER" ]; then
+        env_args+=("SUDO_USER=$HOOK_SUDO_USER")
+    fi
+    if [ -n "$HOOK_TMPDIR" ]; then
+        env_args+=("TMPDIR=$HOOK_TMPDIR")
+    fi
+    # The old D-Bus knobs are removed so resolution is deterministic.
     env -u SUDO_USER -u C640_KBD_SLEEP_USER -u C640_KBD_SLEEP_UID \
         -u C640_KBD_SLEEP_BUS -u C640_KBD_SLEEP_DELAY \
         "${env_args[@]}" "$HOOK" "$@" 2>> "$HOOK_ERR"
@@ -376,24 +467,29 @@ assert_no_bus_or_led_writes "ectool post"
 assert_file "ectool: state retained" "$STATE_DIR/state" "100"
 assert_resume_flag "ectool: resume flag written" "suspend"
 
-# 9. Without C640_KBD_HANDOFF_DIR, loginctl's USER column (field 3) supplies
-#    the uid: the handoff lands in $RUN_USER_ROOT/<uid>, 0600 and chowned.
+# 9. Without C640_KBD_HANDOFF_DIR, one active local graphical session (checked
+#    with show-session + show-seat ActiveSession) supplies the uid.  The
+#    handoff lands in $RUN_USER_ROOT/<uid>, 0600 and chowned to that user.
 reset_case
 HOOK_HANDOFF_DIR=""
-STUB_LOGINCTL_OUTPUT=real
-STUB_LOGINCTL_USER="$(id -nu)"
-STUB_LOGINCTL_UID="$(id -u)"
+STUB_LOGINCTL_MODE=real
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
 assert_file "loginctl: suspend handoff in uid runtime dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
 assert_mode "loginctl: suspend handoff 0600" "600" "$_user_dir/c640-kbd-backlight.suspend"
 assert_owner "loginctl: suspend handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.suspend"
+assert_file "loginctl: pre pins the chosen uid root-only" "$STATE_DIR/session-uid" "$(id -u)"
+assert_mode "loginctl: cycle uid file is 0600" "600" "$STATE_DIR/session-uid"
 # The stat checks above alone are a false pass (mktemp already yields 0600
 # owned by us): assert the hook actually invoked chmod/chown on the handoff
 # temp file. The ".c640-kbd-handoff." filter excludes save_state's own chmod
 # calls, so removing _atomic_write's chmod 600 / chown is detectable.
 assert_log_matches "loginctl: suspend chmod 600 on handoff recorded" "$CHMOD_LOG" '^chmod 600 .*\.c640-kbd-handoff\.'
 assert_log_matches "loginctl: suspend chown uid:gid recorded" "$CHOWN_LOG" "^chown $(id -u):$(id -g) .*\.c640-kbd-handoff\."
+assert_log_matches "loginctl: selected session/seat logged" "$HOOK_ERR" "selected session 3 on seat seat0 for uid $(id -u)"
+assert_log_matches "loginctl: handoff path logged" "$HOOK_ERR" "pre handoff dir $_user_dir for uid $(id -u)"
+assert_log_matches "loginctl: show-session consulted" "$LOGINCTL_LOG" '^loginctl show-session 3$'
+assert_log_matches "loginctl: show-seat ActiveSession consulted" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
 printf '0\n' > "$FAKE_SYSFS"
 : > "$CHMOD_LOG"
 : > "$CHOWN_LOG"
@@ -404,6 +500,7 @@ assert_mode "loginctl: resume handoff 0600" "600" "$_user_dir/c640-kbd-backlight
 assert_owner "loginctl: resume handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "loginctl: resume chmod 600 on handoff recorded" "$CHMOD_LOG" '^chmod 600 .*\.c640-kbd-handoff\.'
 assert_log_matches "loginctl: resume chown uid:gid recorded" "$CHOWN_LOG" "^chown $(id -u):$(id -g) .*\.c640-kbd-handoff\."
+assert_log_matches "loginctl: post handoff path logged" "$HOOK_ERR" "post handoff dir $_user_dir for uid $(id -u)"
 if grep -q 'list-sessions --no-legend' "$LOGINCTL_LOG"; then
     ok "loginctl list-sessions --no-legend consulted"
 else
@@ -413,58 +510,302 @@ assert_empty_log "no gdbus calls (loginctl case)" "$GDBUS_LOG"
 assert_empty_log "no sudo calls (loginctl case)" "$SUDO_LOG"
 assert_empty_log "no ectool calls (loginctl case)" "$ECTOOL_LOG"
 
-# 9b. Multiple loginctl rows without a preferred one: the FIRST real session
-# row is used and the ambiguity is logged as a WARN.  `nobody` is the first
-# row, so a wrong branch is immediately visible in the handoff directory.
+# 9b. A local graphical user session plus an IDLE SSH session.  The old
+#     IDLE=yes/CLASS=active heuristic picked the SSH user (nobody); the
+#     explicit Active/Remote/Class/Type/Seat properties must pick the local
+#     graphical uid instead.
 reset_case
 HOOK_HANDOFF_DIR=""
-STUB_LOGINCTL_MODE=multi
+STUB_LOGINCTL_MODE=idle-ssh
 _nobody_uid="$(id -u nobody)"
-run_hook pre suspend
-assert_file "multi-session: first candidate's handoff written" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend" "7"
-if grep -q 'multiple login sessions (2)' "$HOOK_ERR"; then
-    ok "multi-session: ambiguity is logged as a WARN"
-else
-    bad "multi-session: no WARN (stderr: $(cat "$HOOK_ERR"))"
-fi
-if grep -q "using handoff dir $RUN_USER_ROOT/$_nobody_uid" "$HOOK_ERR"; then
-    ok "multi-session: WARN names the chosen handoff directory"
-else
-    bad "multi-session: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
-fi
-assert_empty_log "multi-session: no gdbus calls" "$GDBUS_LOG"
-
-# 9c. IDLE=yes wins over an earlier (non-idle) candidate.
-reset_case
-HOOK_HANDOFF_DIR=""
-STUB_LOGINCTL_MODE=prefer-idle
+mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
+chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "prefer-idle: handoff in the IDLE=yes session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
-assert_absent "prefer-idle: no handoff in the skipped session dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
-if grep -q 'multiple login sessions (2)' "$HOOK_ERR"; then
-    ok "prefer-idle: multiple-session WARN still emitted"
+assert_file "idle-ssh: handoff in local graphical user's dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_absent "idle-ssh: no handoff in idle SSH user's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+assert_log_matches "idle-ssh: show-session checked both sessions" "$LOGINCTL_LOG" '^loginctl show-session 4$'
+assert_log_matches "idle-ssh: selected session 3 on seat0" "$HOOK_ERR" "selected session 3 on seat seat0 for uid $(id -u)"
+printf '0\n' > "$FAKE_SYSFS"
+run_hook post suspend
+if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
+    ok "idle-ssh: resume flag written for graphical user"
 else
-    bad "prefer-idle: no WARN (stderr: $(cat "$HOOK_ERR"))"
+    bad "idle-ssh: no valid resume flag in graphical user's dir ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
 fi
-if grep -q "using handoff dir $_user_dir" "$HOOK_ERR"; then
-    ok "prefer-idle: WARN names the preferred session's directory"
-else
-    bad "prefer-idle: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
-fi
+assert_absent "idle-ssh: no resume flag in SSH user's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.resume"
+assert_mode "idle-ssh: resume handoff only in graphical dir" "600" "$_user_dir/c640-kbd-backlight.resume"
+assert_empty_log "idle-ssh: no gdbus calls" "$GDBUS_LOG"
 
-# 9d. CLASS=active wins even though IDLE=no.
+# 9c. Greeter + user on the same seat: the greeter (Class=greeter) is never
+#     a handoff owner even though it is Active=yes and local.
 reset_case
 HOOK_HANDOFF_DIR=""
-STUB_LOGINCTL_MODE=prefer-class
+STUB_LOGINCTL_MODE=greeter-user
+mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
+chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
+_user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "prefer-class: handoff in the CLASS=active session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
-assert_absent "prefer-class: no handoff in the skipped session dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
-if grep -q "using handoff dir $_user_dir" "$HOOK_ERR"; then
-    ok "prefer-class: WARN names the active session's directory"
+assert_file "greeter+user: handoff in the user session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_absent "greeter+user: no handoff in greeter's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+assert_log_matches "greeter+user: show-session checked greeter" "$LOGINCTL_LOG" '^loginctl show-session 5$'
+assert_log_matches "greeter+user: selected the user session" "$HOOK_ERR" "selected session 6 on seat seat0 for uid $(id -u)"
+assert_log_matches "greeter+user: seat active session verified" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
+
+# 9d. Two active local graphical sessions on two different seats: no single
+#     owner is safe.  Both pre and post fail closed; root state is still
+#     saved and neither runtime dir receives a handoff.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=ambiguous
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+_other_dir="$RUN_USER_ROOT/$_nobody_uid"
+mkdir -p "$_user_dir" "$_other_dir"
+chmod 700 "$_user_dir" "$_other_dir"
+run_hook pre suspend
+assert_file "ambiguous: root state still saved" "$STATE_DIR/state" "7"
+assert_absent "ambiguous: no suspend handoff in seat0 user dir" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "ambiguous: no suspend handoff in seat1 user dir" "$_other_dir/c640-kbd-backlight.suspend"
+assert_absent "ambiguous: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "ambiguous: fail-closed WARN names 2 candidates" "$HOOK_ERR" 'session selection fail-closed: 2 candidates'
+assert_log_matches "ambiguous: fail-closed WARN names both sessions" "$HOOK_ERR" 'session 10 on seat seat0, session 11 on seat seat1'
+assert_log_matches "ambiguous: show-session checked both seats" "$LOGINCTL_LOG" '^loginctl show-session 11$'
+run_hook post suspend
+assert_absent "ambiguous: no resume flag in seat0 user dir" "$_user_dir/c640-kbd-backlight.resume"
+assert_absent "ambiguous: no resume flag in seat1 user dir" "$_other_dir/c640-kbd-backlight.resume"
+assert_log_matches "ambiguous: post fails closed without cycle uid" "$HOOK_ERR" 'no cycle uid file'
+
+# 9e. pre/post split: the session changes between the two phases.  post
+#     WARNs about the change but still writes to the uid pinned by pre.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+STUB_LOGINCTL_MODE=pre-post-other
+: > "$HOOK_ERR"
+run_hook post suspend
+if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
+    ok "pre/post split: resume flag uses pre's uid dir"
 else
-    bad "prefer-class: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
+    bad "pre/post split: no valid resume flag in pre's uid dir ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
 fi
+assert_log_matches "pre/post split: WARN reports the changed session" "$HOOK_ERR" 'session changed since pre'
+assert_absent "pre/post split: no resume flag in the new session's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.resume"
+
+# 9f. SUDO_USER is only a hint at most: a sudo issued from an SSH session
+#     must not override the loginctl-verified local graphical user.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=idle-ssh
+HOOK_SUDO_USER="$(id -nu nobody)"
+mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
+chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "SUDO_USER hint: handoff still in graphical user's dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_absent "SUDO_USER hint: no handoff in SUDO_USER's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+
+# 9g. Runtime dir validation: pre/post must never create, chmod or chown a
+#     user runtime dir.  Missing, wrong-owner or world-writable dirs fail
+#     closed with a WARN while the root diagnostic snapshot is still saved.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=bad-dir-missing
+run_hook pre suspend
+assert_file "runtime dir missing: root state still saved" "$STATE_DIR/state" "7"
+assert_absent "runtime dir missing: no handoff" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+assert_absent "runtime dir missing: hook did not create the dir" "$RUN_USER_ROOT/$_nobody_uid"
+assert_log_matches "runtime dir missing: fail-closed WARN" "$HOOK_ERR" 'runtime dir .* missing/insecure'
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=bad-dir-owner
+mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
+chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
+run_hook pre suspend
+assert_absent "runtime dir wrong owner: no handoff" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+assert_log_matches "runtime dir wrong owner: fail-closed WARN" "$HOOK_ERR" 'runtime dir .* missing/insecure'
+assert_mode "runtime dir wrong owner: hook did not chmod it" "700" "$RUN_USER_ROOT/$_nobody_uid"
+assert_empty_log "runtime dir wrong owner: hook did not chown it" "$CHOWN_LOG"
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=bad-dir-mode
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+chmod 777 "$_user_dir"
+run_hook pre suspend
+assert_absent "runtime dir world-writable: no handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_log_matches "runtime dir world-writable: fail-closed WARN" "$HOOK_ERR" 'runtime dir .* missing/insecure'
+assert_mode "runtime dir world-writable: hook did not tighten it" "777" "$_user_dir"
+
+# post validates the pinned uid's runtime dir too.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+chmod 777 "$_user_dir"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "runtime dir invalidated before post: no resume flag" "$_user_dir/c640-kbd-backlight.resume"
+assert_log_matches "runtime dir invalidated before post: fail-closed WARN" "$HOOK_ERR" 'runtime dir .* missing/insecure'
+
+# 9h. State=closing is not a live graphical session either.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=closing
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "closing session: no handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_log_matches "closing session: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+
+# 9i. Load-bearing gates.  Each stub below fails ONLY ONE gate (Active /
+#     Remote / Class / Type / seat ActiveSession): all other properties are in
+#     the PASS state and the session IS its seat's ActiveSession.  Removing
+#     that one gate must turn the expected fail-closed result into a handoff.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=active-no
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "gate Active=no: no handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "gate Active=no: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "gate Active=no: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=remote-yes
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "gate Remote=yes: no handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "gate Remote=yes: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "gate Remote=yes: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=type-tty
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "gate Type=tty: no handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "gate Type=tty: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "gate Type=tty: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+
+# Two graphical user sessions on the SAME seat, both otherwise perfect.  Only
+# show-seat ActiveSession distinguishes them; removing that comparison makes
+# two candidates and fail-closes instead of selecting session 41.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=seat-active
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "gate seat ActiveSession: handoff written" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_log_matches "gate seat ActiveSession: chose the seat's active session" "$HOOK_ERR" "selected session 41 on seat seat0 for uid $(id -u)"
+assert_log_matches "gate seat ActiveSession: second session was examined" "$LOGINCTL_LOG" '^loginctl show-session 42$'
+assert_log_matches "gate seat ActiveSession: show-seat consulted" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
+
+# Greeter and user on the same seat; the GREETER is the seat's ActiveSession,
+# is Active=yes / Remote=no / Type=x11, so only Class=greeter excludes it.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=greeter-active
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "gate Class=greeter: no handoff for greeter" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "gate Class=greeter: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "gate Class=greeter: greeter was examined" "$LOGINCTL_LOG" '^loginctl show-session 50$'
+assert_log_matches "gate Class=greeter: show-seat agreed with greeter" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
+assert_log_matches "gate Class=greeter: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+
+# 9j. Cycle uid pin file: 0644 must fail closed in post; a stale pin from a
+#     previous cycle must be cleared before this cycle's failed selection so
+#     post cannot reuse it.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+chmod 644 "$STATE_DIR/session-uid"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "cycle uid 0644: no resume flag" "$_user_dir/c640-kbd-backlight.resume"
+assert_log_matches "cycle uid 0644: post fails closed" "$HOOK_ERR" "$STATE_DIR/session-uid is not 0600"
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "stale pin setup: previous cycle pinned uid" "$STATE_DIR/session-uid" "$(id -u)"
+rm -f "$_user_dir/c640-kbd-backlight.suspend" "$_user_dir/c640-kbd-backlight.resume"
+STUB_LOGINCTL_MODE=closing
+: > "$HOOK_ERR"
+run_hook pre suspend
+assert_absent "stale pin: pre cleared the pin after failed selection" "$STATE_DIR/session-uid"
+assert_absent "stale pin: no new handoff" "$_user_dir/c640-kbd-backlight.suspend"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "stale pin: post did not reuse the old uid" "$_user_dir/c640-kbd-backlight.resume"
+assert_log_matches "stale pin: post fails closed without cycle uid" "$HOOK_ERR" 'no cycle uid file'
+
+# 9k. post's _session_uid call is verification only.  A 0-candidate or
+#     multi-candidate answer must NOT log "no handoff": post still publishes
+#     the resume flag using the uid pinned by pre.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+STUB_LOGINCTL_MODE=closing
+: > "$HOOK_ERR"
+run_hook post suspend
+if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
+    ok "post verification (0 candidates): resume flag still written"
+else
+    bad "post verification (0 candidates): no resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
+fi
+assert_log_matches "post verification (0 candidates): pinned uid still used" "$HOOK_ERR" 'verification only; pinned uid still used'
+if grep -q 'no handoff' "$HOOK_ERR"; then
+    bad "post verification (0 candidates): misleading 'no handoff' log"
+else
+    ok "post verification (0 candidates): no misleading 'no handoff' log"
+fi
+
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+STUB_LOGINCTL_MODE=ambiguous
+: > "$HOOK_ERR"
+run_hook post suspend
+if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
+    ok "post verification (2 candidates): resume flag still written"
+else
+    bad "post verification (2 candidates): no resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
+fi
+assert_log_matches "post verification (2 candidates): pinned uid still used" "$HOOK_ERR" 'verification only; pinned uid still used'
+if grep -q 'no handoff' "$HOOK_ERR"; then
+    bad "post verification (2 candidates): misleading 'no handoff' log"
+else
+    ok "post verification (2 candidates): no misleading 'no handoff' log"
+fi
+
+# 9l. A vanished handoff dir must not be replaced by a /tmp stand-in: the
+#     [ -d ] guard in _runtime_dir_ok / _atomic_write must reject it before
+#     mktemp can fall back to $TMPDIR.
+reset_case
+HOOK_HANDOFF_DIR="$TMP_DIR/vanished-handoff"
+HOOK_TMPDIR="$FALLBACK_DIR"
+run_hook pre suspend
+assert_absent "tmp fallback: no handoff at the vanished target" "$TMP_DIR/vanished-handoff/c640-kbd-backlight.suspend"
+assert_absent "tmp fallback: nothing written into TMPDIR" "$FALLBACK_DIR/c640-kbd-backlight.suspend"
+if grep -Fq "$FALLBACK_DIR/.c640-kbd-handoff" "$MKTEMP_LOG"; then
+    bad "tmp fallback: _atomic_write used a /tmp stand-in mktemp"
+else
+    ok "tmp fallback: _atomic_write never used a /tmp stand-in mktemp"
+fi
+assert_log_matches "tmp fallback: fail-closed WARN" "$HOOK_ERR" 'handoff skipped \(fail-closed\)'
 
 # 10. No resolvable session user: handoff is skipped, root state still saved.
 reset_case
@@ -473,8 +814,11 @@ find "$RUN_USER_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 run_hook pre suspend
 assert_file "no user: root state still saved" "$STATE_DIR/state" "7"
 assert_absent "no user: no suspend handoff" "$SUSPEND_FILE"
+assert_absent "no user: no handoff in runtime root" "$RUN_USER_ROOT/$(id -u)/c640-kbd-backlight.suspend"
+assert_log_matches "no user: fail-closed WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
 run_hook post suspend
 assert_absent "no user: no resume handoff" "$RESUME_FILE"
+assert_log_matches "no user: post fails closed without cycle uid" "$HOOK_ERR" 'no cycle uid file'
 assert_empty_log "no user: no gdbus calls" "$GDBUS_LOG"
 assert_empty_log "no user: no sudo calls" "$SUDO_LOG"
 

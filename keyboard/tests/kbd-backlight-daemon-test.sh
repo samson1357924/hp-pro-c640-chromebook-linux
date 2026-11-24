@@ -65,12 +65,16 @@ STUB_ACTIVE_SEQ_FILE="$TMP_DIR/active-seq"
 HANDOFF_DIR="$TMP_DIR/handoff"
 HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
-# The hook-side directory the daemon watches for a mismatch WARN.  By default
+# An EXPLICIT C640_KBD_HANDOFF_DIR override is the only hook-side directory
+# the daemon diagnoses: a handoff there that differs from the daemon's own
+# path is a test/configuration error worth a user-visible WARN.  By default
 # it is an empty sandbox dir; the mismatch test is the only case that puts a
 # handoff there while the daemon's own path stays empty.
 HOOK_HANDOFF_DIR="$TMP_DIR/hook-handoff"
 HOOK_SUSPEND_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.suspend"
-# Sandboxed /run/user root for the read-only cross-uid mismatch scan.
+# Sandboxed /run/user root.  The daemon must NOT scan it: another user's 0700
+# runtime dir is unreadable, so a "read-only cross-uid scan" cannot diagnose
+# anything.  The directory is kept only as a decoy for the no-warn regression.
 HOOK_RUN_USER_ROOT="$TMP_DIR/hook-run-user"
 LEGACY_LOG="$TMP_DIR/legacy.log"
 mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR" "$HANDOFF_DIR" "$HOOK_HANDOFF_DIR" "$HOOK_RUN_USER_ROOT"
@@ -439,6 +443,9 @@ export PATH="$STUB_DIR:$PATH"
 export C640_KBD_HANDOFF_SUSPEND="$HANDOFF_SUSPEND_FILE"
 export C640_KBD_HANDOFF_RESUME="$HANDOFF_RESUME_FILE"
 export C640_KBD_HANDOFF_DIR="$HOOK_HANDOFF_DIR"
+# Decoy for P3-1: keep the OLD hook-side runtime-root knob exported so that a
+# reintroduced cross-uid scan would actually find the other uid's handoff
+# below and produce a false WARN.  The current daemon deliberately ignores it.
 export C640_KBD_RUN_USER_ROOT="$HOOK_RUN_USER_ROOT"
 export C640_KBD_RESUME_PROBE_MAX=0
 export C640_KBD_RESUME_ALLOW_UNKNOWN=0
@@ -1340,9 +1347,9 @@ else
     bad "adopt(invalid): no warning (stderr: $(cat "$DAEMON_ERR"))"
 fi
 
-# P3. The hook writes /run/user/<uid> while the daemon reads XDG_RUNTIME_DIR.
-# If a handoff exists only in the hook's directory, warn instead of silently
-# losing it; the daemon must NOT cross-adopt a possibly different user's file.
+# P3. An EXPLICIT C640_KBD_HANDOFF_DIR override that disagrees with the
+# daemon's own handoff path is a test/configuration error: warn instead of
+# silently losing the handoff.  Never cross-adopt the override's file.
 reset_case
 printf '7\n' > "$HOOK_SUSPEND_FILE"
 printf '%s suspend\n' "$(date +%s)" > "$HOOK_HANDOFF_DIR/c640-kbd-backlight.resume"
@@ -1362,27 +1369,58 @@ else
     bad "handoff mismatch: no resume-flag warning (stderr: $(cat "$DAEMON_ERR"))"
 fi
 
-# P3-1. The hook can resolve a DIFFERENT session uid (multi-seat): the daemon
-# must still notice the handoff in /run/user/1001 while it reads its own dir,
-# warn, and never cross-adopt it.
+# P3-1. A handoff in ANOTHER uid's runtime dir must produce NO mismatch WARN
+# and must never be cross-adopted.  A real 0700 (here simulated with 000)
+# runtime dir cannot be traversed by this daemon, so the old read-only scan
+# silently saw nothing and its promised diagnosis was unreliable.  The hook
+# now logs uid/session/path/fail-closed to the ROOT journal instead; the
+# authoritative diagnostic no longer depends on cross-uid readability.
 reset_case
 mkdir -p "$HOOK_RUN_USER_ROOT/1001"
 printf '7\n' > "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.suspend"
 printf '%s suspend\n' "$(date +%s)" > "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.resume"
+chmod 000 "$HOOK_RUN_USER_ROOT/1001"
 run_fn adopt_suspend_handoff
-assert_absent "cross-uid mismatch: no cross-adopt into daemon state" "$STATE_FILE"
-assert_present "cross-uid mismatch: other uid's handoff untouched" "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.suspend"
-if grep -q 'handoff directory mismatch.*/1001/c640-kbd-backlight.suspend' "$DAEMON_ERR"; then
-    ok "cross-uid mismatch: suspend handoff warns with the other uid's path"
+assert_absent "cross-uid: no cross-adopt into daemon state" "$STATE_FILE"
+if grep -q 'handoff directory mismatch' "$DAEMON_ERR"; then
+    bad "cross-uid: false mismatch WARN from unreadable dir (stderr: $(cat "$DAEMON_ERR"))"
 else
-    bad "cross-uid mismatch: no warning (stderr: $(cat "$DAEMON_ERR"))"
+    ok "cross-uid: unreadable other uid's dir produces no mismatch WARN"
+fi
+chmod 700 "$HOOK_RUN_USER_ROOT/1001"
+assert_present "cross-uid: other uid's handoff untouched" "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.suspend"
+# Same decoy, now readable: the OLD numeric /run/user/[0-9]*/ scan (with the
+# knob exported above) would warn here, so this is a live regression check,
+# not just a tautological "no warn" on an unreachable path.
+: > "$DAEMON_ERR"
+run_fn adopt_suspend_handoff
+assert_absent "cross-uid (readable decoy): no cross-adopt into daemon state" "$STATE_FILE"
+if grep -q 'handoff directory mismatch' "$DAEMON_ERR"; then
+    bad "cross-uid (readable decoy): false mismatch WARN (stderr: $(cat "$DAEMON_ERR"))"
+else
+    ok "cross-uid (readable decoy): no mismatch WARN"
 fi
 write_state 7
 run_fn handle_resume
-if grep -q 'handoff directory mismatch.*/1001/c640-kbd-backlight.resume' "$DAEMON_ERR"; then
-    ok "cross-uid mismatch: resume flag warns with the other uid's path"
+if grep -q 'handoff directory mismatch.*/1001' "$DAEMON_ERR"; then
+    bad "cross-uid: resume produced a false mismatch WARN (stderr: $(cat "$DAEMON_ERR"))"
 else
-    bad "cross-uid mismatch: no resume warning (stderr: $(cat "$DAEMON_ERR"))"
+    ok "cross-uid: resume flag produces no mismatch WARN"
+fi
+
+# P3-1 (static guard): the diagnosis function itself must not contain a
+# numeric runtime-dir scan or the removed C640_KBD_RUN_USER_ROOT knob.  This
+# catches a reintroduced scan even when a decoy happens to be unreadable.
+_warn_body="$(awk '/^_warn_hook_side_handoff\(\)/ { in_fn=1 } in_fn { print } in_fn && /^}/ { exit }' "$DAEMON")"
+if [ -z "$_warn_body" ]; then
+    bad "static guard: cannot locate _warn_hook_side_handoff body"
+else
+    ok "static guard: located _warn_hook_side_handoff body"
+    if printf '%s\n' "$_warn_body" | grep -Eq 'C640_KBD_RUN_USER_ROOT|HOOK_RUN_USER_ROOT|\[0-9\]'; then
+        bad "static guard: cross-uid numeric scan reintroduced in _warn_hook_side_handoff"
+    else
+        ok "static guard: no cross-uid numeric scan in _warn_hook_side_handoff"
+    fi
 fi
 
 # P4b-3. resume + active: adopt 7, defer, keep state + flag; no LED write.

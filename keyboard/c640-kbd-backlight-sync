@@ -50,31 +50,29 @@ STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
 # STATE_FILE (i.e. $XDG_RUNTIME_DIR).
 HANDOFF_SUSPEND_FILE="${C640_KBD_HANDOFF_SUSPEND:-$STATE_DIR/c640-kbd-backlight.suspend}"
 HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.resume}"
-# The root sleep hook publishes into /run/user/<uid>, while this daemon reads
-# from XDG_RUNTIME_DIR.  Production normally resolves to the same place, but a
-# mismatched XDG (or an override) can leave a handoff in the hook's directory
-# that the daemon never sees.  Keep a read-only view of the hook-side paths so
-# the adoption path can warn loudly instead of silently ignoring the handoff.
-# C640_KBD_HANDOFF_DIR is the same override the hook accepts (tests use it).
-HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-/run/user/$(id -u 2> /dev/null || echo 1000)}"
-# The hook resolves the session uid from loginctl, which may differ from this
-# daemon's uid on a multi-seat host.  Scan the runtime root READ-ONLY for a
-# same-named handoff; a mismatch is diagnosed, never cross-adopted.
-HOOK_RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
+# The root sleep hook publishes into the session user's XDG_RUNTIME_DIR, which
+# production normally resolves to the SAME directory this daemon reads.  The
+# only user-visible diagnostic kept here is an EXPLICIT C640_KBD_HANDOFF_DIR
+# override (tests / deliberate configuration) that disagrees with the file the
+# daemon actually reads.  We deliberately do NOT scan /run/user/<other uid>:
+# a real 0700 runtime dir cannot be traversed by another user, so a "read-only
+# cross-uid scan" would silently see nothing and promise a diagnosis it cannot
+# deliver.  The hook now logs the selected uid/session/path and its
+# fail-closed reasons to the root journal instead; never cross-adopt a file
+# from another user's runtime dir.
+HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-}"
 
 _warn_hook_side_handoff() {
-    local filename="$1" expected="$2" candidate explicit seen=" "
+    local filename="$1" expected="$2" candidate
     if [ -f "$expected" ]; then
         return 0
     fi
-    explicit="${HOOK_HANDOFF_DIR%/}/$filename"
-    for candidate in "$explicit" "$HOOK_RUN_USER_ROOT"/[0-9]*/"$filename"; do
-        [ -f "$candidate" ] || continue
-        [ "$candidate" != "$expected" ] || continue
-        case "$seen" in *" $candidate "*) continue ;; esac
-        seen="$seen$candidate "
-        log_warn "handoff directory mismatch: hook wrote $candidate but daemon reads $expected (check XDG_RUNTIME_DIR / session uid)"
-    done
+    [ -n "$HOOK_HANDOFF_DIR" ] || return 0
+    candidate="${HOOK_HANDOFF_DIR%/}/$filename"
+    [ "$candidate" != "$expected" ] || return 0
+    if [ -f "$candidate" ]; then
+        log_warn "handoff directory mismatch: hook wrote $candidate but daemon reads $expected (check XDG_RUNTIME_DIR / C640_KBD_HANDOFF_DIR)"
+    fi
 }
 # Staging file used while a restore write is in flight.  STATE_FILE is renamed
 # here just before the (potentially slow) write, so a blank arriving mid-write
@@ -1514,9 +1512,9 @@ _adopt_suspend_handoff_locked() {
 
 adopt_suspend_handoff() {
     if [ ! -f "$HANDOFF_SUSPEND_FILE" ]; then
-        # Diagnose the XDG_RUNTIME_DIR vs /run/user/<uid> split, including a
-        # session uid different from this daemon's.  Read-only: never adopt
-        # across directories that may belong to different users.
+        # Only an explicit override mismatch is diagnosable from here; there
+        # is no cross-uid traversal and no cross-adoption.  The root hook's
+        # journal carries the authoritative uid/session/path diagnostics.
         _warn_hook_side_handoff "c640-kbd-backlight.suspend" "$HANDOFF_SUSPEND_FILE"
         log_warn "suspend handoff $HANDOFF_SUSPEND_FILE missing; nothing to adopt"
         # Neutral: the caller simply restores from a valid STATE_FILE if any.

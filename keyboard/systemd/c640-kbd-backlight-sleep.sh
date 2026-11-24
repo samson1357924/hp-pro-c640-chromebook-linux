@@ -40,14 +40,40 @@
 # daemon MUST consume (remove) them, otherwise the next suspend would reuse
 # the stale values left behind by this cycle.
 #
+# SESSION SELECTION / SAME-CYCLE CONTRACT (finding #5)
+# ---------------------------------------------------
+# The handoff owner is NOT chosen by `loginctl list-sessions`' IDLE/CLASS
+# columns: IDLE=yes means "idle", not "active", and CLASS is user/greeter/
+# background, never "active".  On a host with a local graphical user plus an
+# idle SSH session that heuristic picked the SSH user (often nobody, 65534).
+# Only loginctl's real properties are authoritative:
+#   show-session <id>: Active=yes, Remote=no, Class=user,
+#                      Type=wayland|x11, State != closing, numeric UID
+#   show-seat <seat> -p ActiveSession: the session must be its seat's active
+#                      session (this also resolves the multi-seat case)
+# Exactly one such candidate is required; 0 or >1 is FAIL-CLOSED (journal
+# WARN, root state still saved, no handoff from pre and no flag from post).
+# Greeter/background/tty sessions are never selected.  SUDO_USER is ignored:
+# sudo may arrive over SSH and cannot pass the loginctl checks above.
+#
+# To prevent a pre/post split (different sessions, or a session disappearing
+# while user.slice is frozen), `pre` pins the chosen uid in root-only
+# $STATE_DIR/session-uid (0600, mktemp+mv).  `post` reads that file, validates
+# the uid and its runtime dir, and reuses it without re-selecting.  A missing
+# or invalid file fails closed.  The hook never creates, chmods or chowns a
+# runtime dir; an absent/insecure /run/user/<uid> is a fail-closed condition.
+#
 # Environment overrides:
 #   C640_KBD_SLEEP_SYSFS, C640_KBD_SLEEP_STATE_DIR,
 #   C640_KBD_SLEEP_SOURCE_ONLY  (kept)
-#   C640_KBD_HANDOFF_DIR        full handoff directory override (tests)
+#   C640_KBD_HANDOFF_DIR        full handoff directory override (tests);
+#                               a caller-supplied path is trusted as-is and
+#                               bypasses loginctl/uid pinning by design
 #   C640_KBD_RUN_USER_ROOT      runtime root, defaults to /run/user (tests)
 # Removed/deprecated and deliberately ignored:
 #   C640_KBD_SLEEP_USER, C640_KBD_SLEEP_UID, C640_KBD_SLEEP_BUS,
 #   C640_KBD_SLEEP_DELAY  (no D-Bus and no delay in this hook any more)
+#   SUDO_USER             (not authoritative; see above)
 set -eu
 
 SYSFS="${C640_KBD_SLEEP_SYSFS:-/sys/class/leds/chromeos::kbd_backlight/brightness}"
@@ -58,12 +84,13 @@ STATE_FILE="$STATE_DIR/state"
 HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-}"
 RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 HANDOFF_OWNER=""
-# Number of real loginctl session rows.  _session_uid() runs in a command
-# substitution, so it returns this count alongside the uid rather than
-# assigning a global that would be lost in the subshell.
-SESSION_CANDIDATES=0
+CYCLE_UID_FILE="$STATE_DIR/session-uid"
 SUSPEND_HANDOFF="c640-kbd-backlight.suspend"
 RESUME_HANDOFF="c640-kbd-backlight.resume"
+
+log_info() {
+    echo "[c640-kbd-backlight-sleep] $*" >&2
+}
 
 log_warn() {
     echo "[WARN] [c640-kbd-backlight-sleep] $*" >&2
@@ -131,94 +158,225 @@ save_state() {
     rm -f "$_tmp" 2> /dev/null || true
 }
 
-# Resolve the session user's numeric UID from LOCAL sources only:
-#   SUDO_USER -> loginctl list-sessions -> /run/user/<uid>.
-# Deliberately NO gdbus, NO session bus, NO sudo -u, NO timeout: the hook runs
-# with user.slice frozen, so every user-session probe is guaranteed to fail
-# and would only add latency. loginctl is a system service (not frozen).
-_session_uid() {
-    _uid=""
-    _candidates=0
-    if [ -n "${SUDO_USER:-}" ]; then
-        _uid="$(id -u "$SUDO_USER" 2> /dev/null || echo "")"
-    fi
-
-    if [ -z "$_uid" ] && command -v loginctl > /dev/null 2>&1; then
-        # `loginctl list-sessions --no-legend` columns are
-        #   SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE [...]
-        # USER is $3 (never the UID column $2, and never a literal "active").
-        # Prefer a live session (IDLE=yes / CLASS=active), else the first real
-        # session row. Skip the header line.
-        _sessions="$(loginctl list-sessions --no-legend 2> /dev/null || true)"
-        _user="$(printf '%s\n' "$_sessions" \
-            | awk '
-                NF >= 3 && $1 != "SESSION" {
-                    if ($8 == "yes" || $6 == "active") { chosen = $3; exit }
-                    if (first == "") first = $3
-                }
-                END { if (chosen != "") print chosen; else if (first != "") print first }
-              ' 2> /dev/null || true)"
-        # A multi-seat/multi-session host has no single obvious owner for the
-        # handoff.  The preference above (IDLE=yes / CLASS=active) is
-        # deliberate, but make the ambiguity visible in the journal.
-        _candidates="$(printf '%s\n' "$_sessions" \
-            | awk 'NF >= 3 && $1 != "SESSION" { n++ } END { print n+0 }' 2> /dev/null || true)"
-        case "$_candidates" in '' | *[!0-9]*) _candidates=0 ;; esac
-        # The chosen PATH is only known after the uid is resolved, so the
-        # warning is emitted by resolve_handoff_dir() below.  Return the count
-        # with the uid (this function runs in a command substitution).
-        if [ -n "$_user" ]; then
-            _uid="$(id -u "$_user" 2> /dev/null || echo "")"
-        fi
-    fi
-
-    if [ -z "$_uid" ]; then
-        for _dir in "$RUN_USER_ROOT"/[0-9]*; do
-            [ -d "$_dir" ] || continue
-            _cand="${_dir##*/}"
-            case "$_cand" in '' | *[!0-9]*) continue ;; esac
-            # Verify the uid maps to a real user before adopting it.
-            if [ -n "$(id -nu "$_cand" 2> /dev/null || echo "")" ]; then
-                _uid="$_cand"
-                break
-            fi
-        done
-    fi
-
-    case "$_uid" in '' | *[!0-9]*) _uid="" ;; esac
-    printf '%s %s' "$_uid" "$_candidates"
+# Extract one Key=Value property from a `loginctl show-*` snapshot.  Values
+# may contain '=', so slice from the original line rather than using -F=$N.
+_session_prop() {
+    printf '%s\n' "$1" | awk -F= -v key="$2" '$1 == key { print substr($0, length($1) + 2); exit }'
 }
 
-# Decide where handoff files go. With an explicit override the directory is
-# already owned/writable by the caller (tests), so no chown is attempted.
-# Otherwise use /run/user/<resolved uid> and remember the owner for chown.
-# An empty result means "skip handoff" - the root state is still saved.
+# A runtime dir is usable only when it ALREADY exists, is a real directory,
+# has mode 0700 and is owned by the resolved uid.  Root must never create,
+# chmod or chown a user's runtime dir: an absent/insecure dir is fail-closed.
+# With no uid (explicit C640_KBD_HANDOFF_DIR override) only existence is
+# checked - the caller owns that path and deliberately bypasses loginctl.
+_runtime_dir_ok() {
+    _rd="$1"
+    _ru="${2:-}"
+    [ -d "$_rd" ] || return 1
+    if [ -n "$_ru" ]; then
+        [ ! -L "$_rd" ] || return 1
+        _rmode="$(stat -c %a "$_rd" 2> /dev/null || echo '')"
+        [ "$_rmode" = 700 ] || return 1
+        _rowner="$(stat -c %u "$_rd" 2> /dev/null || echo '')"
+        [ "$_rowner" = "$_ru" ] || return 1
+    fi
+    return 0
+}
+
+# Resolve the ONE explicitly active, local, graphical user session from LOCAL
+# sources only.  `loginctl list-sessions` supplies session IDs; the real
+# properties come from `loginctl show-session <id>` and the seat's own active
+# session from `loginctl show-seat <seat> -p ActiveSession`.  Deliberately NO
+# gdbus, NO session bus, NO sudo -u: user.slice is frozen, and loginctl is a
+# system service.  Prints the single uid, or empty on 0/multiple candidates.
+# $1=1 (post verification) suppresses the "selected" info line but still
+# emits fail-closed warnings; the caller never re-selects from that result.
+_session_uid() {
+    _quiet="${1:-0}"
+    _uid=""
+    # In post this call is VERIFICATION ONLY: post reuses the uid pinned by
+    # pre, so a 0/multi-candidate result must not claim "no handoff" (post
+    # still writes the resume flag with the pinned uid).
+    if [ "$_quiet" = 1 ]; then
+        _verdict="verification only; pinned uid still used"
+    else
+        _verdict="no handoff"
+    fi
+    if ! command -v loginctl > /dev/null 2>&1; then
+        log_warn "session selection fail-closed: loginctl unavailable; $_verdict"
+        printf '%s' "$_uid"
+        return 0
+    fi
+    _ids="$(loginctl list-sessions --no-legend 2> /dev/null \
+        | awk 'NF >= 1 && $1 != "SESSION" { print $1 }' 2> /dev/null || true)"
+    _seen=0
+    _candidates=0
+    _chosen=""
+    _desc=""
+    for _id in $_ids; do
+        case "$_id" in '' | *[!0-9]*) continue ;; esac
+        _seen=$((_seen + 1))
+        _props="$(loginctl show-session "$_id" 2> /dev/null || true)"
+        _active="$(_session_prop "$_props" Active)"
+        _remote="$(_session_prop "$_props" Remote)"
+        _class="$(_session_prop "$_props" Class)"
+        _type="$(_session_prop "$_props" Type)"
+        _state="$(_session_prop "$_props" State)"
+        _seat="$(_session_prop "$_props" Seat)"
+        _suid="$(_session_prop "$_props" UID)"
+        # IDLE=yes / CLASS=active are NOT session activity indicators.  Only
+        # these explicit properties describe an active local graphical USER.
+        [ "$_active" = yes ] || continue
+        [ "$_remote" = no ] || continue
+        [ "$_class" = user ] || continue
+        case "$_type" in wayland | x11) ;; *) continue ;; esac
+        [ -n "$_state" ] || continue
+        [ "$_state" != closing ] || continue
+        [ -n "$_seat" ] || continue
+        case "$_suid" in '' | *[!0-9]*) continue ;; esac
+        # A multi-seat host must agree on which session this seat is showing.
+        _seat_active="$(loginctl show-seat "$_seat" -p ActiveSession 2> /dev/null \
+            | awk -F= '$1 == "ActiveSession" { print substr($0, length($1) + 2); exit }' 2> /dev/null || true)"
+        [ "$_seat_active" = "$_id" ] || continue
+        # loginctl is the authority; SUDO_USER is ignored (it may be SSH).
+        [ -n "$(id -nu "$_suid" 2> /dev/null || echo '')" ] || continue
+        _candidates=$((_candidates + 1))
+        if [ "$_candidates" -eq 1 ]; then
+            _chosen="$_suid"
+            _desc="session $_id on seat $_seat"
+        else
+            _desc="$_desc, session $_id on seat $_seat"
+        fi
+    done
+    if [ "$_candidates" -ne 1 ]; then
+        if [ "$_candidates" -eq 0 ]; then
+            _reason="no active local graphical user session"
+        else
+            _reason="$_candidates candidates ($_desc)"
+        fi
+        log_warn "session selection fail-closed: $_reason (examined $_seen session(s)); $_verdict"
+        printf '%s' ""
+        return 0
+    fi
+    if [ "$_quiet" != 1 ]; then
+        log_info "selected $_desc for uid $_chosen"
+    fi
+    printf '%s' "$_chosen"
+}
+
+# Pin the chosen uid for this suspend cycle (root-only, atomic).
+_write_cycle_uid() {
+    _wuid="$1"
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
+    _tmp="$(mktemp "$STATE_DIR/.session-uid.XXXXXX" 2> /dev/null \
+        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-session-uid.XXXXXX" 2> /dev/null || echo '')"
+    if [ -z "$_tmp" ]; then
+        log_warn "cannot create temporary cycle uid file"
+        return 1
+    fi
+    if ! printf '%s\n' "$_wuid" > "$_tmp" 2> /dev/null; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "cannot write cycle uid $_wuid"
+        return 1
+    fi
+    chmod 600 "$_tmp" 2> /dev/null || true
+    if ! mv -f "$_tmp" "$CYCLE_UID_FILE" 2> /dev/null; then
+        cp "$_tmp" "$CYCLE_UID_FILE" 2> /dev/null || {
+            rm -f "$_tmp" 2> /dev/null || true
+            log_warn "cannot publish cycle uid $_wuid"
+            return 1
+        }
+    fi
+    rm -f "$_tmp" 2> /dev/null || true
+    chmod 600 "$CYCLE_UID_FILE" 2> /dev/null || true
+    return 0
+}
+
+# Read and validate the uid pinned by pre.  Never fall back to re-selecting.
+_read_cycle_uid() {
+    if [ ! -f "$CYCLE_UID_FILE" ]; then
+        log_warn "resume handoff skipped (fail-closed): no cycle uid file $CYCLE_UID_FILE"
+        return 1
+    fi
+    _umode="$(stat -c %a "$CYCLE_UID_FILE" 2> /dev/null || echo '')"
+    if [ "$_umode" != 600 ]; then
+        log_warn "resume handoff skipped (fail-closed): $CYCLE_UID_FILE is not 0600"
+        return 1
+    fi
+    _puid="$(cat "$CYCLE_UID_FILE" 2> /dev/null || echo '')"
+    case "$_puid" in '' | *[!0-9]*)
+        log_warn "resume handoff skipped (fail-closed): invalid cycle uid '$_puid'"
+        return 1
+        ;;
+    esac
+    if [ -z "$(id -nu "$_puid" 2> /dev/null || echo '')" ]; then
+        log_warn "resume handoff skipped (fail-closed): unknown cycle uid $_puid"
+        return 1
+    fi
+    _pdir="$RUN_USER_ROOT/$_puid"
+    if ! _runtime_dir_ok "$_pdir" "$_puid"; then
+        log_warn "resume handoff skipped (fail-closed): runtime dir $_pdir missing/insecure for uid $_puid"
+        return 1
+    fi
+    printf '%s' "$_puid"
+}
+
+# Decide where handoff files go.  With an explicit override the caller owns
+# the directory, so neither loginctl nor uid pinning is consulted.  Otherwise
+# pre selects+pins a single uid and post reuses the pinned uid (verification
+# only: a changed loginctl answer is warned about, never followed).  An empty
+# result means "skip handoff" - the root state is still saved.
 resolve_handoff_dir() {
+    _phase="${1:-pre}"
     if [ -n "$HANDOFF_DIR" ]; then
         HANDOFF_OWNER=""
         return 0
     fi
-    _resolved="$(_session_uid)"
-    _uid="${_resolved%% *}"
-    case "$_resolved" in
-        *" "*) SESSION_CANDIDATES="${_resolved#* }" ;;
-        *) SESSION_CANDIDATES=0 ;;
-    esac
-    if [ -z "$_uid" ]; then
-        log_warn "no session uid resolved; suspend/resume handoff skipped"
-        HANDOFF_DIR=""
-        HANDOFF_OWNER=""
-        return 0
+    if [ "$_phase" = post ]; then
+        if ! _uid="$(_read_cycle_uid)"; then
+            HANDOFF_DIR=""
+            HANDOFF_OWNER=""
+            return 0
+        fi
+        _now="$(_session_uid 1)"
+        if [ "$_now" != "$_uid" ]; then
+            log_warn "session changed since pre (now '$_now', pinned '$_uid'); keeping pre's uid (fail-closed against pre/post split)"
+        fi
+    else
+        # A new cycle must not inherit the previous cycle's uid: clear it
+        # first so a failed selection cannot be "rescued" by a stale file.
+        rm -f "$CYCLE_UID_FILE" 2> /dev/null || true
+        _uid="$(_session_uid)"
+        if [ -z "$_uid" ]; then
+            log_warn "suspend handoff skipped (fail-closed): no unambiguous local graphical session"
+            HANDOFF_DIR=""
+            HANDOFF_OWNER=""
+            return 0
+        fi
+        _dir="$RUN_USER_ROOT/$_uid"
+        if ! _runtime_dir_ok "$_dir" "$_uid"; then
+            log_warn "suspend handoff skipped (fail-closed): runtime dir $_dir missing/insecure for uid $_uid"
+            HANDOFF_DIR=""
+            HANDOFF_OWNER=""
+            return 0
+        fi
+        if ! _write_cycle_uid "$_uid"; then
+            log_warn "suspend handoff skipped (fail-closed): cannot pin cycle uid $_uid"
+            HANDOFF_DIR=""
+            HANDOFF_OWNER=""
+            return 0
+        fi
     fi
     HANDOFF_DIR="$RUN_USER_ROOT/$_uid"
     HANDOFF_OWNER="$_uid"
-    if [ "${SESSION_CANDIDATES:-0}" -gt 1 ]; then
-        log_warn "multiple login sessions ($SESSION_CANDIDATES); using handoff dir $HANDOFF_DIR (IDLE=yes / CLASS=active preferred)"
-    fi
+    log_info "$_phase handoff dir $HANDOFF_DIR for uid $_uid"
 }
 
 # Atomically publish one handoff file. All failures are best-effort: warn
 # only, never propagate, so suspend/resume never blocks on a handoff write.
+# The runtime dir must already exist with the right owner/mode; never create
+# a root-owned 0755 stand-in for a user's /run/user/<uid> (finding #5).
 _atomic_write() {
     _file="$1"
     _content="$2"
@@ -226,7 +384,10 @@ _atomic_write() {
     _dir="${_file%/*}"
 
     [ -n "$_dir" ] || return 0
-    mkdir -p "$_dir" 2> /dev/null || true
+    if ! _runtime_dir_ok "$_dir" "$_uid"; then
+        log_warn "handoff skipped (fail-closed): $_dir missing/insecure for uid '${_uid:-<override>}'"
+        return 0
+    fi
     _tmp="$(mktemp "$_dir/.c640-kbd-handoff.XXXXXX" 2> /dev/null \
         || mktemp "${TMPDIR:-/tmp}/.c640-kbd-handoff.XXXXXX" 2> /dev/null || echo "")"
     if [ -z "$_tmp" ]; then
@@ -257,7 +418,7 @@ _atomic_write() {
 # is the raw root reading (0 valid), NOT clamped here - clamping belongs to
 # the daemon's single-writer set_brightness path.
 publish_suspend_handoff() {
-    resolve_handoff_dir
+    resolve_handoff_dir pre
     [ -n "$HANDOFF_DIR" ] || return 0
     _curr="$(_read_current)"
     case "$_curr" in
@@ -273,7 +434,7 @@ publish_suspend_handoff() {
 # no D-Bus. The daemon uses this flag (plus the suspend handoff) after thaw.
 write_resume_handoff() {
     _action="${1:-suspend}"
-    resolve_handoff_dir
+    resolve_handoff_dir post
     [ -n "$HANDOFF_DIR" ] || return 0
     _epoch="$(date +%s 2> /dev/null || echo 0)"
     case "$_epoch" in '' | *[!0-9]*) _epoch=0 ;; esac
