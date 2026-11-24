@@ -203,7 +203,10 @@
   > 再經 gsd-power → UPower → legacy 還原。請勿把舊的 root 端 session bus 探測
   > 加回 hook——那就是當年第二寫入者的 bug。`pre` 寫入的 root
   > `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**
-  > （first-wins，保留到重開機），hook 與 daemon 都不消耗它，也從不用於還原。
+  > （first-wins，保留到重開機），hook 與 daemon 都不消耗它，也從不用於還原。若 hook
+  > 寫入的目錄與 daemon 讀取的不同，daemon 會記錄 `[WARN] handoff directory mismatch`
+  > 並附上路徑、忽略該候選檔；請檢查 `XDG_RUNTIME_DIR`／session uid，或讓兩端設定相同的
+  > `C640_KBD_HANDOFF_DIR`。
 
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
@@ -325,7 +328,9 @@
   * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` 代表至少一個 `systemctl`
     enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗），或有像找不到備份的紀錄
     被保留；這些紀錄會保留供重試，rollback 回傳 rc 1。修好根本問題後重跑 uninstall
-    即可——成功的還原會記錄 `[RESTORED SERVICE]`。
+    即可——成功的還原會記錄 `[RESTORED SERVICE]`。只要有紀錄被保留，各最上層 uninstaller
+    就會印出 `Uninstall incomplete; retained state will be retried (see FAIL/WARN lines
+    above).` 並以非 0 結束，而不會印 `finished!`。
   * `Manifest lock wait failed (rc=... after ...s) ... (holder: ...)` 或 `flock not found`
     來自跨程序鎖。自第十次 re-review 起這是**操作級鎖**：`run_manifest_operation()` 在整個
     元件安裝/解除安裝（備份/紀錄 → 部署檔案與服務 → 完成/回滾）期間持有它，因此平行程序
@@ -441,6 +446,13 @@
     `pam-auth-update --package converged the debconf selection and saved profiles (no
     fprintd).` 是預期的自我收斂日誌；`pam-auth-update --package failed; keeping the selection
     snapshot for uninstall convergence.` 則保留 sidecar。
+  * `Legacy PAM sidecar without any optional metadata; using best-effort compatibility.`
+    代表該 sidecar 由較舊的安裝器寫入、沒有 `saved-snapshot` 中繼資料：還原時改為檢查
+    `.saved` 目錄（空目錄視為 absent、無法讀取則 fail closed），而不是假設快照完整。相關的
+    `Legacy PAM sidecar has an empty ...; inferring saved-snapshot=absent`、
+    `... has no saved metadata; inferring saved-snapshot=complete from ...` 與
+    `... has no saved metadata and no ...; inferring saved-snapshot=absent (best-effort).`
+    都是同一條相容路徑。**新版** sidecar 若出現矛盾的 saved-snapshot 狀態仍會 fail closed。
   * `No PAM selection snapshot at <path>; nothing to restore.` 代表沒有支援 fprintd 的安裝
     留下 sidecar，因此沒有需要收斂回去的狀態。`Original PAM profile selection restored;
     snapshot consumed.` 是成功路徑：rollback 確認完成後，先複回 `.saved` 檔案，再以

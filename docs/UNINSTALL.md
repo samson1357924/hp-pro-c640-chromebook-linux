@@ -48,7 +48,9 @@ confirmed. If a guarantee below cannot be met, the record is **kept** in
 `/var/lib/cros-enablement/install-manifest.json` with a warning and rc 1 — including
 when no original backup exists — so a later `./setup.sh --uninstall` run can retry; it
 is never silently treated as done. Other processable items still roll back normally,
-but the final exit code is non-zero and `finished!` is not printed:
+but the final exit code is non-zero and `finished!` is not printed — the top-level
+uninstallers log `Uninstall incomplete; retained state will be retried (see FAIL/WARN lines
+above).` instead:
 
 * **Unknown original state is never assumed false.** The safety fields
   `was_existing`, `was_enabled`, `was_active` and `was_member` are required. Rollback

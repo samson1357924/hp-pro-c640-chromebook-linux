@@ -64,9 +64,9 @@
 | keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`（`[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護屬預期）、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。語法僅在 CI 以 keyd 2.6.0 驗證（`keyd check`）；行為只在本機以 2.5.0-5 驗證，其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知差異）。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
-| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——各次 re-review 修復後 406 個 daemon 案例全過（見下）；真實 S3 驗證見下 |
+| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——各次 re-review 修復後 460 個 daemon 案例全過（見下）；真實 S3 驗證見下 |
 | 鍵盤背光 user service | 🟢 | `/etc/systemd/user/`，全域啟用且 **uid 1000 的服務為 active**（`systemctl --global is-enabled`、`systemctl --user is-active` 皆正常）；`StandardError=journal` 讓 daemon 日誌可由 `journalctl --user -u c640-kbd-backlight-sync.service` 查看 |
-| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；73 個 hook 案例全過。root 的 `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**——first-wins、不被消耗、也從不用於還原。**真實 S3 freeze/thaw 於 2026-11-22 驗證**（詳情見下） |
+| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；84 個 hook 案例全過。root 的 `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**——first-wins、不被消耗、也從不用於還原。**真實 S3 freeze/thaw 於 2026-11-22 驗證**（詳情見下） |
 
 #### 真實 S3 驗收（2026-11-22，完整 systemd freeze/thaw）
 
@@ -85,10 +85,49 @@
 > `PrepareForSleep` freeze/thaw 與 system-sleep hook 路徑。**手動蓋蓋**循環不在
 > 本次範圍內，仍列為補充待測項目。
 
+#### 現況與測試總數（截至 2026-11-24）
+
+| 測試套件 | 結果 | 範圍 |
+| :--- | :--- | :--- |
+| `keyboard/tests/kbd-backlight-daemon-test.sh` | **460 通過、0 失敗** | 以 stub 為基礎的單元測試 |
+| `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **84 通過、0 失敗** | 以 stub 為基礎的單元測試 |
+| `tests/rollback-test.sh` | **1981 通過、0 失敗** | 需 root |
+| `keyboard/tests/keyd-dualrole-uinput.py` | **22 PASS** | 2026-10-31 歷史 live run（22 PASS），真實 virtual uinput／非 stub——**並非目前 HEAD 的 live run**；`acbc3b9` 後 chord guard 預期已變更，HEAD 上只重跑自我測試 |
+
+出處：stub 測試套件為本機重跑；Python／診斷自我測試為 synthetic（合成）檢查；
+22 PASS 是 2026-10-31 的歷史 live run，並未在 HEAD 重跑。
+
+Python／診斷自我測試：`check-top-row-hwdb.py` 回報 `SELF-TEST=PASS`、
+`keyd-dualrole-uinput.py` 涵蓋 30 個案例、`detect-hardware.sh` 執行 28 個斷言。
+
+keyd 組合鍵案例現在明確把 `[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護視為**預期**；
+單獨長按與輕點仍**不得**有 `LEFTCTRL` 防護（這正是 Mutter 能開啟總覽的條件）。
+頂排 `0x3b`-`0x44` 掃描碼仍是從 hwdb 轉換後 `EVIOCGKEY` 按鍵狀態對照標準 AT 表
+**推論**而來；`EVIOCGKEYCODE` 只確認核心映射表，目前仍**沒有原始 `MSC_SCAN` 捕獲**——
+要確認原始值，需停掉 keyd 後用 `--scan`（或不加 `--grab` 的 `evtest`）。
+
+**沒有新的真實 S3 run。** 上方 2026-11-22（第五輪）驗收表仍是唯一的硬體紀錄；
+第六至第十四次 re-review 只改程式碼，並以單元測試／CI 驗證。
+
+#### 第十四次 re-review — 修復摘要（2026-11-24）
+
+本次 fork 在第十三次之後新增六個 commit：
+
+* `9f41739` — CI：PAM E2E job 現在確實執行並產出可驗證證據，不再是假綠的 no-op。
+* `3c1fcf4` — PAM：正確解析 debconf `seen` 旗標，並以可逆方式還原。
+* `21fc6d3` — PAM：讓 profile 快照／還原交易化且 fail closed。
+* `ac8da5c` — uninstaller：只有 rollback 真正成功才回報成功（狀態誠實；保留狀態時不印
+  `finished!`）。
+* `1f1fc4f` — 背光：修正 gsd 空值處理、resume deadline 與 guard 行為。
+* `acbc3b9` — 鍵盤：修正 chord guard 測試並統一掃描碼證據口徑。
+
+這些 commit 之後的總數：rollback suite **1981**、daemon **460**、sleep hook **84**，
+全部 0 失敗。仍**沒有新的真實 S3 run**——2026-11-22 紀錄不變；keyd chord 測試現在承認
+`LEFTCTRL` guard 為預期；`MSC_SCAN` 仍為推論，需 `--scan` 確認。
+
 #### 第六次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `2905a55`, `f7b1c1b`, `1c447bc`.
 
 * **只有實際套用的還原才消耗 flag。** adopt、還原與新的 `verify_restore_applied()`
   共用結果碼 `0=RC_DONE`、`1=RC_FAIL`、`2=RC_DEFER`。鎖取得失敗、`STATE`/
@@ -107,14 +146,9 @@
   兩次），**之後才**寫入 0；全部失敗時記錄 `blank: brightness NOT saved`、保持 LED
   亮著並重新 seed last-user cache。`--test-blank` 在保存失敗時回傳 1。
 
-目前的單元測試總數（含上述修復與下方第七、八、九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback 案例（最後一項需
-root），全部 0 失敗。
-
 #### 第七次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `a03e4a0`, `461e18e`, `ff78712`.
 
 * **保存熄滅前的快照並自我修復無效 state。** `handle_blank()` 在關閉 LED 前只取樣一次，
   第一次 `save_state "$captured"` 就直接使用該擷取值——若取樣兩次，可能讀到 blank-side
@@ -138,14 +172,9 @@ root），全部 0 失敗。
   `skipping manifest entry with non-absolute target`（Meson plan 的目的路徑也必須是
   絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
 
-目前的單元測試總數（含上述修復與下方第八、九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback 案例（最後一項需
-root），全部 0 失敗。
-
 #### 第八次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `354ad39`, `0113279`, `98291ec`.
 
 * **安全欄位為必填，原始狀態未知即 fail closed。** 驗證器現在要求
   `records[*].was_existing`、`services[*].was_enabled` / `was_active`、
@@ -171,14 +200,9 @@ root），全部 0 失敗。
 所有安裝 caller 現在會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e`
 在 rollback 失敗時提前中止收尾。
 
-目前的單元測試總數（含上述修復與下方第九、十、十一次 re-review
-修復）：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback 案例（最後一項需
-root），全部 0 失敗。
-
 #### 第九次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `cf18f6b`, `ac65507`.
 
 * **還原取代失敗時保留已安裝的目標。** `restore_original()` 現在先暫存到目標旁，對
   普通檔案/symlink 以單次原子 `os.replace()` 取代且**不先 unlink**，因此取代失敗
@@ -197,13 +221,9 @@ root），全部 0 失敗。
   fsync、`chmod 0644` 與 `os.replace`），避免平行 writer 覆寫彼此的暫存檔。鎖檔
   以 noclobber 建立，不會被任何 writer 換掉 inode。
 
-目前的單元測試總數（含上述修復與下方第十、十一次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1642** 個 rollback 案例（最後一項需 root），全部 0 失敗。
-
 #### 第十次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `afdfe19`, `df7e621`.
 
 * **鎖已針對 symlink 替換與非特權 DoS 加固。** manifest 鎖
   （`$MANIFEST_DIR/.install-manifest.lock`、fd 9）現在是 root 擁有的 `0600` 檔案
@@ -225,18 +245,14 @@ root），全部 0 失敗。
   在目標檔缺席時消耗該紀錄，接著 A 才部署檔案，留下沒有追蹤紀錄的已部署檔案。
   `fingerprint --source` 會在整個 clone/compile 期間持鎖，平行操作請調高 timeout。
 
-目前的單元測試總數（含上述修復與下方第十一次 re-review 修復）：**406** 個 daemon、
-**73** 個 sleep-hook、**1642** 個 rollback 案例（最後一項需 root），全部 0 失敗。
-
 #### 第十一次 re-review 修復（2026-11-23，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，此處不宣稱新的硬體實測。
+Commits: `751c609`, `6774033`, `69712a4`, `dab9436`.
 
 * **plugdev 歸屬由所有元件共同判定。** `remove_group_membership()` 彙總所有元件的
   `(group,user)` 紀錄：任一明確的 `was_member=false` 即證明是我們加入的，全部為 `true`
-  （或沒有紀錄）在第十一次 re-review 時是保留（第十二次新增 rc 3：沒有 udev rule 需要
-  該 group 時消耗過期紀錄），安全欄位型別錯誤則 fail closed。`gpasswd -d` 成功後，該組的所有
+  （或沒有紀錄）即保留（但若沒有 udev rule 需要該 group，則以 rc 3、零次 `gpasswd`
+  消耗過期紀錄），安全欄位型別錯誤則 fail closed。`gpasswd -d` 成功後，該組的所有
   紀錄一併消耗，因此完整安裝/解除安裝不再取決於 keyboard 與 fingerprint 的安裝順序。
   `gpasswd -d` 失敗現在是 error 並回 rc 1（R1–R10 涵蓋原非成員/原已成員、兩種順序、
   單一模組、gpasswd 失敗、udev gating、DRY_RUN 與錯型案例）；keyboard、fingerprint 與
@@ -245,11 +261,11 @@ root），全部 0 失敗。
   `disable_pam_fingerprint()` 不直接修改檔案，全由 `rollback_component("fingerprint")`
   還原原始位元組，因此原本就存在的精確 `pam_fprintd` 行會保留。安裝端改用
   `grep -qFx --` 精確比對，並支援 `CROS_ENABLEMENT_PAM_SUDO_PATH` /
-  `CROS_ENABLEMENT_PAM_DIR` 測試 seam。Debian Tier 2 中，確實含 fp 行的 `common-*`
-  會在移除 fp 行前先備份（此第十一次 re-review 的敘述提到 `pam-auth-update --remove
-  fprintd` 呼叫，**第十二次** re-review 已改為直接 `sed`；**第十三次**再新增 selection／
-  已儲存檔案快照、`--package` 收斂與 uninstall 還原（uninstall 現在只在 rollback 確認
-  完成後才寫入 debconf））。唯讀的 rollback 後檢查會在 manifest 仍有紀錄或損毀時警告，
+  `CROS_ENABLEMENT_PAM_DIR` 測試 seam。Debian Tier 2 中，**所有** `common-*` 檔都會先
+  備份，再以直接 `sed -i '/pam_fprintd\.so/d'` 只移除 fp 模組行（絕不使用
+  `pam-auth-update --remove`）；debconf selection 與 `/var/lib/pam` 檔會先做 first-wins
+  快照，安裝器自行以 `pam-auth-update --package` 收斂，uninstall 則在 rollback 確認
+  完成後才還原。唯讀的 rollback 後檢查會在 manifest 仍有紀錄或損毀時警告，
   但絕不修改檔案；Fedora 的
   `authselect` 與 openSUSE 的 `pam-config` profile 狀態列為已知限制（僅警告）。
   PAM-1..8 驗證原始 sudo PAM 已有該行時，安裝→解除安裝後位元組完全相同。
@@ -262,19 +278,16 @@ root），全部 0 失敗。
   rename 雙持鎖防護與非 root 呼叫者在預設 root-owned 路徑不誤傷。自訂可寫的 lock parent
   不再被接受。
 * **CI 失敗修復——PAM 故障注入改為每次呼叫獨立。** push 後 Backup/Rollback CI job
-  回報 1383 通過 / 4 失敗：PAM-4 的 `STUB_FAIL_ROLLBACK_PY=1` 從父 shell 洩漏到
-  PAM-8。`dab9436` 把故障旗標改為 `run_pam_install()` / `run_pam_uninstall()` 的
-  明確傳參，且只在 sandbox snippet 內 export，後續 uninstall 不會繼承。新增
+  回報 1383 通過 / 4 失敗（合計 1387）：PAM-4 的 `STUB_FAIL_ROLLBACK_PY=1` 從父 shell
+  洩漏到 PAM-8。`dab9436` 把故障旗標改為 `run_pam_install()` / `run_pam_uninstall()`
+  的明確傳參，且只在 sandbox snippet 內 export，後續 uninstall 不會繼承。新增
   **PAM-9** 回歸先注入 fail=1，再故意把父環境污染為 fail=0，驗證 rollback 乾淨完成、
-  PAM 檔案位元組完全相同（+5 assertions；rollback 總數 **1642**）。
-
-修復後的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback
-案例（最後一項需 root），全部 0 失敗。
+  PAM 檔案位元組完全相同（+5 assertions，當時總數來到 **1392**；現行 rollback suite 為
+  **1981** 個案例）。
 
 #### 第十二次 re-review 修復（2026-11-24，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，**本輪不宣稱新的硬體實測**。
+Commits: `6b56b0e`, `883d9c7`, `783a035`.
 
 * **鎖的信任邊界是 canonical、無 symlink 的路徑（P2 SECURITY；自訂 manifest 路徑
   BLOCKER）。** `CROS_ENABLEMENT_MANIFEST_DIR` 必須是絕對路徑（否則
@@ -297,27 +310,21 @@ root），全部 0 失敗。
   加入 membership，消耗中繼資料不影響權限，並讓下次安裝重新擷取真實、可能包括管理員
   變更後的狀態。消耗失敗會 fail closed 並保留紀錄。R3 已調整，R11（管理員改群組後再
   安裝的可回滾時序）、R12/R13/R14 與 R9b 涵蓋生命週期。
-* **Debian PAM profile selection 被完整保留（P2 STATE RESTORATION）——已由下方第十三次
-  re-review 取代。** 安裝時完全**不呼叫** `pam-auth-update --remove fprintd`：該動作也會
-  刪除 debconf 的 `libpam-runtime/profiles` selection，而 manifest rollback 無法還原。
-  Tier 2 先備份含 fp 的 `common-*` 檔，再**直接**以 `sed -i '/pam_fprintd\.so/d'` 只移除
-  模組行——同樣讓 `common-auth` 不含 fp 而消除 GDM 解鎖 Claim 競賽。第十二次的設計在該
-  sed 之後不管理 debconf；**第十三次** re-review 發現日後 `pam-auth-update --package`
-  會從當前的 `common-*` 內容推導 profile 清單，進而永久丟失使用者的 selection，因此改為
-  first-wins 快照 + 自我收斂 + uninstall 還原（見下方新小節）。Fedora `authselect` /
-  openSUSE `pam-config` 的 profile 狀態警告保留。
-
-目前的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback
-案例（最後一項需 root），全部 0 失敗。本輪無新的真實 S3 實測。
+* **Debian PAM profile selection 被完整保留（P2 STATE RESTORATION）。** 安裝時完全
+  **不呼叫** `pam-auth-update --remove fprintd`：該動作也會刪除 debconf 的
+  `libpam-runtime/profiles` selection，而 manifest rollback 無法還原。Tier 2 備份
+  **所有** `common-*` 檔，再**直接**以 `sed -i '/pam_fprintd\.so/d'` 只移除 fp 模組行——
+  同樣讓 `common-auth` 不含 fp 而消除 GDM 解鎖 Claim 競賽。由於日後
+  `pam-auth-update --package` 會從當前的 `common-*` 內容推導 profile 清單，安裝器還會
+  先做 selection 與 `/var/lib/pam` 的 first-wins 快照、自行以 `--package` 收斂，並在
+  uninstall 時於 rollback 完成後還原。Fedora `authselect` / openSUSE `pam-config` 的
+  profile 狀態警告保留。
 
 #### 第十三次 re-review 修復（2026-11-24，僅單元測試）
 
-以下為由 shell 單元測試覆蓋的邏輯/穩健性修復；上方 2026-11-22 的真實 S3 紀錄
-原文保留，**本輪不宣稱新的硬體實測**。CI 新增 Ubuntu 24.04 container E2E job，
-在拋棄式容器中使用未修改的 Debian/Ubuntu `pam-auth-update` 與 debconf 工具
-（以真實 `pam-auth-update --enable fprintd` 建立 baseline、敏感度對照確認只 sed 後真實
-`--package` 會丟失 selection、完整安裝 → `--package` → uninstall 來回，以及非 root／
-passwordless `sudo` 的 uninstall 案例）。
+Commits: `7ff2623`, `9799e74`, `20d94c4`.
+
+E2E 情境：詳見 .github/workflows/install-smoke.yml（baseline / sensitivity / round-trip / non-root）。
 
 * **PAM profile selection 跨套件更新可逆（P1）。** 安裝時先將 debconf
   `libpam-runtime/profiles` 與每個 `/var/lib/pam/*` 已儲存模組檔快照到 first-wins sidecar
@@ -338,9 +345,6 @@ passwordless `sudo` 的 uninstall 案例）。
   仍安裝時移除），writer 會設該 flag；歸屬探測把它當作 `was_member=false`（rc 0），
   uninstall 便移除本次授予的成員資格。`usermod` 失敗時以 `manifest_clear_group_added`
   只清除 **flag**；consume-all 則連整列（含 flag）一起移除。R15–R20 涵蓋此生命週期。
-
-目前的單元測試總數：**406** 個 daemon、**73** 個 sleep-hook、**1642** 個 rollback
-案例（最後一項需 root），全部 0 失敗。本輪無新的真實 S3 實測。
 
 ### 4. Wi-Fi / 藍牙 / 視訊鏡頭 / 儲存
 
@@ -389,7 +393,7 @@ passwordless `sudo` 的 uninstall 案例）。
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（406 daemon + 73 hook + 1642 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（460 daemon + 84 hook + 1981 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -433,7 +437,7 @@ cat /sys/power/mem_sleep
   解鎖即成功、喚醒零延遲、日誌無 retry 行；黑屏問題未解決，使用者已接受）、2026-08-23
   （EC 90% 電池守護服務 + `c640-ec-sleep.sh` 零空窗喚醒鉤子 + standalone `ectool` LPC
   通訊已實機驗證；打包迭代 2 `1.94.10-2` 中繼資料已備妥，驅動原始碼未異動）、
-  2026-08-29（鍵盤背光同步已安裝——當時僅設定、CI smoke 通過，已被下方 2026-10-31 條目取代），
+  2026-08-29（鍵盤背光同步已安裝——當時僅設定、CI smoke 通過；2026-10-31 起完整驗證，見下），
   2026-10-31（依據 hwdb 轉換後 `EVIOCGKEY` 對照標準 AT 表修正鍵盤頂排映射：
   hwdb 改映射 `0x3b`-`0x44`，`EVIOCGKEYCODE` 只確認核心映射表，原始 `MSC_SCAN`
   未捕獲；keyd `overloadt2` 雙重角色 Search 以 uinput 測試與實體按鍵被動擷取驗證；
@@ -442,22 +446,25 @@ cat /sys/power/mem_sleep
   gnome-settings-daemon 50 上以 `rtcwake -m no -s 20` + `systemctl suspend`；
   鎖定喚醒時延後並保留 `state=30`，再以 `loginctl unlock-session 2` 解鎖後
   亮度/gsd/UPower 皆還原至 30 且兩個 handoff 檔皆消耗），
-  2026-11-23（第六、七、八、九、十、十一次 re-review 單元測試重跑：406 daemon +
-  73 sleep-hook + 1642 rollback 案例，0 失敗；結果碼、manifest fail-closed、熄滅前保存、
-  單次取樣/無效 state 自我修復、manifest 欄位驗證、副作用前 rollback gate 與 rollback
-  安全語意——安全欄位必填/unknown 即 fail closed、目標缺席時從第一份備份還原、
-  systemctl 還原檢查 rc、群組先記錄後變更、原子還原不先 unlink 且找不到備份回 rc 1，
-  加上跨程序 manifest 鎖與唯一 writer 暫存檔、第十次的 0600 root-only holder 鎖與整個
-  操作序列化，以及第十一次的跨元件 plugdev 歸屬、PAM 原始行只由 rollback 還原與
-  root 控管 lock parent + fd 8 釘住——的文件已同步；無新增真實 S3 實測），
-  2026-11-24（第十二次 re-review 單元測試重跑：406 daemon + 73 sleep-hook + 1642 rollback
-  案例，0 失敗；canonical 無 symlink 的 manifest 鎖信任邊界與 holder 端
-  `FAILED:canonical` / `FAILED:ancestor` 重驗、all-true 過期群組紀錄零 gpasswd 消耗、
-  Debian PAM profile selection 以直接行移除完整保留——的文件已同步；無新增真實 S3 實測），
-  2026-11-24（第十三次 re-review 單元測試重跑：406 daemon + 73 sleep-hook + 1642 rollback
-  案例，0 失敗；PAM selection/已儲存模組 first-wins sidecar 搭配 `--package` 收斂與
-  uninstall 驗證還原，以及選用的逐次安裝 `added_by_project` 群組證據，並含真實工具的
-  Ubuntu 24.04 container E2E——的文件已同步；無新增真實 S3 實測）
+  2026-11-23（第六至第十一次 re-review 單元測試重跑：結果碼、manifest fail-closed、
+  熄滅前保存、單次取樣/無效 state 自我修復、manifest 欄位驗證、副作用前 rollback gate
+  與 rollback 安全語意——安全欄位必填/unknown 即 fail closed、目標缺席時從第一份備份
+  還原、systemctl 還原檢查 rc、群組先記錄後變更、原子還原不先 unlink 且找不到備份
+  回 rc 1，加上跨程序 manifest 鎖與唯一 writer 暫存檔、0600 root-only holder 鎖與
+  整個操作序列化、跨元件 plugdev 歸屬、PAM 原始行只由 rollback 還原、root 控管
+  lock parent + fd 8 釘住與每次呼叫獨立的 PAM 故障注入——現行總數見上方
+  「現況與測試總數」；無新增真實 S3 實測），
+  2026-11-24（第十二次 re-review 單元測試重跑：canonical 無 symlink 的 manifest 鎖
+  信任邊界與 holder 端 `FAILED:canonical` / `FAILED:ancestor` 重驗、all-true 過期
+  群組紀錄零 gpasswd 消耗、Debian PAM profile selection 以直接行移除完整保留——
+  現行總數見上方；無新增真實 S3 實測），
+  2026-11-24（第十三次 re-review 單元測試重跑：PAM selection/已儲存模組 first-wins
+  sidecar 搭配 `--package` 收斂與 uninstall 驗證還原，以及選用的逐次安裝
+  `added_by_project` 群組證據，並含真實工具的 Ubuntu 24.04 container E2E——
+  現行總數見上方；無新增真實 S3 實測），
+  2026-11-24（第十四次 re-review——本次 fork：上方摘要的六個 commit；rollback suite
+  1981 / daemon 460 / hook 84，0 失敗；2026-11-22 後仍無新真實 S3 run；keyd chord
+  的 `LEFTCTRL` guard 現在視為預期，`MSC_SCAN` 仍為推論）
 * **OS / 核心**：Ubuntu 26.04 LTS；2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`，2026-08 證據包為 `7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）

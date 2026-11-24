@@ -45,7 +45,8 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
 **保留**在 `/var/lib/cros-enablement/install-manifest.json`，附上警告並回 rc 1（找不到
 原始備份時也一樣），供日後再次執行 `./setup.sh --uninstall` 重試——絕不會被當成已完成
 而悄悄略過。其他可處理的項目仍會正常 rollback，但最終結束碼非 0，且不會印出
-`finished!`：
+`finished!`——最上層的 uninstaller 會改為記錄
+`Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above).`：
 
 * **原始狀態未知絕不當成 false。** 安全欄位 `was_existing`、`was_enabled`、`was_active`、
   `was_member` 為必填。若快照缺失或不是布林，rollback 拒絕自動還原該筆紀錄：檔案、

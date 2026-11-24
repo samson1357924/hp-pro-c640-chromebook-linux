@@ -240,7 +240,10 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > in the hook — that was the old second-writer bug. The root
   > `/run/c640-kbd-backlight/state` written by `pre` is only a **single-shot diagnostic
   > snapshot of the first suspend in a boot** (first-wins, kept until reboot); it is not
-  > consumed by the hook or the daemon and is never used for restore.
+  > consumed by the hook or the daemon and is never used for restore. If the hook writes to a
+  > different directory than the daemon reads, the daemon logs
+  > `[WARN] handoff directory mismatch` with the path and ignores that candidate; check
+  > `XDG_RUNTIME_DIR` / the session uid, or set `C640_KBD_HANDOFF_DIR` identically for both.
 
 * **Triage** (all gdbus queries below are read-only):
 
@@ -384,7 +387,9 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     enable/disable/start/stop returned non-zero (or timed out / failed to spawn), or a
     record such as a missing backup was retained; those records are kept for retry and
     rollback returns rc 1. Re-run uninstall after fixing the underlying issue —
-    successful restores log `[RESTORED SERVICE]`.
+    successful restores log `[RESTORED SERVICE]`. Whenever any record is retained, each
+    top-level uninstaller prints `Uninstall incomplete; retained state will be retried (see
+    FAIL/WARN lines above).` and exits non-zero instead of printing `finished!`.
   * `Manifest lock wait failed (rc=... after ...s) ... (holder: ...)` or `flock not found`
     comes from the cross-process lock. Since the tenth re-review this is an OPERATION-level
     lock: `run_manifest_operation()` holds it for the whole component install/uninstall
@@ -520,6 +525,14 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     files by hand. `pam-auth-update --package converged the debconf selection and saved
     profiles (no fprintd).` is the expected self-convergence log; `pam-auth-update --package
     failed; keeping the selection snapshot for uninstall convergence.` keeps the sidecar.
+  * `Legacy PAM sidecar without any optional metadata; using best-effort compatibility.`
+    means the sidecar was written by an older installer without the `saved-snapshot` metadata:
+    restore falls back to inspecting the `.saved` directory (empty ⇒ absent, unreadable ⇒ fail
+    closed) instead of assuming a complete snapshot. The related `Legacy PAM sidecar has an
+    empty ...; inferring saved-snapshot=absent`, `... has no saved metadata; inferring
+    saved-snapshot=complete from ...` and `... has no saved metadata and no ...; inferring
+    saved-snapshot=absent (best-effort).` messages are the same compatibility path. A
+    contradictory saved-snapshot state in a **current** sidecar still fails closed.
   * `No PAM selection snapshot at <path>; nothing to restore.` means no fprintd-capable
     install left a sidecar, so there is nothing to converge back. `Original PAM profile
     selection restored; snapshot consumed.` is the success path: after rollback is confirmed

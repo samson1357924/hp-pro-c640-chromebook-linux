@@ -569,7 +569,7 @@ fresh-manual0 adoption and generation-stamped guard user-change protection) and 
 sleep-hook suite has 84 cases (pure handoff, `0600`/`chown`/atomic `mv`,
 `C640_KBD_HANDOFF_DIR`, multi-session resolution with IDLE/CLASS preference and
 chosen-path warnings, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 1642 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 1981 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -586,7 +586,7 @@ Ubuntu 24.04 container E2E for the PAM round-trip.
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 460 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 cases
-sudo bash tests/rollback-test.sh                       # 1642 cases (root)
+sudo bash tests/rollback-test.sh                       # 1981 cases (root)
 ```
 
 ---

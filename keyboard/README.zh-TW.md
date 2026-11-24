@@ -484,7 +484,7 @@ sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 跨 uid handoff 目錄不一致、gsd 確認的新鮮 manual0 adopt 與帶 generation 戳記的
 guard 使用者變更保護）；sleep hook 測試有 84 個案例（純 handoff、`0600`/`chown`/
 原子 `mv`、`C640_KBD_HANDOFF_DIR`、多 session 解析與 IDLE/CLASS 偏好及路徑 WARN、
-不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1642 個案例，包含損毀
+不寫 LED）。rollback 測試（`tests/rollback-test.sh`，需 root）有 1981 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
@@ -499,7 +499,7 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、整個操�
 ```bash
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 460 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 個案例
-sudo bash tests/rollback-test.sh                       # 1642 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 1981 個案例（需 root）
 ```
 
 ---
