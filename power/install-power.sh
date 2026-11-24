@@ -74,7 +74,14 @@ _uninstall_power_body() {
     if [ "${DRY_RUN:-0}" != "1" ]; then
         log_info "Reboot (or log out and back in) for the lid-switch change to take effect."
     fi
-    log_success "Power optimization profiles removed."
+    # Only report success when rollback fully succeeded. A failed rollback
+    # retains state for a later retry, so a SUCCESS line here
+    # would mislead both users and log parsers (see docs/UNINSTALL.md).
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "Power optimization profiles removed."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
     # Propagate a rollback failure only after ALL cleanup above has run.
     return "$rollback_rc"
 }

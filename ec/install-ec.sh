@@ -179,7 +179,14 @@ _uninstall_ec_tools_body() {
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemctl daemon-reload
     fi
-    log_success "EC utilities removed."
+    # Only report success when rollback fully succeeded. A failed rollback
+    # retains state for a later retry, so a SUCCESS line here
+    # would mislead both users and log parsers (see docs/UNINSTALL.md).
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "EC utilities removed."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
     # Propagate a rollback failure only after ALL cleanup above has run.
     return "$rollback_rc"
 }

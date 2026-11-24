@@ -7772,39 +7772,257 @@ run_caller_uninstall() {
     printf '%s\n' "$rc" > "$sandbox/uninstall-rc.txt"
 }
 
+# Shared wording of the explicit failure line (P3-1): rollback_rc can also
+# come from group_rc (gpasswd/manifest) or pam_rc (PAM sidecar/debconf), and
+# the log contains FAIL/ERROR as well as WARN, so the message must stay
+# generic instead of claiming "manifest records" or "WARN lines" only.
+UNINSTALL_INCOMPLETE_MSG='Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above).'
+
+# Keyboard's uninstall body touches keyd paths, so it reuses the dedicated
+# install-keyboard-sandbox.sh + keyd stubs instead of the generic caller
+# sandbox. Fault injection is the same: fail ONLY the rollback python call
+# (marker ROLLBACK_INCOMPLETE) while validator/manifest lookups still run.
+setup_keyboard_caller_uninstall_sandbox() {
+    local sandbox="$1"
+    rm -rf "$sandbox"
+    mkdir -p "$sandbox/backups" "$sandbox/manifest" "$sandbox/stub" "$sandbox/etc/keyd"
+    prepare_keyd_sandbox_script "$sandbox"
+    setup_keyd_stubs "$sandbox" valid
+    : > "$sandbox/manifest/.install-manifest.lock"
+    chmod 0600 "$sandbox/manifest/.install-manifest.lock"
+    # sudo only executes PATH-stubbed commands; rm/rmdir in the uninstall body
+    # must never reach host state. python3 is always allowed (validator and
+    # manifest reads) and is fault-injected only for the rollback call.
+    cat > "$sandbox/stub/sudo" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    python3) ;;
+    *) printf '%s\n' "$*" >> "${STUB_CALL_LOG:?}" ;;
+esac
+[ "${1:-}" = "-u" ] && shift 2
+cmd="${1:-}"
+if [ "$cmd" = bash ] || [ -x "${STUB_DIR:?}/$cmd" ]; then
+    exec "$@"
+fi
+exit 0
+EOF
+    cat > "$sandbox/stub/python3" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ] && [ "$#" -eq 6 ] && [[ "$2" == *"ROLLBACK_INCOMPLETE"* ]] && [ "${STUB_FAIL_ROLLBACK_PY:-0}" = "1" ]; then
+    printf 'stub: forced rollback failure\n' >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+EOF
+    chmod +x "$sandbox/stub/sudo" "$sandbox/stub/python3"
+    python3 - "$sandbox/manifest/install-manifest.json" << 'PY'
+import json, sys
+json.dump({"version": "2.0", "records": [], "services": [], "groups": [
+    {"group": "plugdev", "user": "testuser", "component": "keyboard",
+     "was_member": False}]}, open(sys.argv[1], "w"), indent=2)
+PY
+    : > "$sandbox/caller.log"
+    : > "$sandbox/log.txt"
+    : > "$sandbox/systemctl.log"
+}
+
+run_keyboard_caller_uninstall() {
+    # $1=sandbox $2=1 to force the rollback rc 1 (0 = success path)
+    local sandbox="$1" fail="$2" rc=0
+    if run_sandboxed "$sandbox" '
+        export PATH="$2/stub:$PATH" STUB_CALL_LOG="$2/caller.log" \
+            STUB_SYSTEMCTL_LOG="$2/systemctl.log" STUB_DIR="$2/stub" \
+            STUB_FAIL_ROLLBACK_PY="$3"
+        source "$2/install-keyboard-sandbox.sh"
+        get_real_user() { echo ""; }
+        rc=0
+        _uninstall_keyboard_body || rc=$?
+        exit "$rc"
+    ' "$fail"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf '%s\n' "$rc" > "$sandbox/uninstall-rc.txt"
+}
+
 test_caller_uninstall_rollback_failure() {
     # $1=component $2=uninstall function $3=post-rollback marker
     # $4=log file holding the marker (caller.log or log.txt)
-    local comp="$1" fn="$2" marker="$3" logfile="$4"
+    # $5=the component's original SUCCESS line, which must NOT appear on failure
+    local comp="$1" fn="$2" marker="$3" logfile="$4" success_msg="$5"
     local sandbox="/tmp/rollback-test-caller-$comp-fail"
-    setup_caller_uninstall_sandbox "$sandbox" "$comp"
-    run_caller_uninstall "$sandbox" "$comp" "$fn" 1
+    local log_output
+    if [ "$comp" = "keyboard" ]; then
+        setup_keyboard_caller_uninstall_sandbox "$sandbox"
+        run_keyboard_caller_uninstall "$sandbox" 1
+    else
+        setup_caller_uninstall_sandbox "$sandbox" "$comp"
+        run_caller_uninstall "$sandbox" "$comp" "$fn" 1
+    fi
+    log_output="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
 
     assert_eq "1" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
         "[$comp] uninstall propagates rollback rc 1"
     assert_contains "$marker" "$(cat "$sandbox/$logfile" 2> /dev/null || echo "")" \
         "[$comp] post-rollback cleanup still ran"
     if [ "$comp" = "fingerprint" ] || [ "$comp" = "ec" ]; then
-        assert_contains "group 'plugdev'" "$(cat "$sandbox/log.txt")" \
+        assert_contains "group 'plugdev'" "$log_output" \
             "[$comp] post-rollback group-membership step ran"
     fi
-    assert_contains "rollback of $comp failed" "$(cat "$sandbox/log.txt")" \
+    assert_contains "rollback of $comp failed" "$log_output" \
         "[$comp] rollback failure logged"
+    # Regression (gh-human P1 + install-safety P2): a failed rollback retains
+    # state for retry, so the final SUCCESS line would contradict the FAIL/WARN
+    # lines above it and the docs/UNINSTALL.md promise.
+    assert_not_contains "$success_msg" "$log_output" \
+        "[$comp] no misleading SUCCESS line after rollback failure"
+    assert_contains "$UNINSTALL_INCOMPLETE_MSG" "$log_output" \
+        "[$comp] incomplete uninstall is logged explicitly"
+    assert_not_contains "finished!" "$log_output" \
+        "[$comp] no 'finished!' claim after rollback failure"
+    assert_not_contains "removed successfully" "$log_output" \
+        "[$comp] no 'removed successfully' claim after rollback failure"
+    assert_not_contains "completed" "$log_output" \
+        "[$comp] no 'completed' claim after rollback failure"
 }
 
 test_caller_uninstall_rollback_success() {
-    # Same parameters: a successful rollback must keep rc 0 and still clean up.
-    local comp="$1" fn="$2" marker="$3" logfile="$4"
+    # Same parameters: a successful rollback must keep rc 0, still clean up,
+    # and still print the component's original success message.
+    # $5=the component's original SUCCESS line, which must appear on success
+    local comp="$1" fn="$2" marker="$3" logfile="$4" success_msg="$5"
     local sandbox="/tmp/rollback-test-caller-$comp-ok"
-    setup_caller_uninstall_sandbox "$sandbox" "$comp"
-    run_caller_uninstall "$sandbox" "$comp" "$fn" 0
+    local log_output
+    if [ "$comp" = "keyboard" ]; then
+        setup_keyboard_caller_uninstall_sandbox "$sandbox"
+        run_keyboard_caller_uninstall "$sandbox" 0
+    else
+        setup_caller_uninstall_sandbox "$sandbox" "$comp"
+        run_caller_uninstall "$sandbox" "$comp" "$fn" 0
+    fi
+    log_output="$(cat "$sandbox/log.txt" 2> /dev/null || echo "")"
 
     assert_eq "0" "$(cat "$sandbox/uninstall-rc.txt" 2> /dev/null || echo MISSING)" \
         "[$comp] successful rollback keeps uninstall rc 0"
     assert_contains "$marker" "$(cat "$sandbox/$logfile" 2> /dev/null || echo "")" \
         "[$comp] cleanup still runs after successful rollback"
-    assert_contains "Rollback for component [$comp] finished!" "$(cat "$sandbox/log.txt")" \
+    assert_contains "Rollback for component [$comp] finished!" "$log_output" \
         "[$comp] rollback success logged"
+    assert_contains "$success_msg" "$log_output" \
+        "[$comp] original success message still printed after successful rollback"
+}
+
+# Static guard for ALL five uninstall bodies (including keyboard). Verify the
+# exact ADJACENT structure inside the body, not loose substring finds that
+# could be defeated by deleting `fi`, moving log_error out of the else branch,
+# or appending a legacy log_success after the guarded one:
+#   if [ "$rollback_rc" -eq 0 ]; then
+#       log_success "<original message>"
+#   else
+#       log_error "<shared incomplete message>"
+#   fi
+#   return "$rollback_rc"
+test_uninstall_success_log_is_rollback_conditional() {
+    local comp fn success_msg src
+    for comp in audio fingerprint ec keyboard power; do
+        case "$comp" in
+            audio) fn='_uninstall_audio_body'; success_msg='Audio UCM profiles removed successfully.' ;;
+            fingerprint) fn='_uninstall_fp_body'; success_msg='Fingerprint driver uninstallation finished.' ;;
+            ec) fn='_uninstall_ec_tools_body'; success_msg='EC utilities removed.' ;;
+            keyboard) fn='_uninstall_keyboard_body'; success_msg='Keyboard mapping uninstallation completed.' ;;
+            power) fn='_uninstall_power_body'; success_msg='Power optimization profiles removed.' ;;
+        esac
+        src="$REPO_ROOT/$comp/install-$comp.sh"
+        assert_contains "$success_msg" "$(cat "$src")" \
+            "[$comp] original success message preserved in source"
+        if python3 - "$src" "$fn" "$success_msg" "$UNINSTALL_INCOMPLETE_MSG" << 'PY'
+import sys
+
+path, fn, success_msg, err_msg = sys.argv[1:5]
+lines = open(path).read().splitlines()
+start = next((i for i, line in enumerate(lines)
+              if line.startswith(fn + '() {')), -1)
+if start < 0:
+    sys.exit(1)
+end = next((i for i in range(start + 1, len(lines))
+            if lines[i] == '}'), len(lines))
+# Ignore blank/comment lines so the check compares adjacent CODE statements
+# while still rejecting a deleted `fi`, a moved log_error, or an extra legacy
+# log_success anywhere in the body.
+body = [line.strip() for line in lines[start + 1:end]
+        if line.strip() and not line.strip().startswith('#')]
+
+# The whole uninstall body must contain exactly one final log_success.
+hits = [i for i, line in enumerate(body) if 'log_success' in line]
+if len(hits) != 1:
+    sys.exit(1)
+i = hits[0]
+expected = [
+    'if [ "$rollback_rc" -eq 0 ]; then',
+    'log_success "' + success_msg + '"',
+    'else',
+    'log_error "' + err_msg + '"',
+    'fi',
+    'return "$rollback_rc"',
+]
+actual = body[i - 1:i + 5]
+if len(actual) != len(expected) or any(got != want for got, want in zip(actual, expected)):
+    sys.exit(1)
+PY
+        then
+            ok
+        else
+            fail "[$comp] uninstall body lacks the exact guarded success/error structure"
+        fi
+    done
+}
+
+# Fingerprint must still run ALL cleanup steps (rollback, group removal, PAM
+# disable) before choosing the log message; the log change may not introduce
+# an early return or alter the pam_rc/group_rc folding order.
+test_fingerprint_uninstall_cleanup_order_unchanged() {
+    local src="$REPO_ROOT/fingerprint/install-fingerprint.sh"
+    if python3 - "$src" << 'PY'
+import sys
+
+lines = open(sys.argv[1]).read().splitlines()
+wanted = [
+    'rollback_component "fingerprint" || rollback_rc=$?',
+    'remove_group_membership "plugdev" "$(get_real_user)" "fingerprint" || group_rc=$?',
+    '[ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"',
+    'disable_pam_fingerprint || pam_rc=$?',
+    '[ "$pam_rc" -eq 0 ] || rollback_rc="$pam_rc"',
+]
+pos = []
+for needle in wanted:
+    idx = next((i for i, line in enumerate(lines) if needle in line), -1)
+    if idx < 0:
+        sys.exit(1)
+    pos.append(idx)
+if pos != sorted(pos):
+    sys.exit(1)
+# Bound the scan to _uninstall_fp_body itself: later functions in the same
+# file legitimately have their own returns.
+end = next((i for i in range(pos[0], len(lines)) if lines[i] == '}'), len(lines))
+body = lines[pos[0]:end]
+early = next((line.strip() for line in body
+              if line.strip().startswith('return ')
+              and '"$rollback_rc"' not in line), None)
+if early is not None:
+    sys.exit(1)
+# The final log choice must come AFTER every cleanup/folding step, not just
+# after rollback_component itself.
+guard = next((i for i, line in enumerate(body)
+              if line.strip() == 'if [ "$rollback_rc" -eq 0 ]; then'), -1)
+if guard < 0 or guard < pos[-1] - pos[0]:
+    sys.exit(1)
+PY
+    then
+        ok
+    else
+        fail "fingerprint uninstall cleanup/folding order changed or early return introduced"
+    fi
 }
 
 test_caller_uninstall_regression_detects_unguarded_rollback() {
@@ -9140,14 +9358,20 @@ test_rollback_user_scope_start_failure_keeps_record
 test_rollback_systemctl_spawn_failure_keeps_record
 test_rollback_all_success_consumes_services_and_records
 # Non-keyboard uninstall callers: propagate rollback rc without skipping cleanup
-test_caller_uninstall_rollback_failure fingerprint uninstall_fp "udevadm control --reload-rules" caller.log
-test_caller_uninstall_rollback_failure ec uninstall_ec_tools "systemctl daemon-reload" caller.log
-test_caller_uninstall_rollback_failure audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log
-test_caller_uninstall_rollback_failure power uninstall_power "Reboot (or log out and back in)" log.txt
-test_caller_uninstall_rollback_success fingerprint uninstall_fp "udevadm control --reload-rules" caller.log
-test_caller_uninstall_rollback_success ec uninstall_ec_tools "systemctl daemon-reload" caller.log
-test_caller_uninstall_rollback_success audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log
-test_caller_uninstall_rollback_success power uninstall_power "Reboot (or log out and back in)" log.txt
+test_caller_uninstall_rollback_failure fingerprint uninstall_fp "udevadm control --reload-rules" caller.log "Fingerprint driver uninstallation finished."
+test_caller_uninstall_rollback_failure ec uninstall_ec_tools "systemctl daemon-reload" caller.log "EC utilities removed."
+test_caller_uninstall_rollback_failure audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log "Audio UCM profiles removed successfully."
+test_caller_uninstall_rollback_failure power uninstall_power "Reboot (or log out and back in)" log.txt "Power optimization profiles removed."
+# Keyboard uses the dedicated keyd sandbox: `daemon-reload` is logged only
+# AFTER rollback_component(), so it doubles as the post-rollback cleanup marker.
+test_caller_uninstall_rollback_failure keyboard _uninstall_keyboard_body "daemon-reload" caller.log "Keyboard mapping uninstallation completed."
+test_caller_uninstall_rollback_success fingerprint uninstall_fp "udevadm control --reload-rules" caller.log "Fingerprint driver uninstallation finished."
+test_caller_uninstall_rollback_success ec uninstall_ec_tools "systemctl daemon-reload" caller.log "EC utilities removed."
+test_caller_uninstall_rollback_success audio uninstall_audio "rmdir /usr/share/alsa/ucm2/conf.d/sof-rt5682" caller.log "Audio UCM profiles removed successfully."
+test_caller_uninstall_rollback_success power uninstall_power "Reboot (or log out and back in)" log.txt "Power optimization profiles removed."
+test_caller_uninstall_rollback_success keyboard _uninstall_keyboard_body "daemon-reload" caller.log "Keyboard mapping uninstallation completed."
+test_uninstall_success_log_is_rollback_conditional
+test_fingerprint_uninstall_cleanup_order_unchanged
 test_caller_uninstall_regression_detects_unguarded_rollback
 # Re-review #9 finding #1: cross-process manifest transaction lock
 test_lock_concurrent_writers_keep_both_records

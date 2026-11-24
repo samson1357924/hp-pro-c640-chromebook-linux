@@ -151,7 +151,15 @@ _uninstall_fp_body() {
         log_dryrun "ldconfig"
         log_dryrun "Reinstall stock libfprint package via your distribution's package manager"
     fi
-    log_success "Fingerprint driver uninstallation finished."
+    # Only report success after EVERY cleanup step (rollback, group removal,
+    # PAM disable) has run AND rollback succeeded. A failed rollback retains
+    # state for a later retry, so a SUCCESS line here would
+    # contradict the WARN/FAIL lines and the documented contract.
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "Fingerprint driver uninstallation finished."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
     # Propagate a rollback failure only after ALL cleanup above has run.
     return "$rollback_rc"
 }
