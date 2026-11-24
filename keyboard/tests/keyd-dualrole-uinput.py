@@ -22,9 +22,11 @@ VALUE 1/0 PAIRING IS A PASS REQUIREMENT:
   tolerated and filtered out. A leading reset 0 (fresh virtual device) and
   trailing 0s are tolerated; a missing release or a repeated/second **down**
   is a FAIL. A second up (an extra trailing 0) is NOT a FAIL, because the
-  single final 0 already satisfies the release requirement. Guard keys
-  ("must not appear") are checked by name and are NOT required to be paired,
-  to avoid false FAILs.
+  single final 0 already satisfies the release requirement. Forbidden guard
+  keys are checked by name only (no pairing requirement, to avoid false
+  FAILs); the LEFTCTRL/LEFTMETA guards allowed on the chord path are the
+  exception -- check_hold() also requires each of them to be exactly one
+  clean down/up pair, so a stuck or repeated guard cannot PASS.
 
   Run ``python3 keyboard/tests/keyd-dualrole-uinput.py --self-test`` to verify
   these assertions with synthetic events (no root, device or evdev needed).
@@ -209,23 +211,35 @@ def check_tap(events):
 
 
 def check_hold(events, expected):
-    """hold Search + key -> one down/up of `expected`, no unexpected modifier.
+    """hold Search + key -> one down/up of `expected`, a well-formed guard.
 
     The `[meta:M]` layer legitimately holds LEFTMETA while active, and its
     clear_mod() guard emits an expected LEFTCTRL down/META up/LEFTCTRL up
-    around each chord press. Both are therefore allowed here; RIGHTCTRL,
+    around each chord press. Both modifiers are therefore allowed here, but
+    only as exactly one clean down(1)/up(0) pair each: a stuck LEFTCTRL down
+    without a release, or repeated guards, are a FAIL rather than being
+    silently accepted just because their names are allow-listed. RIGHTCTRL,
     RIGHTMETA and any other modifier are still forbidden (check_lone() keeps
     forbidding LEFTCTRL on the lone-hold path, where it would break Mutter).
     """
     held = names(events)
     exp_values = values_for(events, expected)
+    allowed = ("KEY_LEFTMETA", "KEY_LEFTCTRL")
     # Tolerate reset 0s of non-target keys, just like clean_press() does for
     # the target key's leading/trailing resets.
     held_non_mods = [n for n, v in events if v != 0 and n not in MODIFIERS]
+
+    def guard_ok(mod):
+        vals = values_for(events, mod)
+        # A reset-only (all-zero) trace means the modifier is absent;
+        # otherwise it must be exactly one clean down/up pair.
+        return not any(vals) or clean_press(vals)
+
     ok = (
         clean_press(exp_values)
         and set(held_non_mods) == {expected}
-        and not unexpected_mods(events, allowed=("KEY_LEFTMETA", "KEY_LEFTCTRL"))
+        and not unexpected_mods(events, allowed=allowed)
+        and all(guard_ok(mod) for mod in allowed)
     )
     return ok, {"values": exp_values, "names": held}
 
@@ -430,6 +444,16 @@ def run_self_test():
            seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTMETA", [1, 0]), True)
     expect("hold with expected LEFTCTRL chord guard", hold_f1,
            seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0]), True)
+    expect("hold with full META-layer + LEFTCTRL guard sequence", hold_f1,
+           seq("KEY_LEFTMETA", [1]) + seq("KEY_F1", [1, 2, 0])
+           + seq("KEY_LEFTCTRL", [1]) + seq("KEY_LEFTMETA", [0])
+           + seq("KEY_LEFTCTRL", [0]), True)
+    expect("hold with stuck LEFTCTRL (down, no up)", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1]), False)
+    expect("hold with repeated LEFTCTRL guards", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTCTRL", [1, 0, 1, 0]), False)
+    expect("hold with stuck LEFTMETA (down, no up)", hold_f1,
+           seq("KEY_F1", [1, 2, 0]) + seq("KEY_LEFTMETA", [1]), False)
     expect("hold with RIGHTMETA guard", hold_f1,
            seq("KEY_F1", [1, 2, 0]) + seq("KEY_RIGHTMETA", [1, 0]), False)
     expect("hold with RIGHTCTRL guard", hold_f1,

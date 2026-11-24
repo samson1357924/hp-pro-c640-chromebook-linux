@@ -57,8 +57,6 @@ HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.re
 # the adoption path can warn loudly instead of silently ignoring the handoff.
 # C640_KBD_HANDOFF_DIR is the same override the hook accepts (tests use it).
 HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-/run/user/$(id -u 2> /dev/null || echo 1000)}"
-HOOK_HANDOFF_SUSPEND_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.suspend"
-HOOK_HANDOFF_RESUME_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.resume"
 # The hook resolves the session uid from loginctl, which may differ from this
 # daemon's uid on a multi-seat host.  Scan the runtime root READ-ONLY for a
 # same-named handoff; a mismatch is diagnosed, never cross-adopted.
