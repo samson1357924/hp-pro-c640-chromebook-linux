@@ -9441,11 +9441,90 @@ EOF
     # debconf tools: log EVERY call so a test can prove the installer and
     # uninstaller never touch the profile selection. set-selections really
     # writes the selection file, so any mutation is observable.
+    #
+    # State files (the INDEPENDENT oracle reads these raw, never lib/pam.sh):
+    #   STUB_DEBCONF_PROFILES  raw value; ABSENT => the question does not exist
+    #   STUB_DEBCONF_SEEN      true|false; absent => the seen field is unavailable
     cat > "$s/stub/debconf-show" << 'EOF'
 #!/usr/bin/env bash
 printf 'debconf-show %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
 [ "${1:-}" = "libpam-runtime" ] || exit 0
-printf '  libpam-runtime/profiles: %s\n' "$(cat "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}")"
+_sel="${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+_seen="${STUB_DEBCONF_SEEN:-}"
+[ -f "$_sel" ] || exit 0 # key absent: debconf-show prints NO line at all
+_prefix='  '
+if [ -n "$_seen" ] && [ -f "$_seen" ] && [ "$(cat "$_seen")" = "true" ]; then
+    _prefix='* '
+fi
+printf '%slibpam-runtime/profiles: %s\n' "$_prefix" "$(cat "$_sel")"
+EOF
+
+    # debconf-communicate protocol model. A REAL tool exits with the NUMERIC
+    # STATUS OF THE LAST command (GET of a missing key prints "10 ..." and
+    # exits 10), so this stub MUST mirror that: the product has to check the
+    # process rc and the reply status, not silently fall back (P2-1).
+    # An existing question ALWAYS has a seen flag (true or false); the only
+    # way to model "legacy" is a sidecar WITHOUT metadata (P3), never a
+    # "10 seen field unavailable" reply the real tool could not produce.
+    cat > "$s/stub/debconf-communicate" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-communicate %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+_sel="${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+_seen="${STUB_DEBCONF_SEEN:-}"
+_last_status=0
+while IFS= read -r _cmd; do
+    [ -n "$_cmd" ] || continue
+    printf 'debconf-communicate cmd: %s\n' "$_cmd" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+    _last_status=0
+    case "$_cmd" in
+        GET\ libpam-runtime/profiles*)
+            if [ -f "$_sel" ]; then
+                printf '0 %s\n' "$(cat "$_sel")"
+            else
+                printf '10 libpam-runtime/profiles does not exist\n'
+                _last_status=10
+            fi
+            ;;
+        FGET\ libpam-runtime/profiles\ seen*)
+            if [ -f "$_sel" ]; then
+                # Question exists => the seen field exists. An unset sidecar
+                # file means "unseen" (false), which is what debconf reports.
+                _flag=false
+                if [ -n "$_seen" ] && [ -f "$_seen" ]; then
+                    _flag="$(cat "$_seen")"
+                fi
+                printf '0 %s\n' "$_flag"
+            else
+                printf '10 libpam-runtime/profiles does not exist\n'
+                _last_status=10
+            fi
+            ;;
+        FSET\ libpam-runtime/profiles\ seen\ *)
+            _val="${_cmd##* }"
+            if [ ! -f "$_sel" ]; then
+                printf '10 libpam-runtime/profiles does not exist\n'
+                _last_status=10
+            else
+                case "$_val" in
+                    true|false)
+                        if [ -n "$_seen" ]; then
+                            printf '%s\n' "$_val" > "$_seen"
+                            printf '0\n'
+                        else
+                            # Harness seam missing (not a tool state): report
+                            # a protocol failure so the product fails closed.
+                            printf '12 no seen seam\n'
+                            _last_status=12
+                        fi
+                        ;;
+                    *) printf '12 invalid seen value\n'; _last_status=12 ;;
+                esac
+            fi
+            ;;
+        *) printf '10 unknown command\n'; _last_status=10 ;;
+    esac
+done
+exit "$_last_status"
 EOF
 
     cat > "$s/stub/debconf-set-selections" << 'EOF'
@@ -9463,6 +9542,9 @@ case "$_in" in
     *) _val="$_in" ;;
 esac
 printf '%s\n' "$_val" > "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+# Real debconf-set-selections marks the question seen; FSET must undo that.
+_seen="${STUB_DEBCONF_SEEN:-}"
+[ -z "$_seen" ] || printf 'true\n' > "$_seen"
 EOF
 
     # authselect / pam-config: log only, never call real distro tooling.
@@ -9505,6 +9587,18 @@ pam_write_selection() { # $1=sandbox  $2="unix, systemd, fprintd"
     printf '%s\n' "$2" > "$1/debconf/profiles"
 }
 pam_selection() { cat "$1/debconf/profiles"; }
+
+# --- INDEPENDENT oracles for the re-review P1 #2 regressions -----------------
+# These read the stub's RAW state files directly. They deliberately do NOT call
+# lib/pam.sh's _pam_read_selection() (that would be a self-proving test).
+pam_write_selection_seen() { # $1=sandbox  $2=true|false
+    mkdir -p "$1/debconf"
+    printf '%s\n' "$2" > "$1/debconf/seen"
+}
+pam_selection_seen() { cat "$1/debconf/seen" 2> /dev/null; }
+pam_unset_selection() { # key absent: no profiles file, no seen file
+    rm -f "$1/debconf/profiles" "$1/debconf/seen"
+}
 
 # Write a Debian-style sudo PAM file (and optionally common-auth) into the
 # sandbox. $2 = sudo content: exact | other | none. $3 = common-auth: none | fp.
@@ -9620,6 +9714,7 @@ run_pam_install() {
         export PATH="$2/stub:/usr/bin:/bin"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
         export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -9643,6 +9738,7 @@ run_pam_uninstall() {
         export PATH="$2/stub:/usr/bin:/bin"
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
         export STUB_FAIL_ROLLBACK_PY="$4"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -9731,6 +9827,7 @@ _pam_nonroot_script() {
 export PATH="$1/stub:/usr/bin:/bin"
 export STUB_SED_LOG="$1/sed.log" STUB_TOOL_LOG="$1/tool.log"
 export STUB_DEBCONF_PROFILES="$1/debconf/profiles"
+export STUB_DEBCONF_SEEN="$1/debconf/seen"
 # PAM_NONROOT_SUID is inherited from the parent (set by _pam_nonroot_prepare).
 source "$2/lib/pam.sh"
 DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -9744,6 +9841,7 @@ EOF
 export PATH="$1/stub:/usr/bin:/bin"
 export STUB_SED_LOG="$1/sed.log" STUB_TOOL_LOG="$1/tool.log"
 export STUB_DEBCONF_PROFILES="$1/debconf/profiles"
+export STUB_DEBCONF_SEEN="$1/debconf/seen"
 # PAM_NONROOT_SUID is inherited from the parent (set by _pam_nonroot_prepare).
 source "$2/lib/pam.sh"
 DISTRO_FAMILY="$3" DISTRO_ID="$3"
@@ -10496,6 +10594,572 @@ EOF
         && ok || fail "PAM-21: sidecar retained for retry on a different set"
 }
 
+# ---------------------------------------------------------------------------
+# Re-review P1 blocker #2: debconf seen=true/false parsing + seen reversibility.
+# Every EXPECTED value below comes from the stub's RAW state files
+# (pam_selection / pam_selection_seen), never from lib/pam.sh's own parser.
+# ---------------------------------------------------------------------------
+
+# PAM-22: a seen=true non-empty selection must round-trip value AND seen.
+test_pam_22_seen_true_selection_roundtrip() {
+    local s sel_before seen_before before
+    s="$(setup_pam_sandbox seen-true-roundtrip)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    pam_write_selection_seen "$s" true
+    sel_before="$(pam_selection "$s")"
+    seen_before="$(pam_selection_seen "$s")"
+    before="$(pam_stack_fingerprint "$s")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-22: install rc 0 with a seen=true selection"
+    assert_contains '# cros-enablement: selection-seen=true' \
+        "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-22: sidecar records the seen=true metadata line"
+    assert_eq "$sel_before" "$(sed '/^#/d' "$s/manifest/pam-selection" | tail -n 1)" \
+        "PAM-22: sidecar stores the exact NON-EMPTY value (not an empty string)"
+
+    # Make FSET genuinely REVERSIBLE, not merely "called". Force the raw flag
+    # to false AND make restore's debconf-set-selections VALUE-ONLY: the stock
+    # stub marks the question seen, which would flip it back to true BEFORE
+    # FSET and turn the product's call into a no-op. Two observation wrappers
+    # record the raw flag at set-selections time and immediately after FSET,
+    # so the false -> true change is attributable to the product's FSET alone.
+    pam_write_selection_seen "$s" false
+    assert_eq "false" "$(pam_selection_seen "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-22: pre-uninstall raw seen baseline is false"
+    pam_set_selections_value_only "$s"
+    mv "$s/stub/debconf-set-selections" "$s/stub/debconf-set-selections.value-only"
+    cat > "$s/stub/debconf-set-selections" << 'EOF'
+#!/usr/bin/env bash
+_s="${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+_s="${_s%/debconf/profiles}"
+cat "${STUB_DEBCONF_SEEN:?}" > "$_s/seen.at-set-selections" 2> /dev/null || true
+exec "$0.value-only" "$@"
+EOF
+    mv "$s/stub/debconf-communicate" "$s/stub/debconf-communicate.real"
+    cat > "$s/stub/debconf-communicate" << 'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+printf '%s\n' "$_cmds" | "$0.real" "$@"
+_rc=$?
+case "$_cmds" in
+    FSET\ libpam-runtime/profiles\ seen\ true)
+        _s="${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+        _s="${_s%/debconf/profiles}"
+        cat "${STUB_DEBCONF_SEEN:?}" > "$_s/seen.after-fset" 2> /dev/null || true
+        ;;
+esac
+exit "$_rc"
+EOF
+    chmod +x "$s/stub/debconf-set-selections" "$s/stub/debconf-communicate"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-22: rollback rc 0"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-22: disable rc 0"
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-22: value restored (independent raw-state oracle)"
+    assert_eq "$seen_before" "$(pam_selection_seen "$s")" \
+        "PAM-22: seen flag restored (independent raw-state oracle)"
+    assert_contains 'debconf-communicate cmd: FSET libpam-runtime/profiles seen true' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-22: uninstall FSET the seen flag back to true"
+    assert_eq "false" "$(cat "$s/seen.at-set-selections" 2> /dev/null || echo MISSING)" \
+        "PAM-22: raw seen was STILL false at set-selections time (not pre-flipped)"
+    assert_eq "true" "$(cat "$s/seen.after-fset" 2> /dev/null || echo MISSING)" \
+        "PAM-22: raw seen flipped false->true immediately after the product's FSET"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-22: sudo/common-*/savedir bytes also restored"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-22: sidecar consumed after the round-trip"
+}
+
+# PAM-23: same round-trip with seen=false (the prefix the old parser accepted).
+test_pam_23_seen_false_selection_roundtrip() {
+    local s sel_before before show_out
+    s="$(setup_pam_sandbox seen-false-roundtrip)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    pam_write_selection_seen "$s" false
+    sel_before="$(pam_selection "$s")"
+    before="$(pam_stack_fingerprint "$s")"
+
+    show_out="$(run_sandboxed "$s" '
+        export PATH="$2/stub:/usr/bin:/bin" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        "$2/stub/debconf-show" libpam-runtime
+    ')"
+    assert_contains '  libpam-runtime/profiles:' "$show_out" \
+        "PAM-23: stub emits the seen=false two-space prefix"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_contains '# cros-enablement: selection-seen=false' \
+        "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-23: sidecar records the seen=false metadata line"
+    assert_eq "$sel_before" "$(sed '/^#/d' "$s/manifest/pam-selection" | tail -n 1)" \
+        "PAM-23: exact non-empty value snapshotted for seen=false"
+
+    : > "$s/tool.log"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/rollback.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-23: rollback rc 0"
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-23: disable rc 0"
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-23: value restored (independent raw-state oracle)"
+    assert_eq "false" "$(pam_selection_seen "$s")" \
+        "PAM-23: seen restored to false after set-selections marked it true"
+    assert_contains 'debconf-communicate cmd: FSET libpam-runtime/profiles seen false' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-23: uninstall FSET the seen flag back to false"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-23: sudo/common-*/savedir bytes also restored"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-23: sidecar consumed after the round-trip"
+}
+
+# Probe the product helpers directly, but compare against RAW stub state only.
+pam_helper_probe() { # $1=sandbox -> read.rc/read.out/seen.rc/seen.out/snap.rc
+    run_sandboxed "$1" '
+        export PATH="$2/stub:/usr/bin:/bin"
+        export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        # Must override the seams exported by earlier run_pam_* calls: those
+        # point at a previous sandbox, which would make the sidecar assertions
+        # read a stale path instead of the path used by this probe.
+        export CROS_ENABLEMENT_PAM_SUDO_PATH="$2/pam/sudo"
+        export CROS_ENABLEMENT_PAM_DIR="$2/pam"
+        export CROS_ENABLEMENT_PAM_SAVED_DIR="$2/savedir"
+        export CROS_ENABLEMENT_PAM_SELECTION_FILE="$2/manifest/pam-selection"
+        source "$1/lib/pam.sh"
+        out="$(_pam_read_selection)"; rc=$?
+        printf "%s\n" "$rc" > "$2/read.rc"
+        printf "%s" "$out" > "$2/read.out"
+        seen="$(_pam_read_selection_seen)"; rc=$?
+        printf "%s\n" "$rc" > "$2/seen.rc"
+        printf "%s" "$seen" > "$2/seen.out"
+        _pam_snapshot_selection
+        printf "%s\n" "$?" > "$2/snap.rc"
+    '
+}
+
+# PAM-24: distinguish seen=true non-empty / legal empty / key absent.
+test_pam_24_empty_vs_absent_vs_seen_true() {
+    local s raw show_out
+    # (a) seen=true + non-empty: the exact string must survive the parser.
+    s="$(setup_pam_sandbox oracle-seen-true)"
+    pam_write_selection "$s" 'unix, fprintd'
+    pam_write_selection_seen "$s" true
+    raw="$(pam_selection "$s")"
+    show_out="$(run_sandboxed "$s" '
+        export PATH="$2/stub:/usr/bin:/bin" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        "$2/stub/debconf-show" libpam-runtime
+    ')"
+    assert_contains '* libpam-runtime/profiles:' "$show_out" \
+        "PAM-24a: seen=true uses the '* ' prefix (the old parser's blind spot)"
+    pam_helper_probe "$s"
+    assert_eq "0" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24a: read rc 0 for a non-empty selection"
+    assert_eq "$raw" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-24a: parsed value equals the raw non-empty selection"
+    assert_eq "true" "$(cat "$s/seen.out" 2> /dev/null || echo MISSING)" \
+        "PAM-24a: seen flag read as true"
+    assert_eq "0" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24a: snapshot succeeds with a non-empty selection"
+    assert_eq "$raw" "$(sed '/^#/d' "$s/manifest/pam-selection" | tail -n 1)" \
+        "PAM-24a: sidecar kept the non-empty value"
+
+    # (b) legal EMPTY value: rc 0 + empty stdout, and it is restorable.
+    s="$(setup_pam_sandbox oracle-empty)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" ''
+    pam_write_selection_seen "$s" true
+    pam_helper_probe "$s"
+    assert_eq "0" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: a legal empty value is a SUCCESS (rc 0)"
+    assert_eq "" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: legal empty value is an empty string"
+    assert_eq "0" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: snapshot succeeds for a legal empty value"
+    assert_contains '# cros-enablement: selection-seen=true' \
+        "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: seen metadata still snapshotted for an empty value"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: uninstall rc 0 with an empty snapshot"
+    assert_eq "" "$(pam_selection "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: legal empty value restored (not skipped as 'nothing to do')"
+    assert_eq "true" "$(pam_selection_seen "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-24b: seen restored for the empty value too"
+
+    # (c) key ABSENT: rc 1, no snapshot, never mistaken for a legal empty.
+    s="$(setup_pam_sandbox oracle-absent)"
+    pam_unset_selection "$s"
+    pam_helper_probe "$s"
+    assert_eq "1" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24c: missing key returns a DISTINCT failure status (rc 1)"
+    assert_eq "1" "$(cat "$s/seen.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24c: seen field of a missing key is also unreadable"
+    assert_eq "1" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-24c: snapshot FAILS when the key is absent"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-24c: no sidecar may be published for an unreadable key"
+    assert_contains "refusing to snapshot an unreadable selection" \
+        "$(cat "$s/log.txt" 2> /dev/null || echo MISSING)" \
+        "PAM-24c: failure is explicit, not silent"
+}
+
+# PAM-25: a legacy sidecar (no seen metadata) restores the value only and never
+# drives the seen flag itself — the set-selections stub here deliberately leaves
+# seen alone so any FSET would be attributable to the product.
+test_pam_25_legacy_sidecar_restores_value_only() {
+    local s sel_before
+    s="$(setup_pam_sandbox legacy-seen-sidecar)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    sel_before="$(pam_selection "$s")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    # A real tool always exposes the seen flag, so "legacy" is modelled ONLY
+    # by a sidecar that lacks the metadata line (P3). Strip it after install
+    # instead of pretending the flag was unreadable at snapshot time.
+    sed '/^# cros-enablement: selection-seen=/d' "$s/manifest/pam-selection" \
+        > "$s/manifest/pam-selection.legacy"
+    cat "$s/manifest/pam-selection.legacy" > "$s/manifest/pam-selection"
+    rm -f "$s/manifest/pam-selection.legacy"
+    assert_not_contains 'selection-seen=' \
+        "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-25: legacy sidecar has no seen metadata line"
+
+    # The pre-existing seen state at uninstall time must be left untouched.
+    pam_write_selection_seen "$s" false
+    cat > "$s/stub/debconf-set-selections" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-set-selections %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+_in="$(cat)"
+case "$_in" in
+    libpam-runtime\ libpam-runtime/profiles\ multiselect*)
+        _val="${_in#libpam-runtime libpam-runtime/profiles multiselect}"
+        _val="${_val#"${_val%%[![:space:]]*}"}"
+        ;;
+    *) _val="$_in" ;;
+esac
+printf '%s\n' "$_val" > "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+EOF
+    chmod +x "$s/stub/debconf-set-selections"
+    : > "$s/tool.log"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-25: legacy restore rc 0"
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-25: legacy sidecar still restores the exact value"
+    assert_eq "false" "$(pam_selection_seen "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-25: legacy sidecar does NOT change the existing seen flag"
+    assert_not_contains 'debconf-communicate cmd: FSET' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-25: no FSET call at all for a legacy sidecar"
+}
+
+# PAM-26: if the seen flag cannot be restored, keep the sidecar and fail closed.
+test_pam_26_fset_failure_keeps_sidecar() {
+    local s
+    s="$(setup_pam_sandbox seen-fset-failure)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    pam_write_selection_seen "$s" false
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+
+    mv "$s/stub/debconf-communicate" "$s/stub/debconf-communicate.real"
+    cat > "$s/stub/debconf-communicate" << 'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+if printf '%s\n' "$_cmds" | grep -q '^FSET '; then
+    printf '12 injected FSET failure\n'
+    exit 0
+fi
+printf '%s\n' "$_cmds" | "$0.real" "$@"
+exit $?
+EOF
+    chmod +x "$s/stub/debconf-communicate"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-26: a failed seen restore is a hard failure (rc 1)"
+    [ -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-26: sidecar retained for retry when FSET fails"
+    assert_contains "Could not restore the debconf seen flag" \
+        "$(cat "$s/log.txt" 2> /dev/null || echo MISSING)" \
+        "PAM-26: the failure is explicit"
+}
+
+# --- P2-2: debconf-show fallback (no debconf-communicate at all) ------------
+# The real tool lives in /usr/bin, so simply dropping /usr/sbin from PATH is
+# NOT enough to exercise the fallback. Build a PATH directory containing every
+# host executable EXCEPT debconf-communicate; stubs still win (stub dir comes
+# first), and every command lib/pam.sh needs (sudo/sed/awk/tee/timeout/...)
+# resolves normally.
+pam_make_fallback_bin() { # $1=sandbox
+    local d="$1/fbbin" f name
+    mkdir -p "$d"
+    for f in /usr/bin/* /bin/* /usr/sbin/* /sbin/*; do
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        name="${f##*/}"
+        [ "$name" = "debconf-communicate" ] && continue
+        ln -sf "$f" "$d/$name" 2> /dev/null || true
+    done
+    [ ! -e "$d/debconf-communicate" ] || {
+        echo "fallback bin accidentally contains debconf-communicate" >&2
+        return 1
+    }
+}
+
+# Legacy restore: value only. Like PAM-25, the set-selections stub deliberately
+# leaves the raw seen flag untouched, so any seen mutation must come from FSET.
+pam_set_selections_value_only() { # $1=sandbox
+    cat > "$1/stub/debconf-set-selections" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-set-selections %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+_in="$(cat)"
+case "$_in" in
+    libpam-runtime\ libpam-runtime/profiles\ multiselect*)
+        _val="${_in#libpam-runtime libpam-runtime/profiles multiselect}"
+        _val="${_val#"${_val%%[![:space:]]*}"}"
+        ;;
+    *) _val="$_in" ;;
+esac
+printf '%s\n' "$_val" > "${STUB_DEBCONF_PROFILES:?PAM debconf seam missing}"
+EOF
+    chmod +x "$1/stub/debconf-set-selections"
+}
+
+# Drive the product's own snapshot + restore with the fallback PATH. The guard
+# makes the test INVALID (rc 99) if debconf-communicate leaks onto PATH.
+pam_fallback_probe() { # $1=sandbox -> read.rc/read.out/snap.rc/restore.rc
+    cat > "$1/fallback-probe.sh" << 'EOF'
+#!/usr/bin/env bash
+export PATH="$1/stub:$1/fbbin"
+if command -v debconf-communicate > /dev/null 2>&1; then
+    printf 'FALLBACK PROBE INVALID: debconf-communicate at %s\n' \
+        "$(command -v debconf-communicate)" >&2
+    exit 99
+fi
+export STUB_SED_LOG="$1/sed.log" STUB_TOOL_LOG="$1/tool.log"
+export STUB_DEBCONF_PROFILES="$1/debconf/profiles"
+export STUB_DEBCONF_SEEN="$1/debconf/seen"
+export CROS_ENABLEMENT_PAM_SUDO_PATH="$1/pam/sudo"
+export CROS_ENABLEMENT_PAM_DIR="$1/pam"
+export CROS_ENABLEMENT_PAM_SAVED_DIR="$1/savedir"
+export CROS_ENABLEMENT_PAM_SELECTION_FILE="$1/manifest/pam-selection"
+source "$2/lib/pam.sh"
+out="$(_pam_read_selection)"; rc=$?
+printf '%s' "$out" > "$1/read.out"
+printf '%s\n' "$rc" > "$1/read.rc"
+_pam_snapshot_selection
+printf '%s\n' "$?" > "$1/snap.rc"
+# Preserve the sidecar BEFORE restore consumes it on success.
+cp "$1/manifest/pam-selection" "$1/sidecar.snapshot" 2> /dev/null || true
+_pam_restore_debian_selection
+printf '%s\n' "$?" > "$1/restore.rc"
+EOF
+    chmod +x "$1/fallback-probe.sh"
+    run_sandboxed "$1" 'bash "$2/fallback-probe.sh" "$2" "$1"'
+}
+
+# PAM-27: exercise the debconf-show fallback end-to-end. Both display prefixes
+# must yield the VALUE (the P1 regression), but since the seen flag cannot be
+# written back without the protocol tool the snapshot stays legacy: no seen
+# metadata, value-only restore, no FSET. A missing line is a hard failure.
+test_pam_27_debconf_show_fallback() {
+    local s raw show_out
+    # (a) seen=false -> debconf-show prints the two-space prefix
+    s="$(setup_pam_sandbox fallback-unseen)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    pam_write_selection_seen "$s" false
+    raw="$(pam_selection "$s")"
+    rm -f "$s/stub/debconf-communicate"
+    pam_make_fallback_bin "$s"
+    pam_set_selections_value_only "$s"
+    show_out="$(run_sandboxed "$s" '
+        export PATH="$2/stub:$2/fbbin" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        "$2/stub/debconf-show" libpam-runtime
+    ')"
+    assert_contains '  libpam-runtime/profiles:' "$show_out" \
+        "PAM-27a: unseen value uses debconf-show's two-space prefix"
+    pam_fallback_probe "$s"
+    assert_eq "1" "$(run_sandboxed "$s" '
+        export PATH="$2/stub:$2/fbbin"
+        command -v debconf-communicate > /dev/null 2>&1 && echo 0 || echo 1
+    ')" "PAM-27: control — debconf-communicate is NOT discoverable in fallback PATH"
+    assert_eq "0" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: fallback read of a non-empty value succeeds"
+    assert_eq "$raw" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: two-space prefix parsed to the exact raw value"
+    assert_eq "0" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: fallback snapshot succeeds"
+    assert_eq "$raw" "$(sed '/^#/d' "$s/sidecar.snapshot" | tail -n 1)" \
+        "PAM-27a: sidecar keeps the exact value from debconf-show"
+    assert_not_contains 'selection-seen=' \
+        "$(cat "$s/sidecar.snapshot" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: fallback snapshot is legacy (no seen metadata)"
+    assert_eq "0" "$(cat "$s/restore.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: legacy restore succeeds"
+    assert_eq "$raw" "$(pam_selection "$s")" \
+        "PAM-27a: value restored via debconf-set-selections (raw-state oracle)"
+    assert_eq "false" "$(pam_selection_seen "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: raw seen untouched (value-only restore, no FSET)"
+    assert_not_contains 'FSET' "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: no FSET call in fallback mode"
+    assert_not_contains 'debconf-communicate' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-27a: the product never attempted a communicate call"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-27a: legacy sidecar consumed after restore"
+
+    # (b) seen=true -> the '* ' prefix the OLD parser could not read at all
+    s="$(setup_pam_sandbox fallback-seen)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, fprintd'
+    pam_write_selection_seen "$s" true
+    raw="$(pam_selection "$s")"
+    rm -f "$s/stub/debconf-communicate"
+    pam_make_fallback_bin "$s"
+    pam_set_selections_value_only "$s"
+    show_out="$(run_sandboxed "$s" '
+        export PATH="$2/stub:$2/fbbin" STUB_TOOL_LOG="$2/tool.log"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        "$2/stub/debconf-show" libpam-runtime
+    ')"
+    assert_contains '* libpam-runtime/profiles:' "$show_out" \
+        "PAM-27b: seen value uses debconf-show's '* ' prefix"
+    pam_fallback_probe "$s"
+    assert_eq "0" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27b: fallback read of a '* '-prefixed value succeeds"
+    assert_eq "$raw" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-27b: '* ' prefix parsed to the exact raw value (P1 regression)"
+    assert_eq "0" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27b: fallback snapshot succeeds for a seen value"
+    assert_eq "$raw" "$(sed '/^#/d' "$s/sidecar.snapshot" | tail -n 1)" \
+        "PAM-27b: '* '-prefixed value snapshotted exactly"
+    assert_eq "0" "$(cat "$s/restore.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27b: legacy restore succeeds for a seen value"
+    assert_eq "$raw" "$(pam_selection "$s")" \
+        "PAM-27b: value restored (raw-state oracle)"
+    assert_eq "true" "$(pam_selection_seen "$s" 2> /dev/null || echo MISSING)" \
+        "PAM-27b: raw seen untouched (legacy value-only restore)"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-27b: legacy sidecar consumed after restore"
+
+    # (c) key absent: debconf-show prints NO line => hard failure, no snapshot
+    s="$(setup_pam_sandbox fallback-absent)"
+    pam_unset_selection "$s"
+    rm -f "$s/stub/debconf-communicate"
+    pam_make_fallback_bin "$s"
+    pam_fallback_probe "$s"
+    assert_eq "1" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27c: absent key is rc 1 in the fallback, not an empty value"
+    assert_eq "1" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-27c: snapshot fails closed when the key is absent"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-27c: no sidecar may be published for an absent key"
+    assert_contains "refusing to snapshot an unreadable selection" \
+        "$(cat "$s/log.txt" 2> /dev/null || echo MISSING)" \
+        "PAM-27c: fallback failure is explicit"
+}
+
+# PAM-28: the PROCESS rc is the status of the last command on a real tool.
+# A non-zero rc must hard-fail even when a (hostile/buggy) debconf-show still
+# prints a legal-looking value — otherwise a missing key would fail OPEN.
+test_pam_28_process_rc_never_fails_open() {
+    local s
+    # (a) real-tool behaviour: reply status 10 AND process rc 10.
+    s="$(setup_pam_sandbox process-rc-status)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    pam_write_selection_seen "$s" true
+    cat > "$s/stub/debconf-communicate" << 'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+printf 'debconf-communicate %s\n' "$*" >> "${STUB_TOOL_LOG:?}"
+printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
+printf '10 libpam-runtime/profiles does not exist\n'
+exit 10
+EOF
+    cat > "$s/stub/debconf-show" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-show %s\n' "$*" >> "${STUB_TOOL_LOG:?}"
+printf '* libpam-runtime/profiles: unix, systemd, fprintd\n'
+EOF
+    chmod +x "$s/stub/debconf-communicate" "$s/stub/debconf-show"
+    : > "$s/tool.log"
+    pam_helper_probe "$s"
+    assert_eq "1" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-28a: non-zero process rc is a hard failure, not a fallback cue"
+    assert_eq "1" "$(cat "$s/seen.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-28a: seen read also fails on a non-zero process rc"
+    assert_eq "" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-28a: no legal-looking value leaked from debconf-show"
+    assert_eq "1" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-28a: snapshot fails closed"
+    [ ! -e "$s/manifest/pam-selection" ] \
+        && ok || fail "PAM-28a: no sidecar from a failed GET"
+    assert_not_contains 'debconf-show' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-28a: debconf-show fallback was NOT used"
+
+    # (b) defensive: protocol status 0 but a non-zero PROCESS rc. A real tool
+    # cannot produce this, but trusting the rc keeps the parser fail-closed.
+    s="$(setup_pam_sandbox process-rc-only)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, fprintd'
+    pam_write_selection_seen "$s" true
+    cat > "$s/stub/debconf-communicate" << 'EOF'
+#!/usr/bin/env bash
+_cmds="$(cat)"
+printf 'debconf-communicate %s\n' "$*" >> "${STUB_TOOL_LOG:?}"
+printf 'debconf-communicate cmd: %s\n' "$_cmds" >> "${STUB_TOOL_LOG:?}"
+printf '0 unix, fprintd\n'
+exit 10
+EOF
+    cat > "$s/stub/debconf-show" << 'EOF'
+#!/usr/bin/env bash
+printf 'debconf-show %s\n' "$*" >> "${STUB_TOOL_LOG:?}"
+printf '* libpam-runtime/profiles: unix, fprintd\n'
+EOF
+    chmod +x "$s/stub/debconf-communicate" "$s/stub/debconf-show"
+    : > "$s/tool.log"
+    pam_helper_probe "$s"
+    assert_eq "1" "$(cat "$s/read.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-28b: a non-zero process rc wins over a 0 status token"
+    assert_eq "" "$(cat "$s/read.out" 2> /dev/null || echo MISSING)" \
+        "PAM-28b: no value returned when the process failed"
+    assert_eq "1" "$(cat "$s/snap.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-28b: snapshot fails closed on a contradictory reply"
+    assert_not_contains 'debconf-show' \
+        "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-28b: no debconf-show fallback"
+}
+
 # Re-review #11/#12 finding #2 and #13 finding #1: original sudo/common PAM
 # bytes AND the Debian profile selection must survive install -> uninstall.
 test_pam_1_preexisting_exact_line_survives
@@ -10519,6 +11183,13 @@ test_pam_18_first_wins_snapshot
 test_pam_19_nonroot_uninstall_reads_snapshots
 test_pam_20_canonicalized_selection_consumes_sidecar
 test_pam_21_different_selection_set_fails_closed
+test_pam_22_seen_true_selection_roundtrip
+test_pam_23_seen_false_selection_roundtrip
+test_pam_24_empty_vs_absent_vs_seen_true
+test_pam_25_legacy_sidecar_restores_value_only
+test_pam_26_fset_failure_keeps_sidecar
+test_pam_27_debconf_show_fallback
+test_pam_28_process_rc_never_fails_open
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

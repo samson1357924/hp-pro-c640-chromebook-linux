@@ -413,9 +413,29 @@ jobs:
           printf '#!/bin/bash\ncase "$*" in *is-enabled*|*is-active*|*is-system-running*|*is-failed*) exit 1;; *) exit 0;; esac\n' > /usr/local/bin/systemctl
           chmod +x /usr/local/bin/systemctl
 
-          read_selection() {
-            debconf-show libpam-runtime \
-              | sed -n 's/^  libpam-runtime\/profiles:[[:space:]]*//p' | tail -n 1
+          # INDEPENDENT oracle: talk to debconf directly through its protocol,
+          # NEVER through lib/pam.sh's _pam_read_selection() (that would be a
+          # self-proving test). Parse the protocol STATUS as well as the value:
+          # a non-zero status means "absent", which must not look like an empty
+          # value. This also handles debconf-show's '* ' vs '  ' seen prefixes.
+          debconf_oracle() { # $1 = one debconf-communicate command
+            local reply status value
+            reply="$(printf '%s\n' "$1" | debconf-communicate libpam-runtime 2>/dev/null)" || return 1
+            reply="${reply%%$'\n'*}"
+            status="${reply%% *}"
+            [ "$status" = "0" ] || return 1
+            value=""
+            [ "$reply" = "$status" ] || value="${reply#* }"
+            printf '%s' "$value"
+          }
+          read_selection() { debconf_oracle 'GET libpam-runtime/profiles'; }
+          read_seen() { debconf_oracle 'FGET libpam-runtime/profiles seen'; }
+          set_seen() { # $1 = true|false, forced via the REAL debconf tool
+            local reply
+            reply="$(printf 'FSET libpam-runtime/profiles seen %s\n' "$1" \
+              | debconf-communicate libpam-runtime 2>/dev/null)"
+            [ "${reply%% *}" = "0" ] \
+              || { echo "FSET seen $1 failed: $reply"; return 1; }
           }
           common_files=(/etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive /etc/pam.d/common-password)
           saved_files=(/var/lib/pam/auth /var/lib/pam/account /var/lib/pam/password /var/lib/pam/session /var/lib/pam/session-noninteractive /var/lib/pam/seen)
@@ -439,6 +459,10 @@ jobs:
             [ -e "$f" ] && cp -a "$f" /root/baseline/var/lib/pam/
           done
           printf '%s\n' "$baseline_sel" > /root/baseline/selection
+          # Snapshot the whole /etc/pam.d NAME SET, not just the files we copy
+          # byte-for-byte below: a newly created profile must be detectable.
+          ( cd /etc/pam.d && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort ) \
+            > /root/baseline/etc/pam.d.names
 
           compare_with_baseline() {
             local f base new_files
@@ -463,8 +487,17 @@ jobs:
             new_files="$(LC_ALL=C comm -13 /tmp/pam-e2e-baseline-pam-files /tmp/pam-e2e-current-pam-files)"
             [ -z "$new_files" ] \
               || { echo "MISMATCH: new files in /var/lib/pam: $new_files"; return 1; }
+            # Same NAME-SET guard for /etc/pam.d: a new file there is invisible
+            # to the per-file loop above, just like a new /var/lib/pam file.
+            ( cd /etc/pam.d && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-current-pamd-files
+            new_pamd_files="$(LC_ALL=C comm -13 /root/baseline/etc/pam.d.names /tmp/pam-e2e-current-pamd-files)"
+            [ -z "$new_pamd_files" ] \
+              || { echo "MISMATCH: new files in /etc/pam.d: $new_pamd_files"; return 1; }
             [ "$(read_selection)" = "$baseline_sel" ] \
               || { echo "MISMATCH: debconf selection"; return 1; }
+            [ "$(read_seen)" = "$(cat /root/baseline/selection-seen)" ] \
+              || { echo "MISMATCH: debconf seen flag (expected $(cat /root/baseline/selection-seen), got $(read_seen))"; return 1; }
           }
 
           # SENSITIVITY CONTROL: with NO snapshot/convergence, direct sed alone
@@ -484,6 +517,10 @@ jobs:
           cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
           printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
           pam-auth-update --package
+          # Force a known seen baseline with the REAL tool. set-selections marks
+          # the question seen, so FSET is required for both baselines.
+          set_seen true
+          printf '%s\n' 'true' > /root/baseline/selection-seen
           compare_with_baseline
 
           echo "== lib/pam.sh helpers -> external package --package -> rollback =="
@@ -512,12 +549,48 @@ jobs:
           test ! -e /var/lib/cros-enablement/pam-selection
           echo "PAM lib helper E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
 
+          # Re-review P1 #2: BOTH seen baselines must survive a full real-tool
+          # round-trip. Every expected value below is read by the INDEPENDENT
+          # oracle above (debconf_oracle), not by lib/pam.sh's parser, and the
+          # baseline is checked byte-identical before AND after each cycle.
+          seen_roundtrip() { # $1 = true|false
+            local baseline="$1"
+            echo "== real-tool round-trip with seen=$baseline =="
+            cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+            cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+            printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" \
+              | debconf-set-selections
+            pam-auth-update --package
+            # Force the baseline AFTER --package (which may itself touch seen).
+            set_seen "$baseline"
+            printf '%s\n' "$baseline" > /root/baseline/selection-seen
+            compare_with_baseline
+            [ "$(read_seen)" = "$baseline" ] \
+              || { echo "baseline seen=$baseline was not established"; return 1; }
+
+            configure_pam_fingerprint
+            test -f /var/lib/cros-enablement/pam-selection
+            grep -qF "# cros-enablement: selection-seen=$baseline" \
+              /var/lib/cros-enablement/pam-selection \
+              || { echo "sidecar lacks seen=$baseline metadata"; return 1; }
+            pam-auth-update --package
+            rollback_component "fingerprint"
+            disable_pam_fingerprint
+            compare_with_baseline
+            test ! -e /var/lib/cros-enablement/pam-selection
+            echo "real-tool seen=$baseline round-trip OK: value + seen byte-identical"
+          }
+          seen_roundtrip true
+          seen_roundtrip false
+
           echo "== non-root (passwordless sudo) uninstall with REAL tools =="
           # Restore the pristine baseline before the second round-trip.
           cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
           cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
           printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
           pam-auth-update --package
+          # Match the seen flag left by the last seen_roundtrip before comparing.
+          set_seen "$(cat /root/baseline/selection-seen)"
           compare_with_baseline
 
           configure_pam_fingerprint

@@ -33,8 +33,9 @@ _PAM_DIR="${CROS_ENABLEMENT_PAM_DIR:-/etc/pam.d}"
 # debconf. Merely sed-deleting pam_fprintd.so would therefore permanently lose
 # the user's fprintd selection on the next package maintenance (re-review #13
 # finding #1). Strategy:
-#  1. snapshot the original debconf selection and every saved module file into a
-#     sidecar next to the manifest (first-wins, never overwritten);
+#  1. snapshot the original debconf selection (value AND its seen flag) and every
+#     saved module file into a sidecar next to the manifest (first-wins, never
+#     overwritten); legacy sidecars without seen metadata restore value only;
 #  2. back up ALL existing common-* files (not just fp-containing ones), because
 #     --package may rewrite every one of them; strip only the fp module lines;
 #  3. run `pam-auth-update --package` ourselves so debconf + /var/lib/pam
@@ -67,9 +68,119 @@ _pam_backup_common_files() {
     return 0
 }
 
+# --- debconf selection / seen-flag helpers ----------------------------------
+#
+# re-review P1 #2: debconf-show prints "* libpam-runtime/profiles: ..." when the
+# question is SEEN and "  libpam-runtime/profiles: ..." when it is unseen. The
+# old parser only accepted the latter, so a non-empty seen=true selection was
+# read as an empty string, snapshotted as empty, and never restored on uninstall.
+#
+# Prefer debconf-communicate: its protocol carries BOTH a status and the value,
+# so "question absent" / "tool failed" cannot be confused with a legal empty
+# value. Keep a PREFIX-AWARE debconf-show fallback for the VALUE on hosts
+# without it; the seen flag is NOT available through that fallback (it cannot
+# be written back without the protocol tool), so such snapshots stay LEGACY:
+# value only, no FSET on restore.
+#
+# Contract of _pam_read_selection / _pam_read_selection_seen:
+#   rc 0 -> value on stdout (the SELECTION may legitimately be empty)
+#   rc 1 -> the key/field was unreadable; NEVER report an empty string with rc 0
+_pam_debconf_query() {
+    # Each argument is one debconf-communicate command. A REAL tool exits with
+    # the NUMERIC STATUS OF THE LAST command: GET of a missing key prints
+    # "10 ..." and exits 10. Callers MUST check this process rc AND parse the
+    # reply's status token. The optional `timeout` only bounds a hung tool; it
+    # does not change the sudo invocation (passwordless sudo still applies).
+    if command -v timeout > /dev/null 2>&1; then
+        printf '%s\n' "$@" | timeout 5 sudo debconf-communicate libpam-runtime 2> /dev/null
+    else
+        printf '%s\n' "$@" | sudo debconf-communicate libpam-runtime 2> /dev/null
+    fi
+}
+
+_pam_debconf_reply_value() {
+    # $1 = one "<status> <value>" reply line. Print the value ONLY for status 0.
+    local line="$1" status value
+    status="${line%% *}"
+    [ "$status" = "0" ] || return 1
+    value=""
+    [ "$line" = "$status" ] || value="${line#* }"
+    value="${value%$'\r'}"
+    printf '%s' "$value"
+}
+
 _pam_read_selection() {
-    sudo debconf-show libpam-runtime 2> /dev/null \
-        | sed -n 's/^  libpam-runtime\/profiles:[[:space:]]*//p' | tail -n 1
+    local reply last value rc=0
+    if command -v debconf-communicate > /dev/null 2>&1; then
+        reply="$(_pam_debconf_query 'GET libpam-runtime/profiles')" || rc=$?
+        # The PROCESS rc is the last command's status on the real tool, so a
+        # non-zero rc is a hard failure (absent key / tool error) — NEVER a
+        # cue to fall back to debconf-show.
+        [ "$rc" -eq 0 ] || return 1
+        if [ -n "$reply" ]; then
+            last="$(printf '%s\n' "$reply" | tail -n 1)"
+            if value="$(_pam_debconf_reply_value "$last")"; then
+                printf '%s' "$value"
+                return 0
+            fi
+            # The final reply line carries a NON-ZERO protocol status: the
+            # question is absent. No fallback: debconf-show cannot distinguish
+            # "absent" from a legal empty value.
+            return 1
+        fi
+        # No protocol line at all is unusable too (a legal answer is at least
+        # "0 "), and the tool IS present: still no fallback.
+        return 1
+    fi
+    # Fallback ONLY when debconf-communicate is genuinely unavailable.
+    # Accept BOTH prefixes. A missing line is a hard failure, not an empty value
+    # (the "V:" marker keeps an empty value distinguishable).
+    reply="$(sudo debconf-show libpam-runtime 2>/dev/null \
+        | awk '/^(  |\* )libpam-runtime\/profiles:[[:space:]]*/ {
+                  sub(/^(  |\* )libpam-runtime\/profiles:[[:space:]]*/, "")
+                  print "V:" $0
+              }' | tail -n 1)"
+    [ -n "$reply" ] || return 1
+    printf '%s' "${reply#V:}"
+}
+
+_pam_read_selection_seen() {
+    local reply last value rc=0
+    if command -v debconf-communicate > /dev/null 2>&1; then
+        reply="$(_pam_debconf_query 'FGET libpam-runtime/profiles seen')" || rc=$?
+        # Same rule as _pam_read_selection: the process rc IS the last
+        # command's status on a real tool. Never hide a failure with a fallback.
+        [ "$rc" -eq 0 ] || return 1
+        if [ -n "$reply" ]; then
+            last="$(printf '%s\n' "$reply" | tail -n 1)"
+            if value="$(_pam_debconf_reply_value "$last")"; then
+                case "$value" in
+                    true|false) printf '%s' "$value"; return 0 ;;
+                esac
+            fi
+            # A status-bearing reply means the seen field/question is absent.
+            return 1
+        fi
+        return 1
+    fi
+    # debconf-show's '* ' / '  ' display prefix is NOT a restorable seen flag:
+    # writing it back needs FSET/debconf-communicate, which is absent here.
+    # Report "unavailable" so the snapshot stays LEGACY (value only, no FSET)
+    # instead of recording a flag the product could never put back.
+    return 1
+}
+
+_pam_set_selection_seen() {
+    # $1 = true|false. Check BOTH the process rc (last command's status on a
+    # real tool) and the reply's protocol status — same contract as the readers.
+    local reply last status rc=0
+    command -v debconf-communicate > /dev/null 2>&1 || return 1
+    reply="$(_pam_debconf_query "FSET libpam-runtime/profiles seen $1")" || rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    [ -n "$reply" ] || return 1
+    last="$(printf '%s\n' "$reply" | tail -n 1)"
+    status="${last%% *}"
+    [ "$status" = "0" ]
 }
 
 _PAM_SAVED_SNAPSHOT_STAGE="${_PAM_SAVED_SNAPSHOT_DIR}.stage.$$"
@@ -117,7 +228,7 @@ _pam_snapshot_saved_dir() {
 }
 
 _pam_snapshot_selection() {
-    local sel tmp won=0 staged=0
+    local sel="" sel_rc=0 seen="" has_seen=0 seen_line="" tmp won=0 staged=0
     if [ -e "$_PAM_SEL_SIDECAR" ]; then
         log_info "Keeping the existing PAM selection snapshot at $_PAM_SEL_SIDECAR (first-wins)."
         # Repair the other half of a partially published snapshot instead of
@@ -126,12 +237,24 @@ _pam_snapshot_selection() {
             || log_warn "Could not repair the saved PAM profile snapshot; uninstall convergence may be incomplete."
         return 0
     fi
-    sel="$(_pam_read_selection)"
-    [ -n "$sel" ] || log_warn "Could not read debconf libpam-runtime/profiles; the PAM selection snapshot will be empty."
+    # rc 0 + empty stdout is a LEGAL empty selection. rc 1 means the key is
+    # absent / unreadable and must never be snapshotted as a successful empty.
+    sel="$(_pam_read_selection)" || sel_rc=$?
+    if [ "$sel_rc" -ne 0 ]; then
+        log_error "Could not read debconf libpam-runtime/profiles (key absent or tool failure); refusing to snapshot an unreadable selection."
+        return 1
+    fi
+    if seen="$(_pam_read_selection_seen)"; then
+        has_seen=1
+        seen_line="# cros-enablement: selection-seen=$seen"
+    else
+        log_warn "Could not read the debconf seen flag; the snapshot restores the value only (legacy behaviour)."
+    fi
     tmp="${_PAM_SEL_SIDECAR}.tmp.$$"
     if ! {
         printf '%s\n' "$_PAM_SEL_MAGIC"
-        [ -z "$sel" ] || printf '%s\n' "$sel"
+        [ -z "$seen_line" ] || printf '%s\n' "$seen_line"
+        printf '%s\n' "$sel"
     } \
         | sudo tee "$tmp" > /dev/null; then
         log_warn "Could not write the PAM selection snapshot; the original selection cannot be restored automatically."
@@ -168,7 +291,21 @@ _pam_snapshot_selection() {
 
 _pam_selection_from_sidecar() {
     [ -f "$_PAM_SEL_SIDECAR" ] || return 1
+    # All '# ...' lines are metadata (magic + optional seen flag), never data.
     sed '/^#/d' "$_PAM_SEL_SIDECAR" | tail -n 1
+}
+
+# Optional metadata added to new sidecars. A legacy sidecar has no such line:
+# in that case restore the VALUE only and leave the live seen flag untouched.
+_pam_selection_seen_from_sidecar() {
+    [ -f "$_PAM_SEL_SIDECAR" ] || return 1
+    local v
+    v="$(sed -n 's/^# cros-enablement: selection-seen=\(true\|false\)$/\1/p' \
+        "$_PAM_SEL_SIDECAR" | tail -n 1)"
+    case "$v" in
+        true|false) printf '%s' "$v"; return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # pam-auth-update persists the debconf multiselect in canonical "a, b, c"
@@ -223,15 +360,19 @@ _pam_restore_debian_selection() {
         log_info "No PAM selection snapshot at $_PAM_SEL_SIDECAR; nothing to restore."
         return 0
     fi
-    local snapshot current
+    local snapshot="" seen="" restore_seen=0 current="" current_seen="" current_rc=0
     # Saved module snapshots are restored even if the debconf value could not
     # be captured, so the files never stay in the converged no-fprintd state.
     _pam_restore_saved_dir_snapshot \
         || log_warn "Could not restore every saved PAM profile file from the snapshot."
-    snapshot="$(_pam_selection_from_sidecar)"
-    if [ -z "$snapshot" ]; then
-        log_warn "The PAM selection snapshot is empty; cannot restore the debconf selection."
-        return 0
+    if ! snapshot="$(_pam_selection_from_sidecar)"; then
+        log_error "Could not read the selection sidecar $_PAM_SEL_SIDECAR; keeping it for retry."
+        return 1
+    fi
+    # An EMPTY value is legal and must be restored too (it may clear a value the
+    # tool derived during install); only an unreadable source is a hard error.
+    if seen="$(_pam_selection_seen_from_sidecar)"; then
+        restore_seen=1
     fi
     if ! command -v debconf-set-selections > /dev/null 2>&1; then
         log_warn "debconf-set-selections is unavailable; keeping $_PAM_SEL_SIDECAR for retry."
@@ -246,14 +387,29 @@ _pam_restore_debian_selection() {
         sudo pam-auth-update --package \
             || log_warn "pam-auth-update --package failed during restore; verifying the debconf value directly."
     fi
-    current="$(_pam_read_selection)"
-    if _pam_selection_equal "$snapshot" "$current"; then
+    # debconf-set-selections / --package mark the question seen. Re-apply the
+    # snapshotted flag AFTER the last tool call so it cannot be overwritten.
+    # Legacy sidecars have no seen metadata: skip this entirely (backward compat).
+    if [ "$restore_seen" -eq 1 ] && ! _pam_set_selection_seen "$seen"; then
+        log_error "Could not restore the debconf seen flag ('$seen'); keeping $_PAM_SEL_SIDECAR for retry."
+        return 1
+    fi
+    current="$(_pam_read_selection)" || current_rc=$?
+    if [ "$current_rc" -ne 0 ]; then
+        log_error "Could not read the debconf selection after restore; keeping $_PAM_SEL_SIDECAR for retry."
+        return 1
+    fi
+    if [ "$restore_seen" -eq 1 ]; then
+        current_seen="$(_pam_read_selection_seen)" || current_seen="UNREADABLE"
+    fi
+    if _pam_selection_equal "$snapshot" "$current" \
+        && { [ "$restore_seen" -eq 0 ] || [ "$current_seen" = "$seen" ]; }; then
         sudo rm -f -- "$_PAM_SEL_SIDECAR"
         sudo rm -rf -- "$_PAM_SAVED_SNAPSHOT_DIR"
         log_success "Original PAM profile selection restored; snapshot consumed."
         return 0
     fi
-    log_error "PAM selection restore verification failed: expected '$snapshot', got '$current'. Keeping $_PAM_SEL_SIDECAR for retry."
+    log_error "PAM selection restore verification failed: expected '$snapshot' (seen=$seen), got '$current' (seen=$current_seen). Keeping $_PAM_SEL_SIDECAR for retry."
     return 1
 }
 
