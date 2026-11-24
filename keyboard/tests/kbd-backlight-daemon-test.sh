@@ -34,8 +34,15 @@ STUB_ACTIVE_SEQ_FILE="$TMP_DIR/active-seq"
 HANDOFF_DIR="$TMP_DIR/handoff"
 HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
+# The hook-side directory the daemon watches for a mismatch WARN.  By default
+# it is an empty sandbox dir; the mismatch test is the only case that puts a
+# handoff there while the daemon's own path stays empty.
+HOOK_HANDOFF_DIR="$TMP_DIR/hook-handoff"
+HOOK_SUSPEND_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.suspend"
+# Sandboxed /run/user root for the read-only cross-uid mismatch scan.
+HOOK_RUN_USER_ROOT="$TMP_DIR/hook-run-user"
 LEGACY_LOG="$TMP_DIR/legacy.log"
-mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR" "$HANDOFF_DIR"
+mkdir -p "$STUB_DIR" "$D_STATE_DIR" "$FLOCK_DIR" "$HANDOFF_DIR" "$HOOK_HANDOFF_DIR" "$HOOK_RUN_USER_ROOT"
 
 passed=0
 failed=0
@@ -147,6 +154,12 @@ esac
 
 case "$*" in
     *Properties.Get*)
+        # Independent switch: introspection still advertises gsd-power, but
+        # the pct query times out/fails.  This is the real "empty pct" path;
+        # STUB_GSD_FAIL=1 instead removes the backend entirely.
+        if [ "${STUB_GSD_GET_FAIL:-0}" = "1" ]; then
+            exit 1
+        fi
         if [ "${STUB_GSD_FAIL:-0}" = "1" ]; then
             exit 1
         fi
@@ -315,6 +328,8 @@ export PATH="$STUB_DIR:$PATH"
 # converge immediately (no real sleeping in unit tests).
 export C640_KBD_HANDOFF_SUSPEND="$HANDOFF_SUSPEND_FILE"
 export C640_KBD_HANDOFF_RESUME="$HANDOFF_RESUME_FILE"
+export C640_KBD_HANDOFF_DIR="$HOOK_HANDOFF_DIR"
+export C640_KBD_RUN_USER_ROOT="$HOOK_RUN_USER_ROOT"
 export C640_KBD_RESUME_PROBE_MAX=0
 export C640_KBD_RESUME_ALLOW_UNKNOWN=0
 
@@ -364,6 +379,7 @@ export STUB_RAW_FILE="$RAW_FILE"
 export STUB_PCT_FILE="$PCT_FILE"
 export STUB_KBD_RAW="42"
 export STUB_GSD_FAIL="0"
+export STUB_GSD_GET_FAIL="0"
 export STUB_UPOWER_FAIL="0"
 export STUB_GNOME_ACTIVE="false"
 export STUB_FDO_ACTIVE="false"
@@ -383,7 +399,9 @@ reset_case() {
     rm -f "$STATE_FILE" "$STATE_LOCK" "$LOCK_FILE" "$LAST_USER_FILE" "$LAST_USER_META_FILE" \
         "$RESTORE_GEN_FILE" "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending \
         "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE" \
-        "$HANDOFF_SUSPEND_FILE" "$HANDOFF_RESUME_FILE" "$D_STATE_DIR"/*.resume.lock
+        "$HANDOFF_SUSPEND_FILE" "$HANDOFF_RESUME_FILE" "$HOOK_SUSPEND_FILE" \
+        "$HOOK_HANDOFF_DIR"/c640-kbd-backlight.resume "$D_STATE_DIR"/*.resume.lock
+    rm -f "$HOOK_RUN_USER_ROOT"/[0-9]*/c640-kbd-backlight.* 2> /dev/null || true
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
@@ -394,6 +412,7 @@ reset_case() {
     _BACKENDS_LOGGED=0
     export STUB_KBD_RAW="42"
     export STUB_GSD_FAIL="0"
+    export STUB_GSD_GET_FAIL="0"
     export STUB_UPOWER_FAIL="0"
     export STUB_GNOME_ACTIVE="false"
     export STUB_FDO_ACTIVE="false"
@@ -984,17 +1003,42 @@ run_fn save_state
 export STUB_GSD_FAIL=0
 assert_file "failed gsd pct query does not suppress the live reading" "$STATE_FILE" "30"
 
-# (b6b) A manual0 cache with a FAILING gsd pct query: the result is "empty",
-#       which still counts as "off", so the explicit off is saved.  The old
-#       (b6) used src=nonzero and never queried gsd, so STUB_GSD_FAIL was inert
-#       there; this case exercises the real empty-pct path.
+# (b6b) A manual0 cache with a FAILING gsd PROPERTIES.GET: the backend is
+#       still present (introspect succeeds), so compute_save_brightness really
+#       calls gsd_get_pct and gets "empty" => "cannot confirm", NOT 0.  With
+#       `|| echo 0` mutation in the daemon this case must FAIL (state 0).
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+export STUB_GSD_GET_FAIL=1
+run_fn save_state
+export STUB_GSD_GET_FAIL=0
+assert_file "empty gsd pct does not confirm a manual off" "$STATE_FILE" "30"
+if grep -q 'Properties.Get' "$GDBUS_LOG"; then
+    ok "b6b: gsd pct query was actually attempted (backend present)"
+else
+    bad "b6b: no Properties.Get; empty-pct path not covered (log: $(cat "$GDBUS_LOG"))"
+fi
+# Backend absent: gsd is never queried and the live value still wins.
 reset_case
 write_last_user 0 manual0
 printf '30\n' > "$RAW_FILE"
 export STUB_GSD_FAIL=1
 run_fn save_state
 export STUB_GSD_FAIL=0
-assert_file "manual off survives a failed gsd pct query (empty pct)" "$STATE_FILE" "0"
+assert_file "absent gsd backend does not confirm a manual off" "$STATE_FILE" "30"
+if grep -q 'Properties.Get' "$GDBUS_LOG"; then
+    bad "backend-absent case must not query gsd pct (log: $(cat "$GDBUS_LOG"))"
+else
+    ok "backend-absent case performs no gsd pct query"
+fi
+# Explicit pct 0 still confirms it (the b3/p6-18 behaviour must stay intact).
+reset_case
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn save_state
+assert_file "explicit gsd pct 0 still confirms a manual off" "$STATE_FILE" "0"
 
 # (b7) Regression: a restart seed from an already-off light must record an
 #      explicit off (manual0), not a plain non-zero source.  Otherwise a later
@@ -1070,6 +1114,51 @@ if grep -q 'suspend handoff invalid' "$DAEMON_ERR"; then
     ok "adopt(invalid): warns about invalid handoff"
 else
     bad "adopt(invalid): no warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P3. The hook writes /run/user/<uid> while the daemon reads XDG_RUNTIME_DIR.
+# If a handoff exists only in the hook's directory, warn instead of silently
+# losing it; the daemon must NOT cross-adopt a possibly different user's file.
+reset_case
+printf '7\n' > "$HOOK_SUSPEND_FILE"
+printf '%s suspend\n' "$(date +%s)" > "$HOOK_HANDOFF_DIR/c640-kbd-backlight.resume"
+run_fn adopt_suspend_handoff
+assert_absent "handoff mismatch: daemon state not cross-adopted" "$STATE_FILE"
+assert_present "handoff mismatch: hook copy left untouched" "$HOOK_SUSPEND_FILE"
+if grep -q 'handoff directory mismatch' "$DAEMON_ERR"; then
+    ok "handoff mismatch: adoption warns about the directory split"
+else
+    bad "handoff mismatch: no warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+write_state 7
+run_fn handle_resume
+if grep -q 'handoff directory mismatch.*c640-kbd-backlight.resume' "$DAEMON_ERR"; then
+    ok "handoff mismatch: resume flag path warns too"
+else
+    bad "handoff mismatch: no resume-flag warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P3-1. The hook can resolve a DIFFERENT session uid (multi-seat): the daemon
+# must still notice the handoff in /run/user/1001 while it reads its own dir,
+# warn, and never cross-adopt it.
+reset_case
+mkdir -p "$HOOK_RUN_USER_ROOT/1001"
+printf '7\n' > "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.suspend"
+printf '%s suspend\n' "$(date +%s)" > "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.resume"
+run_fn adopt_suspend_handoff
+assert_absent "cross-uid mismatch: no cross-adopt into daemon state" "$STATE_FILE"
+assert_present "cross-uid mismatch: other uid's handoff untouched" "$HOOK_RUN_USER_ROOT/1001/c640-kbd-backlight.suspend"
+if grep -q 'handoff directory mismatch.*/1001/c640-kbd-backlight.suspend' "$DAEMON_ERR"; then
+    ok "cross-uid mismatch: suspend handoff warns with the other uid's path"
+else
+    bad "cross-uid mismatch: no warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+write_state 7
+run_fn handle_resume
+if grep -q 'handoff directory mismatch.*/1001/c640-kbd-backlight.resume' "$DAEMON_ERR"; then
+    ok "cross-uid mismatch: resume flag warns with the other uid's path"
+else
+    bad "cross-uid mismatch: no resume warning (stderr: $(cat "$DAEMON_ERR"))"
 fi
 
 # P4b-3. resume + active: adopt 7, defer, keep state + flag; no LED write.
@@ -1162,6 +1251,82 @@ else
     bad "resume(allow-unknown): no WARN (stderr: $(cat "$DAEMON_ERR"))"
 fi
 
+# P2-a. Wall-clock probe deadline.  The old loop counted only sleep delays and
+# ignored the time spent in gdbus, so slow queries could hold RESUME_LOCK for
+# ~40s.  Simulate a slow/frozen D-Bus by making `date +%s` advance 3s per call;
+# with probe_max=2 the daemon must stop after the first tristate probe.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+export C640_KBD_RESUME_PROBE_MAX=2
+cat > "$STUB_DIR/date" << 'STUB'
+#!/bin/sh
+clock="${STUB_CLOCK_FILE:-/dev/null}"
+n=0
+if [ -f "$clock" ]; then n="$(cat "$clock" 2> /dev/null || echo 0)"; fi
+case "$n" in '' | *[!0-9]*) n=0 ;; esac
+n=$((n + 3))
+printf '%s\n' "$n" > "$clock"
+echo $((${STUB_CLOCK_BASE:-0} + n))
+STUB
+chmod +x "$STUB_DIR/date"
+export STUB_CLOCK_FILE="$TMP_DIR/slow-clock"
+export STUB_CLOCK_BASE=1000
+rm -f "$STUB_CLOCK_FILE"
+run_fn handle_resume
+rm -f "$STUB_DIR/date"
+unset STUB_CLOCK_FILE STUB_CLOCK_BASE
+export C640_KBD_RESUME_PROBE_MAX=0
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "resume deadline: only one tristate probe (2 GetActive calls)" "2" "$(grep -c 'GetActive' "$GDBUS_LOG" || true)"
+assert_file "resume deadline: state retained" "$STATE_FILE" "7"
+assert_file "resume deadline: LED untouched" "$RAW_FILE" "42"
+assert_absent "resume deadline: handoff.suspend not consumed" "$HANDOFF_SUSPEND_FILE"
+assert_present "resume deadline: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_eq "resume deadline: no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'probe deadline' "$DAEMON_ERR"; then
+    ok "resume deadline: convergence via deadline is logged"
+else
+    bad "resume deadline: no deadline log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-a (b). The deadline is checked AFTER a probe, not as a hard interrupt.
+# With a 3s-per-call clock and probe_max=7, two probes run (wall 3 then 6) and
+# the second one's post-check trips at wall=9.  This documents the honest
+# worst case: ~probe_max + one tristate query (<=6s with two backends).
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+export C640_KBD_RESUME_PROBE_MAX=7
+cat > "$STUB_DIR/date" << 'STUB'
+#!/bin/sh
+clock="${STUB_CLOCK_FILE:-/dev/null}"
+n=0
+if [ -f "$clock" ]; then n="$(cat "$clock" 2> /dev/null || echo 0)"; fi
+case "$n" in '' | *[!0-9]*) n=0 ;; esac
+n=$((n + 3))
+printf '%s\n' "$n" > "$clock"
+echo $((${STUB_CLOCK_BASE:-0} + n))
+STUB
+chmod +x "$STUB_DIR/date"
+export STUB_CLOCK_FILE="$TMP_DIR/slow-clock-2"
+export STUB_CLOCK_BASE=1000
+rm -f "$STUB_CLOCK_FILE"
+run_fn handle_resume
+rm -f "$STUB_DIR/date"
+unset STUB_CLOCK_FILE STUB_CLOCK_BASE
+export C640_KBD_RESUME_PROBE_MAX=0
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_eq "resume deadline(b): two probes before the post-probe deadline" "4" "$(grep -c 'GetActive' "$GDBUS_LOG" || true)"
+assert_file "resume deadline(b): state retained" "$STATE_FILE" "7"
+if grep -q 'probe deadline.*after slow query' "$DAEMON_ERR"; then
+    ok "resume deadline(b): post-probe expiry is logged"
+else
+    bad "resume deadline(b): no post-probe deadline log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
 # P4b-8. A handoff value of 0 is real state, not "no state": it is adopted and
 #        written through gsd, and consumed like any other value.
 reset_case
@@ -1250,6 +1415,116 @@ if grep -q 'suspend handoff 30 overrides differing daemon state 8' "$DAEMON_ERR"
 else
     bad "handoff 30: override not logged (stderr: $(cat "$DAEMON_ERR"))"
 fi
+
+# P2-b. STATE_FILE holds 30 (a DEFER left it there), but the user then switched
+# the light off: the cache is 0/source=manual0 and fresh.  The hook's handoff 0
+# is genuine user intent now, so it must be adopted instead of re-lighting 30.
+reset_case
+write_state 30
+write_last_user 0 manual0
+write_handoff_suspend 0
+write_handoff_resume
+printf '30\n' > "$RAW_FILE"
+# P2-3: the adopt path now demands an EXPLICIT gsd 0 as confirmation too.
+printf '0\n' > "$PCT_FILE"
+run_fn handle_resume
+assert_file "P2-b: fresh manual0 adopts handoff 0 over saved 30" "$RAW_FILE" "0"
+assert_absent "P2-b: saved state consumed after adopting 0" "$STATE_FILE"
+assert_absent "P2-b: handoff 0 consumed" "$HANDOFF_SUSPEND_FILE"
+assert_absent "P2-b: resume flag consumed" "$HANDOFF_RESUME_FILE"
+if grep -q 'fresh manual off' "$DAEMON_ERR"; then
+    ok "P2-b: manual0 adoption is explained in the log"
+else
+    bad "P2-b: no manual0 adoption log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-b (negative).  An EXPIRED manual0 cache is no evidence of current intent,
+# so the blank-side 0 must still be ignored (the original Branch A behaviour).
+reset_case
+write_state 30
+write_last_user 0 manual0
+printf 'source=manual0\nts=%s\n' "$(($(date +%s) - 60))" > "$LAST_USER_META_FILE"
+printf '0\n' > "$PCT_FILE"
+write_handoff_suspend 0
+write_handoff_resume
+export STUB_GNOME_ACTIVE=true
+run_fn handle_resume
+wait 2> /dev/null || true
+export STUB_GNOME_ACTIVE=false
+assert_file "P2-b: stale manual0 still ignores blank-side handoff 0" "$STATE_FILE" "30"
+assert_file "P2-b: stale case leaves LED untouched" "$RAW_FILE" "42"
+if grep -q 'ignoring blank-side suspend handoff 0' "$DAEMON_ERR"; then
+    ok "P2-b: stale manual0 case logs the blank-side override"
+else
+    bad "P2-b: no blank-side override log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-b (negative).  A cache that records a non-zero user brightness is also
+# blank-side evidence, not a fresh manual off.
+reset_case
+write_state 30
+write_last_user 30 nonzero
+printf '0\n' > "$PCT_FILE"
+write_handoff_suspend 0
+run_fn adopt_suspend_handoff
+assert_file "P2-b: nonzero cache keeps saved 30 against handoff 0" "$STATE_FILE" "30"
+assert_absent "P2-b: nonzero cache case consumes the stale handoff" "$HANDOFF_SUSPEND_FILE"
+
+# Reviewer B P3. The `lu = 0` condition must be isolated: a FRESH manual0
+# source with LU=30 is not an explicit off even when gsd reports 0.  Removing
+# `[ "$lu" = "0" ]` from the daemon makes this case adopt 0 and fail.
+reset_case
+write_state 30
+write_last_user 30 manual0
+printf '0\n' > "$PCT_FILE"
+write_handoff_suspend 0
+run_fn adopt_suspend_handoff
+assert_file "P2-b: manual0 source with lu=30 still keeps saved 30" "$STATE_FILE" "30"
+assert_absent "P2-b: lu=30 case consumes the stale handoff" "$HANDOFF_SUSPEND_FILE"
+
+# P2-3. gsd query failure (backend PRESENT, Properties.Get fails) yields empty,
+# which is "cannot confirm" -- a fresh manual0 cache must NOT turn the hook's
+# blank-side 0 into user intent.  Saved 30 must survive.
+reset_case
+write_state 30
+write_last_user 0 manual0
+printf '30\n' > "$RAW_FILE"
+export STUB_GSD_GET_FAIL=1
+write_handoff_suspend 0
+# Adoption only: a full handle_resume() with an inactive screen would restore
+# the saved value and consume STATE_FILE, obscuring the adopt decision.
+run_fn adopt_suspend_handoff
+export STUB_GSD_GET_FAIL=0
+assert_file "P2-3: empty gsd pct keeps saved 30 against handoff 0" "$STATE_FILE" "30"
+assert_file "P2-3: LED untouched" "$RAW_FILE" "30"
+assert_absent "P2-3: unconfirmed handoff 0 consumed without adopting" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'manual off not confirmed by gsd pct' "$DAEMON_ERR"; then
+    ok "P2-3: unconfirmed manual-off adoption is explained"
+else
+    bad "P2-3: no unconfirmed log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-3 (sampler). Two on-screen zeros with a FAILING gsd pct query must not be
+# promoted to manual0; only an explicit pct 0 may do that.
+reset_case
+printf '0\n' > "$RAW_FILE"
+export STUB_GSD_GET_FAIL=1
+run_fn sample_brightness_once
+run_fn sample_brightness_once
+export STUB_GSD_GET_FAIL=0
+assert_absent "P2-3: no manual0 cache from unconfirmed zeros" "$LAST_USER_FILE"
+if [ -f "$LAST_USER_META_FILE" ] && grep -q 'source=manual0' "$LAST_USER_META_FILE"; then
+    bad "P2-3: unconfirmed zeros were recorded as manual0"
+else
+    ok "P2-3: unconfirmed zeros are not recorded as manual0"
+fi
+reset_case
+printf '0\n' > "$RAW_FILE"
+printf '0\n' > "$PCT_FILE"
+run_fn sample_brightness_once
+run_fn sample_brightness_once
+assert_file "P2-3: explicit pct 0 still records manual0" "$LAST_USER_FILE" "0"
+assert_eq "P2-3: explicit pct 0 records source manual0" "manual0" "$(last_user_cache_source)"
 
 # P4b-9. Legacy/sysfs/ectool writers must never be called by the resume path.
 reset_case
@@ -2269,6 +2544,100 @@ write_state garbage
 rc="$(run_fn_rc restore_state)"
 assert_eq "P6-19: restore of invalid state is a safe no-op" "0" "$rc"
 assert_absent "P6-19: invalid state removed" "$STATE_FILE"
+
+# P2-c. The unblank guard is a THIRD writer outside RESUME_LOCK/STATE_LOCK.
+# It must not re-apply the restored value after a POST-restore user change.
+# Set up a real successful restore first so the last-user record can carry the
+# matching restore generation (that stamp is what makes it post-restore).
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+write_last_user 50 nonzero
+printf '50\n' > "$RAW_FILE"
+printf '50\n' > "$PCT_FILE"
+: > "$SET_LOG" # discard the setup restore's write
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "P2-c: guard keeps the user's post-restore brightness 50" "$RAW_FILE" "50"
+assert_eq "P2-c: guard issued no gsd write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'post-restore cache agree' "$DAEMON_ERR"; then
+    ok "P2-c: guard logs that it deferred to user intent"
+else
+    bad "P2-c: no user-choice log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-c (b). A stamped last-user record is sufficient even when the LED currently
+# disagrees with gsd (backend glitch); no write may follow.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+write_last_user 50 nonzero
+printf '42\n' > "$RAW_FILE"
+printf '50\n' > "$PCT_FILE"
+: > "$SET_LOG"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "P2-c: post-restore cache alone blocks a re-set" "$RAW_FILE" "42"
+assert_eq "P2-c: no write from the stamped-cache case" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'recorded after restore' "$DAEMON_ERR"; then
+    ok "P2-c: stamped cache is logged as user intent"
+else
+    bad "P2-c: no stamped-cache log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-c (c). gsd/LED agree on a new value but the last-user cache does NOT
+# support it (stale pre-restore cache): treat it as a lost restore and repair.
+reset_case
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+write_last_user 30 nonzero
+printf '50\n' > "$RAW_FILE"
+printf '50\n' > "$PCT_FILE"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "P2-c: gsd/LED alone does not license skipping the repair" "$RAW_FILE" "30"
+if grep -q 're-setting' "$DAEMON_ERR"; then
+    ok "P2-c: unsupported gsd/LED change is repaired"
+else
+    bad "P2-c: no re-set log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-1 (reviewer A). A 6->8 change made <5s before blank leaves the sampler
+# cache at 6 while STATE_FILE holds 8.  That stale cache must NOT be mistaken
+# for a new post-restore user choice: a lost restore is still repaired.
+reset_case
+write_last_user 6 nonzero
+write_state 8
+printf '8\n' > "$RAW_FILE"
+run_fn restore_state
+printf '6\n' > "$RAW_FILE"
+printf '8\n' > "$PCT_FILE"
+run_fn guard_unblank 8
+wait 2> /dev/null || true
+assert_file "P2-1: stale 6 cache cannot block repair of lost restore 8" "$RAW_FILE" "8"
+if grep -q 're-setting' "$DAEMON_ERR"; then
+    ok "P2-1: stale-cache case re-sets the restored value"
+else
+    bad "P2-1: no re-set log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# P2-c (d). A genuine lost restore (cache still 30, gsd still wants 30, but
+# the LED is 10) is still repaired by the guard.
+reset_case
+write_last_user 30 nonzero
+printf '30\n' > "$PCT_FILE"
+printf '10\n' > "$RAW_FILE"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+assert_file "P2-c: guard still repairs a genuinely lost restore" "$RAW_FILE" "30"
+if grep -q 'Properties.Set' "$SET_LOG"; then
+    ok "P2-c: genuine mismatch still triggers a guard write"
+else
+    bad "P2-c: guard no longer repairs a lost restore (SET_LOG: $(cat "$SET_LOG"))"
+fi
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

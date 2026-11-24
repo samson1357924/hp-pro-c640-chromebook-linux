@@ -58,6 +58,10 @@ STATE_FILE="$STATE_DIR/state"
 HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-}"
 RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 HANDOFF_OWNER=""
+# Number of real loginctl session rows.  _session_uid() runs in a command
+# substitution, so it returns this count alongside the uid rather than
+# assigning a global that would be lost in the subshell.
+SESSION_CANDIDATES=0
 SUSPEND_HANDOFF="c640-kbd-backlight.suspend"
 RESUME_HANDOFF="c640-kbd-backlight.resume"
 
@@ -134,6 +138,7 @@ save_state() {
 # and would only add latency. loginctl is a system service (not frozen).
 _session_uid() {
     _uid=""
+    _candidates=0
     if [ -n "${SUDO_USER:-}" ]; then
         _uid="$(id -u "$SUDO_USER" 2> /dev/null || echo "")"
     fi
@@ -144,7 +149,8 @@ _session_uid() {
         # USER is $3 (never the UID column $2, and never a literal "active").
         # Prefer a live session (IDLE=yes / CLASS=active), else the first real
         # session row. Skip the header line.
-        _user="$(loginctl list-sessions --no-legend 2> /dev/null \
+        _sessions="$(loginctl list-sessions --no-legend 2> /dev/null || true)"
+        _user="$(printf '%s\n' "$_sessions" \
             | awk '
                 NF >= 3 && $1 != "SESSION" {
                     if ($8 == "yes" || $6 == "active") { chosen = $3; exit }
@@ -152,6 +158,15 @@ _session_uid() {
                 }
                 END { if (chosen != "") print chosen; else if (first != "") print first }
               ' 2> /dev/null || true)"
+        # A multi-seat/multi-session host has no single obvious owner for the
+        # handoff.  The preference above (IDLE=yes / CLASS=active) is
+        # deliberate, but make the ambiguity visible in the journal.
+        _candidates="$(printf '%s\n' "$_sessions" \
+            | awk 'NF >= 3 && $1 != "SESSION" { n++ } END { print n+0 }' 2> /dev/null || true)"
+        case "$_candidates" in '' | *[!0-9]*) _candidates=0 ;; esac
+        # The chosen PATH is only known after the uid is resolved, so the
+        # warning is emitted by resolve_handoff_dir() below.  Return the count
+        # with the uid (this function runs in a command substitution).
         if [ -n "$_user" ]; then
             _uid="$(id -u "$_user" 2> /dev/null || echo "")"
         fi
@@ -171,7 +186,7 @@ _session_uid() {
     fi
 
     case "$_uid" in '' | *[!0-9]*) _uid="" ;; esac
-    printf '%s' "$_uid"
+    printf '%s %s' "$_uid" "$_candidates"
 }
 
 # Decide where handoff files go. With an explicit override the directory is
@@ -183,7 +198,12 @@ resolve_handoff_dir() {
         HANDOFF_OWNER=""
         return 0
     fi
-    _uid="$(_session_uid)"
+    _resolved="$(_session_uid)"
+    _uid="${_resolved%% *}"
+    case "$_resolved" in
+        *" "*) SESSION_CANDIDATES="${_resolved#* }" ;;
+        *) SESSION_CANDIDATES=0 ;;
+    esac
     if [ -z "$_uid" ]; then
         log_warn "no session uid resolved; suspend/resume handoff skipped"
         HANDOFF_DIR=""
@@ -192,6 +212,9 @@ resolve_handoff_dir() {
     fi
     HANDOFF_DIR="$RUN_USER_ROOT/$_uid"
     HANDOFF_OWNER="$_uid"
+    if [ "${SESSION_CANDIDATES:-0}" -gt 1 ]; then
+        log_warn "multiple login sessions ($SESSION_CANDIDATES); using handoff dir $HANDOFF_DIR (IDLE=yes / CLASS=active preferred)"
+    fi
 }
 
 # Atomically publish one handoff file. All failures are best-effort: warn

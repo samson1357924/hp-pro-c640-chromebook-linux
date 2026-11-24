@@ -26,6 +26,7 @@ GDBUS_LOG="$TMP_DIR/gdbus.log"
 ECTOOL_LOG="$TMP_DIR/ectool.log"
 SUDO_LOG="$TMP_DIR/sudo.log"
 LOGINCTL_LOG="$TMP_DIR/loginctl.log"
+HOOK_ERR="$TMP_DIR/hook.err"
 CHMOD_LOG="$TMP_DIR/chmod.log"
 CHOWN_LOG="$TMP_DIR/chown.log"
 SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
@@ -155,6 +156,21 @@ STUB
 cat > "$STUB_DIR/loginctl" << 'STUB'
 #!/bin/sh
 printf 'loginctl %s\n' "$*" >> "${STUB_LOGINCTL_LOG:-/dev/null}"
+# SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE.  The first row is always
+# "nobody" so a wrong resolution is visible in the handoff directory.
+case "${STUB_LOGINCTL_MODE:-none}" in
+    multi | prefer-idle | prefer-class)
+        _class=user
+        _idle=no
+        case "${STUB_LOGINCTL_MODE}" in
+            prefer-idle) _idle=yes ;;
+            prefer-class) _class=active ;;
+        esac
+        printf '1 %s nobody seat0 100 user tty2 no 2026-11-22 08:00\n' "$(id -u nobody)"
+        printf '2 %s %s seat0 101 %s tty7 %s 2026-11-22 09:00\n' \
+            "${STUB_LOGINCTL_UID:-0}" "${STUB_LOGINCTL_USER:-root}" "$_class" "$_idle"
+        ;;
+esac
 if [ "${STUB_LOGINCTL_OUTPUT:-none}" = "real" ]; then
     printf '3 %s %s seat0 4242 user tty2 no 2026-11-22 09:00\n' \
         "${STUB_LOGINCTL_UID:-0}" "${STUB_LOGINCTL_USER:-root}"
@@ -171,9 +187,10 @@ fi
 exit 0
 STUB
 # The hook calls `chmod 600` / `chown <uid>:<gid>` by bare command name in
-# _atomic_write. Log the arguments, then exec the real binaries so the file
-# assertions still see the real effect. This proves the hook actually invoked
-# those steps (an unlogged chmod/chown cannot satisfy the case-9 checks).
+# _atomic_write. These stubs log the arguments, then exec the real binaries so
+# the mode/owner assertions still see the real effect.  They only record what
+# this sandboxed unit test observes: a real system-sleep hook runs as root and
+# chowns the handoff to the session user resolved by loginctl.
 cat > "$STUB_DIR/chmod" << 'STUB'
 #!/bin/sh
 printf 'chmod %s\n' "$*" >> "$STUB_CHMOD_LOG"
@@ -195,10 +212,12 @@ STUB_FROZEN=0
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
 STUB_LOGINCTL_OUTPUT=none
+STUB_LOGINCTL_MODE=none
 STUB_LOGINCTL_USER="$(id -nu)"
 STUB_LOGINCTL_UID="$(id -u)"
 
 reset_case() {
+    : > "$HOOK_ERR"
     : > "$GDBUS_LOG"
     : > "$ECTOOL_LOG"
     : > "$SUDO_LOG"
@@ -217,6 +236,7 @@ reset_case() {
     STUB_GNOME_ACTIVE=false
     STUB_FDO_ACTIVE=false
     STUB_LOGINCTL_OUTPUT=none
+    STUB_LOGINCTL_MODE=none
     STUB_LOGINCTL_USER="$(id -nu)"
     STUB_LOGINCTL_UID="$(id -u)"
 }
@@ -231,6 +251,7 @@ run_hook() {
         "STUB_CHMOD_LOG=$CHMOD_LOG"
         "STUB_CHOWN_LOG=$CHOWN_LOG"
         "STUB_LOGINCTL_OUTPUT=$STUB_LOGINCTL_OUTPUT"
+        "STUB_LOGINCTL_MODE=$STUB_LOGINCTL_MODE"
         "STUB_LOGINCTL_USER=$STUB_LOGINCTL_USER"
         "STUB_LOGINCTL_UID=$STUB_LOGINCTL_UID"
         "STUB_GNOME_ACTIVE=$STUB_GNOME_ACTIVE"
@@ -245,7 +266,7 @@ run_hook() {
     # deterministic and we can prove they are no longer consulted.
     env -u SUDO_USER -u C640_KBD_SLEEP_USER -u C640_KBD_SLEEP_UID \
         -u C640_KBD_SLEEP_BUS -u C640_KBD_SLEEP_DELAY \
-        "${env_args[@]}" "$HOOK" "$@"
+        "${env_args[@]}" "$HOOK" "$@" 2>> "$HOOK_ERR"
 }
 
 if [ ! -f "$HOOK" ]; then
@@ -391,6 +412,59 @@ fi
 assert_empty_log "no gdbus calls (loginctl case)" "$GDBUS_LOG"
 assert_empty_log "no sudo calls (loginctl case)" "$SUDO_LOG"
 assert_empty_log "no ectool calls (loginctl case)" "$ECTOOL_LOG"
+
+# 9b. Multiple loginctl rows without a preferred one: the FIRST real session
+# row is used and the ambiguity is logged as a WARN.  `nobody` is the first
+# row, so a wrong branch is immediately visible in the handoff directory.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=multi
+_nobody_uid="$(id -u nobody)"
+run_hook pre suspend
+assert_file "multi-session: first candidate's handoff written" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend" "7"
+if grep -q 'multiple login sessions (2)' "$HOOK_ERR"; then
+    ok "multi-session: ambiguity is logged as a WARN"
+else
+    bad "multi-session: no WARN (stderr: $(cat "$HOOK_ERR"))"
+fi
+if grep -q "using handoff dir $RUN_USER_ROOT/$_nobody_uid" "$HOOK_ERR"; then
+    ok "multi-session: WARN names the chosen handoff directory"
+else
+    bad "multi-session: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
+fi
+assert_empty_log "multi-session: no gdbus calls" "$GDBUS_LOG"
+
+# 9c. IDLE=yes wins over an earlier (non-idle) candidate.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=prefer-idle
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "prefer-idle: handoff in the IDLE=yes session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_absent "prefer-idle: no handoff in the skipped session dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+if grep -q 'multiple login sessions (2)' "$HOOK_ERR"; then
+    ok "prefer-idle: multiple-session WARN still emitted"
+else
+    bad "prefer-idle: no WARN (stderr: $(cat "$HOOK_ERR"))"
+fi
+if grep -q "using handoff dir $_user_dir" "$HOOK_ERR"; then
+    ok "prefer-idle: WARN names the preferred session's directory"
+else
+    bad "prefer-idle: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
+fi
+
+# 9d. CLASS=active wins even though IDLE=no.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=prefer-class
+run_hook pre suspend
+assert_file "prefer-class: handoff in the CLASS=active session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_absent "prefer-class: no handoff in the skipped session dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
+if grep -q "using handoff dir $_user_dir" "$HOOK_ERR"; then
+    ok "prefer-class: WARN names the active session's directory"
+else
+    bad "prefer-class: WARN lacks the chosen path (stderr: $(cat "$HOOK_ERR"))"
+fi
 
 # 10. No resolvable session user: handoff is skipped, root state still saved.
 reset_case

@@ -50,6 +50,34 @@ STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
 # STATE_FILE (i.e. $XDG_RUNTIME_DIR).
 HANDOFF_SUSPEND_FILE="${C640_KBD_HANDOFF_SUSPEND:-$STATE_DIR/c640-kbd-backlight.suspend}"
 HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.resume}"
+# The root sleep hook publishes into /run/user/<uid>, while this daemon reads
+# from XDG_RUNTIME_DIR.  Production normally resolves to the same place, but a
+# mismatched XDG (or an override) can leave a handoff in the hook's directory
+# that the daemon never sees.  Keep a read-only view of the hook-side paths so
+# the adoption path can warn loudly instead of silently ignoring the handoff.
+# C640_KBD_HANDOFF_DIR is the same override the hook accepts (tests use it).
+HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-/run/user/$(id -u 2> /dev/null || echo 1000)}"
+HOOK_HANDOFF_SUSPEND_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.suspend"
+HOOK_HANDOFF_RESUME_FILE="$HOOK_HANDOFF_DIR/c640-kbd-backlight.resume"
+# The hook resolves the session uid from loginctl, which may differ from this
+# daemon's uid on a multi-seat host.  Scan the runtime root READ-ONLY for a
+# same-named handoff; a mismatch is diagnosed, never cross-adopted.
+HOOK_RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
+
+_warn_hook_side_handoff() {
+    local filename="$1" expected="$2" dir candidate explicit seen=" "
+    if [ -f "$expected" ]; then
+        return 0
+    fi
+    explicit="${HOOK_HANDOFF_DIR%/}/$filename"
+    for candidate in "$explicit" "$HOOK_RUN_USER_ROOT"/[0-9]*/"$filename"; do
+        [ -f "$candidate" ] || continue
+        [ "$candidate" != "$expected" ] || continue
+        case "$seen" in *" $candidate "*) continue ;; esac
+        seen="$seen$candidate "
+        log_warn "handoff directory mismatch: hook wrote $candidate but daemon reads $expected (check XDG_RUNTIME_DIR / session uid)"
+    done
+}
 # Staging file used while a restore write is in flight.  STATE_FILE is renamed
 # here just before the (potentially slow) write, so a blank arriving mid-write
 # can still store its new value in STATE_FILE; the staged value is consumed
@@ -64,9 +92,9 @@ LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
 # Sidecar metadata for LAST_USER_FILE: how the value was recorded and when.
 # A "manual0" record means the sampler saw two consecutive on-screen zeros,
 # i.e. the user explicitly switched the light off.  It is only honoured for
-# C640_KBD_LAST_USER_TTL seconds while gsd-power still reports 0, so a live
-# non-zero reading after the user brightens again is not mistaken for a
-# firmware residue.
+# C640_KBD_LAST_USER_TTL seconds while gsd-power still reports an EXPLICIT 0,
+# so a live non-zero reading after the user brightens again is not mistaken for
+# a firmware residue.  A failed/empty gsd query cannot confirm the off intent.
 LAST_USER_META_FILE="${C640_KBD_LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
 C640_KBD_LAST_USER_TTL="${C640_KBD_LAST_USER_TTL:-15}"
 # Bounded wait (seconds) for the state lock in save_state().  A restore can
@@ -598,10 +626,11 @@ screensaver_tristate() {
     echo "unknown"
 }
 
-# Backwards-compatible boolean wrapper for NON-writing callers only (the
-# sampler and guard_blank).  There a fail-open answer merely skips a sample or
-# a forced-off guard; it never writes a restored brightness.  Restore paths
-# must call screensaver_tristate() and fail closed instead.
+# Backwards-compatible boolean wrapper for the sampler, the restart seed and
+# guard_blank.  It is fail-open: "unknown" becomes false.  The sampler/seed
+# then merely skip a sample, but guard_blank CAN write 0 when the answer is an
+# explicit "true" (a best-effort secondary forced-off, not a restore).
+# Restore paths must call screensaver_tristate() and fail closed instead.
 screensaver_is_active() {
     if [ "$(screensaver_tristate)" = "active" ]; then
         echo "true"
@@ -639,11 +668,17 @@ write_last_user() {
     fi
 
     ts="$(date +%s 2> /dev/null || echo 0)"
+    # Stamp the restore generation that was current when this observation was
+    # made.  A later guard can then tell a user change made AFTER a restore
+    # from a stale pre-restore cache that merely differs from the saved value.
+    local gen
+    gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo "")"
     tmp="$(mktemp "$STATE_DIR/.c640-kbd-lum-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lum-XXXXXX" 2> /dev/null || echo "")"
     if [ -n "$tmp" ]; then
         {
             printf 'source=%s\n' "$src"
             printf 'ts=%s\n' "$ts"
+            printf 'restore=%s\n' "$gen"
         } > "$tmp" 2> /dev/null || true
         chmod 600 "$tmp" 2> /dev/null || true
         mv -f "$tmp" "$meta" 2> /dev/null || cp "$tmp" "$meta" 2> /dev/null || true
@@ -685,6 +720,23 @@ last_user_cache_age() {
     fi
 }
 
+# Restore generation recorded by write_last_user() at observation time.  Empty
+# means an older cache with no generation stamp (or no restore yet).
+last_user_restore_gen() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line g=""
+    while IFS= read -r line; do
+        case "$line" in
+            restore=*) g="${line#restore=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    printf '%s' "$g"
+}
+
+current_restore_gen() {
+    cat "$RESTORE_GEN_FILE" 2> /dev/null || echo ""
+}
+
 # One sampler tick, kept separate from the infinite loop so it is unit
 # testable. Only observations made while the screen is ON count as user
 # intent; a blank-side transient 0 is ignored.
@@ -716,6 +768,14 @@ sample_brightness_once() {
         # the zero is a transient/hardware artefact, not user intent.
         if [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ne 0 ]; then
             _C640_ZERO_STREAK=0
+            return 0
+        fi
+        # Empty/failed gsd query is "cannot confirm", NOT 0.  Two unconfirmed
+        # zeros must never be promoted to a manual-off record: that would let
+        # a later suspend adopt a hardware 0 over a real saved brightness.
+        if [ "$pct" != "0" ]; then
+            _C640_ZERO_STREAK=0
+            log_debug "sampler: on-screen 0 with unconfirmed gsd pct='$pct'; not recording manual off"
             return 0
         fi
         _C640_ZERO_STREAK=$((_C640_ZERO_STREAK + 1))
@@ -763,8 +823,9 @@ seed_last_user_from_current() {
 
 # Pure value-selection helper: print the brightness that save_state should
 # persist and return 1 when no usable value exists.  The selection logic is
-# copied verbatim from the old save_state (including the gsd-pct empty-value
-# semantics) but kept separate from the lock/write path so handle_blank can
+# copied verbatim from the old save_state (including the "only an explicit
+# gsd-pct 0 confirms manual off" semantics) but kept separate from the
+# lock/write path so handle_blank can
 # sample the user-visible brightness BEFORE writing 0.  Writing 0 changes the
 # live reading, so recomputing after the write would lose the real value.
 compute_save_brightness() {
@@ -788,13 +849,18 @@ compute_save_brightness() {
             age="$(last_user_cache_age)"
             if [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ]; then
                 pct=""
-                # gsd_get_pct failure/timeout means "empty", not 0, and is
-                # only queried when a gsd keyboard backend is present.
+                # An explicit gsd pct 0 is the confirmation that the user's
+                # manual off is still in force.  A query failure/timeout yields
+                # EMPTY, which means "cannot confirm", NOT 0: in that case fall
+                # through to the live non-zero reading instead of silently
+                # treating an unavailable D-Bus service as user intent.
                 if [ "$HAVE_GSD_KBD" = "1" ]; then
                     pct="$(gsd_get_pct 2> /dev/null || echo "")"
                 fi
-                if [ -z "$pct" ] || [ "$pct" = "0" ]; then
+                if [ "$pct" = "0" ]; then
                     curr=0
+                else
+                    log_debug "manual0 cache unconfirmed by gsd pct (pct='$pct'); using live non-zero reading"
                 fi
             fi
         fi
@@ -1232,7 +1298,7 @@ _adopt_suspend_handoff_locked() {
         log "suspend handoff adoption deferred: restore in progress (staged value pending)"
         return 2
     fi
-    local raw val existing tmp
+    local raw val existing tmp lu src age
     # Command substitution strips the hook's trailing newline; validate what
     # remains strictly.  A bare "0" is a real value, not "no state".
     raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
@@ -1256,10 +1322,33 @@ _adopt_suspend_handoff_locked() {
     # for the following restore -- it does NOT mean a brightness was written.
     # All other cases are unchanged: 0 with no/absent/invalid saved state is
     # adopted (a real "user switched it off"), and a non-zero handoff wins.
+    #
+    # Exception (P2-b): Branch A's "blank-side 0" assumption is false when the
+    # user actively switched the light OFF after a DEFER and before suspend.
+    # In that case the last-user cache says `0 / source=manual0`, is still
+    # within TTL, AND gsd-power explicitly confirms 0.  The same "empty means
+    # cannot confirm" rule as P1 applies: a failed gsd query must NOT turn a
+    # hardware blank-side 0 into user intent.
     if [ "$val" -eq 0 ] && [ -f "$STATE_FILE" ] && [[ "$existing" =~ ^[0-9]+$ ]] && [ "$((10#$existing))" -ne 0 ]; then
-        log "ignoring blank-side suspend handoff 0; keeping saved user brightness $((10#$existing))"
-        rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
-        return 0
+        local pct=""
+        ensure_backends
+        if [ "$HAVE_GSD_KBD" = "1" ]; then
+            pct="$(gsd_get_pct 2> /dev/null || echo "")"
+        fi
+        lu="$(read_last_user_brightness)"
+        src="$(last_user_cache_source)"
+        age="$(last_user_cache_age)"
+        if [ "$lu" = "0" ] && [ "$src" = "manual0" ] && [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ] && [ "$pct" = "0" ]; then
+            log "suspend handoff 0 confirms a fresh manual off (manual0 age ${age}s, gsd pct=0); adopting it over saved $((10#$existing))"
+        else
+            if [ "$pct" != "0" ]; then
+                log "ignoring suspend handoff 0: manual off not confirmed by gsd pct ('$pct'); keeping saved user brightness $((10#$existing))"
+            else
+                log "ignoring blank-side suspend handoff 0; keeping saved user brightness $((10#$existing))"
+            fi
+            rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+            return 0
+        fi
     fi
     if [ -n "$existing" ] && [ "$existing" != "$val" ]; then
         log "suspend handoff $val overrides differing daemon state $existing"
@@ -1292,6 +1381,10 @@ _adopt_suspend_handoff_locked() {
 
 adopt_suspend_handoff() {
     if [ ! -f "$HANDOFF_SUSPEND_FILE" ]; then
+        # Diagnose the XDG_RUNTIME_DIR vs /run/user/<uid> split, including a
+        # session uid different from this daemon's.  Read-only: never adopt
+        # across directories that may belong to different users.
+        _warn_hook_side_handoff "c640-kbd-backlight.suspend" "$HANDOFF_SUSPEND_FILE"
         log_warn "suspend handoff $HANDOFF_SUSPEND_FILE missing; nothing to adopt"
         # Neutral: the caller simply restores from a valid STATE_FILE if any.
         return "$RC_DONE"
@@ -1381,6 +1474,7 @@ _handle_resume_locked() {
     esac
 
     if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+        _warn_hook_side_handoff "c640-kbd-backlight.resume" "$HANDOFF_RESUME_FILE"
         log_debug "resume: no resume flag present; continuing from saved state"
     fi
 
@@ -1395,20 +1489,47 @@ _handle_resume_locked() {
     saved=$((10#$saved))
 
     # Poll for an explicit answer.  Only "inactive" is a write permit;
-    # "active" and "unknown" both defer.  Total budget ~6s, capped by
-    # C640_KBD_RESUME_PROBE_MAX (0 makes "unknown" converge immediately).
+    # "active" and "unknown" both defer.  The old loop capped only the sum of
+    # sleep delays (~6s) and ignored the time spent inside the D-Bus queries:
+    # six slow tristate probes could hold RESUME_LOCK for ~40s.  Track an
+    # additional WALL-CLOCK deadline (C640_KBD_RESUME_PROBE_MAX, default 10s)
+    # and check it after every probe and before the next one.  This is NOT a
+    # hard interrupt: a query already in flight can still take up to ~6s
+    # (GNOME + freedesktop, each `timeout 3`), so the worst case hold time is
+    # ~probe_max + one tristate query.  0 makes an unknown converge at once.
     local ss="unknown"
     local -a delays=(0.2 0.4 0.8 1.6 3.2)
-    local i d next elapsed=0 probe_max="$C640_KBD_RESUME_PROBE_MAX"
+    local i d next elapsed=0 wall=0 probe_max="$C640_KBD_RESUME_PROBE_MAX"
+    local probe_started_at now
     case "$probe_max" in
         '' | *[!0-9.]*) probe_max=10 ;;
     esac
+    probe_started_at="$(date +%s 2> /dev/null || echo 0)"
+    case "$probe_started_at" in '' | *[!0-9]*) probe_started_at=0 ;; esac
     for i in 0 1 2 3 4 5; do
+        if [ "$i" -gt 0 ]; then
+            # The previous iteration's sleep may also have crossed the budget.
+            now="$(date +%s 2> /dev/null || echo 0)"
+            case "$now" in '' | *[!0-9]*) now=0 ;; esac
+            wall=$((now - probe_started_at))
+            if awk -v w="$wall" -v m="$probe_max" 'BEGIN { exit !(w >= m) }'; then
+                log "resume: ScreenSaver probe deadline (${wall}s >= ${probe_max}s); converging as unknown"
+                break
+            fi
+        fi
         ss="$(screensaver_tristate)"
         if [ "$ss" != "unknown" ]; then
             break
         fi
         if [ "$i" -eq 5 ]; then
+            break
+        fi
+        # A slow gdbus/busctl query may already have consumed the whole budget.
+        now="$(date +%s 2> /dev/null || echo 0)"
+        case "$now" in '' | *[!0-9]*) now=0 ;; esac
+        wall=$((now - probe_started_at))
+        if awk -v w="$wall" -v m="$probe_max" 'BEGIN { exit !(w >= m) }'; then
+            log "resume: ScreenSaver probe deadline (${wall}s >= ${probe_max}s) after slow query; converging as unknown"
             break
         fi
         d="${delays[$i]}"
@@ -1419,7 +1540,7 @@ _handle_resume_locked() {
         sleep "$d"
         elapsed="$next"
     done
-    log "resume: ScreenSaver=$ss after ${elapsed}s (saved=$saved)"
+    log "resume: ScreenSaver=$ss after ${elapsed}s delay / ${wall}s wall-clock (saved=$saved)"
 
     local rc cur
     case "$ss" in
@@ -1564,6 +1685,12 @@ guard_unblank() {
     fi
     local want_pct
     want_pct=$((saved * 100 / max))
+    # Capture the generation of THIS restore before forking the guards.  Only
+    # a last-user record stamped with the same generation counts as evidence
+    # of a user change made after the restore; an older cache may simply be
+    # the pre-blank brightness (e.g. 6 while the saved value is 8).
+    local restore_gen_now
+    restore_gen_now="$(current_restore_gen)"
     local delay
     for delay in 0.3 0.9; do
         (
@@ -1576,6 +1703,13 @@ guard_unblank() {
             if [ "$(screensaver_tristate)" != "inactive" ]; then
                 exit 0
             fi
+            # A guard must NEVER overwrite a brightness the user chose AFTER
+            # the restore, but a stale pre-restore cache is NOT such evidence:
+            # blanking right after a 6->8 change leaves LAST_USER_FILE=6 while
+            # STATE_FILE=8.  Demand a generation stamp from this restore too.
+            local lu lu_gen gpct implied_raw
+            lu="$(read_last_user_brightness)"
+            lu_gen="$(last_user_restore_gen)"
             local ok=0
             local raw
             raw="$(get_brightness)"
@@ -1583,11 +1717,28 @@ guard_unblank() {
                 ok=1
             fi
             if [ "$HAVE_GSD_KBD" = "1" ]; then
-                local gpct
                 gpct="$(gsd_get_pct || echo "")"
-                if [ "$gpct" != "$want_pct" ]; then
+                if [[ "$gpct" =~ ^[0-9]+$ ]] && [ "$gpct" -ne "$want_pct" ]; then
+                    implied_raw=$((gpct * max / 100))
+                    if [ "$raw" = "$implied_raw" ] && [ "$raw" != "$saved" ] \
+                        && [ -n "$lu" ] && [ "$lu" = "$raw" ] \
+                        && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
+                        # gsd-power, the LED AND a post-restore last-user
+                        # record agree on a DIFFERENT value: that is a user
+                        # adjustment, not a restore that failed to land.
+                        log "unblank guard +${delay}s: gsd=$gpct, LED=$raw and post-restore cache agree on $lu; treating as user intent, not re-setting"
+                        exit 0
+                    fi
+                    ok=0
+                elif [ "$gpct" != "$want_pct" ]; then
                     ok=0
                 fi
+            fi
+            # A plain post-restore last-user record is enough evidence even if
+            # gsd/LED currently disagree (e.g. a backend glitch mid-change).
+            if [ -n "$lu" ] && [ "$lu" != "$saved" ] && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
+                log "unblank guard +${delay}s: last-user brightness $lu recorded after restore (gen=$restore_gen_now); treating as a new user choice, not re-setting"
+                exit 0
             fi
             if [ "$ok" -ne 1 ]; then
                 log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
@@ -1595,6 +1746,13 @@ guard_unblank() {
                 if set_brightness "$saved"; then grc=0; else grc=$?; fi
                 if [ "$grc" -ne 0 ]; then
                     log_warn "unblank guard +${delay}s: re-set failed (rc=$grc)"
+                fi
+                # Re-read after the write for diagnostics only: never issue a
+                # second write in this guard (that would widen the race).
+                lu="$(read_last_user_brightness)"
+                lu_gen="$(last_user_restore_gen)"
+                if [ -n "$lu" ] && [ "$lu" != "$saved" ] && [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
+                    log "unblank guard +${delay}s: user brightness changed to $lu during re-set; no further write"
                 fi
             fi
         ) &

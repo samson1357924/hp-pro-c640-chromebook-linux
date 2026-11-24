@@ -354,11 +354,15 @@ exact same write-and-verify path as any other value. Brightness selection prefer
 current live non-zero reading, so a change made just before the blank is not lost to the
 5s sampler cache. The cache is used for blank-side zeros (firmware already off),
 unreadable hardware and a *fresh* explicit manual-off (`source=manual0` with `ts`,
-honoured for `C640_KBD_LAST_USER_TTL=15`s only while gsd-power still reports 0). Its
+honoured for `C640_KBD_LAST_USER_TTL=15`s only while gsd-power still reports an
+**explicit** 0; a failed/empty gsd query means "cannot confirm", NOT 0, so the
+live non-zero reading wins). The sampler applies the same rule: two on-screen
+zeros with an empty gsd pct are NOT promoted to `manual0`. Its
 sidecar `LAST_USER_META_FILE` (`c640-kbd-backlight.last-user.meta`) records
-`source=nonzero|manual0` + `ts`; a daemon restart re-seeds the cache from the current
-reading (`cur=0` → `manual0`). With no state file nothing is written, so manual
-adjustments are preserved.
+`source=nonzero|manual0` + `ts` + `restore=<generation>`; the generation stamp lets the
+unblank guard tell a post-restore user change from a stale pre-blank cache. A daemon
+restart re-seeds the cache from the current reading (`cur=0` → `manual0`). With no
+state file nothing is written, so manual adjustments are preserved.
 
 `save_state()` is atomic and **first-wins only for a valid copy**: while holding
 `STATE_LOCK` it checks that the saved value is a bare non-negative decimal integer on a
@@ -395,8 +399,11 @@ crash between staging and finalize is recovered at the next daemon startup.
 **ScreenSaver is a tristate (fail-closed):** `screensaver_tristate()` returns `active`,
 `inactive` or `unknown`; only an explicit `inactive` permits a restore write, while
 `active`/`unknown` defer and keep the state for a later unblank. The boolean
-`screensaver_is_active()` wrapper is used only by the non-writing sampler, seed and
-blank-guard paths.
+`screensaver_is_active()` wrapper is used by the sampler, the restart seed and
+`guard_blank`: the first two only skip a sample on an unknown answer, while
+`guard_blank` **can write 0** when the answer is an explicit `true` (a
+best-effort secondary forced-off). Only restore paths use the fail-closed
+tristate.
 
 **Sleep hook = pure handoff:** on a real S3 cycle systemd freezes `user.slice` before
 the `post` phase, so the hook never queries a user/session D-Bus, never writes the LED
@@ -407,24 +414,45 @@ publishes `c640-kbd-backlight.resume` (`<epoch> <action>`). The root snapshot is
 consumed by the hook or the daemon and is never used for restore**; the daemon consumes
 only the two handoff files and its own `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`.
 Both handoff files are `0600`, chowned to the resolved session user and atomically
-`mv`-ed into `$XDG_RUNTIME_DIR`; `C640_KBD_HANDOFF_DIR` overrides the directory. A
-blank-side handoff `0` is ignored when the daemon holds a different non-zero saved
-value, so the user's brightness survives a suspend started while the screen was blank.
-The hook never consumes the handoff files — the daemon does that after a successful
-adoption/restore.
+`mv`-ed into `$XDG_RUNTIME_DIR`; `C640_KBD_HANDOFF_DIR` overrides the hook's
+directory. A blank-side handoff `0` is ignored when the daemon holds a different
+non-zero saved value, so the user's brightness survives a suspend started while
+the screen was blank — **except** when all three agree: a fresh last-user record
+`source=manual0` (within `C640_KBD_LAST_USER_TTL`), the cache value `0`, and an
+**explicit gsd pct 0**. An empty gsd reply is "cannot confirm", so the `0` is still
+treated as blank-side and ignored. If a handoff exists in a `/run/user/<uid>`
+directory but not in the daemon's runtime directory, the daemon scans that root
+read-only and logs `[WARN] handoff directory mismatch` with the path (including a
+different session uid); it never cross-adopts files that may belong to another
+user. The hook warns with the directory it chose when loginctl reports multiple
+sessions. The hook never consumes the handoff files — the daemon does that after a
+successful adoption/restore.
 
 **Resume handoff (the thawed daemon is the only writer):** `handle_resume()` runs on
 `PrepareForSleep(false)` from the **system** bus (not frozen), on a resume flag picked
 up by the sampler, or on startup recovery. A `RESUME_LOCK` serialises the login1 monitor,
 sampler and startup paths; the daemon re-probes both D-Bus backends, adopts the suspend
-handoff into `STATE_FILE`, then polls the tristate (0.2/0.4/0.8/1.6/3.2s, capped by
-`C640_KBD_RESUME_PROBE_MAX=10`). `inactive` → restore through gsd-power→UPower→legacy;
+handoff into `STATE_FILE`, then polls the tristate with 0.2/0.4/0.8/1.6/3.2s delays
+under a **wall-clock** deadline of `C640_KBD_RESUME_PROBE_MAX=10`s. The deadline is
+checked **after each probe** (and before the next one), so it also counts D-Bus
+query time; it is not a hard interrupt: worst-case `RESUME_LOCK` hold time is
+~`probe_max` + one tristate query (two backends × `timeout 3` ≈ 6s). On expiry the
+answer converges as `unknown`. `inactive` → restore through
+gsd-power→UPower→legacy;
 `active` → defer with retries; `unknown` → converge without a write only when the
 current brightness already equals the saved value, otherwise defer.
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring while the answer is still unknown
 — this accepts the risk of lighting a still-locked screen and is off by default.
 `handle_unblank()` routes through `handle_resume()` whenever a resume flag is present,
-avoiding a double write.
+avoiding a double write. The optional +0.3/+0.9s unblank guard re-applies the saved
+value unless a **post-restore** user choice is proven: `LAST_USER_FILE` differs from
+the saved value AND its meta carries this restore's generation stamp, or gsd/LED and
+that same post-restore cache all agree on a different value. A stale pre-blank cache
+(e.g. 6 while the saved value is 8) therefore cannot suppress repair of a genuinely
+lost restore. Trade-off: a user adjustment made before the sampler's next ~5s tick
+writes the stamped cache may still be overwritten by the guard; the restore itself
+already verifies the write. The stamp proves only that the cache was written after
+this restore; it cannot prove the sampled value itself was correct.
 
 Adoption, restore and `verify_restore_applied()` share a result-code contract:
 `0 = RC_DONE` (write verified, `STATE`/`restore-pending` consumed), `1 = RC_FAIL` (bad
@@ -509,7 +537,9 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 `C640_KBD_FORCE_LEGACY=1` disables both D-Bus backends (see above);
 `C640_KBD_LAST_USER_TTL` sets the manual-off cache TTL (default 15s);
 `C640_KBD_SAVE_LOCK_WAIT` bounds the state-lock wait in `save_state` (default 2s);
-`C640_KBD_RESUME_PROBE_MAX` caps post-thaw ScreenSaver polling (default 10s);
+`C640_KBD_RESUME_PROBE_MAX` caps the **wall-clock** budget of post-thaw
+ScreenSaver polling (checked after each probe; worst case ≈ budget + one query,
+default 10s);
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring on an unknown answer.
 
 **Test-only environment overrides** (no system files are touched): the daemon
@@ -518,14 +548,21 @@ accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node a
 `C640_KBD_RESTORE_PENDING_FILE` / `C640_KBD_RESUME_LOCK` /
 `C640_KBD_LAST_USER_META_FILE` for staging/handoff paths. The sleep hook accepts
 `C640_KBD_SLEEP_SYSFS`, `C640_KBD_SLEEP_STATE_DIR`, `C640_KBD_HANDOFF_DIR` and
-`C640_KBD_RUN_USER_ROOT`; its old `C640_KBD_SLEEP_USER` / `_UID` / `_BUS` /
+`C640_KBD_RUN_USER_ROOT`; when `C640_KBD_HANDOFF_DIR` is set, the daemon uses the
+same value as the hook-side directory for its mismatch diagnostic, and also uses
+`C640_KBD_RUN_USER_ROOT` for the read-only cross-uid scan. Its old
+`C640_KBD_SLEEP_USER` / `_UID` / `_BUS` /
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 406 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 460 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
-blank and invalid-state self-heal) and the sleep-hook suite has 73 cases (pure handoff,
-`0600`/`chown`/atomic `mv`, `C640_KBD_HANDOFF_DIR`, no LED writes). The rollback suite
+blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
+zeros, wall-clock probe deadline, cross-uid handoff mismatch, gsd-confirmed
+fresh-manual0 adoption and generation-stamped guard user-change protection) and the
+sleep-hook suite has 84 cases (pure handoff, `0600`/`chown`/atomic `mv`,
+`C640_KBD_HANDOFF_DIR`, multi-session resolution with IDLE/CLASS preference and
+chosen-path warnings, no LED writes). The rollback suite
 (`tests/rollback-test.sh`, run as root) has 1642 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
@@ -541,8 +578,8 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 406 cases
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 73 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 460 cases
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 84 cases
 sudo bash tests/rollback-test.sh                       # 1642 cases (root)
 ```
 
@@ -664,7 +701,7 @@ Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 | LED node permissions | 🟢 | `-rw-rw---- root plugdev` on `chromeos::kbd_backlight/brightness` after `udevadm trigger --subsystem-match=leds`; user write succeeds without sudo |
 | Daemon blank/unblank | 🟢 | `--test-blank` 2 → 0, `--test-unblank` 0 → 2, state file `0600` and removed |
 | Daemon event path | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → brightness 2 → 0 → 2 with **no `sudo` calls** in the user journal |
-| Sleep hook | 🟢 | `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session; a full real S3 freeze/thaw cycle was validated later on 2026-11-22 — see [verification.md](../docs/verification.md)) |
+| Sleep hook | 🟢 | **2026-10-31 OLD hook behaviour (historical only; no longer valid):** `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session). The hook is now a **pure handoff writer** that never writes brightness or deletes state; a full real S3 freeze/thaw cycle was validated later on 2026-11-22 — see [verification.md](../docs/verification.md) |
 | `--check` | 🟢 | all green, including "backlight node writable by group plugdev (mode 660)" |
 
 **History (fixed 2026-10-31):** the earlier passive captures at `12:49`, `13:25`
