@@ -127,8 +127,11 @@ _uninstall_fp_body() {
         sudo udevadm control --reload-rules 2> /dev/null || true
         log_info "Reloaded udev rules."
 
-        # Revert PAM
-        disable_pam_fingerprint || true
+        # Revert PAM. Do not swallow a restore failure: fold its rc into the
+        # final rollback_rc, but only AFTER all cleanup below has run.
+        local pam_rc=0
+        disable_pam_fingerprint || pam_rc=$?
+        [ "$pam_rc" -eq 0 ] || rollback_rc="$pam_rc"
 
         # Re-register restored stock libraries
         sudo ldconfig

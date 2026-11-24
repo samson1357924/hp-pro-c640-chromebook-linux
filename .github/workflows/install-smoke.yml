@@ -314,7 +314,9 @@ jobs:
       - name: Prepare Minimal Container Environment
         run: |
           apt-get update -y
-          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
+          # gcc builds the tiny setuid-root exec helper used by PAM-19 to model
+          # a non-root caller with passwordless sudo.
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3 gcc libc6-dev
 
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -326,4 +328,176 @@ jobs:
           # (container has no systemd; python subprocess.run needs systemctl)
           printf '%s\n' '#!/bin/bash' 'case "$*" in' '  *is-enabled*|*is-active*|*is-system-running*|*is-failed*) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
           chmod +x /usr/local/bin/systemctl
+          # Defense in depth: the PAM sandbox snippets strip /usr/sbin from
+          # PATH, so an absent stub resolves to "not found" rather than to the
+          # real tool. Make any accidental real-tool call fail LOUDLY instead
+          # of rewriting the container's debconf DB / /var/lib/pam/seen.
+          printf '%s\n' '#!/bin/bash' 'echo "REAL pam-auth-update called from sandbox tests" >&2' 'exit 99' > /usr/local/bin/pam-auth-update
+          chmod +x /usr/local/bin/pam-auth-update
           bash tests/rollback-test.sh
+
+  pam-profile-reversibility-e2e:
+    name: PAM Profile Selection Reversibility (real pam-auth-update, Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Re-review #13 finding #1: stub-only tests can self-prove. This job runs
+      # the UNMODIFIED Debian/Ubuntu pam-auth-update and debconf tools inside a
+      # throwaway ubuntu:24.04 container (never on the runner host).
+      - name: Real install -> --package -> uninstall round-trip + sensitivity control
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace:ro" ubuntu:24.04 bash -s <<'EOS'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            bash coreutils sed grep findutils python3 sudo debconf util-linux \
+            gcc libc6-dev libpam-runtime libpam-fprintd
+          test -f /usr/share/pam-configs/fprintd
+
+          # Root container: transparent sudo passthrough so the production code
+          # path is identical to a sudo host, without touching runner PAM.
+          printf '#!/bin/bash\nexec "$@"\n' > /usr/local/bin/sudo
+          chmod +x /usr/local/bin/sudo
+          # rollback_component asks systemctl about restored services.
+          printf '#!/bin/bash\ncase "$*" in *is-enabled*|*is-active*|*is-system-running*|*is-failed*) exit 1;; *) exit 0;; esac\n' > /usr/local/bin/systemctl
+          chmod +x /usr/local/bin/systemctl
+
+          read_selection() {
+            debconf-show libpam-runtime \
+              | sed -n 's/^  libpam-runtime\/profiles:[[:space:]]*//p' | tail -n 1
+          }
+          common_files=(/etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive /etc/pam.d/common-password)
+          saved_files=(/var/lib/pam/auth /var/lib/pam/account /var/lib/pam/password /var/lib/pam/session /var/lib/pam/session-noninteractive /var/lib/pam/seen)
+
+          # Establish a genuine fprintd selection with the REAL tool. A bare
+          # debconf-set-selections is NOT enough: the following --package lets
+          # diff_profiles() derive the list from common-* + /var/lib/pam and
+          # overwrites it without fprintd (verified with real tools). --enable
+          # both injects pam_fprintd.so into common-auth and persists the
+          # selection, so the sensitivity control below cannot be vacuous.
+          sudo pam-auth-update --enable fprintd
+          grep -qF pam_fprintd.so /etc/pam.d/common-auth \
+            || { echo "baseline --enable did not write pam_fprintd.so to common-auth"; exit 1; }
+          baseline_sel="$(read_selection)"
+          grep -qF fprintd <<< "$baseline_sel" || { echo "baseline selection lost fprintd"; exit 1; }
+
+          mkdir -p /root/baseline/etc/pam.d /root/baseline/var/lib/pam
+          cp -a "${common_files[@]}" /root/baseline/etc/pam.d/
+          cp -a /etc/pam.d/sudo /root/baseline/etc/pam.d/
+          for f in "${saved_files[@]}"; do
+            [ -e "$f" ] && cp -a "$f" /root/baseline/var/lib/pam/
+          done
+          printf '%s\n' "$baseline_sel" > /root/baseline/selection
+
+          compare_with_baseline() {
+            local f
+            for f in "${common_files[@]}" /etc/pam.d/sudo; do
+              cmp -s "$f" "/root/baseline/etc/pam.d/${f##*/}" \
+                || { echo "MISMATCH: $f"; return 1; }
+            done
+            for f in "${saved_files[@]}"; do
+              # Drive the check from the BASELINE: skipping a file that vanished
+              # would make this comparison ignore exactly the data loss we test.
+              base="/root/baseline/var/lib/pam/${f##*/}"
+              [ -e "$base" ] || continue
+              [ -e "$f" ] || { echo "MISMATCH: saved file missing: $f"; return 1; }
+              cmp -s "$f" "$base" || { echo "MISMATCH: $f"; return 1; }
+            done
+            [ "$(read_selection)" = "$baseline_sel" ] \
+              || { echo "MISMATCH: debconf selection"; return 1; }
+          }
+
+          # SENSITIVITY CONTROL: with NO snapshot/convergence, direct sed alone
+          # really does make the real tool drop fprintd. This proves the later
+          # equality assertions are not vacuous.
+          echo "== sensitivity control: sed-only must lose fprintd =="
+          sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
+          pam-auth-update --package
+          if grep -q fprintd <<< "$(read_selection)"; then
+            echo "::error::real --package kept fprintd after sed (control not sensitive)"
+            exit 1
+          fi
+          echo "control confirmed: real --package dropped fprintd"
+
+          # Restore the pristine baseline before exercising the installer.
+          cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+          cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+          printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
+          pam-auth-update --package
+          compare_with_baseline
+
+          echo "== installer -> external package --package -> uninstall =="
+          export CROS_ENABLEMENT_PAM_DIR=/etc/pam.d
+          export CROS_ENABLEMENT_PAM_SAVED_DIR=/var/lib/pam
+          export CROS_ENABLEMENT_PAM_SUDO_PATH=/etc/pam.d/sudo
+          export CROS_ENABLEMENT_MANIFEST_DIR=/var/lib/cros-enablement
+          export CROS_ENABLEMENT_PAM_SELECTION_FILE=/var/lib/cros-enablement/pam-selection
+          export CROS_ENABLEMENT_BACKUP_DIR=/var/backups/cros-enablement
+          cd /workspace
+          source lib/pam.sh
+          DISTRO_FAMILY=debian DISTRO_ID=ubuntu
+          export DISTRO_FAMILY DISTRO_ID
+          configure_pam_fingerprint
+          test -f /var/lib/cros-enablement/pam-selection
+          if grep -q fprintd <<< "$(read_selection)"; then
+            echo "::error::install did not converge the real debconf selection"
+            exit 1
+          fi
+          # Simulate a package upgrade touching PAM after our install.
+          pam-auth-update --package
+          # Mirror _uninstall_fp_body(): rollback first, then PAM disable.
+          rollback_component "fingerprint"
+          disable_pam_fingerprint
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection
+          echo "PAM E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
+
+          echo "== non-root (passwordless sudo) uninstall with REAL tools =="
+          # Restore the pristine baseline before the second round-trip.
+          cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+          cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+          printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
+          pam-auth-update --package
+          compare_with_baseline
+
+          configure_pam_fingerprint
+          pam-auth-update --package
+          # uid 1000 reaches privileged files only via passwordless sudo. The
+          # root path above used a passthrough stub; here a real setuid-root
+          # exec helper models passwordless sudo. (setpriv CANNOT re-escalate:
+          # capabilities are dropped when it changes uid.) Install under
+          # /usr/local so uid 1000 can traverse it; /root is 0700.
+          mkdir -p /usr/local/nonroot-bin
+          cat > /usr/local/nonroot-bin/suid-exec.c <<'CEOS'
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc < 2) return 127;
+              if (setgid(0) != 0) return 126;
+              if (setuid(0) != 0) return 125;
+              execvp(argv[1], &argv[1]);
+              return 127;
+          }
+          CEOS
+          gcc -O2 -o /usr/local/nonroot-bin/suid-exec /usr/local/nonroot-bin/suid-exec.c
+          chown 0:0 /usr/local/nonroot-bin/suid-exec
+          chmod 4755 /usr/local/nonroot-bin/suid-exec
+          printf '#!/bin/bash\nexec /usr/local/nonroot-bin/suid-exec "$@"\n' > /usr/local/nonroot-bin/sudo
+          chmod +x /usr/local/nonroot-bin/sudo
+          stat -c '%u:%a %n' /var/lib/cros-enablement/pam-selection /var/lib/cros-enablement/pam-selection.saved
+          setpriv --reuid=1000 --regid=1000 --clear-groups \
+            env PATH="/usr/local/nonroot-bin:/usr/bin:/bin" LOG_FILE=/tmp/pam-e2e-nonroot.log \
+            bash -c '
+              source /workspace/lib/pam.sh
+              DISTRO_FAMILY=debian DISTRO_ID=ubuntu
+              export DISTRO_FAMILY DISTRO_ID
+              rollback_component "fingerprint"
+              disable_pam_fingerprint
+            '
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection
+          test ! -e /var/lib/cros-enablement/pam-selection.saved
+          echo "non-root PAM E2E OK: root-only sidecar + /var/lib/pam snapshot consumed by uid 1000"
+          EOS
