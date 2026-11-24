@@ -337,25 +337,73 @@ jobs:
           bash tests/rollback-test.sh
 
   pam-profile-reversibility-e2e:
-    name: PAM Profile Selection Reversibility (real pam-auth-update, Ubuntu 24.04)
+    name: lib/pam.sh helper round-trip with real pam-auth-update
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Re-review #13 finding #1: stub-only tests can self-prove. This job runs
-      # the UNMODIFIED Debian/Ubuntu pam-auth-update and debconf tools inside a
-      # throwaway ubuntu:24.04 container (never on the runner host).
-      - name: Real install -> --package -> uninstall round-trip + sensitivity control
+      # the real Debian/Ubuntu pam-auth-update and debconf tools inside a
+      # throwaway container (pinned to the same digest as the other jobs, never
+      # on the runner host). In the non-root sub-test the real tool is wrapped
+      # ONLY by an exec-through logging shim: the shim runs the real binary and
+      # records its exit status, so every byte-for-byte baseline assertion still
+      # exercises the real code. It `source`s lib/pam.sh and calls the helpers
+      # directly (configure_pam_fingerprint / rollback_component /
+      # disable_pam_fingerprint); it does NOT execute the
+      # fingerprint/install-fingerprint.sh entrypoint.
+      #
+      # Re-review #39 hardening:
+      #   * `docker run ... bash -s <<'EOS'` WITHOUT `-i` let the container hit
+      #     EOF immediately and exit 0; apt / real pam-auth-update / baseline /
+      #     sensitivity control / non-root all silently vanished while the job
+      #     stayed green. `-i` now delivers the heredoc to bash -s.
+      #   * A sentinel is written by the container into a mounted, host-writable
+      #     dir; the host step verifies it after docker run returns (and captures
+      #     the real rc even under `set -e`). The dir is created with mktemp -d
+      #     so parallel jobs on a self-hosted runner cannot delete each other's
+      #     artifacts.
+      #   * The non-root child PATH includes /usr/sbin:/sbin. A recording
+      #     wrapper logs uid / args / rc / a host-generated one-time nonce AFTER
+      #     the real .real binary returns, then exits with that real rc. The
+      #     host gate requires rc=0 AND the same nonce, so a pre-written log
+      #     line or a failed .real cannot look green. The child ALSO asserts
+      #     and exports its own uid (1000); the host gate checks that value.
+      - name: "lib/pam.sh helpers (configure / rollback / disable) + real pam-auth-update round-trip + sensitivity control"
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/workspace:ro" ubuntu:24.04 bash -s <<'EOS'
+          set -euo pipefail
+
+          # Unique dir per run: a stale marker must never make a skipped E2E
+          # look green, and parallel jobs must not delete each other's files.
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pam-lib-helper-e2e.XXXXXX")"
+
+          # One-time nonce created HERE (host side) and injected into the
+          # container. No process can pre-forge a matching log line.
+          pam_e2e_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          test -n "$pam_e2e_nonce"
+
+          # Capture the real rc: `|| docker_rc=$?` keeps `set -e` from aborting
+          # before the sentinel checks below, which are the real green/red gate.
+          docker_rc=0
+          docker run --rm -i \
+            -e "PAM_E2E_NONCE=$pam_e2e_nonce" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$artifact_dir:/pam-e2e-artifacts" \
+            ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb \
+            bash -s <<'EOS' || docker_rc=$?
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
+
+          # Written immediately: proves the heredoc really reached bash -s.
+          echo "container script started" > /pam-e2e-artifacts/started
+
           apt-get update -y
           apt-get install -y --no-install-recommends \
             bash coreutils sed grep findutils python3 sudo debconf util-linux \
             gcc libc6-dev libpam-runtime libpam-fprintd
           test -f /usr/share/pam-configs/fprintd
+          test -x /usr/sbin/pam-auth-update
 
           # Root container: transparent sudo passthrough so the production code
           # path is identical to a sudo host, without touching runner PAM.
@@ -393,7 +441,7 @@ jobs:
           printf '%s\n' "$baseline_sel" > /root/baseline/selection
 
           compare_with_baseline() {
-            local f
+            local f base new_files
             for f in "${common_files[@]}" /etc/pam.d/sudo; do
               cmp -s "$f" "/root/baseline/etc/pam.d/${f##*/}" \
                 || { echo "MISMATCH: $f"; return 1; }
@@ -406,6 +454,15 @@ jobs:
               [ -e "$f" ] || { echo "MISMATCH: saved file missing: $f"; return 1; }
               cmp -s "$f" "$base" || { echo "MISMATCH: $f"; return 1; }
             done
+            # Also compare the NAME SET produced by find, not just the baseline
+            # list: a NEW /var/lib/pam file is invisible to the loop above.
+            ( cd /root/baseline/var/lib/pam && find . -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-baseline-pam-files
+            ( cd /var/lib/pam && find . -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-current-pam-files
+            new_files="$(LC_ALL=C comm -13 /tmp/pam-e2e-baseline-pam-files /tmp/pam-e2e-current-pam-files)"
+            [ -z "$new_files" ] \
+              || { echo "MISMATCH: new files in /var/lib/pam: $new_files"; return 1; }
             [ "$(read_selection)" = "$baseline_sel" ] \
               || { echo "MISMATCH: debconf selection"; return 1; }
           }
@@ -422,14 +479,14 @@ jobs:
           fi
           echo "control confirmed: real --package dropped fprintd"
 
-          # Restore the pristine baseline before exercising the installer.
+          # Restore the pristine baseline before exercising the library helpers.
           cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
           cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
           printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
           pam-auth-update --package
           compare_with_baseline
 
-          echo "== installer -> external package --package -> uninstall =="
+          echo "== lib/pam.sh helpers -> external package --package -> rollback =="
           export CROS_ENABLEMENT_PAM_DIR=/etc/pam.d
           export CROS_ENABLEMENT_PAM_SAVED_DIR=/var/lib/pam
           export CROS_ENABLEMENT_PAM_SUDO_PATH=/etc/pam.d/sudo
@@ -453,7 +510,7 @@ jobs:
           disable_pam_fingerprint
           compare_with_baseline
           test ! -e /var/lib/cros-enablement/pam-selection
-          echo "PAM E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
+          echo "PAM lib helper E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
 
           echo "== non-root (passwordless sudo) uninstall with REAL tools =="
           # Restore the pristine baseline before the second round-trip.
@@ -465,6 +522,31 @@ jobs:
 
           configure_pam_fingerprint
           pam-auth-update --package
+
+          # Record every call to the REAL tool. /usr/sbin/pam-auth-update is the
+          # canonical location the product's `command -v pam-auth-update` finds
+          # once /usr/sbin is on PATH. The shim runs the real binary (renamed to
+          # .real) FIRST, then logs uid / args / rc / the host nonce, and exits
+          # with the REAL rc. A missing or failing .real can never be recorded
+          # as a successful call.
+          invoke_log=/tmp/pam-e2e-invocations.log
+          : > "$invoke_log"
+          chown 0:0 "$invoke_log"
+          chmod 0644 "$invoke_log"
+          test -x /usr/sbin/pam-auth-update
+          mv /usr/sbin/pam-auth-update /usr/sbin/pam-auth-update.real
+          test -x /usr/sbin/pam-auth-update.real \
+            || { echo "pam-auth-update.real missing or not executable"; exit 1; }
+          cat > /usr/sbin/pam-auth-update <<'PAEOF'
+          #!/bin/bash
+          /usr/sbin/pam-auth-update.real "$@"
+          rc=$?
+          printf 'uid=%s args=%s rc=%s nonce=%s\n' \
+            "$(/usr/bin/id -u)" "$*" "$rc" "$PAM_E2E_NONCE" >> /tmp/pam-e2e-invocations.log
+          exit "$rc"
+          PAEOF
+          chmod 0755 /usr/sbin/pam-auth-update
+
           # uid 1000 reaches privileged files only via passwordless sudo. The
           # root path above used a passthrough stub; here a real setuid-root
           # exec helper models passwordless sudo. (setpriv CANNOT re-escalate:
@@ -487,17 +569,80 @@ jobs:
           printf '#!/bin/bash\nexec /usr/local/nonroot-bin/suid-exec "$@"\n' > /usr/local/nonroot-bin/sudo
           chmod +x /usr/local/nonroot-bin/sudo
           stat -c '%u:%a %n' /var/lib/cros-enablement/pam-selection /var/lib/cros-enablement/pam-selection.saved
+
+          # Clear the log so ONLY the product's calls are counted below (all
+          # setup calls above used the real binary directly, before wrapping).
+          # Root-owned 0644: writable by the suid-exec'ed wrapper (uid 0), but
+          # NOT pre-forgeable by the uid 1000 child.
+          : > "$invoke_log"
+          chown 0:0 "$invoke_log"
+          chmod 0644 "$invoke_log"
           setpriv --reuid=1000 --regid=1000 --clear-groups \
-            env PATH="/usr/local/nonroot-bin:/usr/bin:/bin" LOG_FILE=/tmp/pam-e2e-nonroot.log \
+            env PATH="/usr/local/nonroot-bin:/usr/bin:/bin:/usr/sbin:/sbin" LOG_FILE=/tmp/pam-e2e-nonroot.log \
             bash -c '
+              set -euo pipefail
+              # Do NOT trust the setpriv flags alone: prove the child really is
+              # uid 1000 and export the value for the host gate.
+              test "$(id -u)" = 1000 || exit 1
+              printf "%s\n" "$(id -u)" > /tmp/pam-e2e-nonroot-uid
+              # Fail loudly if the non-root PATH ever hides the real tool again;
+              # otherwise the product would silently skip --package.
+              test "$(command -v pam-auth-update)" = /usr/sbin/pam-auth-update \
+                || { echo "non-root PATH hides pam-auth-update"; exit 1; }
               source /workspace/lib/pam.sh
               DISTRO_FAMILY=debian DISTRO_ID=ubuntu
               export DISTRO_FAMILY DISTRO_ID
-              rollback_component "fingerprint"
-              disable_pam_fingerprint
+              rollback_component "fingerprint" || exit $?
+              disable_pam_fingerprint || exit $?
             '
+
+          # Root exports the child's own uid claim; the host verifies 1000.
+          cp /tmp/pam-e2e-nonroot-uid /pam-e2e-artifacts/nonroot-uid
+
+          # The real tool must have RUN, returned 0, and logged the host nonce.
+          # `--package` is matched as a whole token (not `.*--package`).
+          test -s "$invoke_log" || { echo "product never called pam-auth-update"; exit 1; }
+          grep -Eq "^uid=0 args=(.* )?--package( .*)? rc=0 nonce=${PAM_E2E_NONCE}\$" "$invoke_log" \
+            || { echo "no successful nonce-matching --package call as uid 0: $(cat "$invoke_log")"; exit 1; }
+          cp "$invoke_log" /pam-e2e-artifacts/pam-auth-update-invocations.log
+
           compare_with_baseline
           test ! -e /var/lib/cros-enablement/pam-selection
           test ! -e /var/lib/cros-enablement/pam-selection.saved
-          echo "non-root PAM E2E OK: root-only sidecar + /var/lib/pam snapshot consumed by uid 1000"
+          echo "non-root PAM lib helper E2E OK: root-only sidecar + /var/lib/pam snapshot consumed by uid 1000"
+
+          # Sentinel: everything above must have passed before this file
+          # appears on the host-mounted artifact dir.
+          printf 'PAM_LIB_HELPER_E2E_OK\n' > /pam-e2e-artifacts/e2e-ok
+          # Final container command: neutralize any restrictive umask so the
+          # host (possibly a different uid on a self-hosted runner) can read
+          # every artifact instead of reporting a false red.
+          chmod -R a+rX /pam-e2e-artifacts
           EOS
+
+          # Host-side verification (under `set -e`, with the real rc captured).
+          if [ "$docker_rc" -ne 0 ]; then
+            echo "::error::PAM lib helper E2E container exited with status $docker_rc"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/started" ]; then
+            echo "::error::PAM lib helper E2E container never ran the script (empty-run regression)"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/e2e-ok" ] \
+             || ! grep -qx 'PAM_LIB_HELPER_E2E_OK' "$artifact_dir/e2e-ok"; then
+            echo "::error::PAM lib helper E2E sentinel missing/invalid - assertions did not all pass; refusing green"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/nonroot-uid" ] \
+             || ! grep -qx '1000' "$artifact_dir/nonroot-uid"; then
+            echo "::error::PAM lib helper E2E child was not uid 1000: $(cat "$artifact_dir/nonroot-uid" 2>/dev/null || echo MISSING)"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/pam-auth-update-invocations.log" ] \
+             || ! grep -Eq "^uid=0 args=(.* )?--package( .*)? rc=0 nonce=${pam_e2e_nonce}\$" \
+                     "$artifact_dir/pam-auth-update-invocations.log"; then
+            echo "::error::product did not run the real pam-auth-update --package successfully (rc=0 + host nonce required)"
+            exit 1
+          fi
+          echo "PAM lib helper E2E sentinel verified on host"
