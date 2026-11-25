@@ -4717,6 +4717,34 @@ wait 2> /dev/null || true
 export STUB_SLEEP_MODE=fast
 assert_zero_writes "G3-36" 10 30 30
 
+# G3-37. A restart must not merely retire a persistent unhealthy marker: the
+# earlier process could have forked a worker that still holds the OLD numeric
+# epoch (revocation failed in place, e.g. an append-only inode).  Initialization
+# must mint a fresh nonce BEFORE clearing the marker, so that survivor fails
+# every epoch gate instead of writing after the restart.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-37" 5
+# The marker is materialized after the worker captured epoch "1": this is the
+# persistent decision a fresh process inherits at startup.
+: > "$UNHEALTHY_MARKER"
+run_fn _ensure_retry_epoch
+assert_absent "G3-37: marker retired only after a verified rotation" "$UNHEALTHY_MARKER"
+if grep -Eq '^R[0-9]+-[0-9]+-[0-9]+$' "$RESTORE_RETRY_EPOCH_FILE"; then
+    ok "G3-37: restart minted a fresh nonce"
+else
+    bad "G3-37: epoch did not become a nonce: $(cat "$RESTORE_RETRY_EPOCH_FILE")"
+fi
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_zero_writes "G3-37" 10 30 30
+
 # --- Phase C: per-cycle handoff identity (finding #2) ----------------------
 
 # D1. Strict token handoff is adopted; the legacy single-integer format is

@@ -51,8 +51,12 @@ root system-sleep hook 只在下列條件下發布 S3 handoff 檔：
    發出 WARN，不掃描其他 uid。
 5. **無 `/tmp` 降級。** `post` 時 runtime dir 消失即 fail closed；hook 絕不退回 `/tmp` 或
    任何其他目錄。
-6. **Root 寫入邊界。** 每個 handoff／root state 都以同目錄 `mktemp` 加單一
-   **`mv -T -f --`** 重新命名發布。目的項目在暫存內容前後都會檢查：最終 component
+6. **Root 寫入邊界。** 兩個使用者 handoff 檔由 inline `python3` writer 以**釘住的
+   directory fd** 發布（`O_DIRECTORY|O_NOFOLLOW`、`O_EXCL|O_NOFOLLOW` 的 `0600` 暫存檔、
+   `fchmod`／`fchown`、重查目錄 identity、以 `src_dir_fd`／`dst_dir_fd` 執行
+   `os.rename`、驗證發布後 inode）——即 fd 釘住版的 `mv -T -f --`，**沒有 `cp` 降級，
+   也沒有一般 `mv` 降級**。root 診斷快照與 uid 釘住檔仍使用有 guard 的同目錄
+   `mv -T -f --`。對 handoff writer 而言，目的項目在暫存內容前後都會檢查：最終 component
    必須不存在或為普通檔；symlink、目錄或特殊檔會以 `unsafe destination entry`（或
    `cannot publish ...`）fail closed，同時重查父目錄的 `(dev,ino)` identity，避免重新
    命名把寫入導向別處。**沒有 `cp` 降級，也沒有一般 `mv` 降級**可能解引用該項目。

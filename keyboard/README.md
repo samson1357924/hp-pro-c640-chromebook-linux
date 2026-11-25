@@ -415,15 +415,24 @@ tristate.
 the `post` phase, so the hook never queries a user/session D-Bus, never writes the LED
 and never deletes state. `pre` writes `/run/c640-kbd-backlight/state` as a **single-shot
 diagnostic snapshot of the first suspend in a boot** (first-wins, kept until reboot) and
-publishes `c640-kbd-backlight.suspend` (one decimal integer, `0` valid); `post` only
-publishes `c640-kbd-backlight.resume` (`<epoch> <action>`). The root snapshot is **not
-consumed by the hook or the daemon and is never used for restore**; the daemon consumes
-only the two handoff files and its own `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`.
-Both handoff files are `0600`, chowned to the resolved session user and published
-with a same-directory temp file plus `mv -T -f --` into `$XDG_RUNTIME_DIR`; a
-destination-entry guard (symlink/directory/special entry fails closed) and a
-parent-inode recheck apply, and there is **no `cp` or plain-`mv` fallback**
-(`unsafe destination entry` / `cannot publish ...`). The uid comes from
+publishes `c640-kbd-backlight.suspend` as `<token> <value> published` (`0` valid);
+`post` only publishes `c640-kbd-backlight.resume` as `<token> <epoch> <action>`.
+The root snapshot is **not consumed by the hook or the daemon and is never used for
+restore**; the daemon consumes only the two handoff files and its own
+`$XDG_RUNTIME_DIR/c640-kbd-backlight.state`. `<token>` is
+`<epoch>-<pid>-<random_hex>`, minted fresh by `pre` for every cycle; a root-only
+`0600` cycle marker (`<token> <dev:ino>`) is the last step of a successful `pre`,
+and both handoffs plus their inode are cross-checked by `post` and the daemon.
+Both handoff files are `0600`, chowned to the resolved session user (uid **and**
+gid) and published by an inline `python3` writer with a pinned directory fd:
+`O_DIRECTORY|O_NOFOLLOW` on the dir, an `O_EXCL|O_NOFOLLOW` `0600` temp with
+`fchmod`/`fchown`, a directory-identity recheck, `os.rename` with
+`src_dir_fd`/`dst_dir_fd` (the fd-pinned equivalent of `mv -T -f --`), then a
+published-inode/owner/mode verification. Destination-entry, identity, mode or
+rename failures are **fail closed** with **no `cp` or plain-`mv` fallback**
+(`unsafe destination entry` / `cannot publish ...`); `python3` is a new runtime
+dependency of `pre`/`post`. The root diagnostic snapshot and the uid pin still
+use a guarded same-directory `mv -T -f --`. The uid comes from
 `Session.User` (`User=<uid>` from `loginctl show-session`), never the User-object
 `UID=` key, and session IDs may be alphanumeric (e.g. `c1`).
 `C640_KBD_HANDOFF_DIR` overrides the hook's directory and is trusted by design
@@ -633,7 +642,7 @@ explicit-override mismatch warning (there is no cross-uid scan any more). Its ol
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 867 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 875 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
 zeros, wall-clock probe deadline, explicit handoff directory override mismatch, gsd-confirmed
@@ -642,8 +651,9 @@ in-lock generation gate with PENDING rollback, strictly monotonic generation bum
 **fail-closed generation publish with readback, epoch barrier that revokes stale
 retries/guards, TTL evidence re-probe**, fail-closed lock failures and single-read
 last-user cache) and the
-sleep-hook suite has 372 cases (pure handoff, `0600`/`chown`/atomic `mv -T -f --`
-with destination-entry guard and no `cp` fallback, `C640_KBD_HANDOFF_DIR`, single active
+sleep-hook suite has 372 cases (pure handoff, `0600`/`chown` with the fd-pinned
+inline-`python3` publisher (dir-fd `os.rename` plus inode/owner/mode verification,
+no `cp`/plain-`mv` fallback), cycle-token and inode binding, `C640_KBD_HANDOFF_DIR`, single active
 local graphical session selection from loginctl `Session.User` (`User=<uid>`, alphanumeric
 session IDs) with root-journal fail-closed warnings, uid pin and reuse,
 0700 runtime-dir gate, no LED writes). The separate
@@ -667,7 +677,7 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 867 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 875 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 cases
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK / SKIP (read-only)
 sudo bash tests/rollback-test.sh                       # 2395 cases (root)
@@ -693,7 +703,9 @@ sudo bash tests/rollback-test.sh                       # 2395 cases (root)
 * **Common-mode failure boundary.** When generation and epoch publishes fail together the
   epoch is revoked **in place** so retries/guards armed in the old cycle cannot survive. If
   that revocation also fails, a persistent `COORDINATION_UNHEALTHY` marker makes **every
-  subsequent gate** fail closed. Guard evidence TTL is measured from the **earliest
+  subsequent gate** fail closed. On **restart** the marker forces a fresh nonce
+  rotation *before* the marker is retired, so a worker forked under the old
+   numeric epoch cannot pass a gate after the restart (G3-37). Guard evidence TTL is measured from the **earliest
   witness** with a monotonic `/proc/uptime` clock and re-checked just before writing; a
   missing/backwards clock marks evidence expired. The daemon deliberately **degrades to
   refusing writes at every gate** rather than trusting stale witnesses. Scope: the marker

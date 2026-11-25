@@ -56,8 +56,13 @@ The root system-sleep hook publishes S3 handoff files only under these condition
    other uids.
 5. **No `/tmp` fallback.** A runtime dir that disappears at `post` is fail-closed; the hook
    never falls back to `/tmp` or any other directory.
-6. **Root write boundary.** Every handoff/root-state publish uses a same-directory `mktemp`
-   plus a single **`mv -T -f --`** rename. The destination entry is guarded both before and
+6. **Root write boundary.** The two user handoff files are published by an inline
+   `python3` writer with a **pinned directory fd** (`O_DIRECTORY|O_NOFOLLOW`, an
+   `O_EXCL|O_NOFOLLOW` `0600` temp, `fchmod`/`fchown`, directory-identity recheck,
+   `os.rename` with `src_dir_fd`/`dst_dir_fd`, then published-inode verification) —
+   the fd-pinned equivalent of `mv -T -f --`, with **no `cp` and no plain-`mv`
+   fallback**. The root diagnostic snapshot and the uid pin still use a guarded
+   same-directory `mv -T -f --`. For the handoff writer, the destination entry is guarded both before and
    after the content is staged: the final component must be absent or a regular file; a
    symlink, directory or special entry fails closed with `unsafe destination entry` (or
    `cannot publish ...`), and the parent directory's `(dev,ino)` identity is rechecked so a

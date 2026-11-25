@@ -1311,21 +1311,29 @@ _rotate_retry_epoch() {
 # Startup/worker initialization of a fresh coordination channel.  Called from
 # main() before any worker is forked, and directly by the unit tests.
 _ensure_retry_epoch() {
-    local e
+    local e had_marker=0
     e="$(_read_retry_epoch)"
-    if [ "$e" = "$EPOCH_INVALID" ]; then
+    # A persistent unhealthy marker means an EARLIER process could not revoke
+    # the epoch in place: a worker it forked may still hold the old numeric
+    # token.  Restarting must not merely prove `: >>` writability and retire
+    # the marker -- that would let the survivor pass every gate again.  Mint a
+    # fresh nonce FIRST, then (only after a verified publish) retire the marker.
+    [ -e "$RETRY_EPOCH_UNHEALTHY_FILE" ] && had_marker=1
+    if [ "$had_marker" -eq 1 ] || [ "$e" = "$EPOCH_INVALID" ]; then
         _next_retry_epoch > /dev/null
         if ! _atomic_publish_text "$RETRY_EPOCH_NONCE" "$RESTORE_RETRY_EPOCH_FILE"; then
             _set_coordination_unhealthy
-            log_warn "cannot initialize retry epoch; all brightness writers fail closed"
+            log_warn "cannot rotate retry epoch on restart; all brightness writers fail closed"
             return 1
         fi
+        # A verified nonce is a token no old worker captured, so the in-process
+        # fail-closed decision is obsolete; the on-disk marker is retired only
+        # after the writability proof below.
+        COORDINATION_UNHEALTHY=0
     fi
-    # Prove the channel BEFORE retiring a marker from an earlier process:
-    # this process has no workers armed under the old token, so ignoring the
-    # marker here cannot resurrect anything.  Once proven, clear it so a
-    # later bump (or a forked worker) no longer sees the stale fail-closed
-    # decision.
+    # Prove the channel BEFORE retiring a marker.  `: >>` can succeed on an
+    # append-only inode where a rename cannot; if the nonce publish above
+    # failed we already returned with the marker intact.
     if ! _coordination_writable ignore-marker; then
         _set_coordination_unhealthy
         log_warn "retry epoch channel unhealthy; all brightness writers fail closed"

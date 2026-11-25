@@ -354,13 +354,21 @@ mktemp/寫入/驗證失敗才回 rc `2` 並保持 LED 亮著。
 `user.slice`，因此 hook 絕不查詢使用者/session D-Bus、絕不寫 LED、絕不刪 state。
 `pre` 寫入 `/run/c640-kbd-backlight/state` 作為**本次開機第一次 suspend 的單次診斷快照**
 （first-wins，保留到重開機），並發佈 `c640-kbd-backlight.suspend`
-（單一十進位整數，`0` 有效）；`post` 只發佈 `c640-kbd-backlight.resume`
-（`<epoch> <action>`）。root 快照**不被 hook 或 daemon 消耗，也從不用於還原**；
-daemon 只消費兩個 handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。
-兩個 handoff 檔都是 `0600`、chown 給解析出的 session user，並以同目錄暫存檔加
-`mv -T -f --` 發布到 `$XDG_RUNTIME_DIR`；發布前後都做 destination entry guard
-（symlink／目錄／特殊檔即 fail closed）並重查父目錄 inode，**沒有 `cp` 或一般
-`mv` 降級**（`unsafe destination entry`／`cannot publish ...`）。uid 來自
+（`<token> <value> published`，`0` 有效）；`post` 只發佈
+`c640-kbd-backlight.resume`（`<token> <epoch> <action>`）。root 快照**不被 hook 或
+daemon 消耗，也從不用於還原**；daemon 只消費兩個 handoff 檔與自己的
+`$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。`<token>` 是
+`<epoch>-<pid>-<random_hex>`，由 `pre` 每次鑄造；root-only `0600` cycle marker
+（`<token> <dev:ino>`）是成功 `pre` 的最後一步，兩個 handoff 與 inode 都會由
+`post`／daemon 交叉比對。兩個 handoff 檔都是 `0600`、chown 給解析出的 session user
+（uid **與** gid），並由 inline `python3` writer 釘住 directory fd 發布：對目錄用
+`O_DIRECTORY|O_NOFOLLOW`，暫存檔用 `O_EXCL|O_NOFOLLOW` 的 `0600` 檔搭配
+`fchmod`／`fchown`，重查目錄 identity，再用 `src_dir_fd`／`dst_dir_fd` 執行
+`os.rename`（fd 釘住版的 `mv -T -f --`），最後驗證發布檔的 inode／owner／mode。
+destination entry、identity、mode 或 rename 失敗即 **fail closed**，**沒有 `cp`
+或一般 `mv` 降級**（`unsafe destination entry`／`cannot publish ...`）；`python3`
+是 `pre`／`post` 的新執行期依賴。root 診斷快照與 uid 釘住檔仍使用有 guard 的
+同目錄 `mv -T -f --`。uid 來自
 `Session.User`（`loginctl show-session` 的 `User=<uid>`），不是 User object 的 `UID=`；
 session ID 可為英數（如 `c1`）。`C640_KBD_HANDOFF_DIR` 可覆寫 hook 的目錄且依設計
 信任 caller（只檢查 `-d`），但最終 component 仍受保護。當 daemon 持有
@@ -539,15 +547,16 @@ guard marker／保留的 Tier 2 sentinel 路徑；sleep hook 接受 `C640_KBD_SL
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 867 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 875 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
 explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
 guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
 嚴格單調的 generation bump、**fail-closed generation 發布與讀回、epoch barrier 吊銷
 過期 retry/guard、TTL 證據重新探測**、fail-closed 鎖失敗與單次讀取的 last-user cache）；
-sleep hook 測試有 372 個案例（純 handoff、`0600`/`chown`/
-原子 `mv -T -f --` 與 destination entry guard、無 `cp` 降級、
+sleep hook 測試有 372 個案例（純 handoff、`0600`/`chown` 搭配
+fd 釘住的 inline `python3` 發布器（directory-fd `os.rename` 與 inode／owner／mode
+驗證、無 `cp`／一般 `mv` 降級）、cycle token 與 inode 綁定、
 `C640_KBD_HANDOFF_DIR`、由 loginctl `Session.User`（`User=<uid>`、英數 session ID）
 選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
 0700 runtime dir 檢查、不寫 LED）。另有唯讀的
@@ -567,7 +576,7 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 867 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 875 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 個案例
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
 sudo bash tests/rollback-test.sh                       # 2395 個案例（需 root）
@@ -590,7 +599,8 @@ sudo bash tests/rollback-test.sh                       # 2395 個案例（需 ro
   `suspend handoff token epoch ... stale`）。同一 cycle 的 DEFER 重試保留 token。
 * **共同故障邊界。** generation 與 epoch 發布同時失敗時，epoch 會**原地**撤銷，讓舊週期
   armed 的 retry/guard 無法存活；若連撤銷也失敗，持久的 `COORDINATION_UNHEALTHY` marker 讓
-  **每個後續 gate** fail closed。guard 證據 TTL 以**最早 witness** 搭配 monotonic
+  **每個後續 gate** fail closed。**重啟**時 marker 會強制先鑄造新 nonce 再清除，讓在舊數字
+  epoch 下 fork 的 worker 無法在重啟後通過 gate（G3-37）。guard 證據 TTL 以**最早 witness** 搭配 monotonic
   `/proc/uptime` 時鐘計時，寫入前重查；時鐘缺失或回撥即視為過期。daemon 刻意**降級為在每個
   gate 拒絕寫入**，而非信任過期 witness。範圍僅限後續 gate；已進入 `WRITE_LOCK` 的 writer
   無法回溯，可能仍完成一次寫入；state 目錄完全不可寫時持久 marker 無法建立，撤銷前已 fork

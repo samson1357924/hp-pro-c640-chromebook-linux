@@ -195,9 +195,12 @@
   > 真實 S3 週期中，systemd 會在 sleep hook 的 `post` 階段前**凍結 `user.slice`**
   > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)）。
   > 因此從 root hook 查詢 session bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
-  > `c640-kbd-backlight.suspend`（單一整數，`0` 有效），`post` 發佈
-  > `c640-kbd-backlight.resume`（`<epoch> <action>`），兩者皆 `0600` + chown 給
-  > session user + 原子 `mv` 進 `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。
+  > `c640-kbd-backlight.suspend`（`<token> <value> published`，`0` 有效），`post` 發佈
+  > `c640-kbd-backlight.resume`（`<token> <epoch> <action>`），兩者皆 `0600` + chown 給
+  > session user（uid 與 gid），由釘住 directory fd 的 `python3` writer 發布到
+  > `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。`<token>` 是 `pre` 每輪新鑄的
+  > `<epoch>-<pid>-<random_hex>`，並綁定到 root-only `0600` cycle marker 與已發布的
+  > suspend inode。
   > 它絕不寫 LED、不刪 state、不查 D-Bus。唯一寫入者是 thaw 後的**使用者 daemon**：
   > 它在 **system** bus（未被凍結）收到 `PrepareForSleep(false)` 時 adopt handoff，
   > 再經 gsd-power → UPower → legacy 還原。請勿把舊的 root 端 session bus 探測
@@ -210,9 +213,12 @@
   > hook 絕不建立／chmod／chown `/run/user/<uid>`；不存在或不安全即 fail closed、不寫 handoff。
   > uid 來自 `loginctl show-session` 的 **Session.User**（`User=<數字 uid>`），不是 User
   > object 的 `UID=` 鍵；session ID 可為英數（如 `c1`），缺少 `User` 即排除該 session。
-  > 兩個 handoff 檔以同目錄暫存檔加 `mv -T -f --` 發布，並做 destination entry 與父目錄
-  > inode 檢查，**沒有 `cp`／一般 `mv` 降級**（`unsafe destination entry`、
-  > `cannot publish ...`）。explicit `C640_KBD_HANDOFF_DIR` 依設計信任 caller（只檢查 `-d`），
+  > 兩個 handoff 檔由 inline `python3` writer 釘住 directory fd 發布
+  > （`O_DIRECTORY|O_NOFOLLOW`、`O_EXCL|O_NOFOLLOW` 的 `0600` 暫存檔、`fchmod`／`fchown`、
+  > 重查目錄 identity、以 `src_dir_fd`／`dst_dir_fd` 執行 `os.rename`、驗證發布後 inode）；
+  > 此為 fd 釘住版的 `mv -T -f --`，**沒有 `cp`／一般 `mv` 降級**（`unsafe destination entry`、
+  > `cannot publish ...`）。root 診斷快照與 uid 釘住檔仍使用有 guard 的 `mv -T -f --`。
+  > explicit `C640_KBD_HANDOFF_DIR` 依設計信任 caller（只檢查 `-d`），
   > 但最終 component 仍受保護。daemon 不再掃描其他 uid 的 runtime dir：只有 explicit
   > `C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
   > 跨 uid 診斷請查 root journal，不要掃描 `/run/user`。
@@ -243,8 +249,8 @@
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
   # 唯讀 handoff 檔（僅在休眠/喚醒週期間存在）：
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # 已存值，0 有效
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<epoch> <action>"
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # "<token> <value> published"，0 有效
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action>"
   # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -300,8 +306,8 @@
     `show-session` 是否缺少 `User`，或舊 hook 是否仍假設 session ID 必為十進位。
   * `handoff skipped (fail-closed): unsafe destination entry <path>` 或
     `... destination entry changed during write` 代表 handoff 最終 component 是 symlink、
-    目錄或特殊檔（或在暫存期間被替換）。`cannot publish <path>` 代表單次
-    `mv -T -f --` 發布失敗；暫存檔會被移除且**不嘗試 `cp`／一般 `mv` 降級**，因此不會
+    目錄或特殊檔（或在暫存期間被替換）。`cannot publish <path>` 代表 fd 釘住的 inline `python3` `os.rename`
+    發布失敗；暫存檔會被移除且**不嘗試 `cp`／一般 `mv` 降級**，因此不會
     解引用惡意項目。請修正 runtime dir 中的該項目（移除 symlink／目錄）後重試 suspend
     週期，並查 root journal 的確切路徑。
   * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` 代表

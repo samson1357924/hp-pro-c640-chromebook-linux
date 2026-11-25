@@ -230,10 +230,13 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > `post` phase ([systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)).
   > A session-bus probe from the root hook therefore always fails or times out;
   > the hook is now a **pure handoff
-  > writer**: `pre` publishes `c640-kbd-backlight.suspend` (one integer, `0` valid),
-  > `post` publishes `c640-kbd-backlight.resume` (`<epoch> <action>`), both `0600` +
-  > chowned to the session user + atomically `mv`-ed into `$XDG_RUNTIME_DIR`
-  > (`C640_KBD_HANDOFF_DIR` overrides it). It never writes the LED, deletes state or
+  > writer**: `pre` publishes `c640-kbd-backlight.suspend` as `<token> <value> published` (`0` valid),
+  > `post` publishes `c640-kbd-backlight.resume` as `<token> <epoch> <action>`,
+  > chowned to the session user (uid + gid), published by a pinned-fd `python3`
+  > writer into `$XDG_RUNTIME_DIR`
+  > (`C640_KBD_HANDOFF_DIR` overrides it). `<token>` is a fresh
+  > `<epoch>-<pid>-<random_hex>` minted by `pre` per cycle and bound to a
+  > root-only `0600` cycle marker plus the published suspend inode. It never writes the LED, deletes state or
   > queries D-Bus. The thawed **user daemon** is the only writer: it adopts the handoff
   > on `PrepareForSleep(false)` from the **system** bus (not frozen) and restores via
   > gsd-power → UPower → legacy. Do not reintroduce root-side session-bus probing
@@ -248,9 +251,13 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > `/run/user/<uid>`; a missing/insecure dir fails closed with no handoff. The uid is read
   > from `loginctl show-session`'s **Session.User** (`User=<numeric uid>`), never the
   > User-object `UID=` key, and session IDs may be alphanumeric (e.g. `c1`); a missing
-  > `User` rejects that session. Both handoff files are published with a same-directory
-  > temp file plus `mv -T -f --`, with destination-entry and parent-inode guards and **no
-  > `cp`/plain-`mv` fallback** (`unsafe destination entry`, `cannot publish ...`). An
+  > `User` rejects that session. Both handoff files are published by an inline `python3`
+  > writer with a pinned directory fd (`O_DIRECTORY|O_NOFOLLOW`, `O_EXCL|O_NOFOLLOW`
+  > `0600` temp, `fchmod`/`fchown`, directory-identity recheck, `os.rename` with
+  > `src_dir_fd`/`dst_dir_fd`, published-inode verification) — the fd-pinned
+  > equivalent of `mv -T -f --`, with **no
+  > `cp`/plain-`mv` fallback** (`unsafe destination entry`, `cannot publish ...`).
+  > The root diagnostic snapshot and uid pin still use a guarded `mv -T -f --`. An
   > explicit `C640_KBD_HANDOFF_DIR` is trusted by design (only `-d` is checked) but its
   > final component is still guarded. The daemon no longer scans other uids' runtime dirs:
   > only an **explicit** `C640_KBD_HANDOFF_DIR` override that disagrees with its own file
@@ -286,8 +293,8 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
   # read-only handoff files (only present across a suspend/resume cycle):
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # saved value, 0 valid
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<epoch> <action>"
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # "<token> <value> published", 0 valid
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action>"
   # read-only D-Bus probes (no writes, safe while the daemon runs):
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -350,7 +357,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * `handoff skipped (fail-closed): unsafe destination entry <path>` or
     `... destination entry changed during write` means the final handoff component is a
     symlink, directory or special entry (or changed while the temp file was being
-    written). `cannot publish <path>` means the single `mv -T -f --` publish failed; the
+    written). `cannot publish <path>` means the fd-pinned inline-`python3` `os.rename` publish failed; the
     temp file is removed and **no `cp`/plain-`mv` fallback** is attempted, so a hostile
     entry is never dereferenced. Fix the runtime dir entry (remove the symlink/dir) and
     retry the suspend cycle; check the root journal for the exact path.

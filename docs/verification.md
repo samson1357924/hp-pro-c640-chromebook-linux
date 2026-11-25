@@ -66,9 +66,9 @@ diagnostic bundle.
 | keyd option B | 🟢 | **Installed 2026-10-31** (keyd 2.5.0-5 as `/usr/bin/keyd.rvaiya`) with `overloadt2(meta, capslock, 200)`. Virtual uinput test (19:45:37, `keyboard/tests/keyd-dualrole-uinput.py`) PASS: tap Search→`CAPSLOCK` only (no `META`, no guard), all ten Search+top-row chords→`F1`-`F10` (the current test now expects the `[meta:M]` layer's `LEFTCTRL` chord guard), all ten top-row keys alone→their media keycode, hold Search alone→bare `LEFTMETA` release with **no `LEFTCTRL` guard**. Syntax is checked in CI with keyd 2.6.0 (`keyd check`) only; behaviour is verified on this device with 2.5.0-5 only — other versions unverified (upstream 2.6.x has known `overloadt2` differences). Real-key passive capture (`18:14:47-18:15:18`): lone hold released as bare `LEFTMETA` (GNOME overview opened on screen), tap sent `CAPSLOCK` only, single brightness/mute/volume presses changed brightness and volume, Search+Back sent `F1`. Journal shows `match 0001:0001 (AT Translated Set 2 keyboard)` and `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI match (real modalias) | 🟢 | `udevadm test /sys/class/input/event2` applies `KEYBOARD_KEY_*` via the `evdev:atkbd:` lookup even with the firmware's extra `br0.0:efr0.0` fields; non-`atkbd` lookups printing `No entry found from hwdb` is expected |
 | kbd backlight udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` installed 2026-10-31; `TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` = `-rw-rw---- root plugdev`, user write succeeds without sudo after `udevadm trigger --subsystem-match=leds` |
-| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 867 daemon cases pass after the re-review fixes (below); the 2026-11-22 real S3 result is historical (old hook) and is **pending on the target machine** for this HEAD — see below |
+| kbd backlight daemon | 🟢 | Installed to `/usr/local/bin/`; 2026-10-31: `--test-blank` 2→0, `--test-unblank` 0→2, state file `0600` and removed; `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2 with **zero sudo calls** in the user journal. Write chain verified by unit tests: one gsd-power `Properties.Set`, UPower fallback with `[WARN]`, forced-legacy sysfs path, 0 saved, non-zero current overwritten, ScreenSaver-active deferral, and log lines visible on stderr. Phase 6 adds back-end re-probe (`RECOVERED`), write+verify `set_brightness()` rc, live-over-cache `save_state`, consume-after-verify staging, tristate defer and resume handoff — 875 daemon cases pass after the re-review fixes (below); the 2026-11-22 real S3 result is historical (old hook) and is **pending on the target machine** for this HEAD — see below |
 | kbd backlight user service | 🟢 | `/etc/systemd/user/`, globally enabled and **active for uid 1000** (`systemctl --global is-enabled`, `systemctl --user is-active` both OK); `StandardError=journal` makes daemon log lines visible in `journalctl --user -u c640-kbd-backlight-sync.service` |
-| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + atomic `mv`; `C640_KBD_HANDOFF_DIR`); 372 hook cases pass. The hook now hands off only for a single active local graphical session (0 or multiple candidates fail closed in the root journal) and never creates/chmods/chowns the runtime dir. The root `/run/c640-kbd-backlight/state` is a **single-shot diagnostic snapshot of the first suspend in a boot** — first-wins, not consumed and never used for restore. The 2026-11-22 freeze/thaw result is historical (old hook); **current HEAD is pending on the target machine** (details below) |
+| kbd backlight sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`; 2026-10-31 direct call: `pre suspend` saved 6, simulated 0 → `post suspend` restored 6, state removed. Now a **pure handoff writer** (no D-Bus/LED/state deletion; `0600` + chown + fd-pinned inline-`python3` `os.rename` publication with per-cycle token/inode binding; `C640_KBD_HANDOFF_DIR`); 372 hook cases pass. The hook now hands off only for a single active local graphical session (0 or multiple candidates fail closed in the root journal) and never creates/chmods/chowns the runtime dir. The root `/run/c640-kbd-backlight/state` is a **single-shot diagnostic snapshot of the first suspend in a boot** — first-wins, not consumed and never used for restore. The 2026-11-22 freeze/thaw result is historical (old hook); **current HEAD is pending on the target machine** (details below) |
 
 #### Real S3 acceptance — historical 2026-11-22 record; current HEAD PENDING
 
@@ -123,7 +123,7 @@ brightness = `0` (screen already blank), ScreenSaver = `true`.
 
 | Suite | Result | Scope |
 | :--- | :--- | :--- |
-| `keyboard/tests/kbd-backlight-daemon-test.sh` | **867 passed, 0 failed** | stub-based unit suite |
+| `keyboard/tests/kbd-backlight-daemon-test.sh` | **875 passed, 0 failed** | stub-based unit suite |
 | `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **372 passed, 0 failed** | stub-based unit suite |
 | `tests/rollback-test.sh` | **2395 passed, 0 failed** | root required |
 | `keyboard/tests/loginctl-contract-check.sh` | **CONTRACT OK** (local systemd host) | new read-only schema check: `Session.User` = `User=<numeric uid>`, `UID=` only on the User object, alphanumeric session IDs; prints `SKIP` on a non-systemd host — **not** a real-S3 test |
@@ -140,9 +140,11 @@ Phase A–E push (`b572f35`..`a4a3fcc`) must have its workflows re-run and is
 
 At the seventeenth re-review the Backup/Rollback job was still running; the
 **same SHA `9bba61d`** later completed all 7 workflows green
-(Backup/Rollback `2026-11-25T12:08:02Z`, 2248/688/234). The four fixes committed at
-`68e7a21` are **not yet pushed**; their status must be read from a new CI run on
-the new SHA — no old result is carried over.
+(Backup/Rollback `2026-11-25T12:08:02Z`, 2248/688/234). The four fixes are in this
+branch's history (commits `3adb0b8`..`68e7a21`, plus the final-review fixups); the
+CI run on the **pushed HEAD** is authoritative for them — no old result is carried
+over. This document deliberately names no "new SHA", which a later commit would
+invalidate.
 
 Python/diagnostic self-tests: `check-top-row-hwdb.py` reports `SELF-TEST=PASS`,
 `keyd-dualrole-uinput.py` covers 34 cases, and `detect-hardware.sh` runs 28 assertions.
@@ -250,7 +252,9 @@ This fork adds five commits on top of the fifteenth re-review:
   name+type manifest) is part of the final verification; any non-regular entry
   fails closed. A legacy `.common` with no entries line degrades to a WARN-only
   best-effort check (`Legacy PAM snapshot has no savedir entry-set manifest ...`).
-* `a4a3fcc` — **root handoff write boundary:** handoff/root-state publishing
+* `a4a3fcc` — **root handoff write boundary (historical sixteenth-re-review
+  contract; the handoff files are now fd-pinned `python3` publishes described
+  below):** handoff/root-state publishing
   uses `mv -T -f --` with a destination-entry guard before and after staging
   (final component must be absent or a regular file; symlink/directory/special
   entry fails closed as `unsafe destination entry` / `cannot publish ...`) and
@@ -310,8 +314,10 @@ seventeenth independent re-review:
   together the epoch is revoked **in place** (`: >` / `rm -f`, verified by observation); if
   that also fails, a persistent `COORDINATION_UNHEALTHY` marker makes **every subsequent gate**
   fail closed. Recovery from `INVALID` uses a nonce that cannot equal an earlier
-  captured token. Guard TTL uses the **earliest witness** and a monotonic `/proc/uptime`
-  clock, re-checked just before writing; a missing/backwards clock marks evidence expired.
+  captured token. On **restart** the marker forces a fresh nonce rotation *before*
+  the marker is retired, so a worker forked by the earlier process under the old
+  numeric epoch stays revoked (G3-37). Guard TTL uses the **earliest witness** and
+  a monotonic `/proc/uptime` clock, re-checked just before writing; a missing/backwards clock marks evidence expired.
   This is an explicit **degradation boundary**: with an unwritable coordination channel the
   daemon refuses writes at every gate rather than trusting stale witnesses. Scope: the
   marker blocks subsequent gates only. A writer already inside the `WRITE_LOCK` critical
@@ -320,15 +326,16 @@ seventeenth independent re-review:
   revocation only see the in-process flag. These are non-blocking residuals — no retroactive
   cancellation is claimed.
 
-Current totals: daemon **867 passed, 0 failed**, sleep hook **372 passed, 0 failed**,
+Current totals: daemon **875 passed, 0 failed**, sleep hook **372 passed, 0 failed**,
 rollback **2395 passed, 0 failed**; keyd self-test **34 cases**,
 `check-top-row-hwdb.py` `SELF-TEST=PASS`, `detect-hardware.sh` **28 assertions**,
 contract check `CONTRACT OK` locally. CI at review time: 6 of 7 workflows were complete and
 the Backup/Rollback job was **still running**; the **same SHA `9bba61d`** subsequently
 finished all 7 workflows green (Backup/Rollback at `2026-11-25T12:08:02Z`, with 2248 rollback /
 688 daemon / 234 hook assertions). The four
-fixes are committed at **`68e7a21`** and **not yet pushed**: judge them only by the **new
-SHA's** CI run — no old result is carried over. **Real S3 on the target HP c640 remains
+fixes are in this branch's history (`3adb0b8`..`68e7a21`, plus the final-review
+fixups): judge them only by the CI run on the **pushed HEAD** — no old result is
+carried over. **Real S3 on the target HP c640 remains
 pending**; the 2026-11-22 freeze/thaw is historical evidence from the old hook and none of
 these four fixes has been exercised on real hardware.
 
@@ -639,7 +646,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (867 daemon + 372 hook + 2395 rollback, the last as root); the **2026-11-22** full real S3 freeze/thaw (locked defer + unlocked restore) is historical evidence from the old hook — **current HEAD is pending on the target machine** (see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (875 daemon + 372 hook + 2395 rollback, the last as root); the **2026-11-22** full real S3 freeze/thaw (locked defer + unlocked restore) is historical evidence from the old hook — **current HEAD is pending on the target machine** (see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -732,13 +739,14 @@ cat /sys/power/mem_sleep
   verified by real S3 on the target machine**; 22 PASS keyd live run remains historical,
   Tier 2 not implemented),
   2026-11-26 (seventeenth re-review — this fork: four commits `3adb0b8`, `d9f3acc`,
-  `01cc2fa`, `68e7a21` summarized above; current totals rollback 2395 / daemon 867 /
+  `01cc2fa`, `68e7a21` summarized above; current totals rollback 2395 / daemon 875 /
   hook 372, 0 failures; PAM-aware module-path parser with non-fp byte preservation and an
   immediate-vs-converged distinction, fd-pinned 0600 handoff publisher with a new python3
   runtime dependency, per-cycle handoff identity that rejects stale handoffs, and
   common-mode cancellation with a monotonic TTL plus an explicit degraded boundary;
   review-time CI had Backup/Rollback still running, same-SHA 9bba61d later 7/7 green
-  (2248/688/234), new SHA 68e7a21 not yet pushed or CI-run; **none of the four fixes verified on
+  (2248/688/234); the pushed HEAD's CI run is authoritative for the four fixes
+   (`3adb0b8`..`68e7a21` plus the final-review fixups); **none of the four fixes verified on
   real S3 — pending on the target HP c640**; 22 PASS keyd live run remains historical,
   Tier 2 not implemented)
 * **OS / kernel**: Ubuntu 26.04 LTS; `7.0.0-38-generic` for the 2026-10-31
