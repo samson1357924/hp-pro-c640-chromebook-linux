@@ -117,6 +117,19 @@ above).` instead:
   verifies the **actual** `common-*` bytes contain no active fprintd — a disabled record
   retained in the debconf selection is **not** sufficient. Fix the symlink/real target by
   hand and re-run the installer.
+* **Only the module-path field counts; custom stacks fail closed.** The scan, strip and
+  postcondition share one PAM rule parser. A trailing `#` comment (or an argument) that
+  merely mentions `pam_fprintd.so` is **not** an active module — a non-fingerprint rule such
+  as `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable` is kept
+  byte-for-byte. Bracketed controls, `\` continuations and `@include`/`@substack` are parsed
+  as stack entries. Uncertain syntax, a malformed module path, or a numeric-jump/custom
+  landing changed by removing an fp rule makes install **fail closed before any edit**
+  (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+  `numeric jump target identity changes after removing fingerprint module`) and leaves the
+  original bytes untouched. The postcondition re-proves non-fp rule order and jump
+  endpoints. "No active fp module now" and "convergence verified" are **separate facts**:
+  a convergence failure is logged honestly (`convergence NOT verified yet`) and does not by
+  itself prove the jump endpoints stayed stable.
 * **PAM file bytes come from rollback; the debconf selection is snapshotted, converged and
   restored.** `disable_pam_fingerprint()` performs **no sed and no direct edit** of
   `/etc/pam.d/sudo` (or any distro PAM file). All bytes come from the first backup via

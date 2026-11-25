@@ -131,6 +131,16 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > 為止。若舊安裝的 `common-auth` 仍有 fp 行，請只移除該行，或重跑
 > `./fingerprint/install-fingerprint.sh`（腳本會處理）：
 
+> [!WARNING]
+> 這個手動 `sed` 是第十七次 re-review PAM-aware 解析器之前的**舊指令**：substring 比對也會
+> 刪除行尾 `#` 註解只是提到 `pam_fprintd.so` 的無關 auth 規則。請優先重跑
+> `./fingerprint/install-fingerprint.sh`——它解析 **module-path 欄位**、以位元組完整保留非
+> fp 內容，並在不確定語法或自訂／numeric jump 落點時 fail closed
+> （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+> `numeric jump target identity changes ...`）。若必須手動編輯，請檢查 module-path 欄位並
+> 於事後驗證非 fp 位元組。「沒有生效 fp 模組」與「收斂已驗證」是不同事實
+> （`convergence NOT verified yet`）。
+
 ```bash
 sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```

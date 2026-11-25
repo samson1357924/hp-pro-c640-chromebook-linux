@@ -65,6 +65,16 @@ root system-sleep hook 只在下列條件下發布 S3 handoff 檔：
 > CI 驗證——**尚未在 HP Pro c640 以現行 HEAD 重跑真實 S3**（待目標機執行）。
 > 請見 [verification.md §3](verification.md) 的 checklist。
 
+#### Fail closed 訊息與處置（第十七次 re-review）
+
+| 訊息（root／user journal） | 意義 | 處置 |
+| :--- | :--- | :--- |
+| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration`／`numeric jump target identity changes after removing fingerprint module` | 自訂 PAM stack 無法安全解析，或移除 fp 模組會改變 numeric jump 落點。 | 安裝在任何 PAM 編輯**之前**以非 0 結束；snapshot 與 debconf 均不變。請手動檢查自訂 stack 後重跑——不要用 substring `sed` 代替。 |
+| `suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、`suspend handoff token epoch ... stale` | handoff 不屬於本次 suspend cycle（過期副本、偽造 flag 或 `pre` 失敗）。 | daemon 保持已存亮度不變；視為 handoff 失敗而非還原。重跑 S3 週期；見 [verification.md](verification.md) §3。 |
+| `retry epoch invalidation failed; all brightness writers fail closed`／`retry epoch channel unhealthy; all brightness writers fail closed` | 連原地撤銷 epoch 也失敗（`COORDINATION_UNHEALTHY`），過期 witness 不可信。引用的 log 字串為逐字輸出，實際強制範圍僅限後續 gate。 | 每個後續 gate fail closed。修好 runtime state 目錄後重啟使用者 daemon。範圍僅限後續 gate；已進入 `WRITE_LOCK` 的 writer 無法回溯，可能仍完成一次寫入；state 目錄完全不可寫時持久 marker 無法建立，撤銷前已 fork 的 worker 只看到 in-process flag。此為非阻塞殘留，此降級狀態下不宣稱回溯撤銷。 |
+| `evidence clock unavailable; evidence expired`／`evidence clock moved backwards; evidence expired` | monotonic 時鐘來源無法讀取或回撥，guard witness 年齡未知。 | guard 重新探測；仍無法驗證即 fail closed、不寫入。檢查 `/proc/uptime`／`C640_KBD_MONOTONIC_FILE`。 |
+| `handoff skipped (fail-closed): python3 unavailable; cannot publish <file>` | hook 執行環境缺少 `python3`。 | 在目標機安裝 `python3`；在此之前不發布 handoff（fail closed、不還原）。 |
+
 ---
 
 ## 🐧 推薦發行版與內核版本需求

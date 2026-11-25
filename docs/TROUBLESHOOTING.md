@@ -257,6 +257,20 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > logs `[WARN] handoff directory mismatch`. For cross-uid diagnosis read the root
   > journal, not a `/run/user` scan.
 
+* **Seventeenth-re-review fail-closed messages** (refusals to write, never silent success):
+  `suspend/resume handoff token mismatch ...`, `cycle-begin file ... not adopted` and
+  `suspend handoff token epoch ... stale` mean the handoff is from an earlier cycle (or
+  `pre` failed), so the saved brightness is left unchanged — re-run the S3 cycle rather than
+  expecting a restore. `handoff skipped (fail-closed): python3 unavailable` means the new
+  fd-pinned publisher cannot run: install `python3` on the target.
+  `retry epoch invalidation failed; all brightness writers fail closed` means the
+  coordination channel could not even be revoked in place (`COORDINATION_UNHEALTHY`): fix the
+  runtime state directory and restart the user daemon. `evidence clock unavailable;
+  evidence expired` / `evidence clock moved backwards; evidence expired` mean the monotonic
+  TTL (`/proc/uptime`) could not be trusted, so the guard re-probes and fails closed if it
+  still cannot verify. In all cases the daemon **degrades to refusing writes** rather than
+  trusting stale witnesses; none of this is a real-S3 verification.
+
 * **Triage** (all gdbus queries below are read-only):
 
   ```bash
@@ -615,6 +629,15 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     the fp line under its real target deliberately), then re-run the installer. After a
     successful install the postcondition checks the **actual** `common-*` bytes for no
     active fprintd — a disabled record left in the debconf selection is not sufficient.
+  * `Uncertain PAM rule syntax in ...; refusing to modify PAM configuration` or
+    `numeric jump target identity changes after removing fingerprint module` means the
+    17th-re-review PAM rule parser could not prove a custom stack is safe to edit. Install
+    exits non-zero **before any PAM edit**, with the original bytes and debconf selection
+    untouched. Trailing comments that merely mention `pam_fprintd.so` are no longer treated
+    as active modules, but uncertain syntax, a custom jump control or a changed jump landing
+    is not guessed at: fix the custom stack by hand and re-run the installer. A later
+    `pam-auth-update` failure is reported honestly (`convergence NOT verified yet`) and does
+    not claim the jump endpoints were re-proved.
 
 ---
 
@@ -707,6 +730,16 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
+
+  > [!WARNING]
+  > These `sed` commands are **legacy manual examples** from before the PAM-aware parser
+  > (17th re-review). A substring match deletes **any** line containing `pam_fprintd.so`,
+  > including an unrelated auth rule whose trailing `#` comment merely mentions it (e.g.
+  > `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable`). On a
+  > custom stack prefer re-running the installer: it parses the **module-path field**,
+  > preserves non-fp bytes, and fails closed on uncertain syntax or changed jump landings
+  > (`Uncertain PAM rule syntax ...`, `numeric jump target identity changes ...`). If you
+  > must edit by hand, check the module-path field and verify the non-fp bytes afterwards.
 
   *(This also removes the previous race window for `sudo` — see section 8
   for the single-stack rule.)* If a `common-*` file is a **symlink** whose target

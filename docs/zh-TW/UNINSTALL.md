@@ -98,6 +98,17 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   也 fail closed；不存在或 dangling 目標視為沒有生效模組。安裝成功後的 postcondition 會
   驗證**實際的** `common-*` 位元組沒有生效 fprintd——debconf selection 中留有已停用記錄
   **不算**通過。請手動修正 symlink／真實目標後重跑安裝。
+* **只有 module-path 欄位算數；自訂 stack 採 fail closed。** scan、strip 與 postcondition
+  共用同一個 PAM 規則解析器。行尾 `#` 註解（或 argument）提及 `pam_fprintd.so` **不是**生效
+  模組——例如 `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable`
+  的非指紋規則會以位元組完整保留。bracketed control、`\` 續行與 `@include`/`@substack`
+  都當作 stack entry 解析。不確定語法、module path 格式錯誤，或移除 fp 規則會改變
+  numeric jump／自訂落點時，安裝在任何編輯**之前 fail closed**
+  （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+  `numeric jump target identity changes after removing fingerprint module`），原始位元組不變。
+  postcondition 會重新驗證非 fp 規則順序與 jump 落點。「目前沒有生效 fp 模組」與「收斂已
+  驗證」是**不同的事實**：收斂失敗會如實記錄（`convergence NOT verified yet`），也不能單獨
+  證明 jump 落點保持穩定。
 * **PAM 檔案位元組由 rollback 還原；debconf selection 則快照、收斂後還原。**
   `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
   或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，

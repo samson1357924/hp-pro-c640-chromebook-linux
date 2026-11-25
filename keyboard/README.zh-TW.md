@@ -539,20 +539,20 @@ guard marker／保留的 Tier 2 sentinel 路徑；sleep hook 接受 `C640_KBD_SL
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 688 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 867 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
 explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
 guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
 嚴格單調的 generation bump、**fail-closed generation 發布與讀回、epoch barrier 吊銷
 過期 retry/guard、TTL 證據重新探測**、fail-closed 鎖失敗與單次讀取的 last-user cache）；
-sleep hook 測試有 234 個案例（純 handoff、`0600`/`chown`/
+sleep hook 測試有 372 個案例（純 handoff、`0600`/`chown`/
 原子 `mv -T -f --` 與 destination entry guard、無 `cp` 降級、
 `C640_KBD_HANDOFF_DIR`、由 loginctl `Session.User`（`User=<uid>`、英數 session ID）
 選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
 0700 runtime dir 檢查、不寫 LED）。另有唯讀的
 `keyboard/tests/loginctl-contract-check.sh`（systemd host 為 `CONTRACT OK`、其他為 `SKIP`
-——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2248 個案例，包含損毀
+——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2395 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
@@ -567,11 +567,34 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 個案例
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 867 個案例
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 個案例
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
-sudo bash tests/rollback-test.sh                       # 2248 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 2395 個案例（需 root）
 ```
+
+#### Handoff 發布與協調合約（第十七次 re-review）
+
+* **發布合約。** inline `python3` writer 以 `O_DIRECTORY|O_NOFOLLOW` 開啟 handoff 目錄、釘住
+  directory fd、驗證**解析後的 owner** 與 `0700` mode，以
+  `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` 建立 `0600` 暫存檔，寫入／`fchmod`／`fchown` 後重查
+  目錄 `(dev,ino)`，再以 `src_dir_fd`/`dst_dir_fd` 重新命名並驗證發布檔的**新 inode**。
+  owner、mode、暫存 identity 或 rename 失敗都是 **fail closed**（不發布 handoff、不動預期外
+  項目）；`python3` 是目標機上 `pre`/`post` 的**新執行期依賴**，缺失時記錄
+  `handoff skipped (fail-closed): python3 unavailable`。
+* **Cycle identity。** `pre` 鑄造 `<epoch>-<pid>-<random_hex>`，先作廢上一輪產物，發布
+  root-only `0600` cycle marker 並把 token 寫進 suspend handoff；`post` 與 daemon 交叉比對
+  suspend/resume token、cycle-begin epoch 與 handoff inode。過期 handoff、token/epoch 不符、
+  epoch 超出範圍或 `pre` 失敗都不覆蓋已存值
+  （`suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、
+  `suspend handoff token epoch ... stale`）。同一 cycle 的 DEFER 重試保留 token。
+* **共同故障邊界。** generation 與 epoch 發布同時失敗時，epoch 會**原地**撤銷，讓舊週期
+  armed 的 retry/guard 無法存活；若連撤銷也失敗，持久的 `COORDINATION_UNHEALTHY` marker 讓
+  **每個後續 gate** fail closed。guard 證據 TTL 以**最早 witness** 搭配 monotonic
+  `/proc/uptime` 時鐘計時，寫入前重查；時鐘缺失或回撥即視為過期。daemon 刻意**降級為在每個
+  gate 拒絕寫入**，而非信任過期 witness。範圍僅限後續 gate；已進入 `WRITE_LOCK` 的 writer
+  無法回溯，可能仍完成一次寫入；state 目錄完全不可寫時持久 marker 無法建立，撤銷前已 fork
+  的 worker 只看到 in-process flag。此為非阻塞殘留，協調通道不可寫時不宣稱回溯撤銷。
 
 ---
 

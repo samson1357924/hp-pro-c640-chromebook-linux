@@ -633,7 +633,7 @@ explicit-override mismatch warning (there is no cross-uid scan any more). Its ol
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 688 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 867 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
 zeros, wall-clock probe deadline, explicit handoff directory override mismatch, gsd-confirmed
@@ -642,14 +642,14 @@ in-lock generation gate with PENDING rollback, strictly monotonic generation bum
 **fail-closed generation publish with readback, epoch barrier that revokes stale
 retries/guards, TTL evidence re-probe**, fail-closed lock failures and single-read
 last-user cache) and the
-sleep-hook suite has 234 cases (pure handoff, `0600`/`chown`/atomic `mv -T -f --`
+sleep-hook suite has 372 cases (pure handoff, `0600`/`chown`/atomic `mv -T -f --`
 with destination-entry guard and no `cp` fallback, `C640_KBD_HANDOFF_DIR`, single active
 local graphical session selection from loginctl `Session.User` (`User=<uid>`, alphanumeric
 session IDs) with root-journal fail-closed warnings, uid pin and reuse,
 0700 runtime-dir gate, no LED writes). The separate
 `keyboard/tests/loginctl-contract-check.sh` is a read-only schema check (`CONTRACT OK`
 on a systemd host, `SKIP` otherwise — not a real-S3 test). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 2248 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 2395 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -667,11 +667,41 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 cases
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 867 cases
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 cases
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK / SKIP (read-only)
-sudo bash tests/rollback-test.sh                       # 2248 cases (root)
+sudo bash tests/rollback-test.sh                       # 2395 cases (root)
 ```
+
+#### Handoff publication and coordination contract (17th re-review)
+
+* **Publication contract.** An inline `python3` writer opens the handoff directory with
+  `O_DIRECTORY|O_NOFOLLOW`, pins its directory fd, verifies the **resolved owner** and `0700`
+  mode, creates the temp with `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` at `0600`, writes,
+  `fchmod`s and `fchown`s it, re-checks the directory `(dev,ino)`, renames with
+  `src_dir_fd`/`dst_dir_fd`, then verifies the **fresh inode** of the published file. Owner,
+  mode, temp-identity or rename failures are **fail closed** (no handoff, no mutation of
+  unexpected entries); `python3` is a **new runtime dependency** of `pre`/`post` on the
+  target machine and its absence logs `handoff skipped (fail-closed): python3 unavailable`.
+* **Cycle identity.** `pre` mints `<epoch>-<pid>-<random_hex>`, invalidates the previous
+  cycle's artifacts first, publishes a root-only `0600` cycle marker and embeds the token in
+  the suspend handoff; `post` and the daemon cross-check suspend/resume tokens, the
+  cycle-begin epoch and the handoff inode. A stale handoff, token/epoch mismatch,
+  out-of-range epoch or failed `pre` never overwrites the saved value
+  (`suspend/resume handoff token mismatch ...`, `cycle-begin file ... not adopted`,
+  `suspend handoff token epoch ... stale`). Same-cycle DEFER retries keep the token.
+* **Common-mode failure boundary.** When generation and epoch publishes fail together the
+  epoch is revoked **in place** so retries/guards armed in the old cycle cannot survive. If
+  that revocation also fails, a persistent `COORDINATION_UNHEALTHY` marker makes **every
+  subsequent gate** fail closed. Guard evidence TTL is measured from the **earliest
+  witness** with a monotonic `/proc/uptime` clock and re-checked just before writing; a
+  missing/backwards clock marks evidence expired. The daemon deliberately **degrades to
+  refusing writes at every gate** rather than trusting stale witnesses. Scope: the marker
+  blocks subsequent gates only. A writer already inside the `WRITE_LOCK` critical section
+  cannot be recalled and may still complete one write; if the state directory is completely
+  unwritable the persistent marker cannot be created, so workers forked before revocation
+  only see the in-process flag. These are non-blocking residuals — no retroactive
+  cancellation is claimed when the coordination channel itself is unwritable.
 
 ---
 

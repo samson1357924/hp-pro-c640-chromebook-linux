@@ -140,6 +140,17 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > uninstall. If `common-auth` still has an fp line on an older install, remove
 > only that line, or re-run `./fingerprint/install-fingerprint.sh`, which handles it:
 
+> [!WARNING]
+> This manual `sed` is a **legacy** instruction from before the 17th-re-review PAM-aware
+> parser: a substring match also deletes unrelated auth rules whose trailing `#` comment
+> merely mentions `pam_fprintd.so`. Prefer re-running
+> `./fingerprint/install-fingerprint.sh` — it parses the **module-path field**, preserves
+> non-fp bytes byte-for-byte, and fails closed on uncertain syntax or a custom/numeric jump
+> landing (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+> `numeric jump target identity changes ...`). If you edit by hand, check the module-path
+> field and verify the non-fp bytes afterwards. "No active fp module" and "convergence
+> verified" are separate facts (`convergence NOT verified yet`).
+
 ```bash
 sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```

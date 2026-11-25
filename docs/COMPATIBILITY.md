@@ -73,6 +73,16 @@ The root system-sleep hook publishes S3 handoff files only under these condition
 > re-run on real S3 on the HP Pro c640 with this HEAD** (pending on the target machine).
 > See the checklist in [verification.md §3](verification.md).
 
+#### Fail-closed messages and handling (17th re-review)
+
+| Message (root/user journal) | Meaning | Handling |
+| :--- | :--- | :--- |
+| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration` / `numeric jump target identity changes after removing fingerprint module` | A custom PAM stack could not be parsed safely, or removing an fp module would change a numeric-jump landing. | Install exits non-zero **before any PAM edit**; no snapshot or debconf change. Review the custom stack by hand and re-run — do not substitute a substring `sed`. |
+| `suspend/resume handoff token mismatch ...`, `cycle-begin file ... not adopted`, `suspend handoff token epoch ... stale` | The handoff does not belong to this suspend cycle (stale copy, forged flag or a failed `pre`). | The daemon leaves the saved brightness unchanged; treat it as a failed handoff, not a restore. Re-run the S3 cycle; see [verification.md](verification.md) §3. |
+| `retry epoch invalidation failed; all brightness writers fail closed` / `retry epoch channel unhealthy; all brightness writers fail closed` | Even in-place epoch revocation failed (`COORDINATION_UNHEALTHY`); stale witnesses cannot be trusted. The quoted log wording is verbatim; the enforced scope is subsequent gates only. | Every subsequent gate fails closed. Fix the runtime state directory and restart the user daemon. Scope: the marker blocks subsequent gates only. A writer already inside the `WRITE_LOCK` critical section cannot be recalled and may still complete one write; if the state directory is completely unwritable the persistent marker cannot be created, so workers forked before revocation only see the in-process flag. These are non-blocking residuals — no retroactive cancellation is claimed in this degraded state. |
+| `evidence clock unavailable; evidence expired` / `evidence clock moved backwards; evidence expired` | The monotonic clock source is unreadable or moved backwards, so guard witness age is unknown. | The guard re-probes; if still unverifiable it fails closed with no write. Check `/proc/uptime` / `C640_KBD_MONOTONIC_FILE`. |
+| `handoff skipped (fail-closed): python3 unavailable; cannot publish <file>` | `python3` is missing from the hook's runtime environment. | Install `python3` on the target; until then no handoff is published (fail closed, no restore). |
+
 ---
 
 ## 🐧 Recommended Distros & Kernel Requirements

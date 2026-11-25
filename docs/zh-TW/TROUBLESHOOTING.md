@@ -217,6 +217,17 @@
   > `C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
   > 跨 uid 診斷請查 root journal，不要掃描 `/run/user`。
 
+* **第十七次 re-review 的 fail closed 訊息**（都是拒絕寫入，絕不靜默成功）：
+  `suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、
+  `suspend handoff token epoch ... stale` 代表 handoff 來自更早的 cycle（或 `pre` 失敗），
+  因此已存亮度保持不變——請重跑 S3 週期，不要期待還原。`handoff skipped (fail-closed):
+  python3 unavailable` 代表新的 fd 釘住寫入器無法執行：請在目標機安裝 `python3`。
+  `retry epoch invalidation failed; all brightness writers fail closed` 代表協調通道連原地
+  撤銷都失敗（`COORDINATION_UNHEALTHY`）：修好 runtime state 目錄並重啟使用者 daemon。
+  `evidence clock unavailable; evidence expired`／`evidence clock moved backwards; evidence
+  expired` 代表 monotonic TTL（`/proc/uptime`）不可信，guard 會重新探測，仍無法驗證即 fail
+  closed。以上情況 daemon 皆**降級為拒絕寫入**，而非信任過期 witness；這些都不是真實 S3 驗證。
+
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
@@ -519,6 +530,13 @@
     沒有生效模組。請把 symlink 換成普通檔（或在其真實目標下手動移除 fp 行）後重跑安裝。
     安裝成功後的 postcondition 會檢查**實際的** `common-*` 位元組沒有生效 fprintd——
     debconf selection 中留有已停用記錄並不算數。
+  * `Uncertain PAM rule syntax in ...; refusing to modify PAM configuration` 或
+    `numeric jump target identity changes after removing fingerprint module` 代表第十七次
+    re-review 的 PAM 規則解析器無法證明自訂 stack 可安全編輯。安裝在任何 PAM 編輯**之前**
+    以非 0 結束，原始位元組與 debconf selection 完全不變。行尾註解提及 `pam_fprintd.so`
+    不再被當成生效模組，但不確定語法、自訂 jump control 或變動的 jump 落點不會被猜測：
+    請手動修正自訂 stack 後重跑安裝器。日後 `pam-auth-update` 失敗會如實記錄
+    （`convergence NOT verified yet`），也不宣稱 jump 落點已重新驗證。
 
 ---
 
@@ -603,6 +621,15 @@
   sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
+
+  > [!WARNING]
+  > 這些 `sed` 指令是 PAM-aware 解析器（第十七次 re-review）之前的**舊手動範例**：substring
+  > 比對會刪除**任何**含 `pam_fprintd.so` 的行，包括行尾 `#` 註解只是提到它的無關 auth 規則
+  > （例如 `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable`）。
+  > 自訂 stack 請優先重跑安裝器：它解析 **module-path 欄位**、保留非 fp 位元組，並在不確定
+  > 語法或 jump 落點變動時 fail closed（`Uncertain PAM rule syntax ...`、
+  > `numeric jump target identity changes ...`）。若必須手動編輯，請檢查 module-path 欄位並
+  > 於事後驗證非 fp 位元組。
 
   *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）* 若某個
   `common-*` 檔案是 **symlink**，其目標有生效的 `pam_fprintd.so` 行，`sed -i` 會
