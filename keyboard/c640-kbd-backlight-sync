@@ -127,15 +127,34 @@ C640_KBD_SAVE_LOCK_WAIT="${C640_KBD_SAVE_LOCK_WAIT:-2}"
 # An unblank guard's gsd/ScreenSaver evidence can age during a slow probe and
 # a WRITE_LOCK wait.  Past this many seconds the guard releases the lock,
 # re-probes and re-acquires (bounded) instead of acting on stale evidence.
+# The TTL is measured against a monotonic clock: wall time can jump backwards
+# (NTP / manual adjustment), which must never make stale evidence look fresh.
 C640_KBD_GUARD_EVIDENCE_TTL="${C640_KBD_GUARD_EVIDENCE_TTL:-6}"
+# A non-numeric TTL must never weaken the freshness gate.
+case "$C640_KBD_GUARD_EVIDENCE_TTL" in
+    '' | *[!0-9]*) C640_KBD_GUARD_EVIDENCE_TTL=6 ;;
+esac
+# Monotonic clock source for the evidence TTL.  /proc/uptime is the default;
+# "date" is an explicit degraded/test mode that does NOT resist wall-clock
+# jumps.  Both overrides are intended for tests / unusual environments.
+C640_KBD_MONOTONIC_SOURCE="${C640_KBD_MONOTONIC_SOURCE:-uptime}"
+C640_KBD_MONOTONIC_FILE="${C640_KBD_MONOTONIC_FILE:-/proc/uptime}"
 # Generation gate.  The env override mirrors WRITE_LOCK / the guard markers so
 # tests (and alternate runtime layouts) can redirect it before the daemon is
 # sourced.
 RESTORE_GEN_FILE="${C640_KBD_RESTORE_GEN_FILE:-$STATE_DIR/c640-kbd-backlight.restore-gen}"
-# Retry / guard epoch.  bump_restore_gen() rotates it under WRITE_LOCK on BOTH
-# success and failure, so retries and guards armed before a failed publish are
-# revoked even though the generation counter did not advance.
+# Retry / guard epoch.  A SUCCESSFUL bump rotates it (numeric e+1) under
+# WRITE_LOCK.  If the publish channel fails, the epoch is revoked IN PLACE
+# (truncate/unlink, see _invalidate_retry_epoch) so retries and guards armed in
+# the old cycle cannot survive.  If even that fails, COORDINATION_UNHEALTHY
+# plus a persistent marker file make every brightness writer fail closed.
 RESTORE_RETRY_EPOCH_FILE="${C640_KBD_RESTORE_RETRY_EPOCH:-$STATE_DIR/c640-kbd-backlight.retry-epoch}"
+# Persistent mirror of COORDINATION_UNHEALTHY.  The in-memory flag is NOT
+# visible to workers forked before the failure (e.g. an append-only inode that
+# defeats `: >` and `rm -f` but still accepts `: >>`).  Every gate therefore
+# reads this marker file at check time; a successful rotation/initialization
+# removes it.  Same directory as the epoch so overrides stay together.
+RETRY_EPOCH_UNHEALTHY_FILE="${C640_KBD_RETRY_EPOCH_UNHEALTHY:-${RESTORE_RETRY_EPOCH_FILE}.unhealthy}"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
 C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
@@ -166,6 +185,23 @@ HAVE_UPOWER_KBD=""
 # logs so the journal stays readable while re-probing on every use.
 _BACKENDS_LOGGED=0
 restore_gen=0
+# Coordination token.  The publish channel (_atomic_publish_text) can fail as a
+# whole (full FS, mktemp/mv failure), so a failed bump cannot be revoked through
+# that same channel.  INVALID is a VALUE, not a number: INVALID == INVALID is
+# never "current".  COORDINATION_UNHEALTHY is set when even the in-place
+# revocation (`: >` / `rm -f`) fails; from then on all writers fail closed.
+# It is mirrored to $RETRY_EPOCH_UNHEALTHY_FILE so workers forked BEFORE the
+# failure also fail closed (the env override below is test-only).
+EPOCH_INVALID='INVALID'
+retry_epoch_seq=0
+RETRY_EPOCH_NONCE=""
+COORDINATION_UNHEALTHY=0
+# Only the test harness forces this; production never sets it.  It models a
+# coordination channel that cannot prove a revocation (e.g. read-only dir).
+C640_KBD_FORCE_COORD_UNHEALTHY="${C640_KBD_FORCE_COORD_UNHEALTHY:-0}"
+case "$C640_KBD_FORCE_COORD_UNHEALTHY" in
+    '' | *[!0-9]*) C640_KBD_FORCE_COORD_UNHEALTHY=0 ;;
+esac
 # In-process mirror of the last user-visible brightness.  The value is also
 # persisted to LAST_USER_FILE so save_state (which runs in a subshell) can read
 # it.  A value of 0 means "the user explicitly turned the backlight off".
@@ -205,6 +241,33 @@ log_debug() {
     if [ "$C640_KBD_DEBUG" = "1" ]; then
         echo "[DEBUG] [c640-kbd-backlight-sync] $*" >&2
     fi
+}
+
+# Milliseconds from an arbitrary monotonic origin.  /proc/uptime is "SEC.FRAC
+# IDLE.FRAC"; only the first field matters.  Any unparsable value, missing file
+# or backward/unavailable wall clock is reported as failure so callers treat
+# the evidence as expired instead of trusting a negative/zero age.  `date` is
+# an explicit degraded/test source and is NOT monotonic.
+_monotonic_ms() {
+    local f="$C640_KBD_MONOTONIC_FILE" line secs frac ms s
+    if [ "$C640_KBD_MONOTONIC_SOURCE" = "uptime" ] && [ -r "$f" ]; then
+        IFS= read -r line 2> /dev/null < "$f" || return 1
+        line="${line%% *}"
+        case "$line" in '' | *[!0-9.]* | *.*.*) return 1 ;; esac
+        secs="${line%%.*}"
+        [ -n "$secs" ] || return 1
+        frac="${line#*.}"
+        [ "$frac" != "$line" ] || frac=0
+        frac="${frac}000"
+        ms=$((10#$secs * 1000 + 10#${frac:0:3}))
+        printf '%s' "$ms"
+        return 0
+    fi
+    # Wall-clock fallback: only when explicitly requested or /proc/uptime is
+    # unreadable.  It cannot resist jumps; see the degraded-mode documentation.
+    s="$(date +%s 2> /dev/null || echo 0)"
+    case "$s" in '' | *[!0-9]*) s=0 ;; esac
+    printf '%s' "$((10#$s * 1000))"
 }
 
 # Extract the first decimal number from a gdbus reply such as "(50,)" or
@@ -1115,26 +1178,161 @@ _atomic_publish_text() {
 }
 
 # Retry/guard epoch helpers.  Reading with `read` (not cat) keeps the gate
-# independent of PATH-level readers; an unreadable epoch means generation 0.
+# independent of PATH-level readers.  Absent / empty / non-numeric / symlink /
+# directory / overflowing content is INVALID, never "0": "0" could equal a
+# captured token and resurrect a worker after a failed publish.
 _read_retry_epoch() {
     local e=""
+    [ -f "$RESTORE_RETRY_EPOCH_FILE" ] && [ ! -L "$RESTORE_RETRY_EPOCH_FILE" ] \
+        || {
+            printf '%s' "$EPOCH_INVALID"
+            return 0
+        }
     IFS= read -r e 2> /dev/null < "$RESTORE_RETRY_EPOCH_FILE" || e=""
-    [[ "$e" =~ ^[0-9]+$ ]] || e=0
+    # Bound the digits so 10#$e cannot wrap (Phase C D4 overflow lesson).
+    # A minted nonce is R<seq>-<pid>-<random>: the PID prevents a seq collision
+    # after a daemon restart.  INVALID is never a valid token.
+    [[ "$e" =~ ^[0-9]{1,18}$ || "$e" =~ ^R[0-9]+-[0-9]+-[0-9]+$ ]] || e="$EPOCH_INVALID"
     printf '%s' "$e"
 }
 
-_epoch_is_current() {
-    [ "$(_read_retry_epoch)" = "$1" ]
+# Fail-closed helpers.  COORDINATION_UNHEALTHY lives only in this process, so
+# a worker forked before a failed revocation would never see it.  The marker is
+# materialized as an empty file next to the epoch: every gate calls
+# _coordination_writable(), which reads the marker with [ -e ] AT CHECK TIME.
+# Removing that one check resurrects already-forked writers.
+_set_coordination_unhealthy() {
+    COORDINATION_UNHEALTHY=1
+    : > "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
 }
 
-# Called by bump_restore_gen() under WRITE_LOCK.  Even when the generation
-# publish fails, rotating the epoch revokes retries/guards armed in the old
-# cycle; they re-check it after sleeping, after their probe and inside the
-# lock, exactly like the generation gate.
+_clear_coordination_unhealthy() {
+    COORDINATION_UNHEALTHY=0
+    rm -f -- "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
+}
+
+# Channel health: `: >> file` appends ZERO bytes -- no temp, no rename, no new
+# block -- so it still works under the fs-full condition that breaks
+# _atomic_publish_text().  A forced hook exists only for deterministic tests.
+# "ignore-marker" is used ONLY by _ensure_retry_epoch: a restart must be able
+# to prove writability before it retires a marker left by an earlier process.
+_coordination_writable() {
+    [ "${C640_KBD_FORCE_COORD_UNHEALTHY:-0}" -eq 0 ] || return 1
+    [ "${COORDINATION_UNHEALTHY:-0}" -eq 0 ] || return 1
+    if [ "${1:-}" != "ignore-marker" ]; then
+        [ ! -e "$RETRY_EPOCH_UNHEALTHY_FILE" ] || return 1
+    fi
+    local f="$RESTORE_RETRY_EPOCH_FILE"
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    : >> "$f" 2> /dev/null || return 1
+    return 0
+}
+
+# Four independent rejections: a globally unhealthy channel, a PERSISTENT
+# unhealthy marker (visible to already-forked workers), a channel that cannot
+# prove writability right now, and INVALID == INVALID.
+_epoch_is_current() {
+    local captured="$1" cur
+    _coordination_writable || return 1
+    cur="$(_read_retry_epoch)"
+    [ "$cur" != "$EPOCH_INVALID" ] && [ "$cur" = "$captured" ]
+}
+
+# In-place revocation.  NEVER route this through _atomic_publish_text(): that
+# is exactly the channel that just failed.  Truncation needs no new directory
+# entry or block; unlink is the fallback (absent reads as INVALID).  Verify the
+# OBSERVED result: a leftover DIRECTORY also reads as INVALID but must be
+# rejected, because it cannot be trusted as coordination storage.
+_invalidate_retry_epoch() {
+    local f="$RESTORE_RETRY_EPOCH_FILE" e=""
+    if [ -L "$f" ]; then
+        # Never truncate through a symlink; unlink it instead.
+        rm -f -- "$f" 2> /dev/null || true
+    elif [ -p "$f" ]; then
+        # Opening a FIFO for truncation BLOCKS forever with no writer.  An
+        # unlink is non-blocking and leaves absent == INVALID, as intended.
+        rm -f -- "$f" 2> /dev/null || true
+    elif ! : > "$f" 2> /dev/null; then
+        # append-only inode (chattr +a) or read-only dir: rm is the fallback.
+        rm -f -- "$f" 2> /dev/null || true
+    fi
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        return 0
+    fi
+    [ -f "$f" ] && [ ! -L "$f" ] || {
+        _set_coordination_unhealthy
+        return 1
+    }
+    IFS= read -r e 2> /dev/null < "$f" || e=""
+    # An append-only file still holds the OLD token: truncating failed, so the
+    # revocation did NOT happen.  Never let old workers through.
+    [ -z "$e" ] || {
+        _set_coordination_unhealthy
+        return 1
+    }
+    return 0
+}
+
+# A numeric e+1 after INVALID could equal a token captured BEFORE the failure
+# (e.g. 1 -> 0+1 = 1), resurrecting the old worker.  Mint a fresh-form nonce.
+# seq is process-local and restarts at 0 after a daemon restart, so include the
+# PID (plus RANDOM for two mints in one process) to keep tokens disjoint.
+_next_retry_epoch() {
+    retry_epoch_seq=$((retry_epoch_seq + 1))
+    RETRY_EPOCH_NONCE="R$retry_epoch_seq-$$-$RANDOM"
+    printf '%s' "$RETRY_EPOCH_NONCE"
+}
+
+# Called by bump_restore_gen() under WRITE_LOCK.  A rotate failure is handled
+# by the caller with an in-place invalidation (fail closed).  Numeric rotations
+# keep the existing e+1 semantics; only recovery from INVALID uses a nonce.
 _rotate_retry_epoch() {
+    local e="" rc=1
+    e="$(_read_retry_epoch)"
+    if [[ "$e" =~ ^[0-9]{1,18}$ ]]; then
+        if _atomic_publish_text "$((10#$e + 1))" "$RESTORE_RETRY_EPOCH_FILE"; then
+            rc=0
+        fi
+    else
+        # INVALID or a previously minted nonce: never resurrect an old token.
+        _next_retry_epoch > /dev/null
+        if _atomic_publish_text "$RETRY_EPOCH_NONCE" "$RESTORE_RETRY_EPOCH_FILE"; then
+            rc=0
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        # A verified rotate mints a token no old worker can match, so a
+        # fail-closed marker from an earlier cycle can be retired here.
+        rm -f -- "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
+    fi
+    return "$rc"
+}
+
+# Startup/worker initialization of a fresh coordination channel.  Called from
+# main() before any worker is forked, and directly by the unit tests.
+_ensure_retry_epoch() {
     local e
     e="$(_read_retry_epoch)"
-    _atomic_publish_text "$((e + 1))" "$RESTORE_RETRY_EPOCH_FILE"
+    if [ "$e" = "$EPOCH_INVALID" ]; then
+        _next_retry_epoch > /dev/null
+        if ! _atomic_publish_text "$RETRY_EPOCH_NONCE" "$RESTORE_RETRY_EPOCH_FILE"; then
+            _set_coordination_unhealthy
+            log_warn "cannot initialize retry epoch; all brightness writers fail closed"
+            return 1
+        fi
+    fi
+    # Prove the channel BEFORE retiring a marker from an earlier process:
+    # this process has no workers armed under the old token, so ignoring the
+    # marker here cannot resurrect anything.  Once proven, clear it so a
+    # later bump (or a forked worker) no longer sees the stale fail-closed
+    # decision.
+    if ! _coordination_writable ignore-marker; then
+        _set_coordination_unhealthy
+        log_warn "retry epoch channel unhealthy; all brightness writers fail closed"
+        return 1
+    fi
+    _clear_coordination_unhealthy
+    return 0
 }
 
 # Atomic publish of the in-process $restore_gen.  Caller holds WRITE_LOCK
@@ -1150,11 +1348,22 @@ _publish_restore_gen() {
 # a guard holds during its final check -- so two concurrent bumps cannot stamp
 # the same generation and no guard can pass its check before the bump lands.
 # In-memory restore_gen advances ONLY after a verified publish AND successful
-# marker cleanup.  The epoch is rotated on both the success and failure paths.
-# Returns 0 only when the publish, marker cleanup and epoch rotation succeeded.
+# marker cleanup.  On success the epoch is rotated; on failure it is revoked in
+# place (and a failed revocation makes all writers fail closed).  Returns 0
+# only when the publish, marker cleanup and epoch rotation all succeeded.
 bump_restore_gen() {
     if ! _acquire_write_lock; then
-        log_warn "cannot take write lock while bumping restore generation; not publishing"
+        # No lock means no atomic bump; the only safe move is to revoke every
+        # worker armed in the old cycle.  In-place invalidation takes no lock.
+        # Scope (for the Phase E docs): this blocks all SUBSEQUENT gates; a
+        # writer that already entered the WRITE_LOCK critical section cannot be
+        # recalled and may still perform one write.  Without the lock there is
+        # no way to retract it; the next gate check will reject it.
+        log_warn "cannot take write lock while bumping restore generation; not publishing, invalidating retry epoch"
+        if ! _invalidate_retry_epoch; then
+            _set_coordination_unhealthy
+            log_warn "retry epoch invalidation failed; all brightness writers fail closed"
+        fi
         return 1
     fi
     local g="" gen rc=0
@@ -1175,7 +1384,11 @@ bump_restore_gen() {
         restore_gen="$gen"
     fi
     if ! _rotate_retry_epoch; then
-        log_warn "retry epoch rotation failed; armed retries/guards may survive"
+        log_warn "retry epoch rotation failed; invalidating retry epoch in place"
+        if ! _invalidate_retry_epoch; then
+            _set_coordination_unhealthy
+            log_warn "retry epoch invalidation failed; all brightness writers fail closed"
+        fi
         rc=1
     fi
     _release_write_lock
@@ -1317,6 +1530,12 @@ schedule_restore_retries() {
     # a retry armed before that failure must not write with a stale gen.
     local epoch
     epoch="$(_read_retry_epoch)"
+    # Never arm on a revoked/unprovable token: a worker that cannot be revoked
+    # must not be created in the first place.
+    if [ "$epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "restore retries: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
     local delay
     for delay in "$@"; do
         (
@@ -2012,6 +2231,10 @@ guard_blank() {
     # covers a cycle whose generation publish FAILED (no gen bump to detect).
     captured_gen="$(current_restore_gen)"
     captured_epoch="$(_read_retry_epoch)"
+    if [ "$captured_epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "blank guard: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
     for delay in 0.25 1.0; do
         (
             sleep "$delay"
@@ -2085,6 +2308,10 @@ guard_unblank() {
     local restore_gen_now captured_epoch
     restore_gen_now="$(current_restore_gen)"
     captured_epoch="$(_read_retry_epoch)"
+    if [ "$captured_epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "unblank guard: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
     local delay
     for delay in 0.3 0.9; do
         (
@@ -2105,6 +2332,15 @@ guard_unblank() {
                 log "unblank guard +${delay}s: retry epoch superseded after sleep; guard cancelled"
                 exit 0
             fi
+            # Evidence TTL starts HERE: after backend preparation and the
+            # deliberate gated sleep (which are NOT evidence and cost up to
+            # 6s each), but BEFORE the first evidence query.  A slow tristate /
+            # last-user / LED / gsd probe, the WRITE_LOCK wait and the gsd
+            # re-check all still count toward witness age.  Taking the stamp
+            # after those probes would make age ~0 forever; taking it before
+            # the sleep would make a slow backend/sleep burn the whole TTL.
+            local ev_at
+            ev_at="$(_monotonic_ms || echo '')"
             # This guard can write a restored brightness, so it follows the
             # same fail-closed rule as restore_state: only inactive proceeds.
             if [ "$(screensaver_tristate)" != "inactive" ]; then
@@ -2173,9 +2409,7 @@ guard_unblank() {
                 # the LED here, then keep the lock only for cheap local checks
                 # plus the physical write.  The gsd/ScreenSaver witnesses have
                 # a TTL because both the probe and the lock wait can be slow.
-                local raw_now now age ev_at attempts=0 grc=0
-                ev_at="$(date +%s 2> /dev/null || echo 0)"
-                case "$ev_at" in '' | *[!0-9]*) ev_at=0 ;; esac
+                local raw_now now age_ms=0 attempts=0 grc=0 stale=0 clock_bad=0
                 while :; do
                     raw_now="$(get_brightness 2> /dev/null || echo "")"
                     if [ "$raw_now" = "$saved" ]; then
@@ -2190,17 +2424,33 @@ guard_unblank() {
                     # TTL re-check INSIDE the lock.  Stale evidence -> unlock,
                     # re-probe outside the lock, re-acquire (bounded retries).
                     # Every re-acquire re-runs the generation and epoch gates.
-                    now="$(date +%s 2> /dev/null || echo 0)"
-                    case "$now" in '' | *[!0-9]*) now=0 ;; esac
-                    age=$((now - ev_at))
-                    if [ "$age" -gt "$C640_KBD_GUARD_EVIDENCE_TTL" ]; then
+                    stale=0 clock_bad=0
+                    now="$(_monotonic_ms || echo '')"
+                    # Keep the two clock failures distinguishable in the log,
+                    # and NEVER print "aged 0ms > TTL" for them: no age was
+                    # actually measured.
+                    if [ -z "$now" ] || [ -z "$ev_at" ]; then
+                        log_warn "unblank guard +${delay}s: evidence clock unavailable; evidence expired"
+                        stale=1 clock_bad=1
+                    elif [ "$now" -lt "$ev_at" ]; then
+                        log_warn "unblank guard +${delay}s: evidence clock moved backwards; evidence expired"
+                        stale=1 clock_bad=1
+                    else
+                        age_ms=$((now - ev_at))
+                        if [ "$age_ms" -gt "$((C640_KBD_GUARD_EVIDENCE_TTL * 1000))" ]; then
+                            stale=1
+                        fi
+                    fi
+                    if [ "$stale" -eq 1 ]; then
                         _release_write_lock
                         if [ "$attempts" -ge 2 ]; then
                             log_warn "unblank guard +${delay}s: evidence still stale after $attempts re-probes; guard cancelled"
                             exit 0
                         fi
                         attempts=$((attempts + 1))
-                        log "unblank guard +${delay}s: evidence aged ${age}s > TTL ${C640_KBD_GUARD_EVIDENCE_TTL}s; re-probing ($attempts)"
+                        if [ "$clock_bad" -eq 0 ]; then
+                            log "unblank guard +${delay}s: evidence aged ${age_ms}ms > TTL $((C640_KBD_GUARD_EVIDENCE_TTL * 1000))ms; re-probing ($attempts)"
+                        fi
                         if [ "$(screensaver_tristate)" != "inactive" ]; then
                             exit 0
                         fi
@@ -2222,8 +2472,9 @@ guard_unblank() {
                             log "unblank guard +${delay}s: gsd no longer supports a re-set after re-probe (pct=${gpct:-unknown}); guard cancelled"
                             exit 0
                         fi
-                        ev_at="$(date +%s 2> /dev/null || echo 0)"
-                        case "$ev_at" in '' | *[!0-9]*) ev_at=0 ;; esac
+                        # Re-stamp AFTER the fresh evidence has been read, not
+                        # before: the new witnesses start aging from here.
+                        ev_at="$(_monotonic_ms || echo '')"
                         continue
                     fi
                     # The generation gate lives inside the lock bump_restore_gen()
@@ -2541,8 +2792,12 @@ print_help() {
     echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
     echo "  C640_KBD_SAVE_LOCK_WAIT=N      Bounded wait for the state lock on save (default 2s)"
     echo "  C640_KBD_GUARD_EVIDENCE_TTL=N  Max age (s) of LED/gsd evidence before a guard re-probes (default 6)"
+    echo "  C640_KBD_MONOTONIC_SOURCE=SRC  Evidence clock: uptime (default) or date (degraded/test)"
+    echo "  C640_KBD_MONOTONIC_FILE=PATH   Override monotonic clock file (tests)"
+    echo "  C640_KBD_FORCE_COORD_UNHEALTHY=1 Force coordination fail-closed (tests)"
     echo "  C640_KBD_RESTORE_GEN_FILE=PATH Override restore-generation file (tests)"
     echo "  C640_KBD_RESTORE_RETRY_EPOCH=PATH Override retry/guard epoch file (tests)"
+    echo "  C640_KBD_RETRY_EPOCH_UNHEALTHY=PATH Override fail-closed marker file (tests)"
 }
 
 check_status() {
@@ -2664,6 +2919,11 @@ main() {
     fi
 
     trap cleanup TERM INT EXIT HUP
+
+    # Initialize the coordination channel BEFORE forking any worker that may
+    # capture a token.  Failure is not fatal to the service, but leaves every
+    # brightness writer fail closed until a later restart proves writability.
+    _ensure_retry_epoch || true
 
     log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR Legacy=$C640_KBD_FORCE_LEGACY"
 

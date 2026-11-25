@@ -36,8 +36,20 @@ GUARD_ERR="$TMP_DIR/guard.err"
 GEN_FAULT_LOG="$TMP_DIR/gen-fault.log"
 ORIG_TMPDIR="${TMPDIR:-/tmp}"
 RESTORE_RETRY_EPOCH_FILE="$D_STATE_DIR/c640-kbd-backlight.retry-epoch"
+# Persistent fail-closed marker derived from the same epoch path as the daemon.
+UNHEALTHY_MARKER="$RESTORE_RETRY_EPOCH_FILE.unhealthy"
+# One-shot "slow evidence query" marker: the gdbus stub ages the fake clock
+# when the first GetActive happens, i.e. AFTER the guard's witness stamp.
+STUB_SLOW_ACTIVE="$TMP_DIR/slow-active-clock"
+FAKE_UPTIME="$TMP_DIR/fake-uptime"
 export C640_KBD_RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
 export C640_KBD_RESTORE_RETRY_EPOCH="$RESTORE_RETRY_EPOCH_FILE"
+export C640_KBD_RETRY_EPOCH_UNHEALTHY="$UNHEALTHY_MARKER"
+export STUB_SLOW_ACTIVE
+# Phase D: coordination health hook and monotonic clock source.  Exported
+# before sourcing so the daemon's source-time globals mirror these values.
+export C640_KBD_FORCE_COORD_UNHEALTHY=0
+export C640_KBD_MONOTONIC_SOURCE=uptime C640_KBD_MONOTONIC_FILE=/proc/uptime
 # These three are derived by the daemon at SOURCE time from STATE_DIR, which
 # the test only overrides after sourcing.  Pass them in as env overrides so
 # the daemon never touches the real /run/user/<uid> runtime dir.
@@ -48,6 +60,9 @@ export C640_KBD_SELF_WRITE_SENTINEL="$SELF_WRITE_SENTINEL_FILE"
 # gate blocks only the guard delays until STUB_SLEEP_RELEASE is created.
 STUB_SLEEP_STARTED="$TMP_DIR/sleep-started"
 STUB_SLEEP_RELEASE="$TMP_DIR/sleep-release"
+# Minimum number of distinct gated delays start_gated_guard waits for.  G3-26
+# arms two guard families (four subshells), so it overrides this to 4.
+GUARD_GATE_MIN=2
 STUB_BUMP_FLAG="$TMP_DIR/bump-on-get"
 # Retry/interleaving gates.  The retry gate is deliberately SEPARATE from the
 # guard gate so a retry can be held in its sleep without wedging guard tests.
@@ -177,6 +192,20 @@ _epoch_on_nth_active() {
     [ "$_n" -eq "$STUB_EPOCH_ON_NTH_ACTIVE" ] && _rotate_test_epoch
     return 0
 }
+# Phase D P2-2: model a SLOW evidence query.  The first GetActive that finds
+# the marker advances the fake monotonic clock; the claim is one-shot so a
+# re-probe after stale detection does not age it a second time.
+_slow_active_clock() {
+    [ -n "${STUB_SLOW_ACTIVE:-}" ] || return 0
+    [ -e "${STUB_SLOW_ACTIVE:-/nonexistent}" ] || return 0
+    _claim="${STUB_SLOW_ACTIVE}.claimed.$$"
+    if mv -- "$STUB_SLOW_ACTIVE" "$_claim" 2> /dev/null; then
+        command rm -f -- "$_claim" 2> /dev/null || true
+        printf '%s\n' "${STUB_SLOW_ACTIVE_UPTIME:-107.00}" \
+            > "${C640_KBD_MONOTONIC_FILE:-/nonexistent}" 2> /dev/null || true
+    fi
+    return 0
+}
 
 case "$*" in
     *introspect*)
@@ -203,6 +232,9 @@ esac
 
 case "$*" in
     *GetActive*)
+        # Age the clock only AFTER the caller's witness stamp, inside the
+        # evidence query itself (a slow D-Bus answer).
+        _slow_active_clock
         # One-shot / Nth-probe epoch rotation: fires between a caller's
         # after-sleep gate and its after-probe gate. The one-shot flag is
         # claimed with a single rename: two concurrent gated guards could both
@@ -672,9 +704,11 @@ reset_case() {
         "$STUB_EPOCH_ACTIVE_COUNT_FILE" \
         "$STUB_RETRY_GATE" "$STUB_RETRY_RELEASE" "$STUB_RETRY_STARTED" \
         "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE" \
-        "$STUB_TORN_META" "$STUB_TORN_OLD" "$STUB_TORN_NEW" "$STUB_TORN_COUNTER"
+        "$STUB_TORN_META" "$STUB_TORN_OLD" "$STUB_TORN_NEW" "$STUB_TORN_COUNTER" \
+        "$UNHEALTHY_MARKER" "$STUB_SLOW_ACTIVE" "$STUB_SLOW_ACTIVE".claimed.*
     export STUB_TORN_META_ON=0
     export STUB_SLEEP_MODE=fast
+    GUARD_GATE_MIN=2
     export C640_KBD_DEBUG=0
     export STUB_EPOCH_ON_NTH_ACTIVE=0
     rm -f "$HOOK_RUN_USER_ROOT"/[0-9]*/c640-kbd-backlight.* 2> /dev/null || true
@@ -688,8 +722,24 @@ reset_case() {
     export STUB_GEN_RM_FAIL=0
     export STUB_GEN_DATE_STALE='' STUB_GEN_DATE_STALE_SECS=10
     export TMPDIR="$ORIG_TMPDIR"
-    rm -f "$RESTORE_RETRY_EPOCH_FILE" "$D_STATE_DIR"/.c640-kbd-gen-* \
+    # Phase D: G3-27 leaves a DIRECTORY at the epoch path, so rm -rf (not just
+    # rm -f) is required before seeding a valid numeric token.  Forgetting the
+    # seed would silently suppress every existing arming case.
+    rm -rf "$RESTORE_RETRY_EPOCH_FILE" 2> /dev/null || true
+    # Persistent fail-closed marker: an earlier case may have revoked the
+    # channel (G3-27/G3-33); a fresh case must start healthy.
+    rm -f "$UNHEALTHY_MARKER" 2> /dev/null || true
+    export STUB_SLOW_ACTIVE_UPTIME=''
+    rm -f "$D_STATE_DIR"/.c640-kbd-gen-* \
         "$HANDOFF_DIR"/.c640-kbd-gen-* "$ORIG_TMPDIR"/.c640-kbd-gen-* 2> /dev/null || true
+    printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+    retry_epoch_seq=0
+    COORDINATION_UNHEALTHY=0
+    export C640_KBD_FORCE_COORD_UNHEALTHY=0
+    export C640_KBD_MONOTONIC_SOURCE=uptime C640_KBD_MONOTONIC_FILE=/proc/uptime
+    export C640_KBD_GUARD_EVIDENCE_TTL=6
+    rm -f "$FAKE_UPTIME" 2> /dev/null || true
+    export STUB_FLOCK_FAIL_FD='' STUB_FLOCK_FAIL_COUNT=0
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
     printf '%s\n' "$STUB_KBD_RAW" > "$RAW_FILE"
@@ -888,7 +938,7 @@ start_gated_guard() {
         "$fn" "$@" 2> "$GUARD_ERR"
         wait
     ) &
-    while [ "$(sort -u "$STUB_SLEEP_STARTED" 2> /dev/null | wc -l)" -lt 2 ] && [ "$n" -lt 400 ]; do
+    while [ "$(sort -u "$STUB_SLEEP_STARTED" 2> /dev/null | wc -l)" -lt "$GUARD_GATE_MIN" ] && [ "$n" -lt 400 ]; do
         # /bin/sleep, NOT the stub: the stub is deliberately blocked here.
         /bin/sleep 0.02
         n=$((n + 1))
@@ -3600,6 +3650,24 @@ failed_bump_rotates_epoch() {
     export STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
 }
 
+# Common-mode cancellation oracle: a cancelled worker must leave ALL physical
+# and staged traces untouched, not merely return a benign rc.
+assert_zero_writes() {
+    local label="$1" raw="$2" pct="$3" state="$4"
+    assert_file "$label: RAW unchanged" "$RAW_FILE" "$raw"
+    assert_file "$label: PCT unchanged" "$PCT_FILE" "$pct"
+    assert_eq "$label: no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+    assert_file "$label: STATE_FILE intact" "$STATE_FILE" "$state"
+    assert_absent "$label: nothing staged in PENDING" "$RESTORE_PENDING_FILE"
+}
+
+# Arm both guard families under ONE gated wrapper so all four workers share a
+# single stderr file and their cancellation logs cannot overwrite each other.
+g3_arm_unblank_and_blank() {
+    guard_unblank "$1"
+    guard_blank
+}
+
 # G3-01. Control: the verified publish advances the file and the in-memory
 # mirror, then clears both markers.
 g3_setup
@@ -3853,6 +3921,9 @@ write_state 30
 printf '30\n' > "$RAW_FILE"
 printf '30\n' > "$PCT_FILE"
 export C640_KBD_GUARD_EVIDENCE_TTL=6
+# The legacy one-shot `date +%s` jump is only visible in the explicit degraded
+# clock mode; the default /proc/uptime source must not be perturbed by it.
+export C640_KBD_MONOTONIC_SOURCE=date
 : > "$TMP_DIR/g3-g312-count"
 rm -f "$TMP_DIR/g3-date-stale"
 export STUB_GEN_DATE_STALE="$TMP_DIR/g3-date-stale" STUB_GEN_DATE_STALE_SECS=10
@@ -4139,6 +4210,8 @@ printf '30\n' > "$RAW_FILE"
 printf '30\n' > "$PCT_FILE"
 run_fn restore_state
 assert_file "G3-22: initial restore established G6" "$RESTORE_GEN_FILE" "6"
+# isolate the rotation caused by the failed bump from restore_state's own bump
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
 start_gated_guard guard_unblank 30
 assert_eq "G3-22: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
 failed_bump_rotates_epoch
@@ -4161,6 +4234,8 @@ write_state 30
 printf '30\n' > "$RAW_FILE"
 printf '30\n' > "$PCT_FILE"
 run_fn restore_state
+# see G3-22: rewind the witness before arming so 1 -> 2 is the injected rotation
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
 start_gated_guard guard_unblank 30
 assert_eq "G3-23: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
 : > "$STUB_EPOCH_ON_ACTIVE"
@@ -4186,7 +4261,11 @@ write_state 30
 printf '30\n' > "$RAW_FILE"
 printf '30\n' > "$PCT_FILE"
 export C640_KBD_GUARD_EVIDENCE_TTL=6
+# G3-24 uses the same one-shot `date +%s` jump as G3-12; select it explicitly.
+export C640_KBD_MONOTONIC_SOURCE=date
 run_fn restore_state
+# see G3-22: rewind the witness before arming so 1 -> 2 is the injected rotation
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
 printf '10\n' > "$RAW_FILE"
 : > "$SET_LOG"
 : > "$TMP_DIR/g3-g324-count"
@@ -4245,6 +4324,8 @@ write_state 30
 printf '30\n' > "$RAW_FILE"
 printf '30\n' > "$PCT_FILE"
 run_fn restore_state
+# see G3-22: rewind the witness before arming so 1 -> 2 is the injected rotation
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
 printf '10\n' > "$RAW_FILE"
 : > "$SET_LOG"
 start_gated_guard guard_unblank 30
@@ -4259,6 +4340,382 @@ if grep -Fq 'unblank guard +0.3s: retry epoch superseded inside WRITE_LOCK; guar
 else
     bad "G3-25: no in-lock epoch log (stderr: $(cat "$GUARD_ERR"))"
 fi
+
+# --- Phase D (17th re-review finding #3): common-mode revocation + TTL -----
+# The generation publish and the epoch rotation share _atomic_publish_text().
+# When that channel fails as a whole, the epoch must be revoked IN PLACE
+# (`: >` / `rm -f`); if even that fails, every writer must fail closed.
+
+# G3-26. Both publishes fail together.  Retry + both guard families were armed
+# with epoch=1; after the in-place revocation all four workers must cancel and
+# leave RAW/PCT/STATE_FILE/PENDING untouched.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-26" 5
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+GUARD_GATE_MIN=4
+start_gated_guard g3_arm_unblank_and_blank 30
+assert_eq "G3-26: all four guards gated" "0.25,0.3,0.9,1.0," "$GUARD_STARTED"
+export STUB_GEN_MKTEMP_FAIL=1
+g3_bump_rc
+export STUB_GEN_MKTEMP_FAIL=0
+assert_eq "G3-26: common-mode bump failed" "1" "$G3_RC"
+assert_file "G3-26: generation stayed at 5" "$RESTORE_GEN_FILE" "5"
+assert_eq "G3-26: epoch revoked in place (0 bytes)" "0" \
+    "$(wc -c < "$RESTORE_RETRY_EPOCH_FILE" | tr -d '[:space:]')"
+assert_eq "G3-26: revoked epoch reads INVALID" "INVALID" "$(_read_retry_epoch)"
+: > "$STUB_RETRY_RELEASE"
+release_guards
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+export STUB_SLEEP_MODE=fast
+assert_zero_writes "G3-26" 10 30 30
+if grep -Fq 'restore retry +0.5s (gen=5): epoch superseded after sleep; retry cancelled' "$DAEMON_ERR"; then
+    ok "G3-26: retry cancellation witness"
+else
+    bad "G3-26: no retry cancellation log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+if grep -Fq 'unblank guard +0.3s: retry epoch superseded after sleep; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-26: unblank guard cancellation witness"
+else
+    bad "G3-26: no unblank cancellation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+if grep -Fq 'blank guard +0.25s: retry epoch superseded after sleep; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-26: blank guard cancellation witness"
+else
+    bad "G3-26: no blank cancellation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-27. Revocation itself fails (the epoch path is a directory, so both
+# `: >` and `rm -f` fail).  The leftover directory reads as INVALID but must
+# NOT be accepted: COORDINATION_UNHEALTHY makes all gates and arming fail.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+rm -f "$RESTORE_RETRY_EPOCH_FILE"
+mkdir "$RESTORE_RETRY_EPOCH_FILE"
+assert_eq "G3-27: baseline gate rejects the directory" "1" "$(run_fn_rc _epoch_is_current 1)"
+export STUB_GEN_MKTEMP_FAIL=1
+g3_bump_rc
+export STUB_GEN_MKTEMP_FAIL=0
+assert_eq "G3-27: bump failed" "1" "$G3_RC"
+assert_eq "G3-27: coordination marked unhealthy" "1" "$COORDINATION_UNHEALTHY"
+assert_present "G3-27: fail-closed marker persisted for forked workers" "$UNHEALTHY_MARKER"
+assert_log_matches "G3-27: fail-closed warning" "$DAEMON_ERR" 'all brightness writers fail closed'
+assert_eq "G3-27: gate fails closed after failed revocation" "1" "$(run_fn_rc _epoch_is_current 1)"
+run_fn schedule_restore_retries 5 0.5
+run_fn guard_unblank 30
+run_fn guard_blank
+assert_absent "G3-27: no retry armed" "$STUB_RETRY_STARTED"
+assert_absent "G3-27: no guard armed" "$STUB_SLEEP_STARTED"
+rm -rf "$RESTORE_RETRY_EPOCH_FILE"
+
+# G3-28. INVALID == INVALID is never current, and a healthy-looking numeric
+# token is rejected when the channel cannot prove writability (force hook).
+g3_setup
+printf 'INVALID\n' > "$RESTORE_RETRY_EPOCH_FILE"
+assert_eq "G3-28: INVALID == INVALID rejected" "1" "$(run_fn_rc _epoch_is_current INVALID)"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+export C640_KBD_FORCE_COORD_UNHEALTHY=1
+assert_eq "G3-28: unwritable channel rejected" "1" "$(run_fn_rc _epoch_is_current 1)"
+run_fn schedule_restore_retries 5 0.5
+run_fn guard_unblank 30
+run_fn guard_blank
+assert_absent "G3-28: no retry armed on unhealthy channel" "$STUB_RETRY_STARTED"
+assert_absent "G3-28: no guard armed on unhealthy channel" "$STUB_SLEEP_STARTED"
+export C640_KBD_FORCE_COORD_UNHEALTHY=0
+
+# G3-28b. The SAME rejection with a WRITABLE channel but an INVALID epoch.
+# The three arming gates themselves must refuse to fork; testing only
+# _epoch_is_current lets a mutant that drops a gate survive.  Gate-mode sleeps
+# plus STUB_RETRY_GATE make a would-be fork observable.  stderr is APPENDED to
+# one dedicated file because run_fn()/2> would overwrite earlier logs.
+printf 'INVALID\n' > "$RESTORE_RETRY_EPOCH_FILE"
+G3_28B_ERR="$TMP_DIR/g3-28b-arm.err"
+: > "$G3_28B_ERR"
+rm -f "$STUB_RETRY_STARTED" "$STUB_SLEEP_STARTED" "$STUB_RETRY_RELEASE"
+: > "$STUB_RETRY_GATE"
+export STUB_SLEEP_MODE=gate C640_KBD_DEBUG=1
+schedule_restore_retries 5 0.5 2>> "$G3_28B_ERR" || true
+guard_unblank 30 2>> "$G3_28B_ERR" || true
+guard_blank 2>> "$G3_28B_ERR" || true
+# A forked worker records its gated sleep almost immediately; give it a short
+# bounded window before declaring that nothing was armed.
+g3_28b_n=0
+while [ "$g3_28b_n" -lt 25 ] && [ ! -e "$STUB_RETRY_STARTED" ] && [ ! -e "$STUB_SLEEP_STARTED" ]; do
+    /bin/sleep 0.02
+    g3_28b_n=$((g3_28b_n + 1))
+done
+assert_absent "G3-28b: no retry armed with INVALID epoch" "$STUB_RETRY_STARTED"
+assert_absent "G3-28b: no guard armed with INVALID epoch" "$STUB_SLEEP_STARTED"
+assert_log_matches "G3-28b: retry arming gate logged" "$G3_28B_ERR" 'restore retries: retry epoch invalid/unwritable; not arming'
+assert_log_matches "G3-28b: unblank arming gate logged" "$G3_28B_ERR" 'unblank guard: retry epoch invalid/unwritable; not arming'
+assert_log_matches "G3-28b: blank arming gate logged" "$G3_28B_ERR" 'blank guard: retry epoch invalid/unwritable; not arming'
+# Release every gate in case a mutant forked a worker before we asserted.
+: > "$STUB_RETRY_RELEASE"
+: > "$STUB_SLEEP_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast C640_KBD_DEBUG=0
+rm -f "$STUB_RETRY_GATE"
+
+# G3-29. A WRITE_LOCK acquisition failure also revokes the epoch: without the
+# lock there is no atomic bump, so every worker armed in the old cycle must be
+# cancelled (reviewer #3's residual path).
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-29" 5
+export STUB_FLOCK_FAIL_FD=209 STUB_FLOCK_FAIL_COUNT=1
+g3_bump_rc
+export STUB_FLOCK_FAIL_FD='' STUB_FLOCK_FAIL_COUNT=0
+assert_eq "G3-29: lock failure returns 1" "1" "$G3_RC"
+assert_eq "G3-29: epoch revoked after lock failure" "INVALID" "$(_read_retry_epoch)"
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_zero_writes "G3-29" 10 30 30
+assert_log_matches "G3-29: lock-failure revocation logged" "$DAEMON_ERR" 'invalidating retry epoch'
+
+# G3-30. Recovery after INVALID must not resurrect a worker that captured 1:
+# the epoch becomes a fresh nonce, and later initializations advance the seq.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-30" 5
+export STUB_GEN_MKTEMP_FAIL=1
+g3_bump_rc
+export STUB_GEN_MKTEMP_FAIL=0
+assert_eq "G3-30: common-mode bump failed" "1" "$G3_RC"
+assert_eq "G3-30: epoch INVALID before recovery" "INVALID" "$(_read_retry_epoch)"
+g3_bump_rc
+assert_eq "G3-30: recovery bump succeeds" "0" "$G3_RC"
+assert_file "G3-30: generation advanced to 6" "$RESTORE_GEN_FILE" "6"
+ep1="$(_read_retry_epoch)"
+if [[ "$ep1" =~ ^R1-[0-9]+-[0-9]+$ ]]; then
+    ok "G3-30: INVALID recovery mints a pid-qualified nonce"
+else
+    bad "G3-30: recovery did not mint an R1-<pid>-<rand> nonce (got '$ep1')"
+fi
+rm -f "$RESTORE_RETRY_EPOCH_FILE"
+run_fn _ensure_retry_epoch
+ep2="$(_read_retry_epoch)"
+if [[ "$ep2" =~ ^R2-[0-9]+-[0-9]+$ ]]; then
+    ok "G3-30: absent initialization mints a fresh pid-qualified nonce"
+else
+    bad "G3-30: absent initialization did not mint an R2-<pid>-<rand> nonce (got '$ep2')"
+fi
+printf 'INVALID\n' > "$RESTORE_RETRY_EPOCH_FILE"
+run_fn _ensure_retry_epoch
+ep3="$(_read_retry_epoch)"
+if [[ "$ep3" =~ ^R3-[0-9]+-[0-9]+$ ]]; then
+    ok "G3-30: INVALID initialization mints a fresh pid-qualified nonce"
+else
+    bad "G3-30: INVALID initialization did not mint an R3-<pid>-<rand> nonce (got '$ep3')"
+fi
+assert_eq "G3-30: nonce sequence advanced three times" "3" "$retry_epoch_seq"
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_zero_writes "G3-30" 10 30 30
+
+# G3-31. The TTL stamp is taken AFTER backend setup and the gated sleep but
+# BEFORE the first evidence query.  A slow GetActive that advances the fake
+# clock by 7s must therefore force a re-probe and only then a write.  A mutant
+# that moves the stamp back after the probe (M5) sees age 0 and never re-probes.
+g3_setup
+printf '100.00\n' > "$FAKE_UPTIME"
+export C640_KBD_MONOTONIC_SOURCE=uptime C640_KBD_MONOTONIC_FILE="$FAKE_UPTIME"
+export C640_KBD_GUARD_EVIDENCE_TTL=6
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+run_fn restore_state
+start_gated_guard guard_unblank 30
+assert_eq "G3-31: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+# Create a write intent only AFTER the guards are parked.  The clock must age
+# DURING the evidence query (not during the gated sleep): the gdbus stub
+# consumes this one-shot marker on the first GetActive after the stamp.
+printf '10\n' > "$RAW_FILE"
+# The initial restore's own write is not part of this assertion.
+: > "$SET_LOG"
+: > "$GDBUS_LOG"
+export STUB_SLOW_ACTIVE_UPTIME=107.00
+: > "$STUB_SLOW_ACTIVE"
+# Release one delay at a time: the test flock stub is not atomic between two
+# simultaneous acquirers, so both guards waking together could both pass the
+# marker check and write twice (a harness race, not a daemon race).
+: > "${STUB_SLEEP_RELEASE}.0.3"
+g3_wait_n=0
+while [ "$(grep -c 'Properties.Set' "$SET_LOG" 2> /dev/null || true)" -eq 0 ] && [ "$g3_wait_n" -lt 300 ]; do
+    /bin/sleep 0.02
+    g3_wait_n=$((g3_wait_n + 1))
+done
+: > "${STUB_SLEEP_RELEASE}.0.9"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_file "G3-31: guard re-set after re-probe" "$RAW_FILE" "30"
+assert_eq "G3-31: exactly one re-set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "G3-31: TTL re-probe triggered" "$GUARD_ERR" 'evidence aged'
+probe_n="$(grep -c -F 'Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness' "$GDBUS_LOG" || true)"
+if [ "$probe_n" -ge 2 ]; then
+    ok "G3-31: gsd witness was actually re-probed ($probe_n reads)"
+else
+    bad "G3-31: gsd witness was not re-probed ($probe_n reads)"
+fi
+
+# G3-32. A monotonic clock that moves BACKWARDS must be treated as expired,
+# never as a negative age that passes the TTL check.  A deterministic
+# decreasing clock makes both inside-lock checks stale until the bounded
+# re-probe limit cancels the guard.
+g3_setup
+write_state 30
+printf '30\n' > "$PCT_FILE"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+: > "$TMP_DIR/g3-g332-count"
+_orig_monotonic_ms_g332="$(declare -f _monotonic_ms)"
+_monotonic_ms() {
+    local n
+    n="$(/bin/cat "$TMP_DIR/g3-g332-count" 2> /dev/null || echo 0)"
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$TMP_DIR/g3-g332-count"
+    printf '%s' "$((200000 - n * 10000))"
+}
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+eval "$_orig_monotonic_ms_g332"
+assert_file "G3-32: backward clock caused no write" "$RAW_FILE" "10"
+assert_eq "G3-32: no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "G3-32: backward clock logged" "$DAEMON_ERR" 'moved backwards'
+
+# G3-33. COORDINATION_UNHEALTHY is process-local, so a worker forked BEFORE a
+# failed revocation would still write.  The decision is mirrored to a marker
+# file that every gate reads at check time.  This is the observable model of
+# an append-only epoch inode (`: >` / `rm -f` fail but `: >>` succeeds).
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-33" 5
+start_gated_guard guard_unblank 30
+start_gated_guard guard_blank
+assert_absent "G3-33: no marker before the failure" "$UNHEALTHY_MARKER"
+# Materialize the fail-closed decision AFTER the workers were forked: only
+# the marker (not the in-memory flag) can reach those children.
+: > "$UNHEALTHY_MARKER"
+G3_33_ERR="$TMP_DIR/g3-33-arm.err"
+: > "$G3_33_ERR"
+rm -f "$STUB_RETRY_STARTED" "$STUB_SLEEP_STARTED"
+: > "$STUB_RETRY_GATE"
+export STUB_SLEEP_MODE=gate
+schedule_restore_retries 5 0.5 2>> "$G3_33_ERR" || true
+guard_unblank 30 2>> "$G3_33_ERR" || true
+guard_blank 2>> "$G3_33_ERR" || true
+g3_33_n=0
+while [ "$g3_33_n" -lt 25 ] && [ ! -e "$STUB_RETRY_STARTED" ] && [ ! -e "$STUB_SLEEP_STARTED" ]; do
+    /bin/sleep 0.02
+    g3_33_n=$((g3_33_n + 1))
+done
+assert_absent "G3-33: no retry armed with persistent marker" "$STUB_RETRY_STARTED"
+assert_absent "G3-33: no guard armed with persistent marker" "$STUB_SLEEP_STARTED"
+assert_log_matches "G3-33: retry arming refused" "$G3_33_ERR" 'restore retries: retry epoch invalid/unwritable; not arming'
+assert_log_matches "G3-33: unblank arming refused" "$G3_33_ERR" 'unblank guard: retry epoch invalid/unwritable; not arming'
+assert_log_matches "G3-33: blank arming refused" "$G3_33_ERR" 'blank guard: retry epoch invalid/unwritable; not arming'
+# Open every gate so old and (under mutation) newly forked workers all exit.
+: > "$STUB_RETRY_RELEASE"
+: > "$STUB_SLEEP_RELEASE"
+: > "${STUB_SLEEP_RELEASE}.0.25" "${STUB_SLEEP_RELEASE}.0.3" \
+    "${STUB_SLEEP_RELEASE}.0.9" "${STUB_SLEEP_RELEASE}.1.0"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+rm -f "$STUB_RETRY_GATE"
+assert_zero_writes "G3-33" 10 30 30
+# A verified initialization retires the marker so a later cycle can arm.
+run_fn _ensure_retry_epoch
+assert_absent "G3-33: _ensure_retry_epoch cleared the marker" "$UNHEALTHY_MARKER"
+
+# G3-34. A FIFO at the epoch path must be unlinked, not opened for truncation:
+# `: > fifo` blocks forever when no writer is attached, so revocation would
+# hang instead of cancelling armed workers.
+g3_setup
+rm -f "$RESTORE_RETRY_EPOCH_FILE"
+mkfifo "$RESTORE_RETRY_EPOCH_FILE"
+G3_34_DONE="$TMP_DIR/g3-34-done"
+rm -f "$G3_34_DONE"
+(_invalidate_retry_epoch > /dev/null 2>> "$DAEMON_ERR" && : > "$G3_34_DONE") &
+g3_34_pid=$!
+if wait_for_file "$G3_34_DONE"; then
+    ok "G3-34: FIFO invalidation returned without blocking"
+else
+    bad "G3-34: FIFO invalidation blocked on open-for-truncate"
+fi
+kill "$g3_34_pid" 2> /dev/null || true
+wait "$g3_34_pid" 2> /dev/null || true
+assert_absent "G3-34: FIFO unlinked" "$RESTORE_RETRY_EPOCH_FILE"
+assert_eq "G3-34: absent epoch reads INVALID" "INVALID" "$(_read_retry_epoch)"
+
+# G3-35. An unavailable evidence clock must be reported as such; printing
+# "aged 0ms > TTL" for a missing/backward clock would mislead the journal.
+g3_setup
+printf '30\n' > "$PCT_FILE"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+_orig_monotonic_ms_g335="$(declare -f _monotonic_ms)"
+_monotonic_ms() { return 1; }
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+eval "$_orig_monotonic_ms_g335"
+assert_file "G3-35: unavailable clock caused no write" "$RAW_FILE" "10"
+assert_eq "G3-35: no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "G3-35: unavailable clock logged" "$DAEMON_ERR" 'evidence clock unavailable'
+if grep -q 'evidence aged' "$DAEMON_ERR"; then
+    bad "G3-35: misleading 'evidence aged' log for an unavailable clock"
+else
+    ok "G3-35: no misleading 'evidence aged' log"
+fi
+
+# G3-36. A VERIFIED rotate retires the persistent fail-closed marker left by an
+# earlier cycle: otherwise workers forked before that failure stay fail-closed
+# forever, and no later cycle can arm a retry or a guard.
+g3_setup
+printf '9\n' > "$RESTORE_RETRY_EPOCH_FILE"
+: > "$UNHEALTHY_MARKER"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+g3_bump_rc
+assert_eq "G3-36: bump succeeds with a stale marker" "0" "$G3_RC"
+assert_absent "G3-36: verified rotate cleared the marker" "$UNHEALTHY_MARKER"
+assert_file "G3-36: epoch is a normal numeric value" "$RESTORE_RETRY_EPOCH_FILE" "10"
+assert_eq "G3-36: coordination flag stays healthy" "0" "$COORDINATION_UNHEALTHY"
+if grep -q 'fail closed' "$DAEMON_ERR"; then
+    bad "G3-36: unexpected fail-closed log"
+else
+    ok "G3-36: no fail-closed log"
+fi
+# A stale retry (old gen 5) must still be armable after the rotate, proving the
+# marker no longer blocks gates; it cancels without writing once released.
+arm_gated_retry "G3-36" 5
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_zero_writes "G3-36" 10 30 30
 
 # --- Phase C: per-cycle handoff identity (finding #2) ----------------------
 
