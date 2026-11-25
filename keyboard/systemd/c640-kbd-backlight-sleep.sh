@@ -30,13 +30,21 @@
 #   $XDG_RUNTIME_DIR/c640-kbd-backlight.suspend : one decimal integer, 0 valid.
 #   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<epoch> <action>", e.g.
 #                                                   "1763800000 suspend".
-# Both files are 0600, owned by the resolved session user when placed under
-# /run/user/<uid>, and atomically published in the destination directory
-# (mktemp + printf + chmod + chown + `mv -T -f --`) so the daemon can never
-# observe a half-written value.  `-T` gives GNU rename semantics: the final
-# path component is never followed as a symlink nor treated as a directory
-# container.  There is deliberately NO cp fallback and NO /tmp mktemp
-# fallback: a failed publish fails closed instead of escaping the boundary.
+# Both files are 0600, owned by the resolved session user (uid AND gid) when
+# placed under /run/user/<uid>.  Publication is performed by one inline
+# python3 helper using a pinned directory fd: O_DIRECTORY|O_NOFOLLOW on the
+# directory, O_CREAT|O_EXCL|O_NOFOLLOW for a same-directory temp, fchmod(0600),
+# fchown(uid,gid), fstat verification, directory-identity recheck, then
+# rename(src,dst,src_dir_fd=,dst_dir_fd=) - the fd-pinned equivalent of
+# `mv -T -f --` (the final path component is never followed as a symlink nor
+# treated as a directory container).  The helper re-verifies inode/owner/mode
+# after the rename and prints `OK dev:ino` on stdout; that record is the
+# published identity consumed by later phases.  There is deliberately NO cp
+# fallback and NO /tmp mktemp fallback: a failed publish fails closed instead
+# of escaping the boundary, and cleanup only unlinks a temp that still has the
+# original inode.  python3 is therefore a runtime dependency of pre/post; if
+# it is unavailable, or any publish step fails, the hook warns and does not
+# publish (hook process still exits 0 so resume is never blocked).
 # The daemon-side paths are $XDG_RUNTIME_DIR/c640-kbd-backlight.{suspend,resume}.
 # Both files are written with a trailing "\n"; the daemon must trim it when
 # reading the value (e.g. `read` or command substitution already strips it).
@@ -96,6 +104,7 @@ STATE_FILE="$STATE_DIR/state"
 HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-}"
 RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 HANDOFF_OWNER=""
+HANDOFF_GID=""
 CYCLE_UID_FILE="$STATE_DIR/session-uid"
 SUSPEND_HANDOFF="c640-kbd-backlight.suspend"
 RESUME_HANDOFF="c640-kbd-backlight.resume"
@@ -371,12 +380,14 @@ resolve_handoff_dir() {
     _phase="${1:-pre}"
     if [ -n "$HANDOFF_DIR" ]; then
         HANDOFF_OWNER=""
+        HANDOFF_GID=""
         return 0
     fi
     if [ "$_phase" = post ]; then
         if ! _uid="$(_read_cycle_uid)"; then
             HANDOFF_DIR=""
             HANDOFF_OWNER=""
+            HANDOFF_GID=""
             return 0
         fi
         _now="$(_session_uid 1)"
@@ -392,6 +403,7 @@ resolve_handoff_dir() {
             log_warn "suspend handoff skipped (fail-closed): no unambiguous local graphical session"
             HANDOFF_DIR=""
             HANDOFF_OWNER=""
+            HANDOFF_GID=""
             return 0
         fi
         _dir="$RUN_USER_ROOT/$_uid"
@@ -399,107 +411,317 @@ resolve_handoff_dir() {
             log_warn "suspend handoff skipped (fail-closed): runtime dir $_dir missing/insecure for uid $_uid"
             HANDOFF_DIR=""
             HANDOFF_OWNER=""
+            HANDOFF_GID=""
             return 0
         fi
         if ! _write_cycle_uid "$_uid"; then
             log_warn "suspend handoff skipped (fail-closed): cannot pin cycle uid $_uid"
             HANDOFF_DIR=""
             HANDOFF_OWNER=""
+            HANDOFF_GID=""
             return 0
         fi
     fi
+    # gid is now part of the publish contract: the fd helper fchowns the
+    # handoff to the resolved uid:gid and verifies it via fstat.  An
+    # unresolvable gid must fail closed here, before any temp is created.
+    _gid="$(id -g "$_uid" 2> /dev/null || echo '')"
+    case "$_gid" in
+        '' | *[!0-9]*)
+            log_warn "$_phase handoff skipped (fail-closed): cannot resolve gid for uid $_uid"
+            HANDOFF_DIR=""
+            HANDOFF_OWNER=""
+            HANDOFF_GID=""
+            return 0
+            ;;
+    esac
     HANDOFF_DIR="$RUN_USER_ROOT/$_uid"
     HANDOFF_OWNER="$_uid"
+    HANDOFF_GID="$_gid"
     log_info "$_phase handoff dir $HANDOFF_DIR for uid $_uid"
 }
 
-# Identity of a directory as (device:inode, mode, owner).  An empty result
-# means "not stat-able" and always fails closed.
-_dir_identity() {
-    stat -c '%d:%i %a %u:%g' "$1" 2> /dev/null || echo ''
-}
-
-# A publish target may only be absent or a regular file.  A symlink (even a
-# symlink to a directory), a real directory, or any other non-regular entry is
-# user-controlled state that root must not repoint, follow or replace.
-_handoff_dest_safe() {
-    _dest="$1"
-    [ ! -L "$_dest" ] || return 1
-    [ ! -d "$_dest" ] || return 1
-    [ ! -e "$_dest" ] || [ -f "$_dest" ] || return 1
-    return 0
-}
-
-# Atomically publish one handoff file. All failures are best-effort: warn
-# only, never propagate, so suspend/resume never blocks on a handoff write.
-# The runtime dir must already exist with the right owner/mode; never create
-# a root-owned 0755 stand-in for a user's /run/user/<uid> (finding #5).
-#
-# Root write boundary (finding #5, P2):
-#   - snapshot the parent dir identity before creating the temp file and
-#     re-check it immediately before the rename (no directory inode swap);
-#   - guard the destination entry both before and after the content is ready;
-#   - mktemp in the SAME directory (no /tmp fallback), then one
-#     `mv -T -f --` rename: -T never follows a final symlink and never treats
-#     a directory as a container;
-#   - NO cp and NO plain-mv fallback.  A failed rename removes the temp file,
-#     warns and fails closed instead of dereferencing an attacker's symlink.
-_atomic_write() {
+# Atomically publish one handoff file through a PINNED directory fd (finding
+# #4, P2).  Every privileged step in the old _atomic_write re-resolved an
+# attacker-controlled pathname (printf/chmod/chown/mv after mktemp) and every
+# failure only warned with rc 0.  Here one inline python3 helper owns the
+# whole sequence:
+#   - open(dir, O_RDONLY|O_DIRECTORY|O_NOFOLLOW) + fstat: uid/mode 0700 check
+#     for the real /run/user/<uid>; an explicit test override is trusted;
+#   - lstat the destination through dir_fd: absent or regular only;
+#   - open(temp, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0600, dir_fd=dfd) then
+#     write/fchmod/fchown/fstat - no pathname is re-resolved for these ops;
+#   - re-check the pinned dir identity, the destination entry and the TEMP
+#     inode (a swapped temp is never renamed);
+#   - rename(src,dst,src_dir_fd=dfd,dst_dir_fd=dfd): the fd-based equivalent
+#     of `mv -T -f --` (never follows the final symlink, never treats a
+#     directory as a container), with no cp and no /tmp fallback;
+#   - re-stat the published entry via dir_fd and compare inode/owner/mode;
+#   - on success print `OK dev:ino` on stdout (the published identity that
+#     later phases consume); on any failure warn, return nonzero, and only
+#     unlink a temp that STILL has the original inode.
+# python3 is a new pre/post runtime dependency; a missing interpreter is
+# fail-closed too.  Callers must check the rc; main() downgrades the WARN so
+# the hook itself still exits 0 and never blocks resume.
+_publish_handoff() {
     _file="$1"
     _content="$2"
     _uid="${3:-}"
+    _gid="${4:-}"
     _dir="${_file%/*}"
+    _name="${_file##*/}"
 
-    [ -n "$_dir" ] || return 0
+    [ -n "$_dir" ] && [ -n "$_name" ] || return 1
     if ! _runtime_dir_ok "$_dir" "$_uid"; then
         log_warn "handoff skipped (fail-closed): $_dir missing/insecure for uid '${_uid:-<override>}'"
-        return 0
+        return 1
     fi
-    _dir_id="$(_dir_identity "$_dir")"
-    if [ -z "$_dir_id" ]; then
-        log_warn "handoff skipped (fail-closed): cannot stat $_dir"
-        return 0
+    if ! command -v python3 > /dev/null 2>&1; then
+        log_warn "handoff skipped (fail-closed): python3 unavailable; cannot publish $_file"
+        return 1
     fi
-    if ! _handoff_dest_safe "$_file"; then
-        log_warn "handoff skipped (fail-closed): unsafe destination entry $_file"
-        return 0
-    fi
-    _tmp="$(mktemp "$_dir/.c640-kbd-handoff.XXXXXX" 2> /dev/null || echo '')"
-    if [ -z "$_tmp" ]; then
-        log_warn "cannot create temporary handoff file for $_file"
-        return 0
-    fi
-    if ! printf '%s\n' "$_content" > "$_tmp" 2> /dev/null; then
-        rm -f "$_tmp" 2> /dev/null || true
-        log_warn "cannot write handoff content to $_file"
-        return 0
-    fi
-    chmod 600 "$_tmp" 2> /dev/null || true
     if [ -n "$_uid" ]; then
-        _gid="$(id -g "$_uid" 2> /dev/null || echo "")"
-        if [ -n "$_gid" ]; then
-            chown "$_uid:$_gid" "$_tmp" 2> /dev/null || log_warn "cannot chown $_uid:$_gid on $_file"
-        fi
+        case "$_gid" in
+            '' | *[!0-9]*)
+                log_warn "handoff skipped (fail-closed): no numeric gid for uid $_uid"
+                return 1
+                ;;
+        esac
     fi
-    # Re-check both boundaries after the content is ready: a user swapping
-    # the directory inode or the destination entry mid-write must not turn a
-    # legitimate publish into a write outside $_dir.
-    if ! _handoff_dest_safe "$_file"; then
-        rm -f "$_tmp" 2> /dev/null || true
-        log_warn "handoff skipped (fail-closed): destination entry changed during write: $_file"
-        return 0
+    if ! _out="$(python3 -c '
+import os, stat, sys
+
+dirpath, name, content, uid_s, gid_s = sys.argv[1:6]
+uid = int(uid_s) if uid_s else None
+gid = int(gid_s) if gid_s else None
+failpoint = os.environ.get("C640_KBD_PUBLISH_TEST_FAILPOINT", "")
+outside = os.environ.get("C640_KBD_PUBLISH_TEST_OUTSIDE", "/dev/null")
+# The old printf writer always terminated handoff content with a trailing
+# newline (the daemon strips it on read); keep that wire format opaque here.
+data = (content + "\n").encode("utf-8")
+dfd = tfd = None
+tname = tst = None
+published = False
+
+def identity(st):
+    return (st.st_dev, st.st_ino, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+def inode(st):
+    return (st.st_dev, st.st_ino)
+
+# Test-only stat wrapper: report a different owner (uid AND gid) while keeping
+# the real dev/ino/mode/size.  Used to simulate a root-created temp (uid/gid 0)
+# in an unprivileged test process, and to tamper with the post-publish owner
+# check.  Faking both fields is load-bearing: verification must read the final
+# fstat owner, not a faked pre-chown stat.
+def fake_owner(st, uid, gid):
+    class _St(object):
+        def __init__(self, src, fake_uid, fake_gid):
+            self._src = src
+            self._fake_uid = fake_uid
+            self._fake_gid = fake_gid
+
+        def __getattr__(self, name):
+            if name == "st_uid":
+                return self._fake_uid
+            if name == "st_gid":
+                return self._fake_gid
+            return getattr(self._src, name)
+
+    return _St(st, uid, gid)
+
+
+# The injection must sit at the syscall boundary, not on a line before it:
+# a mutation that deletes the fchmod/fchown call must become observable.
+marker_dir = os.environ.get("C640_KBD_PUBLISH_TEST_MARKER_DIR", "")
+
+
+def mark_syscall(name):
+    if not marker_dir:
+        return
+    try:
+        with open(os.path.join(marker_dir, name), "a") as handle:
+            handle.write("called\n")
+    except OSError:
+        pass
+
+
+real_fchmod = os.fchmod
+real_fchown = os.fchown
+
+
+def traced_fchmod(fd, mode):
+    if failpoint == "mode":
+        mark_syscall("fchmod")
+        raise RuntimeError("injected fchmod failure")
+    return real_fchmod(fd, mode)
+
+
+def traced_fchown(fd, uid, gid):
+    if failpoint == "ownership":
+        mark_syscall("fchown")
+        raise RuntimeError("injected fchown failure")
+    return real_fchown(fd, uid, gid)
+
+
+if failpoint == "mode":
+    os.fchmod = traced_fchmod
+elif failpoint == "ownership":
+    os.fchown = traced_fchown
+
+
+def unlink_if_ours(path, st):
+    if st is None or path is None:
+        return
+    try:
+        cur = os.stat(path, dir_fd=dfd, follow_symlinks=False)
+        if inode(cur) == inode(st):
+            os.unlink(path, dir_fd=dfd)
+    except OSError:
+        pass
+
+try:
+    dfd = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    dirst = os.fstat(dfd)
+    if not stat.S_ISDIR(dirst.st_mode):
+        raise RuntimeError("handoff path is not a directory")
+    if uid is not None and (
+        dirst.st_uid != uid or stat.S_IMODE(dirst.st_mode) != 0o700
+    ):
+        raise RuntimeError("handoff dir owner/mode mismatch")
+    try:
+        dent = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        dent = None
+    if dent is not None and not stat.S_ISREG(dent.st_mode):
+        raise RuntimeError("unsafe destination entry")
+    tname = ".c640-kbd-handoff.%d.%s" % (os.getpid(), os.urandom(6).hex())
+    tfd = os.open(
+        tname,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dfd,
+    )
+    written = 0
+    while written < len(data):
+        written += os.write(tfd, data[written:])
+    # tst is ONLY the original (dev, ino): inode-bound cleanup and the
+    # post-publish identity check must not trust its pre-fchown owner/mode.
+    tst = os.fstat(tfd)
+    if failpoint == "root-creator":
+        tst = fake_owner(tst, 0, 0)
+    os.fchmod(tfd, 0o600)
+    if uid is not None:
+        os.fchown(tfd, uid, gid)
+    # Verify the FINAL state after both privileged operations.  The old
+    # pre-chown stat made a real root-created temp fail "owner mismatch".
+    vst = os.fstat(tfd)
+    if not stat.S_ISREG(vst.st_mode):
+        raise RuntimeError("temp is not a regular file")
+    if stat.S_IMODE(vst.st_mode) != 0o600:
+        raise RuntimeError("temp mode is not 0600")
+    if vst.st_size != len(data):
+        raise RuntimeError("temp size mismatch")
+    if uid is not None and (vst.st_uid != uid or vst.st_gid != gid):
+        raise RuntimeError("temp owner mismatch")
+    if identity(os.fstat(dfd)) != identity(dirst):
+        raise RuntimeError("handoff dir identity changed")
+    try:
+        dent = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        dent = None
+    if dent is not None and not stat.S_ISREG(dent.st_mode):
+        raise RuntimeError("destination entry changed during write")
+    if failpoint == "dir-swap":
+        os.rename(dirpath, dirpath + ".swapped")
+        os.mkdir(dirpath, 0o700)
+    if failpoint == "temp-symlink":
+        os.unlink(tname, dir_fd=dfd)
+        os.symlink(outside, tname, dir_fd=dfd)
+    elif failpoint == "temp-regular":
+        os.unlink(tname, dir_fd=dfd)
+        ffd = os.open(
+            tname,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dfd,
+        )
+        os.write(ffd, b"FOREIGN")
+        os.close(ffd)
+    now = os.stat(tname, dir_fd=dfd, follow_symlinks=False)
+    if inode(now) != inode(tst):
+        raise RuntimeError("temp identity changed before rename")
+    if failpoint == "rename":
+        raise RuntimeError("injected rename failure")
+    os.rename(tname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    published = True
+    # Test-only: swap the published entry AFTER rename but BEFORE the
+    # post-publish verification, proving that verification is load-bearing.
+    if failpoint == "post-swap":
+        os.unlink(name, dir_fd=dfd)
+        sfd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dfd,
+        )
+        os.write(sfd, b"FOREIGN")
+        os.close(sfd)
+    pst = None
+    if failpoint == "post-mode":
+        # Same inode, wrong mode: only the post-publish verification can see it.
+        pfd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        os.fchmod(pfd, 0o644)
+        os.close(pfd)
+    elif failpoint == "post-owner":
+        # Same inode, wrong owner (unprivileged tests cannot really chown away).
+        pfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        pst = fake_owner(os.fstat(pfd), 0, 0)
+        os.close(pfd)
+    if pst is None:
+        pst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    if inode(pst) != inode(tst):
+        raise RuntimeError("published identity mismatch")
+    if (
+        not stat.S_ISREG(pst.st_mode)
+        or stat.S_IMODE(pst.st_mode) != 0o600
+        or pst.st_size != len(data)
+    ):
+        raise RuntimeError("published mode/size mismatch")
+    if uid is not None and (pst.st_uid != uid or pst.st_gid != gid):
+        raise RuntimeError("published owner mismatch")
+    try:
+        os.stat(tname, dir_fd=dfd, follow_symlinks=False)
+        raise RuntimeError("temp path survived rename")
+    except FileNotFoundError:
+        pass
+    if failpoint == "post-dir-mode":
+        os.fchmod(dfd, 0o755)
+    if identity(os.fstat(dfd)) != identity(dirst):
+        raise RuntimeError("handoff dir identity changed after rename")
+    sys.stdout.write("OK %d:%d\n" % inode(tst))
+except Exception as exc:
+    unlink_if_ours(tname, tst)
+    if published:
+        unlink_if_ours(name, tst)
+    sys.stderr.write("publish failed: %s\n" % exc)
+    sys.exit(1)
+finally:
+    if tfd is not None:
+        os.close(tfd)
+    if dfd is not None:
+        os.close(dfd)
+' "$_dir" "$_name" "$_content" "$_uid" "$_gid" 2>&1)"; then
+        log_warn "cannot publish $_file: $_out"
+        return 1
     fi
-    if [ "$(_dir_identity "$_dir")" != "$_dir_id" ]; then
-        rm -f "$_tmp" 2> /dev/null || true
-        log_warn "handoff skipped (fail-closed): $_dir changed during write"
-        return 0
+    _lines="$(printf '%s\n' "$_out" | wc -l)"
+    if [ "$_lines" -ne 1 ] \
+        || ! printf '%s\n' "$_out" | grep -Eq '^OK [0-9]+:[0-9]+$'; then
+        log_warn "cannot publish $_file: invalid publish record '$_out'"
+        return 1
     fi
-    if ! mv -T -f -- "$_tmp" "$_file" 2> /dev/null; then
-        rm -f "$_tmp" 2> /dev/null || true
-        log_warn "cannot publish $_file"
-        return 0
-    fi
-    rm -f "$_tmp" 2> /dev/null || true
+    printf '%s\n' "$_out"
     return 0
 }
 
@@ -516,7 +738,8 @@ publish_suspend_handoff() {
             return 0
             ;;
     esac
-    _atomic_write "$HANDOFF_DIR/$SUSPEND_HANDOFF" "$_curr" "$HANDOFF_OWNER"
+    _publish_handoff "$HANDOFF_DIR/$SUSPEND_HANDOFF" "$_curr" \
+        "$HANDOFF_OWNER" "$HANDOFF_GID"
 }
 
 # post: only drop the resume flag. No brightness read/write, no state change,
@@ -527,19 +750,23 @@ write_resume_handoff() {
     [ -n "$HANDOFF_DIR" ] || return 0
     _epoch="$(date +%s 2> /dev/null || echo 0)"
     case "$_epoch" in '' | *[!0-9]*) _epoch=0 ;; esac
-    _atomic_write "$HANDOFF_DIR/$RESUME_HANDOFF" "$_epoch $_action" "$HANDOFF_OWNER"
+    _publish_handoff "$HANDOFF_DIR/$RESUME_HANDOFF" "$_epoch $_action" \
+        "$HANDOFF_OWNER" "$HANDOFF_GID"
 }
 
 main() {
     case "${1:-}" in
         pre)
             save_state
-            publish_suspend_handoff
+            # A failed fd publish is still a WARN only: the hook must never
+            # turn a suspend into a failed systemd job (phase C builds the
+            # per-cycle invalid marker on top of this rc contract).
+            publish_suspend_handoff || log_warn "suspend handoff publish failed; root state retained"
             ;;
         post)
             # No sleep, no ScreenSaver probe, no sysfs/ectool write, no state
             # deletion. The thawed user daemon owns the restore (Phase 4b).
-            write_resume_handoff "${2:-}"
+            write_resume_handoff "${2:-}" || log_warn "resume handoff publish failed; no state change"
             ;;
     esac
 }

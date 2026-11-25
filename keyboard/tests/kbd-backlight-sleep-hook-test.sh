@@ -33,10 +33,19 @@ MKTEMP_LOG="$TMP_DIR/mktemp.log"
 MV_LOG="$TMP_DIR/mv.log"
 CP_LOG="$TMP_DIR/cp.log"
 STAT_COUNT="$TMP_DIR/stat-count"
+PUBLISH_OUT="$TMP_DIR/publish.out"
+HOOK_MARKER_DIR="$TMP_DIR/publish-markers"
 FALLBACK_DIR="$TMP_DIR/tmp-fallback"
 SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
-mkdir -p "$STUB_DIR" "$STATE_DIR" "$HANDOFF_DIR" "$RUN_USER_ROOT" "$FALLBACK_DIR"
+# The independent oracle runs with the runner's ORIGINAL PATH and the real
+# interpreter, never with the stub PATH used to drive the hook.  Capture both
+# before any stub is installed (the hook's own python3 is stubbed below).
+CLEAN_PATH="$PATH"
+REAL_PYTHON="$(command -v python3)"
+ORACLE_PY="$TMP_DIR/dir-oracle.py"
+mkdir -p "$STUB_DIR" "$STATE_DIR" "$HANDOFF_DIR" "$RUN_USER_ROOT" "$FALLBACK_DIR" \
+    "$HOOK_MARKER_DIR"
 
 passed=0
 failed=0
@@ -122,11 +131,74 @@ assert_no_handoff_temp() {
         ok "$label"
     fi
 }
-# The destination guard must reject the entry before any handoff rename.
-assert_no_handoff_mv() {
-    local label="$1" calls
-    calls="$(grep -F '.c640-kbd-handoff.' "$MV_LOG" 2> /dev/null || echo '')"
-    assert_eq "$label" "" "$calls"
+# The fd publisher never calls `mv`; success is recorded as `OK dev:ino` on
+# stdout.  A guard rejection must leave no publish record at all (an empty
+# MV_LOG would be a vacuous pass with the new implementation).
+assert_no_handoff_publish() {
+    local label="$1" out
+    out="$(cat "$PUBLISH_OUT" 2> /dev/null || echo '')"
+    assert_eq "$label" "" "$out"
+}
+assert_text_matches() {
+    local label="$1" text="$2" pattern="$3"
+    if printf '%s\n' "$text" | grep -Eq -- "$pattern"; then
+        ok "$label"
+    else
+        bad "$label (no match for '$pattern' in: $text)"
+    fi
+}
+# dev:ino of the last recorded successful publish; Phase C consumes the same
+# `OK dev:ino` record as PUBLISHED_IDENTITY.
+published_identity() {
+    sed -n 's/^OK \([0-9][0-9]*:[0-9][0-9]*\)$/\1/p' "$PUBLISH_OUT" \
+        2> /dev/null | tail -n1
+}
+assert_publish_identity() {
+    local label="$1" file="$2" expected actual
+    expected="$(stat -c '%d:%i' "$file" 2> /dev/null || echo '<missing>')"
+    actual="$(published_identity)"
+    assert_eq "$label" "$expected" "$actual"
+}
+# Independent oracle: a separate python3 program under the CLEAN_PATH reads
+# every directory entry with lstat (name/dev/ino/mode/uid/gid) and hashes
+# regular-file bytes.  It does not source the hook, use its stubs, or trust
+# any hook log, so "zero mutation" comparisons cannot pass on empty logs.
+cat > "$ORACLE_PY" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+rows = []
+for name in sorted(os.listdir(root)):
+    path = os.path.join(root, name)
+    st = os.lstat(path)
+    digest = ""
+    if stat.S_ISREG(st.st_mode):
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    rows.append("|".join((
+        name,
+        str(st.st_dev),
+        str(st.st_ino),
+        oct(stat.S_IMODE(st.st_mode)),
+        str(st.st_uid),
+        str(st.st_gid),
+        digest,
+    )))
+sys.stdout.write("\n".join(rows))
+if rows:
+    sys.stdout.write("\n")
+PY
+snapshot_dir() {
+    env -i PATH="$CLEAN_PATH" "$REAL_PYTHON" "$ORACLE_PY" "$1" 2> /dev/null \
+        || echo '<unreadable>'
+}
+assert_snapshot_same() {
+    local label="$1" dir="$2" expected="$3" actual
+    actual="$(snapshot_dir "$dir")"
+    assert_eq "$label" "$expected" "$actual"
 }
 
 # --- stubs -----------------------------------------------------------------
@@ -305,11 +377,10 @@ if [ "${1:-}" = "pwmgetkblight" ]; then
 fi
 exit 0
 STUB
-# The hook calls `chmod 600` / `chown <uid>:<gid>` by bare command name in
-# _atomic_write. These stubs log the arguments, then exec the real binaries so
-# the mode/owner assertions still see the real effect.  They only record what
-# this sandboxed unit test observes: a real system-sleep hook runs as root and
-# chowns the handoff to the session user resolved by loginctl.
+# Legacy chmod/chown stubs are kept to prove the fd publisher does NOT go
+# back to pathname-based chmod/chown: those calls are now fchmod/fchown inside
+# the pinned python helper.  They exec the real binaries so any other caller
+# (save_state / the cycle-uid pin) still behaves normally.
 cat > "$STUB_DIR/chmod" << 'STUB'
 #!/bin/sh
 printf 'chmod %s\n' "$*" >> "$STUB_CHMOD_LOG"
@@ -320,18 +391,19 @@ cat > "$STUB_DIR/chown" << 'STUB'
 printf 'chown %s\n' "$*" >> "$STUB_CHOWN_LOG"
 exec /bin/chown "$@"
 STUB
-# Record every mktemp template so the no-/tmp-fallback case can prove that a
-# missing runtime dir never triggers _atomic_write's /tmp stand-in.
+# Legacy mktemp stub: the fd publisher never calls mktemp, but save_state and
+# the cycle-uid pin still use same-directory mktemp.  Kept so those root-only
+# paths remain observable; the no-/tmp-fallback case now uses the independent
+# directory oracle instead of this log.
 cat > "$STUB_DIR/mktemp" << 'STUB'
 #!/bin/sh
 printf 'mktemp %s\n' "$*" >> "$STUB_MKTEMP_LOG"
 exec /usr/bin/mktemp "$@"
 STUB
-# Publishing must use `mv -T -f --`: -T gives GNU rename semantics (replace
-# the final path component; never follow a symlink, never treat a directory as
-# a container).  Log every call so the -T flag itself is falsifiable.  When
-# STUB_MV_FAIL=1, only the handoff rename fails - save_state and the cycle uid
-# keep working, so a test can observe a pure handoff-publish failure.
+# Legacy mv stub: save_state and the cycle-uid pin still use `mv -T -f --`.
+# The handoff publisher now uses rename(dir_fd -> dir_fd) in python, so the
+# handoff rename-failure sensitivity cases use the failpoint env instead of
+# STUB_MV_FAIL (an empty MV_LOG would be a vacuous pass).
 cat > "$STUB_DIR/mv" << 'STUB'
 #!/bin/sh
 printf 'mv %s\n' "$*" >> "${STUB_MV_LOG:-/dev/null}"
@@ -356,6 +428,33 @@ cat > "$STUB_DIR/cp" << 'STUB'
 #!/bin/sh
 printf 'cp %s\n' "$*" >> "${STUB_CP_LOG:-/dev/null}"
 exec /bin/cp "$@"
+STUB
+# python3 is a new pre/post runtime dependency.  STUB_PYTHON_FAIL=1 models an
+# interpreter that cannot be executed; the hook must warn, return nonzero
+# from _publish_handoff and leave the handoff directory untouched.  Otherwise
+# pass through to the real interpreter captured before the stub PATH existed.
+cat > "$STUB_DIR/python3" << STUB
+#!/bin/sh
+if [ "\${STUB_PYTHON_FAIL:-0}" = "1" ]; then
+    printf 'python3 unavailable\n' >&2
+    exit 127
+fi
+exec "$REAL_PYTHON" "\$@"
+STUB
+# `id -g` is a load-bearing part of the publish contract (fchown uid:gid).
+# STUB_ID_G_FAIL=1 makes ONLY -g fail; `id -nu` (session validation) still
+# works, so the gid failure is isolated and must fail closed before any temp.
+cat > "$STUB_DIR/id" << 'STUB'
+#!/bin/sh
+if [ "${STUB_ID_G_FAIL:-0}" = "1" ]; then
+    for _arg in "$@"; do
+        if [ "$_arg" = "-g" ]; then
+            printf 'id: cannot resolve gid\n' >&2
+            exit 1
+        fi
+    done
+fi
+exec /usr/bin/id "$@"
 STUB
 # Optional TOCTOU simulation for the -T sensitivity case.  On the Nth full
 # directory-identity stat (2 = the re-check just before the rename), replace
@@ -384,7 +483,8 @@ exec /bin/stat "$@"
 STUB
 chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/loginctl" \
     "$STUB_DIR/chmod" "$STUB_DIR/chown" "$STUB_DIR/mktemp" \
-    "$STUB_DIR/mv" "$STUB_DIR/cp" "$STUB_DIR/stat"
+    "$STUB_DIR/mv" "$STUB_DIR/cp" "$STUB_DIR/stat" \
+    "$STUB_DIR/python3" "$STUB_DIR/id"
 
 # 0. Fixture schema self-check: the stub itself must emit the REAL loginctl
 #    session schema (User=<numeric uid>, never UID=).  Without this guard a
@@ -414,6 +514,10 @@ STUB_MV_FAIL=0
 STUB_RACE_AT=0
 STUB_RACE_LINK=""
 STUB_RACE_TARGET=""
+STUB_PYTHON_FAIL=0
+STUB_ID_G_FAIL=0
+HOOK_FAILPOINT=""
+HOOK_OUTSIDE="$TMP_DIR/boundary-victim"
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
 STUB_LOGINCTL_MODE=none
@@ -430,6 +534,8 @@ reset_case() {
     : > "$MKTEMP_LOG"
     : > "$MV_LOG"
     : > "$CP_LOG"
+    : > "$PUBLISH_OUT"
+    rm -f "$HOOK_MARKER_DIR/fchmod" "$HOOK_MARKER_DIR/fchown"
     printf '0' > "$STAT_COUNT"
     rm -f "$STATE_DIR/state" "$STATE_DIR"/.state.* "$STATE_DIR/session-uid" \
         "$STATE_DIR"/.session-uid.* "$FAKE_SYSFS" "$FAKE_MAX"
@@ -438,7 +544,14 @@ reset_case() {
     rm -f "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
     rm -rf "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
     rm -f "$HANDOFF_DIR"/.c640-kbd-handoff.* 2> /dev/null || true
-    rm -rf "$TMP_DIR/boundary-target" "$TMP_DIR/boundary-victim"
+    # 9ag chmods the pinned dir to 0755; restore 0700 so later cases start
+    # from the same clean state (even though the override path skips the check).
+    if [ -d "$HANDOFF_DIR" ]; then
+        chmod 700 "$HANDOFF_DIR"
+    fi
+    rm -rf "$TMP_DIR/boundary-target" "$TMP_DIR/boundary-victim" "$TMP_DIR/boundary-outside"
+    # The dir-swap failpoint moves the pinned dir aside; remove that too.
+    rm -rf "$HANDOFF_DIR.swapped"
     rm -rf "$RUN_USER_ROOT"
     mkdir -p "$RUN_USER_ROOT/$(id -u)"
     chmod 700 "$RUN_USER_ROOT/$(id -u)"
@@ -456,6 +569,10 @@ reset_case() {
     STUB_RACE_AT=0
     STUB_RACE_LINK=""
     STUB_RACE_TARGET=""
+    STUB_PYTHON_FAIL=0
+    STUB_ID_G_FAIL=0
+    HOOK_FAILPOINT=""
+    HOOK_OUTSIDE="$TMP_DIR/boundary-victim"
 }
 
 run_hook() {
@@ -475,6 +592,11 @@ run_hook() {
         "STUB_RACE_AT=$STUB_RACE_AT"
         "STUB_RACE_LINK=$STUB_RACE_LINK"
         "STUB_RACE_TARGET=$STUB_RACE_TARGET"
+        "STUB_PYTHON_FAIL=$STUB_PYTHON_FAIL"
+        "STUB_ID_G_FAIL=$STUB_ID_G_FAIL"
+        "C640_KBD_PUBLISH_TEST_FAILPOINT=$HOOK_FAILPOINT"
+        "C640_KBD_PUBLISH_TEST_OUTSIDE=$HOOK_OUTSIDE"
+        "C640_KBD_PUBLISH_TEST_MARKER_DIR=$HOOK_MARKER_DIR"
         "STUB_LOGINCTL_MODE=$STUB_LOGINCTL_MODE"
         "STUB_UID_FIELD=$STUB_UID_FIELD"
         "STUB_GNOME_ACTIVE=$STUB_GNOME_ACTIVE"
@@ -496,7 +618,7 @@ run_hook() {
     # The old D-Bus knobs are removed so resolution is deterministic.
     env -u SUDO_USER -u C640_KBD_SLEEP_USER -u C640_KBD_SLEEP_UID \
         -u C640_KBD_SLEEP_BUS -u C640_KBD_SLEEP_DELAY \
-        "${env_args[@]}" "$HOOK" "$@" 2>> "$HOOK_ERR"
+        "${env_args[@]}" "$HOOK" "$@" >> "$PUBLISH_OUT" 2>> "$HOOK_ERR"
 }
 
 # Source the hook read-only and call its session resolver directly, so the
@@ -530,8 +652,9 @@ assert_mode "root state file is 0600" "600" "$STATE_DIR/state"
 assert_file "pre saves root state" "$STATE_DIR/state" "7"
 assert_file "pre publishes suspend handoff" "$SUSPEND_FILE" "7"
 assert_mode "suspend handoff is 0600" "600" "$SUSPEND_FILE"
-# The publish itself must be a GNU `mv -T -f --` rename, never cp.
-assert_log_matches "publish uses mv -T -f --" "$MV_LOG" '^mv -T -f -- .*\.c640-kbd-handoff\.'
+# The publish is now an fd-pinned rename; its success record is `OK dev:ino`.
+assert_log_matches "publish records OK dev:ino" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
+assert_publish_identity "publish identity matches published inode" "$SUSPEND_FILE"
 assert_empty_log "publish has no cp fallback" "$CP_LOG"
 printf '0\n' > "$FAKE_SYSFS"
 run_hook post suspend
@@ -639,12 +762,12 @@ assert_mode "loginctl: suspend handoff 0600" "600" "$_user_dir/c640-kbd-backligh
 assert_owner "loginctl: suspend handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.suspend"
 assert_file "loginctl: pre pins the chosen uid root-only" "$STATE_DIR/session-uid" "$(id -u)"
 assert_mode "loginctl: cycle uid file is 0600" "600" "$STATE_DIR/session-uid"
-# The stat checks above alone are a false pass (mktemp already yields 0600
-# owned by us): assert the hook actually invoked chmod/chown on the handoff
-# temp file. The ".c640-kbd-handoff." filter excludes save_state's own chmod
-# calls, so removing _atomic_write's chmod 600 / chown is detectable.
-assert_log_matches "loginctl: suspend chmod 600 on handoff recorded" "$CHMOD_LOG" '^chmod 600 .*\.c640-kbd-handoff\.'
-assert_log_matches "loginctl: suspend chown uid:gid recorded" "$CHOWN_LOG" "^chown $(id -u):$(id -g) .*\.c640-kbd-handoff\."
+# fchmod/fchown now happen inside the pinned python helper, so the old
+# pathname-based chmod/chown log assertions would be vacuous.  The positive
+# evidence is the `OK dev:ino` record plus the real stat mode/owner above;
+# failpoints 9u/9y make the fchown/fchmod steps independently falsifiable.
+assert_log_matches "loginctl: suspend publish identity recorded" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
+assert_publish_identity "loginctl: suspend identity matches inode" "$_user_dir/c640-kbd-backlight.suspend"
 assert_log_matches "loginctl: selected session/seat logged" "$HOOK_ERR" "selected session 3 on seat seat0 for uid $(id -u)"
 assert_log_matches "loginctl: handoff path logged" "$HOOK_ERR" "pre handoff dir $_user_dir for uid $(id -u)"
 assert_log_matches "loginctl: show-session consulted" "$LOGINCTL_LOG" '^loginctl show-session 3$'
@@ -657,8 +780,8 @@ assert_file "loginctl: post leaves sysfs alone" "$FAKE_SYSFS" "0"
 assert_file "loginctl: state retained" "$STATE_DIR/state" "7"
 assert_mode "loginctl: resume handoff 0600" "600" "$_user_dir/c640-kbd-backlight.resume"
 assert_owner "loginctl: resume handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.resume"
-assert_log_matches "loginctl: resume chmod 600 on handoff recorded" "$CHMOD_LOG" '^chmod 600 .*\.c640-kbd-handoff\.'
-assert_log_matches "loginctl: resume chown uid:gid recorded" "$CHOWN_LOG" "^chown $(id -u):$(id -g) .*\.c640-kbd-handoff\."
+assert_log_matches "loginctl: resume publish identity recorded" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
+assert_publish_identity "loginctl: resume identity matches inode" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "loginctl: post handoff path logged" "$HOOK_ERR" "post handoff dir $_user_dir for uid $(id -u)"
 if grep -q 'list-sessions --no-legend' "$LOGINCTL_LOG"; then
     ok "loginctl list-sessions --no-legend consulted"
@@ -953,19 +1076,18 @@ else
 fi
 
 # 9l. A vanished handoff dir must not be replaced by a /tmp stand-in: the
-#     [ -d ] guard in _runtime_dir_ok / _atomic_write must reject it before
-#     mktemp can fall back to $TMPDIR.
+#     [ -d ] guard in _runtime_dir_ok / _publish_handoff rejects it before
+#     any fd is opened.  The fd publisher never calls mktemp, so the oracle
+#     inspects the fallback dir entry set directly (no vacuous log check).
 reset_case
 HOOK_HANDOFF_DIR="$TMP_DIR/vanished-handoff"
 HOOK_TMPDIR="$FALLBACK_DIR"
+_fallback_before="$(snapshot_dir "$FALLBACK_DIR")"
 run_hook pre suspend
 assert_absent "tmp fallback: no handoff at the vanished target" "$TMP_DIR/vanished-handoff/c640-kbd-backlight.suspend"
 assert_absent "tmp fallback: nothing written into TMPDIR" "$FALLBACK_DIR/c640-kbd-backlight.suspend"
-if grep -Fq "$FALLBACK_DIR/.c640-kbd-handoff" "$MKTEMP_LOG"; then
-    bad "tmp fallback: _atomic_write used a /tmp stand-in mktemp"
-else
-    ok "tmp fallback: _atomic_write never used a /tmp stand-in mktemp"
-fi
+assert_snapshot_same "tmp fallback: fallback entry set unchanged" "$FALLBACK_DIR" "$_fallback_before"
+assert_no_handoff_publish "tmp fallback: no publish record"
 assert_log_matches "tmp fallback: fail-closed WARN" "$HOOK_ERR" 'handoff skipped \(fail-closed\)'
 
 # 9m. Sensitivity for the finding #1 schema bug: flip ONLY the uid key from
@@ -1040,29 +1162,25 @@ assert_absent "ambiguous ids: no cycle uid pinned" "$STATE_DIR/session-uid"
 assert_file "ambiguous ids: root state still saved" "$STATE_DIR/state" "7"
 
 # 9q. ROOT WRITE BOUNDARY - destination is a symlink to an OUTSIDE directory.
-# Plain `mv -f` follows the final symlink and drops the temp into that dir
-# (rc 0, handoff missing under the expected name); `mv -T` would replace the
-# symlink.  Either way root would have written outside its boundary, so the
-# entry guard must reject it before any rename.
+# The fd publisher rejects it via lstat(dir_fd) before creating any temp.
+# The independent oracle compares the outside directory's full entry set
+# (name/dev/ino/mode/uid/gid/sha256), so an empty log alone cannot pass.
 reset_case
 _target="$TMP_DIR/boundary-target"
 mkdir -p "$_target"
 printf 'SENTINEL\n' > "$_target/sentinel"
 ln -s "$_target" "$SUSPEND_FILE"
+_target_before="$(snapshot_dir "$_target")"
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook pre suspend
 if [ -L "$SUSPEND_FILE" ]; then
     ok "symlink-to-dir: destination symlink left intact"
 else
     bad "symlink-to-dir: destination symlink was replaced/followed"
 fi
-assert_eq "symlink-to-dir: outside dir still has only its sentinel" "1" \
-    "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
-assert_file "symlink-to-dir: sentinel untouched" "$_target/sentinel" "SENTINEL"
-assert_absent "symlink-to-dir: no handoff under the expected name in outside dir" \
-    "$_target/c640-kbd-backlight.suspend"
-assert_no_handoff_temp "symlink-to-dir: no temp in outside dir" "$_target"
-assert_no_handoff_temp "symlink-to-dir: no temp left in handoff dir"
-assert_no_handoff_mv "symlink-to-dir: guard rejected before rename"
+assert_snapshot_same "symlink-to-dir: outside dir inode/content unchanged" "$_target" "$_target_before"
+assert_snapshot_same "symlink-to-dir: handoff dir unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_no_handoff_publish "symlink-to-dir: guard rejected before publish"
 assert_empty_log "symlink-to-dir: cp never called" "$CP_LOG"
 assert_log_matches "symlink-to-dir: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
 assert_file "symlink-to-dir: root state still saved" "$STATE_DIR/state" "7"
@@ -1072,100 +1190,322 @@ reset_case
 _target="$TMP_DIR/boundary-target"
 mkdir -p "$_target"
 ln -s "$_target" "$RESUME_FILE"
+_target_before="$(snapshot_dir "$_target")"
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook post suspend
 if [ -L "$RESUME_FILE" ]; then
     ok "symlink-to-dir: resume destination symlink left intact"
 else
     bad "symlink-to-dir: resume destination symlink was replaced/followed"
 fi
-assert_eq "symlink-to-dir: post wrote nothing into outside dir" "0" \
-    "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
-assert_no_handoff_temp "symlink-to-dir: no post temp in outside dir" "$_target"
-assert_no_handoff_mv "symlink-to-dir: post guard rejected before rename"
+assert_snapshot_same "symlink-to-dir: post wrote nothing into outside dir" "$_target" "$_target_before"
+assert_snapshot_same "symlink-to-dir: post handoff dir unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_no_handoff_publish "symlink-to-dir: post guard rejected before publish"
 assert_empty_log "symlink-to-dir: post never called cp" "$CP_LOG"
 assert_log_matches "symlink-to-dir: post fail-closed WARN" "$HOOK_ERR" 'unsafe destination entry'
 
-# Same destination, but swapped into a symlink AFTER the guard (TOCTOU): the
-# stub fires on the second directory-identity stat, i.e. immediately before
-# the rename.  `mv -T` replaces the symlink and publishes under the expected
-# name; plain `mv -f` would follow it and write into the outside directory.
+# Same destination, but swapped AFTER the fd was opened (the old TOCTOU
+# sensitivity case).  The `dir-swap` failpoint renames the whole handoff dir
+# aside and creates a fresh dir at the old pathname.  Because the publisher
+# holds the pinned fd, the file lands in the ORIGINAL dir and the replacement
+# dir stays empty: this is the fd-based equivalent of `mv -T` protection.
 reset_case
-_target="$TMP_DIR/boundary-target"
-mkdir -p "$_target"
-printf 'SENTINEL\n' > "$_target/sentinel"
-STUB_RACE_AT=2
-STUB_RACE_LINK="$SUSPEND_FILE"
-STUB_RACE_TARGET="$_target"
+HOOK_FAILPOINT='dir-swap'
+_replacement_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook pre suspend
-if [ -L "$SUSPEND_FILE" ]; then
-    bad "TOCTOU: final path still follows the outside symlink"
+if [ -f "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}" ]; then
+    ok "dir-swap: handoff published into the pinned directory"
 else
-    ok "TOCTOU: mv -T replaced the swapped symlink in place"
+    bad "dir-swap: handoff was diverted by the pathname swap"
 fi
-assert_file "TOCTOU: handoff published under the expected name" "$SUSPEND_FILE" "7"
-assert_eq "TOCTOU: outside dir unchanged" "1" "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
-assert_file "TOCTOU: sentinel untouched" "$_target/sentinel" "SENTINEL"
-assert_no_handoff_temp "TOCTOU: no temp in outside dir" "$_target"
-assert_empty_log "TOCTOU: cp never called" "$CP_LOG"
+assert_snapshot_same "dir-swap: new dir at original path stays empty" \
+    "$HANDOFF_DIR" "$_replacement_before"
+assert_file "dir-swap: pinned-dir handoff content" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}" "7"
+assert_publish_identity "dir-swap: identity matches pinned inode" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}"
+assert_no_handoff_temp "dir-swap: no temp in pinned dir" "$HANDOFF_DIR.swapped"
+assert_no_handoff_temp "dir-swap: no temp in replacement dir" "$HANDOFF_DIR"
+assert_empty_log "dir-swap: cp never called" "$CP_LOG"
 
 # 9r. ROOT WRITE BOUNDARY - destination is a regular symlink to an external
 # file.  The old cp fallback dereferenced it and overwrote the victim; the
-# guard must reject the symlink before rename, and cp must never be called
-# even if a rename later fails.
+# dir_fd lstat guard must reject the symlink before any temp is created.
 reset_case
-_victim="$TMP_DIR/boundary-victim"
-printf 'ORIGINAL\n' > "$_victim"
-ln -s "$_victim" "$SUSPEND_FILE"
+_outside="$TMP_DIR/boundary-outside"
+mkdir -p "$_outside"
+printf 'ORIGINAL\n' > "$_outside/victim"
+ln -s "$_outside/victim" "$SUSPEND_FILE"
+_outside_before="$(snapshot_dir "$_outside")"
 run_hook pre suspend
-assert_file "symlink-to-file: external victim not overwritten" "$_victim" "ORIGINAL"
+assert_file "symlink-to-file: external victim not overwritten" "$_outside/victim" "ORIGINAL"
+assert_snapshot_same "symlink-to-file: outside dir inode/content unchanged" "$_outside" "$_outside_before"
 if [ -L "$SUSPEND_FILE" ]; then
     ok "symlink-to-file: destination symlink left intact"
 else
     bad "symlink-to-file: destination symlink was replaced/followed"
 fi
-assert_no_handoff_mv "symlink-to-file: guard rejected before rename"
+assert_no_handoff_publish "symlink-to-file: guard rejected before publish"
 assert_empty_log "symlink-to-file: cp never called" "$CP_LOG"
 assert_log_matches "symlink-to-file: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
 assert_no_handoff_temp "symlink-to-file: no temp left in handoff dir"
 
+# Rename failure after a valid temp: no handoff, no cp fallback, and the
+# handoff dir entry set is byte/inode-identical to the pre-run snapshot.
 rm -f "$SUSPEND_FILE"
-STUB_MV_FAIL=1
+HOOK_FAILPOINT=rename
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook pre suspend
 assert_absent "symlink-to-file: failed rename publishes no handoff" "$SUSPEND_FILE"
+assert_snapshot_same "symlink-to-file: rename fail left dir identical" "$HANDOFF_DIR" "$_handoff_before"
+assert_no_handoff_publish "symlink-to-file: no publish record after rename failure"
 assert_empty_log "symlink-to-file: no cp fallback after rename failure" "$CP_LOG"
 assert_no_handoff_temp "symlink-to-file: no temp after rename failure"
+assert_log_matches "symlink-to-file: rename fail reason recorded" "$HOOK_ERR" 'injected rename failure'
 
-# 9s. ROOT WRITE BOUNDARY - destination is a real directory.  mv -T would
-# fail-closed here, but the guard must reject it explicitly before renaming
-# (and must not leave a temp behind).
+# 9s. ROOT WRITE BOUNDARY - destination is a real directory.  The dir_fd
+# guard must reject it explicitly before creating a temp.
 reset_case
 mkdir -p "$SUSPEND_FILE"
 printf 'SENTINEL\n' > "$SUSPEND_FILE/keep"
+_dest_before="$(snapshot_dir "$SUSPEND_FILE")"
 run_hook pre suspend
 if [ -d "$SUSPEND_FILE" ] && [ ! -L "$SUSPEND_FILE" ]; then
     ok "real-dir: destination directory left intact"
 else
     bad "real-dir: destination directory was replaced"
 fi
-assert_eq "real-dir: directory contents unchanged" "1" \
-    "$(find "$SUSPEND_FILE" -mindepth 1 -maxdepth 1 | wc -l)"
-assert_file "real-dir: sentinel untouched" "$SUSPEND_FILE/keep" "SENTINEL"
-assert_no_handoff_mv "real-dir: guard rejected before rename"
+assert_snapshot_same "real-dir: destination dir inode/content unchanged" "$SUSPEND_FILE" "$_dest_before"
+assert_no_handoff_publish "real-dir: guard rejected before publish"
 assert_no_handoff_temp "real-dir: no temp left in handoff dir"
 assert_empty_log "real-dir: cp never called" "$CP_LOG"
 assert_log_matches "real-dir: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
 
-# 9t. ROOT WRITE BOUNDARY - rename fails (STUB_MV_FAIL=1).  Fail closed with
-# no handoff, no cp fallback, a WARN and no leftover temp file.
+# 9t. ROOT WRITE BOUNDARY - rename fails after a valid temp.  Fail closed
+# with no handoff, no publish record, no cp fallback, a WARN and zero
+# mutation of the handoff directory entry set.
 reset_case
-STUB_MV_FAIL=1
+HOOK_FAILPOINT=rename
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook pre suspend
-assert_absent "mv fail: no suspend handoff published" "$SUSPEND_FILE"
-assert_file "mv fail: root state still saved" "$STATE_DIR/state" "7"
-assert_log_matches "mv fail: rename was attempted" "$MV_LOG" '^mv -T -f -- .*\.c640-kbd-handoff\.'
-assert_log_matches "mv fail: WARN cannot publish" "$HOOK_ERR" 'cannot publish .*c640-kbd-backlight\.suspend'
-assert_empty_log "mv fail: no cp fallback" "$CP_LOG"
-assert_no_handoff_temp "mv fail: temp cleaned up"
+assert_absent "rename fail: no suspend handoff published" "$SUSPEND_FILE"
+assert_file "rename fail: root state still saved" "$STATE_DIR/state" "7"
+assert_snapshot_same "rename fail: handoff dir entry set unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_no_handoff_publish "rename fail: no OK record"
+assert_log_matches "rename fail: WARN cannot publish" "$HOOK_ERR" 'cannot publish .*c640-kbd-backlight\.suspend'
+assert_log_matches "rename fail: reason recorded" "$HOOK_ERR" 'injected rename failure'
+assert_empty_log "rename fail: no cp fallback" "$CP_LOG"
+assert_no_handoff_temp "rename fail: temp cleaned up"
+
+# 9u. FAILPOINT `ownership`: fchown in the pinned helper fails.  This must go
+# through uid/gid resolution: with an explicit HANDOFF_DIR override the helper
+# intentionally skips owner checks, so that path cannot falsify fchown at all.
+# The old code merely warned and kept publishing with the wrong owner; now
+# there must be no handoff and zero mutation of the runtime directory.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+HOOK_FAILPOINT=ownership
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+_dir_before="$(snapshot_dir "$_user_dir")"
+run_hook pre suspend
+assert_absent "ownership fail: no suspend handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_no_handoff_publish "ownership fail: no OK record"
+assert_snapshot_same "ownership fail: handoff dir unchanged" "$_user_dir" "$_dir_before"
+assert_log_matches "ownership fail: WARN names fchown failure" "$HOOK_ERR" 'injected fchown failure'
+assert_file "ownership fail: fchown syscall reached" "$HOOK_MARKER_DIR/fchown" "called"
+assert_no_handoff_temp "ownership fail: original temp cleaned up" "$_user_dir"
+assert_file "ownership fail: root state still saved" "$STATE_DIR/state" "7"
+
+# 9v. `id -g` fails while `id -nu` still succeeds: resolve_handoff_dir must
+# fail closed BEFORE any temp is created (gid is part of the publish contract).
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+STUB_ID_G_FAIL=1
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+_dir_before="$(snapshot_dir "$_user_dir")"
+run_hook pre suspend
+assert_absent "id-g fail: no suspend handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_no_handoff_publish "id-g fail: no OK record"
+assert_snapshot_same "id-g fail: runtime dir unchanged" "$_user_dir" "$_dir_before"
+assert_log_matches "id-g fail: WARN names gid failure" "$HOOK_ERR" 'cannot resolve gid'
+assert_file "id-g fail: root state still saved" "$STATE_DIR/state" "7"
+
+# 9w. FAILPOINT `temp-symlink`: the temp pathname is swapped for a symlink to
+# an outside victim after the fd is opened.  The helper must compare the
+# lstat inode with its own fstat inode and refuse the rename.  Cleanup must
+# NOT unlink the foreign inode, so the symlink survives untouched.
+reset_case
+_outside="$TMP_DIR/boundary-outside"
+mkdir -p "$_outside"
+printf 'ORIGINAL\n' > "$_outside/victim"
+HOOK_FAILPOINT='temp-symlink'
+HOOK_OUTSIDE="$_outside/victim"
+_outside_before="$(snapshot_dir "$_outside")"
+run_hook pre suspend
+assert_absent "temp-symlink: no handoff published" "$SUSPEND_FILE"
+assert_no_handoff_publish "temp-symlink: no OK record"
+assert_snapshot_same "temp-symlink: outside victim unchanged" "$_outside" "$_outside_before"
+assert_log_matches "temp-symlink: WARN names identity mismatch" "$HOOK_ERR" 'temp identity changed'
+_temp_path="$(find "$HANDOFF_DIR" -maxdepth 1 -name '.c640-kbd-handoff.*' -print -quit 2> /dev/null || echo '')"
+if [ -n "$_temp_path" ] && [ -L "$_temp_path" ]; then
+    ok "temp-symlink: foreign symlink left in place (only original inode cleaned)"
+else
+    bad "temp-symlink: foreign temp was removed or not a symlink ($_temp_path)"
+fi
+assert_eq "temp-symlink: symlink still points at outside victim" "$_outside/victim" \
+    "$(readlink "$_temp_path" 2> /dev/null || echo '')"
+assert_file "temp-symlink: root state still saved" "$STATE_DIR/state" "7"
+
+# 9x. FAILPOINT `temp-regular`: the temp pathname is swapped for a DIFFERENT
+# regular inode carrying foreign content.  Same inode check must refuse the
+# rename; the foreign inode must not be cleaned up by the failing publisher.
+reset_case
+HOOK_FAILPOINT='temp-regular'
+run_hook pre suspend
+assert_absent "temp-regular: no handoff published" "$SUSPEND_FILE"
+assert_no_handoff_publish "temp-regular: no OK record"
+assert_log_matches "temp-regular: WARN names identity mismatch" "$HOOK_ERR" 'temp identity changed'
+_temp_path="$(find "$HANDOFF_DIR" -maxdepth 1 -name '.c640-kbd-handoff.*' -print -quit 2> /dev/null || echo '')"
+if [ -n "$_temp_path" ] && [ -f "$_temp_path" ] && [ ! -L "$_temp_path" ]; then
+    ok "temp-regular: foreign regular temp left in place"
+else
+    bad "temp-regular: foreign temp missing or not regular ($_temp_path)"
+fi
+assert_file "temp-regular: foreign temp content untouched" "$_temp_path" "FOREIGN"
+assert_file "temp-regular: root state still saved" "$STATE_DIR/state" "7"
+
+# 9y. FAILPOINT `mode`: fchmod is injected to fail, so the helper must abort
+# before rename.  The old code ignored a chmod failure and published anyway.
+reset_case
+HOOK_FAILPOINT=mode
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
+run_hook pre suspend
+assert_absent "mode fail: no suspend handoff" "$SUSPEND_FILE"
+assert_no_handoff_publish "mode fail: no OK record"
+assert_snapshot_same "mode fail: handoff dir unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_log_matches "mode fail: WARN names fchmod failure" "$HOOK_ERR" 'injected fchmod failure'
+assert_file "mode fail: fchmod syscall reached" "$HOOK_MARKER_DIR/fchmod" "called"
+assert_no_handoff_temp "mode fail: original temp cleaned up"
+assert_file "mode fail: root state still saved" "$STATE_DIR/state" "7"
+
+# 9z. Rename failure in POST with an already-published suspend handoff: the
+# successful suspend file must remain byte/inode-identical while the resume
+# publish fails closed (no mutation, no OK, no temp).
+reset_case
+run_hook pre suspend
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
+: > "$PUBLISH_OUT"
+: > "$HOOK_ERR"
+HOOK_FAILPOINT=rename
+run_hook post suspend
+assert_snapshot_same "post rename fail: suspend handoff unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_absent "post rename fail: no resume handoff" "$RESUME_FILE"
+assert_no_handoff_publish "post rename fail: no OK record"
+assert_log_matches "post rename fail: WARN cannot publish" "$HOOK_ERR" 'cannot publish .*c640-kbd-backlight\.resume'
+assert_log_matches "post rename fail: reason recorded" "$HOOK_ERR" 'injected rename failure'
+assert_no_handoff_temp "post rename fail: temp cleaned up"
+
+# 9aa. python3 unavailable: a new runtime dependency must FAIL CLOSED rather
+# than silently falling back to the old pathname-based writer.
+reset_case
+STUB_PYTHON_FAIL=1
+_handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
+run_hook pre suspend
+assert_absent "python3 missing: no suspend handoff" "$SUSPEND_FILE"
+assert_no_handoff_publish "python3 missing: no OK record"
+assert_snapshot_same "python3 missing: handoff dir unchanged" "$HANDOFF_DIR" "$_handoff_before"
+assert_log_matches "python3 missing: WARN names interpreter" "$HOOK_ERR" 'python3 unavailable'
+assert_no_handoff_temp "python3 missing: no temp created"
+assert_file "python3 missing: root state still saved" "$STATE_DIR/state" "7"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "python3 missing: no resume handoff" "$RESUME_FILE"
+assert_log_matches "python3 missing: post also warns" "$HOOK_ERR" 'python3 unavailable'
+
+# 9ab. Explicit HANDOFF_DIR override deliberately skips uid/gid checks, so the
+# dirfd O_NOFOLLOW is the ONLY guard against a symlinked handoff directory.
+# Removing it makes the helper follow the link and publish into the target.
+reset_case
+_link_dir="$TMP_DIR/handoff-link"
+_target_dir="$TMP_DIR/real-handoff"
+mkdir -p "$_target_dir"
+ln -s "$_target_dir" "$_link_dir"
+HOOK_HANDOFF_DIR="$_link_dir"
+_target_before="$(snapshot_dir "$_target_dir")"
+run_hook pre suspend
+assert_absent "dir symlink: no handoff at override path" "$_link_dir/c640-kbd-backlight.suspend"
+assert_absent "dir symlink: no handoff in target dir" "$_target_dir/c640-kbd-backlight.suspend"
+assert_no_handoff_publish "dir symlink: no OK record"
+assert_snapshot_same "dir symlink: target dir unchanged" "$_target_dir" "$_target_before"
+assert_log_matches "dir symlink: fail-closed WARN" "$HOOK_ERR" 'cannot publish .*c640-kbd-backlight\.suspend'
+assert_file "dir symlink: root state still saved" "$STATE_DIR/state" "7"
+rm -rf "$_link_dir" "$_target_dir"
+
+# 9ac. FAILPOINT `post-swap`: the published entry is replaced immediately
+# after rename.  The post-verify inode/owner/mode check must catch it and
+# fail closed, instead of emitting an OK record for a file we did not write.
+reset_case
+HOOK_FAILPOINT=post-swap
+run_hook pre suspend
+assert_file "post-swap: foreign entry not treated as handoff" "$SUSPEND_FILE" "FOREIGN"
+assert_no_handoff_publish "post-swap: no OK record"
+assert_log_matches "post-swap: WARN names identity mismatch" "$HOOK_ERR" 'published identity mismatch'
+assert_no_handoff_temp "post-swap: no temp left"
+assert_file "post-swap: root state still saved" "$STATE_DIR/state" "7"
+
+# 9ad. Root creator: the temp starts owned by uid 0, then must be fchowned to
+# the resolved non-root uid.  Verification must use the POST-fchown stat; the
+# stale pre-chown stat used to make this fail closed in real root operation.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+HOOK_FAILPOINT='root-creator'
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "root-creator: handoff content" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_owner "root-creator: owner is resolved uid:gid" "$(id -u):$(id -g)" \
+    "$_user_dir/c640-kbd-backlight.suspend"
+assert_log_matches "root-creator: records OK dev:ino" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
+assert_publish_identity "root-creator: identity matches inode" \
+    "$_user_dir/c640-kbd-backlight.suspend"
+assert_no_handoff_temp "root-creator: no temp left" "$_user_dir"
+
+# 9ae. FAILPOINT `post-mode`: published entry keeps its inode but its mode is
+# changed after rename.  Post-verify must reject it AND clean the same inode.
+reset_case
+HOOK_FAILPOINT='post-mode'
+run_hook pre suspend
+assert_absent "post-mode: handoff removed" "$SUSPEND_FILE"
+assert_no_handoff_publish "post-mode: no OK record"
+assert_log_matches "post-mode: WARN mode mismatch" "$HOOK_ERR" 'published mode/size mismatch'
+assert_no_handoff_temp "post-mode: no temp left"
+assert_file "post-mode: root state still saved" "$STATE_DIR/state" "7"
+
+# 9af. FAILPOINT `post-owner`: same inode, wrong owner after rename.  An
+# unprivileged test cannot really chown away, so the oracle fakes the stat.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+HOOK_FAILPOINT='post-owner'
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_absent "post-owner: handoff removed" "$_user_dir/c640-kbd-backlight.suspend"
+assert_no_handoff_publish "post-owner: no OK record"
+assert_log_matches "post-owner: WARN owner mismatch" "$HOOK_ERR" 'published owner mismatch'
+assert_no_handoff_temp "post-owner: no temp left" "$_user_dir"
+assert_file "post-owner: root state still saved" "$STATE_DIR/state" "7"
+
+# 9ag. FAILPOINT `post-dir-mode`: the pinned dir's mode changes after rename.
+# The second dir-identity recheck must fail closed and remove the handoff.
+reset_case
+HOOK_FAILPOINT='post-dir-mode'
+run_hook pre suspend
+assert_absent "post-dir-mode: handoff removed" "$SUSPEND_FILE"
+assert_no_handoff_publish "post-dir-mode: no OK record"
+assert_log_matches "post-dir-mode: WARN dir identity changed" "$HOOK_ERR" \
+    'handoff dir identity changed after rename'
+assert_no_handoff_temp "post-dir-mode: no temp left"
+assert_file "post-dir-mode: root state still saved" "$STATE_DIR/state" "7"
 
 # 10. No resolvable session user: handoff is skipped, root state still saved.
 reset_case
