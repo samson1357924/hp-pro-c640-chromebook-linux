@@ -12132,7 +12132,7 @@ EOF
 # PAM-39: savedir verification is bidirectional and rejects an empty snapshot;
 # a genuinely empty live savedir is recorded as "absent" instead.
 test_pam_39_savedir_bidirectional_and_empty_checks() {
-    local s
+    local s log
     # (a) extra LIVE saved file must be detected even when every snapshotted
     #     file is byte-identical.
     s="$(setup_pam_sandbox savedir-extra-live)"
@@ -12143,8 +12143,15 @@ test_pam_39_savedir_bidirectional_and_empty_checks() {
     assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
         "PAM-39a: extra live saved profile fails the restore"
     [ -e "$s/manifest/pam-selection" ] && ok || fail "PAM-39a: sidecar retained"
-    assert_contains "has no counterpart" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
-        "PAM-39a: extra live file named in the log"
+    # The entry-set gate now names the divergence first; the byte comparator's
+    # older "has no counterpart" reason may still appear on other paths. Both
+    # prove the same fail-closed decision.
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    if printf '%s' "$log" | grep -qE 'has no counterpart|entry-set mismatch'; then
+        ok
+    else
+        fail "PAM-39a: extra live file named in the log"
+    fi
 
     # (b) sidecar says complete but .saved was emptied: fail closed.
     s="$(setup_pam_sandbox savedir-empty-snapshot)"
@@ -12422,6 +12429,7 @@ pam_all_halves_hex() { # $1=sandbox
     for f in "$s/manifest/pam-selection" \
         "$s/manifest/pam-selection.saved"/* \
         "$s/manifest/pam-selection.common/state" \
+        "$s/manifest/pam-selection.common/savedir.entries" \
         "$s/manifest/pam-selection.common/files"/*; do
         [ -f "$f" ] || continue
         out="$out ${f##*/}=$(sha256sum -- "$f" | awk '{print $1}')"
@@ -13020,6 +13028,8 @@ test_pam_55_common_snapshot_dir_is_root_only_0700() {
         "PAM-55: .common/files is root:0700"
     assert_eq "600:0:0" "$(stat -c '%a:%u:%g' -- "$common/state" 2> /dev/null || echo MISSING)" \
         "PAM-55: .common/state is root:0600"
+    assert_eq "600:0:0" "$(stat -c '%a:%u:%g' -- "$common/savedir.entries" 2> /dev/null || echo MISSING)" \
+        "PAM-55: .common/savedir.entries is root:0600"
 }
 
 # PAM-56: a failure removing the THIRD half (.common) happens AFTER .saved was
@@ -13088,7 +13098,7 @@ EOF
 # savedir metadata mismatches (final review P2).
 test_pam_57_final_verify_rejects_common_and_savedir_mismatches() {
     local case_name s needle log
-    for case_name in bytes mode owner link absent savedir_mode savedir_missing; do
+    for case_name in bytes mode owner link absent savedir_mode savedir_missing savedir_entries; do
         s="$(setup_pam_sandbox "final-verify-$case_name")"
         pam_write_full_stack "$s"
         pam_write_selection "$s" 'unix, systemd, fprintd'
@@ -13136,8 +13146,10 @@ test_pam_57_final_verify_rejects_common_and_savedir_mismatches() {
             absent) rm -f "$s/pam/common-password" ;;
             savedir_mode) chmod 0700 "$s/savedir" ;;
             savedir_missing) rm -rf "$s/savedir" ;;
+            savedir_entries) ln -s /tmp/pam-57-entry "$s/savedir/new-link" ;;
         esac
         case "$case_name" in
+            savedir_entries) needle="Final savedir entry-set mismatch" ;;
             savedir_*) needle="Final savedir" ;;
             *) needle="Final PAM state mismatch" ;;
         esac
@@ -13311,6 +13323,254 @@ test_pam_59_installed_state_postcondition() {
         "PAM-59: the offending actual file state is named"
 }
 
+# Call one lib/pam.sh function directly inside the PAM sandbox with every seam
+# exported (used by the finding #4 unit tests, PAM-57 style).
+run_pam_direct_fn() {
+    local sandbox="$1" fn="$2"
+    export CROS_ENABLEMENT_PAM_SUDO_PATH="$sandbox/pam/sudo"
+    export CROS_ENABLEMENT_PAM_DIR="$sandbox/pam"
+    export CROS_ENABLEMENT_PAM_SAVED_DIR="$sandbox/savedir"
+    export CROS_ENABLEMENT_PAM_SELECTION_FILE="$sandbox/manifest/pam-selection"
+    run_sandboxed "$sandbox" '
+        export PATH="$2/stub:/usr/bin:/bin"
+        export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
+        export STUB_DEBCONF_SEEN="$2/debconf/seen"
+        source "$1/lib/pam.sh"
+        rc=0
+        "$3" || rc=$?
+        printf "%s\n" "$rc" > "$2/direct.rc"
+    ' "$fn"
+}
+
+# PAM-60 (re-review #16 finding #4): .common records a symlink's LSTAT owner.
+# The old `rm + sudo ln -sfn` rebuilt the link root-owned, so the final owner
+# probe failed closed for every non-root original link. Both a live target and
+# a DANGLING link must come back byte-, type- and owner-identical, with no
+# leftover .cros-common-restore.* stage file.
+test_pam_60_symlink_owner_restored() {
+    local variant s hook before state_before state_after target target_hex link_before
+    for variant in valid dangling; do
+        s="$(setup_pam_sandbox "symlink-owner-$variant")"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd'
+        # A symlinked common-* with an ACTIVE fp module is rejected preflight
+        # (PAM-58); make the fixture self-consistent first (PAM-44 style).
+        /usr/bin/sed -i -e '/pam_fprintd\.so/d' -e '/^Module: fprintd$/d' "$s/savedir/auth"
+        target="$s/common-auth.target"
+        cp -a "$s/pam/common-auth" "$target"
+        /usr/bin/sed -i '/pam_fprintd\.so/d' "$target"
+        ln -sfn "$target" "$s/pam/common-auth"
+        chown -h 65534:65534 "$s/pam/common-auth"
+        if [ "$variant" = dangling ]; then
+            ln -sfn "$s/no-such-target" "$s/pam/common-session"
+            chown -h 65534:65534 "$s/pam/common-session"
+        fi
+        state_before="$(pam_common_state "$s")"
+        target_hex="$(file_hex "$target")"
+        link_before="$(readlink -- "$s/pam/common-auth")"
+
+        # Replace the live link AFTER rollback so the restore really has to
+        # rebuild it rather than taking the already-identical skip path.
+        hook="$s/tamper-link.sh"
+        if [ "$variant" = valid ]; then
+            cat > "$hook" << 'EOF'
+#!/usr/bin/env bash
+rm -f "$1/pam/common-auth"
+printf 'tampered by external actor\n' > "$1/pam/common-auth"
+EOF
+        else
+            cat > "$hook" << 'EOF'
+#!/usr/bin/env bash
+rm -f "$1/pam/common-session"
+ln -s "$1/wrong-target" "$1/pam/common-session"
+chown -h 0:0 "$1/pam/common-session"
+EOF
+        fi
+        chmod +x "$hook"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-60/$variant: install rc 0"
+        assert_eq "65534:65534" \
+            "$(awk -F '\t' '$1 == "common-auth" { print $6 }' \
+                "$s/manifest/pam-selection.common/state" 2> /dev/null | tail -n 1)" \
+            "PAM-60/$variant: .common records the LSTAT owner (not the target's)"
+        assert_eq "$target_hex" "$(file_hex "$target")" \
+            "PAM-60/$variant: symlink target bytes unchanged by install"
+
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian 0 "$hook"
+        assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-60/$variant: uninstall rc 0 with a non-root original owner"
+        state_after="$(pam_common_state "$s")"
+        assert_eq "$state_before" "$state_after" \
+            "PAM-60/$variant: full lstat state (type/mode/owner/link/sha) restored"
+        assert_eq "$link_before" "$(readlink -- "$s/pam/common-auth")" \
+            "PAM-60/$variant: link target string unchanged"
+        assert_eq "$target_hex" "$(file_hex "$target")" \
+            "PAM-60/$variant: symlink target bytes unchanged by restore"
+        assert_eq "65534:65534" "$(stat -c '%u:%g' -- "$s/pam/common-auth")" \
+            "PAM-60/$variant: restored link itself is owned by 65534:65534"
+        if [ "$variant" = dangling ]; then
+            assert_eq "65534:65534" "$(stat -c '%u:%g' -- "$s/pam/common-session")" \
+                "PAM-60/dangling: dangling link owner restored with chown -h"
+        fi
+        assert_eq "" "$(find "$s/pam" -name '*cros-common-restore*' -print)" \
+            "PAM-60/$variant: no restore stage file left behind"
+    done
+}
+
+# PAM-61 (finding #4): the savedir ENTRY SET is part of the snapshot. A tool
+# that adds a file/dir/symlink to an originally EMPTY savedir (or changes a
+# populated one) must fail closed and keep all three halves. A legacy .common
+# without savedir-entries stays warn-only (PAM-25/41/48 compatibility).
+test_pam_61_savedir_entry_set_fail_closed() {
+    local s state halves hook log
+
+    # (a) originally empty savedir + tool-added DIRECTORY and SYMLINK.
+    s="$(setup_pam_sandbox savedir-entries-empty-add)"
+    pam_write_initial_files "$s" none none
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/empty: install rc 0"
+    state="$(cat "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)"
+    assert_contains 'savedir-entries=empty:0:' "$state" \
+        "PAM-61/empty: empty entry set is recorded in .common/state"
+    assert_eq "600:0:0" \
+        "$(stat -c '%a:%u:%g' -- "$s/manifest/pam-selection.common/savedir.entries" 2> /dev/null || echo MISSING)" \
+        "PAM-61/empty: .common/savedir.entries is root:0600"
+    halves="$(pam_all_halves_hex "$s")"
+    hook="$s/add-entries.sh"
+    printf '#!/usr/bin/env bash\nmkdir -p "$1/savedir/newdir"\nln -s /tmp/pam-61-entry "$1/savedir/newlink"\n' > "$hook"
+    chmod +x "$hook"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian 0 "$hook"
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/empty: added dir+symlink fail closed (rc 1)"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-61/empty: all three halves retained byte-identically"
+    assert_contains "Final savedir entry-set mismatch" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-61/empty: entry-set mismatch is named in the log"
+
+    # (b) populated savedir + tool-added entry.
+    s="$(setup_pam_sandbox savedir-entries-nonempty-add)"
+    pam_install_for_restore_test "$s"
+    state="$(cat "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)"
+    assert_contains 'savedir-entries=nonempty:5:' "$state" \
+        "PAM-61/nonempty: all five saved profiles are recorded as entries"
+    halves="$(pam_all_halves_hex "$s")"
+    hook="$s/add-entry.sh"
+    printf '#!/usr/bin/env bash\nmkdir -p "$1/savedir/extra.d"\nln -s /tmp/pam-61-extra "$1/savedir/extra.link"\n' > "$hook"
+    chmod +x "$hook"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian 0 "$hook"
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/nonempty-add: extra entry fails closed (rc 1)"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-61/nonempty-add: all three halves retained"
+    assert_contains "Final savedir entry-set mismatch" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-61/nonempty-add: entry-set mismatch logged"
+
+    # (c) populated savedir + tool-REMOVED entry (also caught before the byte
+    # comparison so the fail is visible even for a non-profile entry).
+    s="$(setup_pam_sandbox savedir-entries-nonempty-remove)"
+    pam_install_for_restore_test "$s"
+    halves="$(pam_all_halves_hex "$s")"
+    # Remove the entry from INSIDE the restore's --package call: a removal
+    # before disable would simply be repaired by _pam_restore_saved_dir_snapshot.
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+rm -f "\$CROS_ENABLEMENT_PAM_SAVED_DIR/auth"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "1" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/nonempty-remove: removed entry fails closed (rc 1)"
+    assert_eq "$halves" "$(pam_all_halves_hex "$s")" \
+        "PAM-61/nonempty-remove: all three halves retained"
+    assert_contains "Final savedir entry-set mismatch" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-61/nonempty-remove: entry-set mismatch logged"
+
+    # (d) legacy .common (no savedir-entries line/file): WARN only, rc 0.
+    s="$(setup_pam_sandbox savedir-entries-legacy)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    run_pam_direct_fn "$s" _pam_snapshot_common_state
+    assert_eq "0" "$(cat "$s/direct.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/legacy: live-state snapshot rc 0"
+    /usr/bin/sed -i '/savedir-entries=/d' "$s/manifest/pam-selection.common/state"
+    rm -f "$s/manifest/pam-selection.common/savedir.entries"
+    : > "$s/log.txt"
+    run_pam_direct_fn "$s" _pam_verify_common_targets_against_snapshot
+    assert_eq "0" "$(cat "$s/direct.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/legacy: missing entry-set manifest is warn-only"
+    assert_contains "no savedir entry-set manifest" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-61/legacy: legacy degradation is explicit"
+
+    # (e) a non-regular entry at SNAPSHOT time is refused: only -type f is
+    # copied into .saved, so silently ignoring a symlink would be asymmetric.
+    s="$(setup_pam_sandbox savedir-entries-install-nonregular)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    ln -s /tmp/pam-61-install-entry "$s/savedir/extra.link"
+    : > "$s/log.txt"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "1" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-61/install-nonregular: symlink entry fails the snapshot gate"
+    assert_contains "non-regular saved profile entry" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-61/install-nonregular: reason logged"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-61/install-nonregular: no sidecar published"
+}
+
+# PAM-63 (finding #4): a link restore must rename the stage with `mv -T`.
+# With plain `mv -f`, a symlink-to-DIRECTORY destination makes mv follow the
+# link and deposit the stage INSIDE that directory, leaving the original link
+# untouched. Exercise _pam_restore_common_state_from_snapshot() directly so the
+# symlink-to-dir case is not masked by an earlier manifest rollback.
+test_pam_63_symlink_to_dir_restore_uses_mv_T() {
+    local s dir target before
+    s="$(setup_pam_sandbox symlink-to-dir-restore)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    dir="$s/pam/auth-target-dir"
+    mkdir -p "$dir" "$s/pam/other-dir"
+    printf 'inside the target directory\n' > "$dir/inside"
+    rm -f "$s/pam/common-auth"
+    ln -s "$dir" "$s/pam/common-auth"
+    run_pam_direct_fn "$s" _pam_snapshot_common_state
+    assert_eq "0" "$(cat "$s/direct.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-63: live symlink-to-dir snapshot rc 0"
+    assert_contains $'common-auth\t' "$(grep 'common-auth' "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)" \
+        "PAM-63: common-auth recorded as a link target row"
+    assert_contains $'\tlink\t' "$(grep 'common-auth' "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)" \
+        "PAM-63: snapshot type is 'link', not 'file'"
+
+    # Point the live link somewhere else: the restore must replace the LINK.
+    rm -f "$s/pam/common-auth"
+    ln -s "$s/pam/other-dir" "$s/pam/common-auth"
+    before="$(find "$dir" -mindepth 1 -maxdepth 1 -name '*cros-common-restore*' -print)"
+    : > "$s/log.txt"
+    run_pam_direct_fn "$s" _pam_restore_common_state_from_snapshot
+    assert_eq "0" "$(cat "$s/direct.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-63: symlink-to-dir restore rc 0"
+    assert_eq "$dir" "$(readlink -- "$s/pam/common-auth")" \
+        "PAM-63: the symlink itself was replaced (not the directory contents)"
+    assert_eq "$before" "$(find "$dir" -mindepth 1 -maxdepth 1 -name '*cros-common-restore*' -print)" \
+        "PAM-63: no stage file created inside the symlink's target directory"
+    assert_eq "" "$(find "$s/pam/other-dir" -mindepth 1 -maxdepth 1 -name '*cros-common-restore*' -print)" \
+        "PAM-63: no stage file left in the replaced link's former target"
+}
+
 # PAM-62: a missing/failing pam-auth-update is still only a warning (rc 2/1).
 # After a successful strip the install returns 0 even though the debconf
 # selection still records fprintd, and uninstall still restores everything.
@@ -13415,6 +13675,9 @@ test_pam_56_common_consume_failure_is_manual_recovery
 test_pam_57_final_verify_rejects_common_and_savedir_mismatches
 test_pam_58_symlinked_active_fp_fails_closed
 test_pam_59_installed_state_postcondition
+test_pam_60_symlink_owner_restored
+test_pam_61_savedir_entry_set_fail_closed
+test_pam_63_symlink_to_dir_restore_uses_mv_T
 test_pam_62_converge_rc_compatibility
 
 echo ""

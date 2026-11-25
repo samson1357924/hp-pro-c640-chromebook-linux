@@ -65,6 +65,13 @@ _PAM_COMMON_MAGIC='# cros-enablement: PAM common/sudo state snapshot (first-wins
 # never "the dir exists now": during staging a foreign installer may win the
 # race, and its snapshot must survive even though our install fails (P2-3).
 _PAM_COMMON_PUBLISHED=0
+# Re-review #16 finding #4: a legacy .common predates the savedir entry-set
+# manifest. Recomputed by _pam_verify_saved_entries_against_snapshot() in its
+# OWN shell on EVERY verification (from _pam_common_snapshot_fields' output), so
+# a stale legacy classification can never survive into a later verification —
+# do not "simplify" this by relying on the parser to reset it (command
+# substitution runs in a subshell).
+_PAM_COMMON_ENTRIES_LEGACY=0
 
 # A pam_fprintd.so MODULE line: a leading '#' comments out the whole line, so
 # that is not active. The regex is deliberately conservative — a trailing
@@ -350,6 +357,44 @@ _pam_enumerate_saved_files() {
     printf '%s\n' "$list"
 }
 
+# Full savedir ENTRY SET (not just regular files): NUL-separated, sorted
+# "name\t type" records, where type is find's %y (f/l/d/p/b/c/s). Two-phase like
+# _pam_enumerate_saved_files(): materialise `sudo find` into a CALLER-OWNED
+# buffer, CHECK find's rc, then sort there. A pipeline into `sort -z` would throw
+# away find's rc, and a root-owned redirect would break non-root read-back.
+# $2=1 tolerates a genuinely absent directory (empty set) but never a find
+# failure on an EXISTING directory.
+_pam_enumerate_saved_entries() {
+    local dir="$1" allow_absent="${2:-0}" raw sorted
+    raw="$(_pam_tmp_file)" || return 1
+    sorted="$(_pam_tmp_file)" || {
+        rm -f -- "$raw"
+        return 1
+    }
+    # shellcheck disable=SC2024 # caller-owned buffer, not a root-owned redirect
+    if ! sudo find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\t%y\0' > "$raw" 2> /dev/null; then
+        if [ "$allow_absent" -eq 1 ] && ! _pam_fs_probe d "$dir"; then
+            : > "$sorted"
+            rm -f -- "$raw"
+            printf '%s\n' "$sorted"
+            return 0
+        fi
+        rm -f -- "$raw" "$sorted"
+        return 1
+    fi
+    if ! LC_ALL=C sort -z -- "$raw" > "$sorted" 2> /dev/null; then
+        rm -f -- "$raw" "$sorted"
+        return 1
+    fi
+    rm -f -- "$raw"
+    printf '%s\n' "$sorted"
+}
+
+# Count NUL-terminated records (a filename may legitimately contain a newline).
+_pam_count_nul_records() {
+    tr -cd '\0' < "$1" | wc -c | awk '{print $1}'
+}
+
 _pam_snapshot_cleanup_stage() {
     # Stage data is ours and temporary, but a failed cleanup is logged rather
     # than silently swallowed (review P3).
@@ -380,11 +425,30 @@ _pam_count_enumerated_files() {
 # so a non-root caller with passwordless sudo can snapshot a root-only
 # /var/lib/pam (a plain user glob would silently match nothing).
 _pam_stage_saved_dir() {
-    local f base rc=0 list
+    local f base rc=0 list entry_list nonregular
     [ -d "$_PAM_SAVED_DIR" ] || return 0
     _pam_snapshot_cleanup_stage
     if ! sudo install -d -m 700 -- "$_PAM_SAVED_SNAPSHOT_STAGE"; then
         log_error "Could not create the saved PAM profile snapshot staging directory."
+        return 1
+    fi
+    # Finding #4 symmetry: below we copy ONLY -type f. Silently ignoring a
+    # symlink/dir/fifo would make the entry-set manifest and .saved disagree, so
+    # refuse to snapshot a directory we cannot represent completely.
+    entry_list="$(_pam_enumerate_saved_entries "$_PAM_SAVED_DIR" 1)" || {
+        log_error "Could not enumerate $_PAM_SAVED_DIR; refusing to snapshot an incomplete saved profile set."
+        _pam_snapshot_cleanup_stage
+        return 1
+    }
+    # NUL-delimited records: a filename may itself contain a tab or newline,
+    # so tr/awk -F '\t' could misread `x<TAB>f` as type f. With RS="\0" the
+    # record is exact; the type is the FINAL character (`name\t<type>`), so
+    # substr(length) is safe even when the name contains tabs or newlines.
+    nonregular="$(awk 'BEGIN { RS="\0" } { t=substr($0, length($0)); n += (t!="f") } END { print n+0 }' "$entry_list")"
+    rm -f -- "$entry_list"
+    if [ "$nonregular" -ne 0 ]; then
+        log_error "$_PAM_SAVED_DIR contains $nonregular non-regular saved profile entry/entries; refusing to snapshot only a subset."
+        _pam_snapshot_cleanup_stage
         return 1
     fi
     list="$(_pam_enumerate_saved_files "$_PAM_SAVED_DIR")" || {
@@ -635,7 +699,11 @@ _pam_verify_sidecar_content() {
 _pam_common_snapshot_fields() {
     # $1 = snapshot dir (defaults to the published one). Prints validated
     # savedir-* metadata lines followed by validated target rows.
-    local dir="${1:-$_PAM_COMMON_SNAPSHOT_DIR}" tmp rc
+    local dir="${1:-$_PAM_COMMON_SNAPSHOT_DIR}" tmp rc fields
+    # A legacy .common has no savedir-entries line; warn-only, never a parse
+    # failure (PAM-25/41/48 compatibility). New publishes always have exactly
+    # one. Callers run this in a command substitution (subshell), so the legacy
+    # classification is derived from OUR OUTPUT by the verifier in its own shell.
     _pam_fs_probe d "$dir" || return 1
     tmp="$(_pam_tmp_file)" || return 1
     # shellcheck disable=SC2024 # caller-owned buffer: sudo tee would make the read-back file root-owned
@@ -643,14 +711,27 @@ _pam_common_snapshot_fields() {
         rm -f -- "$tmp"
         return 1
     fi
-    awk -v magic="$_PAM_COMMON_MAGIC" -v expected="$((${#_PAM_COMMON_BASES[@]} + 1))" '
-        BEGIN { magic_n=0; other=0; bad=0; rows=0 }
+    fields="$(awk -v magic="$_PAM_COMMON_MAGIC" -v expected="$((${#_PAM_COMMON_BASES[@]} + 1))" '
+        BEGIN { magic_n=0; other=0; bad=0; rows=0; entries_n=0; entries_bad=0 }
         $0 == magic { magic_n++; next }
         /^# cros-enablement: savedir-path=\// { saved_path++; print; next }
         /^# cros-enablement: savedir-present=[01]$/ { saved_present++; print; next }
         /^# cros-enablement: savedir-mode=([0-7]+|-)$/ { saved_mode++; print; next }
         /^# cros-enablement: savedir-owner=[0-9]+:[0-9]+$/ || /^# cros-enablement: savedir-owner=-$/ {
             saved_owner++; print; next
+        }
+        /^# cros-enablement: savedir-entries=/ {
+            entries_n++
+            e=$0; sub(/^# cros-enablement: savedir-entries=/, "", e)
+            if (split(e, ep, ":") != 3) entries_bad=1
+            else {
+                if (ep[1] !~ /^(absent|empty|nonempty)$/ || ep[2] !~ /^[0-9]+$/) entries_bad=1
+                else if (ep[1] == "absent" && (ep[2] != "0" || ep[3] != "-")) entries_bad=1
+                else if (ep[1] == "empty" && ep[2] != "0") entries_bad=1
+                else if (ep[1] == "nonempty" && ep[2] == "0") entries_bad=1
+                if (ep[3] != "-" && (length(ep[3]) != 64 || ep[3] !~ /^[0-9a-f]+$/)) entries_bad=1
+            }
+            print; next
         }
         /^#/ { other=1; next }
         {
@@ -675,12 +756,15 @@ _pam_common_snapshot_fields() {
         }
         END {
             if (magic_n != 1 || other || bad || rows != expected \
-                || saved_path != 1 || saved_present != 1 || saved_mode != 1 || saved_owner != 1) exit 1
+                || saved_path != 1 || saved_present != 1 || saved_mode != 1 || saved_owner != 1 \
+                || entries_n > 1 || entries_bad) exit 1
         }
-    ' "$tmp"
+    ' "$tmp")"
     rc=$?
     rm -f -- "$tmp"
-    return "$rc"
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$fields"
+    return 0
 }
 
 _pam_common_normalized_hash() {
@@ -760,7 +844,7 @@ _pam_common_snapshot_readable() {
     # $1=snapshot dir (published or staged). Read back the state file AND every
     # copied byte so a half-published/truncated snapshot can never be accepted.
     local dir="${1:-$_PAM_COMMON_SNAPSHOT_DIR}" fields line base path present type mode owner link sha
-    local saved_present saved_mode saved_owner sum
+    local saved_present saved_mode saved_owner sum entries_line entries_class entries_count entries_sha
     fields="$(_pam_common_snapshot_fields "$dir")" || {
         log_error "$dir has a missing/corrupt PAM common-state manifest; failing closed."
         return 1
@@ -768,6 +852,24 @@ _pam_common_snapshot_readable() {
     saved_present="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-present=//p')"
     saved_mode="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-mode=//p')"
     saved_owner="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-owner=//p')"
+    entries_line="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-entries=//p')"
+    # Legacy .common has neither line nor file; new snapshots must carry a
+    # complete, checksum-matching entry-set manifest (no live comparison here:
+    # this same reader is called AFTER external tools on restore).
+    if [ -n "$entries_line" ]; then
+        IFS=: read -r entries_class entries_count entries_sha <<< "$entries_line"
+        if ! _pam_fs_probe f "$dir/savedir.entries"; then
+            log_error "$dir/savedir.entries is missing; refusing an incomplete PAM common-state snapshot."
+            return 1
+        fi
+        if [ "$entries_sha" != "-" ]; then
+            sum="$(sudo sha256sum -- "$dir/savedir.entries" | awk '{print $1}')" || return 1
+            if [ "$sum" != "$entries_sha" ]; then
+                log_error "$dir/savedir.entries does not match its recorded checksum; refusing an incomplete snapshot."
+                return 1
+            fi
+        fi
+    fi
     case "$saved_present" in
         0) [ "$saved_mode" = "-" ] && [ "$saved_owner" = "-" ] || return 1 ;;
         1)
@@ -814,6 +916,7 @@ _pam_snapshot_common_state() {
     # .common is validated and never overwritten.
     local stage="${_PAM_COMMON_SNAPSHOT_DIR}.stage.$$" tmp="" base file
     local saved_present=1 saved_mode="-" saved_owner="-" rc=0
+    local entries_list="" entries_class="absent" entries_count=0 entries_sha="-"
     _PAM_COMMON_PUBLISHED=0
     if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
         log_error "Orphaned $_PAM_COMMON_SNAPSHOT_DIR has no sidecar published by this invocation; preserving it."
@@ -841,12 +944,39 @@ _pam_snapshot_common_state() {
     else
         saved_present=0
     fi
+    # Two-phase, fully privileged enumeration of ALL savedir entries. The class
+    # and count must agree with savedir-present/count or nothing is published.
+    entries_list="$(_pam_enumerate_saved_entries "$_PAM_SAVED_DIR" 1)" || {
+        log_error "Could not enumerate the $_PAM_SAVED_DIR entry set; refusing to snapshot an incomplete saved profile directory."
+        rc=1
+    }
+    if [ -n "$entries_list" ]; then
+        entries_count="$(_pam_count_nul_records "$entries_list")"
+        entries_sha="$(sha256sum -- "$entries_list" | awk '{print $1}')"
+        if [ "$entries_count" -eq 0 ]; then
+            entries_class="empty"
+        else
+            entries_class="nonempty"
+        fi
+        if ! sudo install -m 600 -- "$entries_list" "$stage/savedir.entries"; then
+            log_error "Could not install the savedir entry-set manifest into the common snapshot."
+            rc=1
+        fi
+    fi
+    case "$saved_present:$entries_class" in
+        0:absent | 1:empty | 1:nonempty) ;;
+        *)
+            log_error "Inconsistent savedir snapshot: present=$saved_present but entry set is $entries_class/$entries_count; refusing to publish."
+            rc=1
+            ;;
+    esac
     {
         printf '%s\n' "$_PAM_COMMON_MAGIC"
         printf '# cros-enablement: savedir-path=%s\n' "$_PAM_SAVED_DIR"
         printf '# cros-enablement: savedir-present=%s\n' "$saved_present"
         printf '# cros-enablement: savedir-mode=%s\n' "$saved_mode"
         printf '# cros-enablement: savedir-owner=%s\n' "$saved_owner"
+        printf '# cros-enablement: savedir-entries=%s:%s:%s\n' "$entries_class" "$entries_count" "$entries_sha"
         for base in "${_PAM_COMMON_BASES[@]}"; do
             _pam_common_snapshot_row "$base" "$_PAM_DIR/$base" "$stage/files" || printf 'SNAPSHOT_ROW_FAILED\n'
         done
@@ -858,11 +988,11 @@ _pam_snapshot_common_state() {
         || ! sudo install -m 600 -- "$tmp" "$stage/state" \
         || ! _pam_common_snapshot_readable "$stage"; then
         log_error "Could not build a complete PAM common/sudo state snapshot; refusing to publish it."
-        rm -f -- "$tmp"
+        rm -f -- "$tmp" "$entries_list"
         _pam_common_cleanup_stage "$stage"
         return 1
     fi
-    rm -f -- "$tmp"
+    rm -f -- "$tmp" "$entries_list"
     if _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
         log_error "$_PAM_COMMON_SNAPSHOT_DIR appeared while staging; preserving it and refusing to publish."
         _pam_common_cleanup_stage "$stage"
@@ -1418,12 +1548,12 @@ _pam_consume_snapshot() {
 }
 
 # Re-apply the ORIGINAL common-*/sudo state AFTER every external tool call.
-# This is deliberately idempotent: stage -> verify -> atomic mv (regular file),
-# ln -sfn (symlink), rm -f (was absent). A directory at any target is a hard
-# failure - rm -rf would destroy live state. No sed is used here (PAM-7).
+# This is deliberately idempotent: stage -> verify -> atomic mv -T (regular file
+# and symlink), rm -f (was absent). A directory at any target is a hard failure -
+# rm -rf would destroy live state. No sed is used here (PAM-7).
 _pam_restore_common_state_from_snapshot() {
     local fields base path present type mode owner link sha stage probe live
-    local live_norm snap_norm rc=0
+    local live_norm snap_norm rc=0 entries_rc=0
     fields="$(_pam_common_snapshot_fields)" || {
         log_error "Could not read $_PAM_COMMON_SNAPSHOT_DIR/state for the final common/sudo restore."
         return 1
@@ -1443,8 +1573,28 @@ _pam_restore_common_state_from_snapshot() {
                 fi
                 ;;
             link)
-                if ! sudo rm -f -- "$path" || ! sudo ln -sfn -- "$link" "$path"; then
-                    log_error "Could not restore PAM symlink $path -> $link."
+                # Finding #4: an already-identical link is NOT recreated (no
+                # needless unlink window). When it must be rebuilt, stage the
+                # link IN THE SAME DIRECTORY and chown -h the LINK ITSELF (a
+                # plain chown would follow it and change the target's owner),
+                # then rename with -T: without -T, mv follows a symlink-to-dir
+                # destination and deposits the stage INSIDE that directory.
+                probe="$(_pam_probe_common_target "$path")" || {
+                    log_error "Could not probe PAM symlink $path for idempotent restore."
+                    rc=1
+                    continue
+                }
+                live="$(printf '%s' "$probe" | cut -f2-)"
+                if [ "$live" = "$(printf '%s\t%s\t%s\t%s\t%s' "$type" "$mode" "$owner" "$link" "$sha")" ]; then
+                    continue
+                fi
+                stage="${path}.cros-common-restore.$$"
+                sudo rm -f -- "$stage" 2> /dev/null
+                if ! sudo ln -sfn -- "$link" "$stage" \
+                    || ! sudo chown -h -- "$owner" "$stage" \
+                    || ! sudo mv -T -f -- "$stage" "$path"; then
+                    log_error "Could not restore PAM symlink $path -> $link with its original owner."
+                    sudo rm -f -- "$stage" 2> /dev/null
                     rc=1
                 fi
                 ;;
@@ -1465,7 +1615,7 @@ _pam_restore_common_state_from_snapshot() {
                     || ! sudo chown "$owner" -- "$stage" \
                     || ! sudo chmod "$mode" -- "$stage" \
                     || ! sudo cmp -s -- "$_PAM_COMMON_SNAPSHOT_DIR/files/$base" "$stage" \
-                    || ! sudo mv -f -- "$stage" "$path"; then
+                    || ! sudo mv -T -f -- "$stage" "$path"; then
                     log_error "Could not atomically restore PAM file $path from the common-state snapshot."
                     sudo rm -f -- "$stage" 2> /dev/null
                     rc=1
@@ -1497,8 +1647,103 @@ _pam_restore_common_state_from_snapshot() {
             rc=1
         fi
     done <<< "$fields"
+    # Fail early on an entry-set divergence (a tool-added file/symlink/dir in a
+    # formerly empty savedir would otherwise only be caught by the final gate).
+    _pam_verify_saved_entries_against_snapshot || entries_rc=$?
+    case "$entries_rc" in
+        0 | 2) ;;
+        *)
+            log_error "Post-restore savedir entry-set verification failed; keeping the snapshot for retry."
+            rc=1
+            ;;
+    esac
     [ "$rc" -eq 0 ] || return 1
     log_info "PAM common/sudo state re-applied from $_PAM_COMMON_SNAPSHOT_DIR after all external tool calls."
+    return 0
+}
+
+# Finding #4: compare the LIVE savedir entry set with .common/savedir.entries.
+# rc 0 = identical, 1 = mismatch/unreadable (FAIL CLOSED), 2 = legacy .common
+# with no entry-set manifest (WARN only, no byte guarantee).
+# Entries are NUL-separated, LC_ALL=C sorted "name\t type" records produced by
+# `sudo find -mindepth 1 -maxdepth 1 -printf '%f\t%y\0'`; the type byte covers
+# regular files, symlinks, directories, FIFOs and devices alike.
+_pam_verify_saved_entries_against_snapshot() {
+    local fields entries_line="" cls count sha snap_buf live_buf sum snap_count
+    fields="$(_pam_common_snapshot_fields)" || {
+        log_error "Could not read $_PAM_COMMON_SNAPSHOT_DIR/state for savedir entry-set verification."
+        return 1
+    }
+    # This function runs in the caller's shell (unlike _pam_common_snapshot_fields
+    # above, which is captured in a subshell), so the legacy classification is
+    # recorded HERE. A legacy sidecar (PAM-25/41/48) degrades the entry-set check
+    # as well: its old .saved half may have been repaired/removed by hand.
+    if [ -n "$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-entries=//p')" ]; then
+        _PAM_COMMON_ENTRIES_LEGACY=0
+    else
+        _PAM_COMMON_ENTRIES_LEGACY=1
+    fi
+    if [ "$_PAM_COMMON_ENTRIES_LEGACY" -eq 1 ] || [ "${_PAM_VERIFY_LEGACY:-0}" -eq 1 ]; then
+        log_warn "Legacy PAM snapshot has no savedir entry-set manifest; entry-set verification is unavailable (best effort only)."
+        return 2
+    fi
+    entries_line="$(printf '%s\n' "$fields" | sed -n 's/^# cros-enablement: savedir-entries=//p')"
+    IFS=: read -r cls count sha <<< "$entries_line"
+    case "$cls" in
+        absent | empty | nonempty) ;;
+        *)
+            log_error "Invalid savedir entry-set class '$cls' in $_PAM_COMMON_SNAPSHOT_DIR/state."
+            return 1
+            ;;
+    esac
+    case "$count" in
+        '' | *[!0-9]*)
+            log_error "Invalid savedir entry-set count '$count' in $_PAM_COMMON_SNAPSHOT_DIR/state."
+            return 1
+            ;;
+    esac
+    if ! _pam_fs_probe f "$_PAM_COMMON_SNAPSHOT_DIR/savedir.entries"; then
+        log_error "$_PAM_COMMON_SNAPSHOT_DIR/savedir.entries is missing; refusing to verify the savedir entry set."
+        return 1
+    fi
+    snap_buf="$(_pam_tmp_file)" || return 1
+    # shellcheck disable=SC2024 # caller-owned buffer, not a root-owned redirect
+    if ! sudo cat -- "$_PAM_COMMON_SNAPSHOT_DIR/savedir.entries" > "$snap_buf" 2> /dev/null; then
+        log_error "Could not read $_PAM_COMMON_SNAPSHOT_DIR/savedir.entries back through sudo."
+        rm -f -- "$snap_buf"
+        return 1
+    fi
+    sum="$(sha256sum -- "$snap_buf" | awk '{print $1}')"
+    if [ "$sha" != "-" ] && [ "$sum" != "$sha" ]; then
+        log_error "$_PAM_COMMON_SNAPSHOT_DIR/savedir.entries is corrupt (checksum mismatch)."
+        rm -f -- "$snap_buf"
+        return 1
+    fi
+    snap_count="$(_pam_count_nul_records "$snap_buf")"
+    case "$cls:$snap_count" in
+        absent:0 | empty:0 | nonempty:[1-9]*) ;;
+        *)
+            log_error "Savedir entry-set manifest disagrees with $_PAM_COMMON_SNAPSHOT_DIR/state ($cls/$count vs $snap_count records)."
+            rm -f -- "$snap_buf"
+            return 1
+            ;;
+    esac
+    if [ "$snap_count" -ne "$count" ]; then
+        log_error "Savedir entry-set manifest disagrees with $_PAM_COMMON_SNAPSHOT_DIR/state ($cls/$count vs $snap_count records)."
+        rm -f -- "$snap_buf"
+        return 1
+    fi
+    live_buf="$(_pam_enumerate_saved_entries "$_PAM_SAVED_DIR" 1)" || {
+        log_error "Could not enumerate the live $_PAM_SAVED_DIR entry set; failing closed."
+        rm -f -- "$snap_buf"
+        return 1
+    }
+    if ! cmp -s -- "$snap_buf" "$live_buf"; then
+        log_error "Final savedir entry-set mismatch: live entries differ from $_PAM_COMMON_SNAPSHOT_DIR/savedir.entries (new/removed file, directory, symlink or special entry)."
+        rm -f -- "$snap_buf" "$live_buf"
+        return 1
+    fi
+    rm -f -- "$snap_buf" "$live_buf"
     return 0
 }
 
@@ -1507,7 +1752,7 @@ _pam_restore_common_state_from_snapshot() {
 # (legacy degradation; callers must WARN and must NOT claim byte guarantees).
 _pam_verify_common_targets_against_snapshot() {
     local fields base path present type mode owner link sha probe live mode_live owner_live
-    local link_live sha_live type_live present_live rc=0
+    local link_live sha_live type_live present_live rc=0 entries_rc=0
     local saved_path saved_present saved_mode saved_owner line
     if ! _pam_fs_probe e "$_PAM_COMMON_SNAPSHOT_DIR"; then
         log_warn "No PAM common-state snapshot ($_PAM_COMMON_SNAPSHOT_DIR); final common-*/sudo byte/metadata verification is unavailable (legacy best effort)."
@@ -1573,8 +1818,15 @@ _pam_verify_common_targets_against_snapshot() {
             rc=1
         fi
     fi
+    # Entry set (including non-regular entries) is part of the final authority.
+    # rc 2 only means LEGACY .common: warn in the helper, keep rc 0 here.
+    _pam_verify_saved_entries_against_snapshot || entries_rc=$?
+    case "$entries_rc" in
+        0 | 2) ;;
+        *) rc=1 ;;
+    esac
     [ "$rc" -eq 0 ] || return 1
-    log_info "Verified final common-*/sudo state (bytes, mode, owner, type, link target, absence) and savedir metadata against $_PAM_COMMON_SNAPSHOT_DIR."
+    log_info "Verified final common-*/sudo state (bytes, mode, owner, type, link target, absence), savedir metadata and entry set against $_PAM_COMMON_SNAPSHOT_DIR."
     return 0
 }
 
