@@ -112,7 +112,18 @@ C640_KBD_LAST_USER_TTL="${C640_KBD_LAST_USER_TTL:-15}"
 # (instead of silently skipping the save) prevents a blank from turning the
 # LED off with no persisted copy of the new brightness.  0 = no wait.
 C640_KBD_SAVE_LOCK_WAIT="${C640_KBD_SAVE_LOCK_WAIT:-2}"
-RESTORE_GEN_FILE="$STATE_DIR/c640-kbd-backlight.restore-gen"
+# An unblank guard's gsd/ScreenSaver evidence can age during a slow probe and
+# a WRITE_LOCK wait.  Past this many seconds the guard releases the lock,
+# re-probes and re-acquires (bounded) instead of acting on stale evidence.
+C640_KBD_GUARD_EVIDENCE_TTL="${C640_KBD_GUARD_EVIDENCE_TTL:-6}"
+# Generation gate.  The env override mirrors WRITE_LOCK / the guard markers so
+# tests (and alternate runtime layouts) can redirect it before the daemon is
+# sourced.
+RESTORE_GEN_FILE="${C640_KBD_RESTORE_GEN_FILE:-$STATE_DIR/c640-kbd-backlight.restore-gen}"
+# Retry / guard epoch.  bump_restore_gen() rotates it under WRITE_LOCK on BOTH
+# success and failure, so retries and guards armed before a failed publish are
+# revoked even though the generation counter did not advance.
+RESTORE_RETRY_EPOCH_FILE="${C640_KBD_RESTORE_RETRY_EPOCH:-$STATE_DIR/c640-kbd-backlight.retry-epoch}"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
 C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
@@ -694,7 +705,9 @@ write_last_user() {
     # Stamp the restore generation that was current when this observation was
     # made.  A later guard can then tell a user change made AFTER a restore
     # from a stale pre-restore cache that merely differs from the saved value.
-    gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo "")"
+    # Absolute reader (no PATH-level `cat`) so a stubbed/compromised reader
+    # cannot forge the generation stamp of a last-user observation.
+    gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo "")"
     tmp="$(mktemp "$STATE_DIR/.c640-kbd-lum-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lum-XXXXXX" 2> /dev/null || echo "")"
     if [ -n "$tmp" ]; then
         {
@@ -761,7 +774,7 @@ last_user_restore_gen() {
 }
 
 current_restore_gen() {
-    cat "$RESTORE_GEN_FILE" 2> /dev/null || echo ""
+    /bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo ""
 }
 
 # One sampler tick, kept separate from the infinite loop so it is unit
@@ -1027,50 +1040,134 @@ _release_write_lock() {
 }
 
 # Cleared under WRITE_LOCK by bump_restore_gen(): a guard that already wrote
-# for generation N must not suppress generation N+1's guards.
+# for generation N must not suppress generation N+1's guards.  Return nonzero
+# if a marker survives, so the caller can treat the cycle as unsettled.
 _clear_guard_markers() {
-    rm -f "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL" 2> /dev/null || true
+    local rc=0
+    rm -f -- "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL" 2> /dev/null || rc=1
+    if [ -e "$GUARD_WRITTEN_GEN_FILE" ] || [ -e "$SELF_WRITE_SENTINEL" ]; then
+        rc=1
+    fi
+    return "$rc"
 }
 
-# Atomic publish of the in-process $restore_gen.  Caller normally holds
-# WRITE_LOCK (see bump_restore_gen) so guards cannot miss the new generation
-# between the check and their own write.
-_publish_restore_gen() {
-    local tmp
-    tmp="$(mktemp "$STATE_DIR/.c640-kbd-gen-XXXXXX" 2> /dev/null \
-        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-gen-XXXXXX" 2> /dev/null || echo "")"
-    if [ -z "$tmp" ]; then
-        return 0
+# Atomic, fail-closed publish of a small text value to $2.  Same-directory
+# mktemp + printf + chmod + `mv -T` (no cross-device TMPDIR fallback and no cp
+# fallback): any failed step returns nonzero and leaves no temp behind.  The
+# readback uses the bash `read` builtin, so a PATH-level `cat` stub cannot fake
+# success.  A mismatching destination is REMOVED, so every generation gate
+# fails closed on the next read instead of trusting an unverifiable value.
+_atomic_publish_text() {
+    local value="$1" dest="$2" dir tmp got rc=0
+    dir="${dest%/*}"
+    [ "$dir" != "$dest" ] || dir="."
+    if [ ! -d "$dir" ]; then
+        log_warn "cannot publish $dest: parent directory $dir missing"
+        return 1
     fi
-    printf '%s\n' "$restore_gen" > "$tmp" 2> /dev/null || true
-    chmod 600 "$tmp" 2> /dev/null || true
-    mv -f "$tmp" "$RESTORE_GEN_FILE" 2> /dev/null || cp "$tmp" "$RESTORE_GEN_FILE" 2> /dev/null || true
-    rm -f "$tmp" 2> /dev/null || true
+    # A symlink or directory destination would be followed / used as a
+    # container by mv; neither is a legitimate generation or marker file.
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if [ ! -f "$dest" ] || [ -L "$dest" ]; then
+            log_warn "cannot publish $dest: destination is not a regular file"
+            return 1
+        fi
+    fi
+    tmp="$(mktemp "$dir/.c640-kbd-gen-XXXXXX" 2> /dev/null)" || {
+        log_warn "cannot create same-dir temp for $dest"
+        return 1
+    }
+    if ! printf '%s\n' "$value" > "$tmp" 2> /dev/null; then
+        log_warn "cannot write value to temp for $dest"
+        rc=1
+    elif ! chmod 600 "$tmp" 2> /dev/null; then
+        log_warn "cannot chmod temp for $dest"
+        rc=1
+    elif ! mv -T -f -- "$tmp" "$dest" 2> /dev/null; then
+        log_warn "cannot rename temp onto $dest"
+        rc=1
+    else
+        tmp=""
+        got=""
+        IFS= read -r got 2> /dev/null < "$dest" || true
+        if [ "$got" != "$value" ]; then
+            log_warn "readback mismatch for $dest ('$got' != '$value'); invalidating destination"
+            rm -f -- "$dest" 2> /dev/null || true
+            rc=1
+        fi
+    fi
+    if [ -n "$tmp" ]; then
+        rm -f -- "$tmp" 2> /dev/null || true
+    fi
+    return "$rc"
+}
+
+# Retry/guard epoch helpers.  Reading with `read` (not cat) keeps the gate
+# independent of PATH-level readers; an unreadable epoch means generation 0.
+_read_retry_epoch() {
+    local e=""
+    IFS= read -r e 2> /dev/null < "$RESTORE_RETRY_EPOCH_FILE" || e=""
+    [[ "$e" =~ ^[0-9]+$ ]] || e=0
+    printf '%s' "$e"
+}
+
+_epoch_is_current() {
+    [ "$(_read_retry_epoch)" = "$1" ]
+}
+
+# Called by bump_restore_gen() under WRITE_LOCK.  Even when the generation
+# publish fails, rotating the epoch revokes retries/guards armed in the old
+# cycle; they re-check it after sleeping, after their probe and inside the
+# lock, exactly like the generation gate.
+_rotate_retry_epoch() {
+    local e
+    e="$(_read_retry_epoch)"
+    _atomic_publish_text "$((e + 1))" "$RESTORE_RETRY_EPOCH_FILE"
+}
+
+# Atomic publish of the in-process $restore_gen.  Caller holds WRITE_LOCK
+# (see bump_restore_gen) so guards cannot miss the new generation between the
+# check and their own write.
+_publish_restore_gen() {
+    local gen="${1:-$restore_gen}"
+    _atomic_publish_text "$gen" "$RESTORE_GEN_FILE"
 }
 
 # Fail-closed generation bump.  The read-modify-publish of the generation and
 # the clearing of the guard markers happen INSIDE WRITE_LOCK -- the same lock
 # a guard holds during its final check -- so two concurrent bumps cannot stamp
 # the same generation and no guard can pass its check before the bump lands.
-# On lock failure NOTHING is published (no degraded write outside the lock):
-# callers must treat this as "cycle not settled", keep flag/state and defer.
-# Returns 0 on success, 1 on lock failure.
+# In-memory restore_gen advances ONLY after a verified publish AND successful
+# marker cleanup.  The epoch is rotated on both the success and failure paths.
+# Returns 0 only when the publish, marker cleanup and epoch rotation succeeded.
 bump_restore_gen() {
     if ! _acquire_write_lock; then
         log_warn "cannot take write lock while bumping restore generation; not publishing"
         return 1
     fi
-    local g gen
-    g="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
-    if ! [[ "$g" =~ ^[0-9]+$ ]]; then
-        g=0
+    local g="" gen rc=0
+    # Read the file under the lock with the bash builtin: no cat, no stale
+    # in-memory value, no fallback write outside the lock.  In-memory
+    # restore_gen is only clamped AFTER a successful publish below.
+    IFS= read -r g 2> /dev/null < "$RESTORE_GEN_FILE" || g=""
+    [[ "$g" =~ ^[0-9]+$ ]] || g=0
+    gen=$((10#$g + 1))
+    if ! _publish_restore_gen "$gen"; then
+        log_warn "restore generation publish failed (gen=$gen); markers and state kept"
+        rc=1
+    elif ! _clear_guard_markers; then
+        log_warn "guard marker cleanup failed after generation $gen publish; cycle not settled"
+        rc=1
+    else
+        # Only a fully settled cycle advances the in-process mirror.
+        restore_gen="$gen"
     fi
-    gen=$((g + 1))
-    restore_gen="$gen"
-    _publish_restore_gen
-    _clear_guard_markers
+    if ! _rotate_retry_epoch; then
+        log_warn "retry epoch rotation failed; armed retries/guards may survive"
+        rc=1
+    fi
     _release_write_lock
-    return 0
+    return "$rc"
 }
 
 # Crash recovery for the staging window: the value in PENDING is a restore
@@ -1204,14 +1301,22 @@ verify_restore_applied() {
 schedule_restore_retries() {
     local gen="$1"
     shift
+    # Epoch barrier: a bump that fails to publish still rotates this epoch, so
+    # a retry armed before that failure must not write with a stale gen.
+    local epoch
+    epoch="$(_read_retry_epoch)"
     local delay
     for delay in "$@"; do
         (
             sleep "$delay"
             local cur_gen
-            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
             if [ "$cur_gen" != "$gen" ]; then
                 log_debug "restore retry +${delay}s gen=$gen superseded by $cur_gen"
+                exit 0
+            fi
+            if ! _epoch_is_current "$epoch"; then
+                log_debug "restore retry +${delay}s (gen=$gen): epoch superseded after sleep; retry cancelled"
                 exit 0
             fi
             # Recovery is startup-only: a PENDING that still exists here can
@@ -1224,6 +1329,12 @@ schedule_restore_retries() {
             if [ "$(screensaver_tristate)" != "inactive" ]; then
                 exit 0
             fi
+            # A slow tristate probe can straddle a failed bump; the epoch is
+            # the only witness that the generation was never published.
+            if ! _epoch_is_current "$epoch"; then
+                log_debug "restore retry +${delay}s (gen=$gen): epoch superseded after probe; retry cancelled"
+                exit 0
+            fi
             if ! exec 202> "$STATE_LOCK"; then
                 exit 0
             fi
@@ -1233,8 +1344,8 @@ schedule_restore_retries() {
             fi
             # Re-check the generation while holding the lock, so a restore
             # that started after this retry was scheduled cannot be undone.
-            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
-            if [ "$cur_gen" != "$gen" ]; then
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ] || ! _epoch_is_current "$epoch"; then
                 flock -u 202
                 exec 202>&-
                 exit 0
@@ -1270,7 +1381,13 @@ schedule_restore_retries() {
             # the gate MUST be re-checked after acquiring the write lock.  On a
             # mismatch, roll the staged value back to STATE_FILE before exiting;
             # just `exit` here would orphan PENDING and strand the saved value.
-            cur_gen="$(cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if ! _epoch_is_current "$epoch"; then
+                log "restore retry +${delay}s (gen=$gen): epoch superseded inside WRITE_LOCK; rolling staged value back"
+                _release_write_lock
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
             if [ "$cur_gen" != "$gen" ]; then
                 log "restore retry +${delay}s (gen=$gen): generation superseded inside WRITE_LOCK ($cur_gen); rolling staged value back"
                 _release_write_lock
@@ -1805,10 +1922,12 @@ startup_resume_handoff() {
 # --- Blank / unblank guards ----------------------------------------------
 
 guard_blank() {
-    local delay captured_gen
+    local delay captured_gen captured_epoch
     # A blank guard started in generation N must never force 0 after a newer
-    # resume cycle (N+1) has restored the user's brightness.
+    # resume cycle (N+1) has restored the user's brightness.  The epoch also
+    # covers a cycle whose generation publish FAILED (no gen bump to detect).
     captured_gen="$(current_restore_gen)"
+    captured_epoch="$(_read_retry_epoch)"
     for delay in 0.25 1.0; do
         (
             sleep "$delay"
@@ -1818,11 +1937,19 @@ guard_blank() {
                 log "blank guard +${delay}s: generation superseded (${captured_gen:-none} -> ${gen_now:-none}); guard cancelled"
                 exit 0
             fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "blank guard +${delay}s: retry epoch superseded after sleep; guard cancelled"
+                exit 0
+            fi
             # Only an explicit "true" counts as active; every other value
             # (including a future tristate "unknown") means inactive.
             if [ "$(screensaver_is_active)" = "true" ]; then
                 : # active: verify the light is really off
             else
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "blank guard +${delay}s: retry epoch superseded after probe; guard cancelled"
                 exit 0
             fi
             local cur
@@ -1839,6 +1966,11 @@ guard_blank() {
                 gen_now="$(current_restore_gen)"
                 if [ "$gen_now" != "$captured_gen" ]; then
                     log "blank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
+                if ! _epoch_is_current "$captured_epoch"; then
+                    log "blank guard +${delay}s: retry epoch superseded inside WRITE_LOCK; guard cancelled"
                     _release_write_lock
                     exit 0
                 fi
@@ -1866,8 +1998,9 @@ guard_unblank() {
     # a last-user record stamped with the same generation counts as evidence
     # of a user change made after the restore; an older cache may simply be
     # the pre-blank brightness (e.g. 6 while the saved value is 8).
-    local restore_gen_now
+    local restore_gen_now captured_epoch
     restore_gen_now="$(current_restore_gen)"
+    captured_epoch="$(_read_retry_epoch)"
     local delay
     for delay in 0.3 0.9; do
         (
@@ -1884,9 +2017,17 @@ guard_unblank() {
                 log "unblank guard +${delay}s: generation superseded (${restore_gen_now:-none} -> ${gen_now:-none}); guard cancelled"
                 exit 0
             fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "unblank guard +${delay}s: retry epoch superseded after sleep; guard cancelled"
+                exit 0
+            fi
             # This guard can write a restored brightness, so it follows the
             # same fail-closed rule as restore_state: only inactive proceeds.
             if [ "$(screensaver_tristate)" != "inactive" ]; then
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "unblank guard +${delay}s: retry epoch superseded after probe; guard cancelled"
                 exit 0
             fi
             local lu lu_gen rec gpct raw gsd_positive=0 gsd_changed=0 write_it=0
@@ -1946,58 +2087,106 @@ guard_unblank() {
                 # restore wait up to 5s for this lock, and a multi-second
                 # gdbus timeout here widens that degradation window.  Re-read
                 # the LED here, then keep the lock only for cheap local checks
-                # plus the physical write.
-                local raw_now
-                raw_now="$(get_brightness 2> /dev/null || echo "")"
-                if [ "$raw_now" = "$saved" ]; then
-                    log "unblank guard +${delay}s: brightness already $saved before write; skipping (gen=$restore_gen_now)"
-                    exit 0
-                fi
-                log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
-                if ! _acquire_write_lock; then
-                    log_warn "unblank guard +${delay}s: WRITE_LOCK unavailable; not re-setting"
-                    exit 0
-                fi
-                # The generation gate lives inside the lock bump_restore_gen()
-                # uses, so a writer cannot slip between the check and the
-                # physical write.
-                gen_now="$(current_restore_gen)"
-                if [ "$gen_now" != "$restore_gen_now" ]; then
-                    log "unblank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
-                    _release_write_lock
-                    exit 0
-                fi
-                local written_gen
-                written_gen="$(cat "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || echo "")"
-                if [ -n "$restore_gen_now" ] && [ "$written_gen" = "$restore_gen_now" ]; then
-                    log "unblank guard +${delay}s: generation $restore_gen_now already re-set; skipping duplicate write"
-                    _release_write_lock
-                    exit 0
-                fi
-                # Last-chance re-check immediately before set_brightness: a
-                # non-cooperative publisher cannot slip a new generation past
-                # the first check while the marker is being examined.
-                gen_now="$(current_restore_gen)"
-                if [ "$gen_now" != "$restore_gen_now" ]; then
-                    log "unblank guard +${delay}s: generation changed before write inside WRITE_LOCK; guard cancelled"
-                    _release_write_lock
-                    exit 0
-                fi
-                local grc=0
-                if set_brightness "$saved"; then grc=0; else grc=$?; fi
-                if [ "$grc" -eq 0 ] && [ -n "$restore_gen_now" ]; then
-                    # Publish the marker while still holding the lock so the
-                    # later guard of the same generation cannot write twice.
-                    local mtmp
-                    mtmp="$(mktemp "$STATE_DIR/.c640-kbd-gw-XXXXXX" 2> /dev/null || echo "")"
-                    if [ -n "$mtmp" ]; then
-                        printf '%s\n' "$restore_gen_now" > "$mtmp" 2> /dev/null || true
-                        chmod 600 "$mtmp" 2> /dev/null || true
-                        mv -f "$mtmp" "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || cp "$mtmp" "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || true
-                        rm -f "$mtmp" 2> /dev/null || true
+                # plus the physical write.  The gsd/ScreenSaver witnesses have
+                # a TTL because both the probe and the lock wait can be slow.
+                local raw_now now age ev_at attempts=0 grc=0
+                ev_at="$(date +%s 2> /dev/null || echo 0)"
+                case "$ev_at" in '' | *[!0-9]*) ev_at=0 ;; esac
+                while :; do
+                    raw_now="$(get_brightness 2> /dev/null || echo "")"
+                    if [ "$raw_now" = "$saved" ]; then
+                        log "unblank guard +${delay}s: brightness already $saved before write; skipping (gen=$restore_gen_now)"
+                        exit 0
                     fi
-                fi
-                _release_write_lock
+                    log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
+                    if ! _acquire_write_lock; then
+                        log_warn "unblank guard +${delay}s: WRITE_LOCK unavailable; not re-setting"
+                        exit 0
+                    fi
+                    # TTL re-check INSIDE the lock.  Stale evidence -> unlock,
+                    # re-probe outside the lock, re-acquire (bounded retries).
+                    # Every re-acquire re-runs the generation and epoch gates.
+                    now="$(date +%s 2> /dev/null || echo 0)"
+                    case "$now" in '' | *[!0-9]*) now=0 ;; esac
+                    age=$((now - ev_at))
+                    if [ "$age" -gt "$C640_KBD_GUARD_EVIDENCE_TTL" ]; then
+                        _release_write_lock
+                        if [ "$attempts" -ge 2 ]; then
+                            log_warn "unblank guard +${delay}s: evidence still stale after $attempts re-probes; guard cancelled"
+                            exit 0
+                        fi
+                        attempts=$((attempts + 1))
+                        log "unblank guard +${delay}s: evidence aged ${age}s > TTL ${C640_KBD_GUARD_EVIDENCE_TTL}s; re-probing ($attempts)"
+                        if [ "$(screensaver_tristate)" != "inactive" ]; then
+                            exit 0
+                        fi
+                        if ! _epoch_is_current "$captured_epoch"; then
+                            log "unblank guard +${delay}s: retry epoch superseded during evidence re-probe; guard cancelled"
+                            exit 0
+                        fi
+                        gpct="$(gsd_get_pct || echo "")"
+                        raw="$(get_brightness || echo "")"
+                        gsd_positive=0
+                        if [[ "$gpct" =~ ^[0-9]+$ ]] && [ "$gpct" = "$want_pct" ]; then
+                            gsd_positive=1
+                        fi
+                        if [ "$raw" = "$saved" ]; then
+                            log "unblank guard +${delay}s: brightness already $saved after re-probe; skipping"
+                            exit 0
+                        fi
+                        if [ "$gsd_positive" -ne 1 ]; then
+                            log "unblank guard +${delay}s: gsd no longer supports a re-set after re-probe (pct=${gpct:-unknown}); guard cancelled"
+                            exit 0
+                        fi
+                        ev_at="$(date +%s 2> /dev/null || echo 0)"
+                        case "$ev_at" in '' | *[!0-9]*) ev_at=0 ;; esac
+                        continue
+                    fi
+                    # The generation gate lives inside the lock bump_restore_gen()
+                    # uses, so a writer cannot slip between the check and the
+                    # physical write.
+                    gen_now="$(current_restore_gen)"
+                    if [ "$gen_now" != "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    if ! _epoch_is_current "$captured_epoch"; then
+                        log "unblank guard +${delay}s: retry epoch superseded inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    local written_gen
+                    written_gen="$(cat "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || echo "")"
+                    if [ -n "$restore_gen_now" ] && [ "$written_gen" = "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation $restore_gen_now already re-set; skipping duplicate write"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    # Last-chance re-check immediately before set_brightness: a
+                    # non-cooperative publisher cannot slip a new generation past
+                    # the first check while the marker is being examined.
+                    gen_now="$(current_restore_gen)"
+                    if [ "$gen_now" != "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation changed before write inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    if set_brightness "$saved"; then grc=0; else grc=$?; fi
+                    if [ "$grc" -eq 0 ] && [ -n "$restore_gen_now" ]; then
+                        # Publish the marker while still holding the lock so the
+                        # later guard of the same generation cannot write twice.
+                        # The atomic helper verifies the readback: the old
+                        # `|| true` chain could silently leave no marker and let a
+                        # second guard re-write the same generation.  The LED
+                        # re-check above still skips a redundant physical write.
+                        if ! _atomic_publish_text "$restore_gen_now" "$GUARD_WRITTEN_GEN_FILE"; then
+                            log_warn "unblank guard +${delay}s: cannot publish generation marker (gen=$restore_gen_now); duplicate suppression degraded"
+                        fi
+                    fi
+                    _release_write_lock
+                    break
+                done
                 if [ "$grc" -ne 0 ]; then
                     log_warn "unblank guard +${delay}s: re-set failed (rc=$grc)"
                 fi
@@ -2246,6 +2435,9 @@ print_help() {
     echo "  C640_KBD_RESUME_PROBE_MAX=N    Cap ScreenSaver polling after thaw (default 10s)"
     echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
     echo "  C640_KBD_SAVE_LOCK_WAIT=N      Bounded wait for the state lock on save (default 2s)"
+    echo "  C640_KBD_GUARD_EVIDENCE_TTL=N  Max age (s) of LED/gsd evidence before a guard re-probes (default 6)"
+    echo "  C640_KBD_RESTORE_GEN_FILE=PATH Override restore-generation file (tests)"
+    echo "  C640_KBD_RESTORE_RETRY_EPOCH=PATH Override retry/guard epoch file (tests)"
 }
 
 check_status() {

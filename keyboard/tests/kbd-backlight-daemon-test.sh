@@ -30,6 +30,14 @@ WRITE_LOCK_FILE="$D_STATE_DIR/c640-kbd-backlight.write.lock"
 GUARD_WRITTEN_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.guard-written-gen"
 SELF_WRITE_SENTINEL_FILE="$D_STATE_DIR/c640-kbd-backlight.self-write"
 GUARD_ERR="$TMP_DIR/guard.err"
+# G3 (16th re-review finding #3): atomic-publish fault injection.  All stubs
+# pass through to absolute paths; a fault only fires for a narrowly scoped
+# template/destination so unrelated test traffic is unaffected.
+GEN_FAULT_LOG="$TMP_DIR/gen-fault.log"
+ORIG_TMPDIR="${TMPDIR:-/tmp}"
+RESTORE_RETRY_EPOCH_FILE="$D_STATE_DIR/c640-kbd-backlight.retry-epoch"
+export C640_KBD_RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
+export C640_KBD_RESTORE_RETRY_EPOCH="$RESTORE_RETRY_EPOCH_FILE"
 # These three are derived by the daemon at SOURCE time from STATE_DIR, which
 # the test only overrides after sourcing.  Pass them in as env overrides so
 # the daemon never touches the real /run/user/<uid> runtime dir.
@@ -99,7 +107,9 @@ assert_eq() {
 }
 assert_file() {
     local label="$1" file="$2" expected="$3"
-    assert_eq "$label" "$expected" "$(cat "$file" 2> /dev/null || echo '<missing>')"
+    # Use /bin/cat, not the PATH `cat` stub (which fault-injection cases may
+    # point at the generation file) — an oracle must not share the tested seam.
+    assert_eq "$label" "$expected" "$(/bin/cat "$file" 2> /dev/null || echo '<missing>')"
 }
 assert_absent() {
     local label="$1" file="$2"
@@ -126,6 +136,27 @@ cat > "$STUB_DIR/gdbus" << 'STUB'
 #!/bin/sh
 printf '%s\n' "$*" >> "$STUB_GDBUS_LOG"
 
+# Epoch fault injection for the barrier tests.  Rotating the epoch (not the
+# generation) models a bump whose generation publish FAILED: only the epoch
+# witness changes, exactly like _rotate_retry_epoch() on the failure path.
+_rotate_test_epoch() {
+    _ep="${C640_KBD_RESTORE_RETRY_EPOCH:-/nonexistent}"
+    _e="$(command cat "$_ep" 2> /dev/null || printf '0')"
+    case "$_e" in '' | *[!0-9]*) _e=0 ;; esac
+    printf '%s\n' "$((_e + 1))" > "$_ep" 2> /dev/null || true
+}
+# On the Nth GetActive (probe) in a guard/retry: rotate after the earlier gate.
+_epoch_on_nth_active() {
+    [ "${STUB_EPOCH_ON_NTH_ACTIVE:-0}" -gt 0 ] 2> /dev/null || return 0
+    _f="${STUB_EPOCH_ACTIVE_COUNT_FILE:-/nonexistent}"
+    _n="$(command cat "$_f" 2> /dev/null || printf '0')"
+    case "$_n" in '' | *[!0-9]*) _n=0 ;; esac
+    _n=$((_n + 1))
+    printf '%s\n' "$_n" > "$_f" 2> /dev/null || true
+    [ "$_n" -eq "$STUB_EPOCH_ON_NTH_ACTIVE" ] && _rotate_test_epoch
+    return 0
+}
+
 case "$*" in
     *introspect*)
         case "$*" in
@@ -151,6 +182,13 @@ esac
 
 case "$*" in
     *GetActive*)
+        # One-shot / Nth-probe epoch rotation: fires between a caller's
+        # after-sleep gate and its after-probe gate.
+        if [ -n "${STUB_EPOCH_ON_ACTIVE:-}" ] && [ -e "$STUB_EPOCH_ON_ACTIVE" ]; then
+            rm -f "$STUB_EPOCH_ON_ACTIVE"
+            _rotate_test_epoch
+        fi
+        _epoch_on_nth_active
         case "$*" in
             *org.gnome.ScreenSaver*) _ans="${STUB_GNOME_ACTIVE:-false}" ;;
             *) _ans="${STUB_FDO_ACTIVE:-false}" ;;
@@ -232,6 +270,12 @@ case "$*" in
             printf '%s\n' "$((g + 1))" > "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || true
             printf 'BUMP-ON-GET %s\n' "$*" >> "$STUB_GDBUS_LOG"
         fi
+        # Rotate the epoch on the first LED read after the probe: the guard's
+        # inside-WRITE_LOCK epoch gate is then the only witness left.
+        if [ -n "${STUB_EPOCH_ON_GET:-}" ] && [ -e "$STUB_EPOCH_ON_GET" ]; then
+            rm -f "$STUB_EPOCH_ON_GET"
+            _rotate_test_epoch
+        fi
         printf '(%s,)\n' "$(cat "$STUB_RAW_FILE" 2> /dev/null || printf '%s' "${STUB_KBD_RAW:-42}")"
         exit 0
         ;;
@@ -297,6 +341,17 @@ done
 case "$wait_secs" in
     '' | *[!0-9]*) wait_secs=0 ;;
 esac
+# Epoch fault injection at the retry's STATE_LOCK acquisition (fd 202, -n):
+# after the after-sleep and after-probe gates, before the inside-lock gate.
+if [ "$op" = "n" ] && [ "$fd" = "${STUB_EPOCH_ON_LOCK_FD:-none}" ] \
+    && [ -n "${STUB_EPOCH_ON_LOCK_FLAG:-}" ] \
+    && [ -e "$STUB_EPOCH_ON_LOCK_FLAG" ]; then
+    rm -f "$STUB_EPOCH_ON_LOCK_FLAG"
+    _ep="${C640_KBD_RESTORE_RETRY_EPOCH:-/nonexistent}"
+    _e="$(cat "$_ep" 2> /dev/null || echo 0)"
+    case "$_e" in '' | *[!0-9]*) _e=0 ;; esac
+    printf '%s\n' "$((_e + 1))" > "$_ep" 2> /dev/null || true
+fi
 # 50 polls per second (0.02s each).
 polls=$((wait_secs * 50))
 [ -n "$fd" ] || exit 0
@@ -480,6 +535,7 @@ export LOCK_FILE="$D_STATE_DIR/c640-kbd-backlight.lock"
 export LAST_USER_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user"
 export LAST_USER_META_FILE="$D_STATE_DIR/c640-kbd-backlight.last-user.meta"
 export RESTORE_GEN_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-gen"
+export RESTORE_RETRY_EPOCH_FILE="$RESTORE_RETRY_EPOCH_FILE"
 export RESTORE_PENDING_FILE="$D_STATE_DIR/c640-kbd-backlight.restore-pending"
 export HANDOFF_SUSPEND_FILE="$HANDOFF_SUSPEND_FILE"
 export HANDOFF_RESUME_FILE="$HANDOFF_RESUME_FILE"
@@ -513,6 +569,15 @@ export STUB_SLEEP_MODE=fast
 export STUB_SLEEP_STARTED="$STUB_SLEEP_STARTED"
 export STUB_SLEEP_RELEASE="$STUB_SLEEP_RELEASE"
 export STUB_BUMP_FLAG="$STUB_BUMP_FLAG"
+# Epoch barrier fault injection (one-shot files / Nth probe).  Each hook
+# rotates ONLY the epoch, modelling a generation publish that FAILED.
+STUB_EPOCH_ON_ACTIVE="$TMP_DIR/epoch-on-active"
+STUB_EPOCH_ON_GET="$TMP_DIR/epoch-on-get"
+STUB_EPOCH_ON_LOCK_FLAG="$TMP_DIR/epoch-on-lock"
+STUB_EPOCH_ACTIVE_COUNT_FILE="$TMP_DIR/epoch-active-count"
+export STUB_EPOCH_ON_ACTIVE STUB_EPOCH_ON_GET STUB_EPOCH_ON_LOCK_FLAG
+export STUB_EPOCH_ON_NTH_ACTIVE=0
+export STUB_EPOCH_ACTIVE_COUNT_FILE STUB_EPOCH_ON_LOCK_FD=202
 export STUB_RETRY_GATE="$STUB_RETRY_GATE"
 export STUB_RETRY_RELEASE="$STUB_RETRY_RELEASE"
 export STUB_RETRY_STARTED="$STUB_RETRY_STARTED"
@@ -523,6 +588,9 @@ export STUB_TORN_COUNTER="$STUB_TORN_COUNTER"
 export STUB_TORN_META_ON=0
 
 reset_case() {
+    # Disarm the rm fault first: reset_case itself must always be able to
+    # clean the state directory.
+    export STUB_GEN_RM_FAIL=0
     # Open every gate BEFORE retiring retry/guard subshells from the previous
     # case, otherwise a still-gated child would keep `wait` blocked.
     : > "$STUB_SLEEP_RELEASE"
@@ -549,13 +617,28 @@ reset_case() {
     rm -f "$WRITE_LOCK_FILE" "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL_FILE" \
         "$STUB_SLEEP_STARTED" "$STUB_SLEEP_RELEASE" "$STUB_SLEEP_RELEASE".* \
         "$STUB_BUMP_FLAG" \
+        "$STUB_EPOCH_ON_ACTIVE" "$STUB_EPOCH_ON_GET" "$STUB_EPOCH_ON_LOCK_FLAG" \
+        "$STUB_EPOCH_ACTIVE_COUNT_FILE" \
         "$STUB_RETRY_GATE" "$STUB_RETRY_RELEASE" "$STUB_RETRY_STARTED" \
         "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE" \
         "$STUB_TORN_META" "$STUB_TORN_OLD" "$STUB_TORN_NEW" "$STUB_TORN_COUNTER"
     export STUB_TORN_META_ON=0
     export STUB_SLEEP_MODE=fast
+    export C640_KBD_DEBUG=0
+    export STUB_EPOCH_ON_NTH_ACTIVE=0
     rm -f "$HOOK_RUN_USER_ROOT"/[0-9]*/c640-kbd-backlight.* 2> /dev/null || true
     rm -f "$FLOCK_DIR"/flock.* 2> /dev/null || true
+    # G3 publish faults are per-case; disarm them before any harness output.
+    : > "$GEN_FAULT_LOG"
+    export STUB_GEN_MKTEMP_FAIL=0 STUB_GEN_PRINTF_FAIL=0 STUB_GEN_PRINTF_FAIL_VALUE=''
+    export STUB_GEN_CHMOD_FAIL=0 STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
+    export STUB_GEN_MV_NOOP=0 STUB_GEN_MV_NOOP_DEST=''
+    export STUB_GEN_CAT_LIE=0 STUB_GEN_CAT_LIE_VALUE=''
+    export STUB_GEN_RM_FAIL=0
+    export STUB_GEN_DATE_STALE='' STUB_GEN_DATE_STALE_SECS=10
+    export TMPDIR="$ORIG_TMPDIR"
+    rm -f "$RESTORE_RETRY_EPOCH_FILE" "$D_STATE_DIR"/.c640-kbd-gen-* \
+        "$ORIG_TMPDIR"/.c640-kbd-gen-* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
     printf '%s\n' "$STUB_KBD_RAW" > "$RAW_FILE"
@@ -610,6 +693,98 @@ run_fn_rc() {
     local rc=0
     "$@" 2> "$DAEMON_ERR" || rc=$?
     printf '%s' "$rc"
+}
+
+# --- G3: atomic-publish fault stubs -----------------------------------------
+# Every stub passes through to the real binary (`command`/`builtin` bypass the
+# function).  Faults are narrowly scoped to the generation temp template or
+# destination, so they cannot perturb unrelated test traffic.
+mktemp() {
+    local tpl="${1:-}"
+    case "$tpl" in
+        "$D_STATE_DIR"/.c640-kbd-gen-*)
+            if [ "${STUB_GEN_MKTEMP_FAIL:-0}" = "1" ]; then
+                builtin printf 'mktemp-fail %s\n' "$tpl" >> "$GEN_FAULT_LOG"
+                return 1
+            fi
+            ;;
+    esac
+    command mktemp "$@"
+}
+
+printf() {
+    if [ "${STUB_GEN_PRINTF_FAIL:-0}" = "1" ] && [ "${1:-}" = '%s\n' ] \
+        && [ "${2:-}" = "${STUB_GEN_PRINTF_FAIL_VALUE:-}" ]; then
+        builtin printf 'printf-fail %s\n' "${2:-}" >> "$GEN_FAULT_LOG"
+        return 1
+    fi
+    builtin printf "$@"
+}
+
+chmod() {
+    if [ "${STUB_GEN_CHMOD_FAIL:-0}" = "1" ] && [ "${1:-}" = "600" ]; then
+        builtin printf 'chmod-fail %s\n' "${2:-}" >> "$GEN_FAULT_LOG"
+        return 1
+    fi
+    command chmod "$@"
+}
+
+mv() {
+    local dest="${!#}"
+    builtin printf 'mv %s\n' "$*" >> "$GEN_FAULT_LOG"
+    if [ "${STUB_GEN_MV_FAIL:-0}" = "1" ] \
+        && [ "$dest" = "${STUB_GEN_MV_FAIL_DEST:-$RESTORE_GEN_FILE}" ]; then
+        builtin printf 'mv-fail %s\n' "$dest" >> "$GEN_FAULT_LOG"
+        return 1
+    fi
+    # Pretend the rename succeeded without moving anything: only a real
+    # readback can detect this.
+    if [ "${STUB_GEN_MV_NOOP:-0}" = "1" ] \
+        && [ "$dest" = "${STUB_GEN_MV_NOOP_DEST:-$RESTORE_GEN_FILE}" ]; then
+        return 0
+    fi
+    command mv "$@"
+}
+
+cp() {
+    builtin printf 'cp %s\n' "$*" >> "$GEN_FAULT_LOG"
+    command cp "$@"
+}
+
+rm() {
+    if [ "${STUB_GEN_RM_FAIL:-0}" = "1" ]; then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                "$GUARD_WRITTEN_GEN_FILE" | "$SELF_WRITE_SENTINEL_FILE")
+                    builtin printf 'rm-fail %s\n' "$arg" >> "$GEN_FAULT_LOG"
+                    return 1
+                    ;;
+            esac
+        done
+    fi
+    command rm "$@"
+}
+
+cat() {
+    if [ "${STUB_GEN_CAT_LIE:-0}" = "1" ] && [ "$#" -eq 1 ] \
+        && [ "$1" = "$RESTORE_GEN_FILE" ]; then
+        builtin printf '%s\n' "${STUB_GEN_CAT_LIE_VALUE:-5}"
+        return 0
+    fi
+    command cat "$@"
+}
+
+date() {
+    # One-shot "time jumped" injection for the guard evidence TTL: the first
+    # +%s query with the marker present returns a time far in the future.
+    if [ "${1:-}" = "+%s" ] && [ -n "${STUB_GEN_DATE_STALE:-}" ] \
+        && [ -e "$STUB_GEN_DATE_STALE" ]; then
+        rm -f "$STUB_GEN_DATE_STALE"
+        builtin printf '%s\n' "$(($(command date +%s) + ${STUB_GEN_DATE_STALE_SECS:-10}))"
+        return 0
+    fi
+    command date "$@"
 }
 
 # Finding #4 helpers.  start_gated_guard forks a guard with the controllable
@@ -3282,6 +3457,721 @@ export STUB_TORN_META_ON=0
 export STUB_SLEEP_MODE=fast
 assert_file "P2-3: coherent meta read repairs G2" "$RAW_FILE" "70"
 assert_eq "P2-3: exactly one re-set (second guard suppressed)" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+# ==========================================================================
+# G3 (16th re-review finding #3): the generation bump must publish atomically
+# and fail closed.  The old code swallowed every write error, could publish an
+# EMPTY generation file, and cleared the guard markers anyway.
+# ==========================================================================
+
+g3_setup() {
+    reset_case
+    printf '5\n' > "$RESTORE_GEN_FILE"
+    printf '9\n' > "$GUARD_WRITTEN_GEN_FILE"
+    printf 'sentinel\n' > "$SELF_WRITE_SENTINEL_FILE"
+    # shellcheck disable=SC2154  # global owned by the daemon
+    restore_gen=0
+    : > "$GEN_FAULT_LOG"
+    : > "$GUARD_ERR"
+}
+
+g3_bump_rc() {
+    # Call in the CURRENT shell (no command substitution) so the in-memory
+    # mirror can be asserted afterwards; publish the rc via a global.
+    G3_RC=0
+    bump_restore_gen 2> "$DAEMON_ERR" || G3_RC=$?
+}
+
+# Rotate ONLY the epoch, i.e. simulate the failure path of bump_restore_gen():
+# the generation publish failed but armed retries/guards must be revoked.
+_bump_test_epoch() {
+    local e=""
+    IFS= read -r e 2> /dev/null < "$RESTORE_RETRY_EPOCH_FILE" || e=""
+    [[ "$e" =~ ^[0-9]+$ ]] || e=0
+    printf '%s\n' "$((10#$e + 1))" > "$RESTORE_RETRY_EPOCH_FILE"
+}
+
+# Park one retry in the controllable sleep gate.  Caller releases it after
+# injecting the epoch change; guards use their separate sleep gate.
+arm_gated_retry() {
+    local label="$1" gen="$2"
+    : > "$STUB_RETRY_STARTED"
+    : > "$STUB_RETRY_GATE"
+    rm -f "$STUB_RETRY_RELEASE"
+    # Retry epoch cancellations are DEBUG-level logs; enable them so each
+    # gate's exact log can be asserted (reset_case turns DEBUG off again).
+    export STUB_SLEEP_MODE=gate C640_KBD_DEBUG=1
+    schedule_restore_retries "$gen" 0.5 2> "$DAEMON_ERR"
+    if wait_for_line "$STUB_RETRY_STARTED" "0.5"; then
+        ok "$label: retry reached the controllable sleep gate"
+    else
+        bad "$label: retry never reached the sleep gate"
+    fi
+}
+
+# Fail the generation publish but still rotate the epoch (production failure
+# path).  A separate stderr file keeps the retry/guard log intact.
+failed_bump_rotates_epoch() {
+    export STUB_GEN_MV_FAIL=1 STUB_GEN_MV_FAIL_DEST="$RESTORE_GEN_FILE"
+    bump_restore_gen 2> "$TMP_DIR/epoch-bump.err" || true
+    export STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
+}
+
+# G3-01. Control: the verified publish advances the file and the in-memory
+# mirror, then clears both markers.
+g3_setup
+g3_bump_rc
+g3_rc="$G3_RC"
+assert_eq "G3-01: control bump succeeds" "0" "$g3_rc"
+assert_file "G3-01: generation advanced to 6" "$RESTORE_GEN_FILE" "6"
+# shellcheck disable=SC2154  # restore_gen is the daemon global
+assert_eq "G3-01: in-memory mirror advanced" "6" "$restore_gen"
+assert_absent "G3-01: guard marker cleared" "$GUARD_WRITTEN_GEN_FILE"
+assert_absent "G3-01: sentinel cleared" "$SELF_WRITE_SENTINEL_FILE"
+assert_absent "G3-01: no temp left behind" "$D_STATE_DIR/.c640-kbd-gen-XXXXXX"
+
+# G3-02. Same-dir mktemp fails: no publish, no marker cleanup, no in-memory
+# advance.  rc=1 is what makes callers defer.
+g3_setup
+export STUB_GEN_MKTEMP_FAIL=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MKTEMP_FAIL=0
+assert_eq "G3-02: mktemp failure returns 1" "1" "$g3_rc"
+assert_file "G3-02: generation unchanged" "$RESTORE_GEN_FILE" "5"
+# shellcheck disable=SC2154
+assert_eq "G3-02: in-memory mirror unchanged" "0" "$restore_gen"
+assert_file "G3-02: guard marker kept" "$GUARD_WRITTEN_GEN_FILE" "9"
+assert_present "G3-02: sentinel kept" "$SELF_WRITE_SENTINEL_FILE"
+if grep -q 'cannot create same-dir temp' "$DAEMON_ERR"; then
+    ok "G3-02: mktemp failure is logged"
+else
+    bad "G3-02: no mktemp warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-03. Temp write fails.  The old `|| true` published an EMPTY generation
+# file (a reader then numbered generations from 0 again).
+g3_setup
+export STUB_GEN_PRINTF_FAIL=1 STUB_GEN_PRINTF_FAIL_VALUE=6
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_PRINTF_FAIL=0 STUB_GEN_PRINTF_FAIL_VALUE=''
+assert_eq "G3-03: temp write failure returns 1" "1" "$g3_rc"
+assert_file "G3-03: published generation is still 5 (not empty)" "$RESTORE_GEN_FILE" "5"
+assert_file "G3-03: guard marker kept" "$GUARD_WRITTEN_GEN_FILE" "9"
+assert_present "G3-03: sentinel kept" "$SELF_WRITE_SENTINEL_FILE"
+if [ -n "$(find "$D_STATE_DIR" -maxdepth 1 -name '.c640-kbd-gen-*' -print -quit 2> /dev/null)" ]; then
+    bad "G3-03: a failed temp survived"
+else
+    ok "G3-03: failed temp removed"
+fi
+
+# G3-04. chmod failure is no longer swallowed.
+g3_setup
+export STUB_GEN_CHMOD_FAIL=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_CHMOD_FAIL=0
+assert_eq "G3-04: chmod failure returns 1" "1" "$g3_rc"
+assert_file "G3-04: generation unchanged" "$RESTORE_GEN_FILE" "5"
+assert_file "G3-04: guard marker kept" "$GUARD_WRITTEN_GEN_FILE" "9"
+
+# G3-05. mv failure returns 1 and there is NO cp fallback at all.
+g3_setup
+export STUB_GEN_MV_FAIL=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MV_FAIL=0
+assert_eq "G3-05: rename failure returns 1" "1" "$g3_rc"
+assert_file "G3-05: generation unchanged" "$RESTORE_GEN_FILE" "5"
+assert_eq "G3-05: cp fallback never invoked" "0" "$(grep -c '^cp ' "$GEN_FAULT_LOG" || true)"
+
+# G3-06. Rename reports success but changes nothing; a lying `cat` stub must
+# not matter because the readback uses the bash builtin.
+g3_setup
+export STUB_GEN_MV_NOOP=1 STUB_GEN_CAT_LIE=1 STUB_GEN_CAT_LIE_VALUE=6
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MV_NOOP=0 STUB_GEN_CAT_LIE=0 STUB_GEN_CAT_LIE_VALUE=''
+assert_eq "G3-06: fake rename is detected" "1" "$g3_rc"
+assert_absent "G3-06: untrustworthy destination removed" "$RESTORE_GEN_FILE"
+assert_file "G3-06: guard marker kept" "$GUARD_WRITTEN_GEN_FILE" "9"
+if grep -q 'readback mismatch' "$DAEMON_ERR"; then
+    ok "G3-06: builtin readback caught the mismatch"
+else
+    bad "G3-06: no readback-mismatch warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-07. A symlink or directory destination must be rejected before mv can
+# replace the link or write into the directory.
+g3_setup
+rm -f "$RESTORE_GEN_FILE"
+printf 'outside\n' > "$TMP_DIR/gen-outside"
+ln -s "$TMP_DIR/gen-outside" "$RESTORE_GEN_FILE"
+g3_bump_rc
+g3_rc="$G3_RC"
+assert_eq "G3-07: symlink destination rejected" "1" "$g3_rc"
+assert_file "G3-07: external target untouched" "$TMP_DIR/gen-outside" "outside"
+rm -f "$RESTORE_GEN_FILE"
+mkdir "$RESTORE_GEN_FILE"
+g3_bump_rc
+g3_rc="$G3_RC"
+assert_eq "G3-07: directory destination rejected" "1" "$g3_rc"
+if [ -d "$RESTORE_GEN_FILE" ]; then
+    ok "G3-07: directory destination left alone"
+else
+    bad "G3-07: directory destination was replaced"
+fi
+assert_eq "G3-07: no temp staged inside the directory" "0" \
+    "$(find "$RESTORE_GEN_FILE" -maxdepth 1 -type f -print 2> /dev/null | wc -l)"
+rmdir "$RESTORE_GEN_FILE"
+
+# G3-08. Removing the TMPDIR fallback: a same-dir mktemp failure must NOT
+# create a temp under TMPDIR.
+g3_setup
+FAKE_TMPDIR="$TMP_DIR/fake-tmp"
+mkdir -p "$FAKE_TMPDIR"
+export TMPDIR="$FAKE_TMPDIR"
+export STUB_GEN_MKTEMP_FAIL=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MKTEMP_FAIL=0 TMPDIR="$ORIG_TMPDIR"
+assert_eq "G3-08: no cross-device fallback publish" "1" "$g3_rc"
+assert_file "G3-08: generation unchanged" "$RESTORE_GEN_FILE" "5"
+assert_eq "G3-08: TMPDIR has no temp files" "0" "$(find "$FAKE_TMPDIR" -maxdepth 1 -type f -print | wc -l)"
+
+# G3-09. The removed destination makes every gate fail closed: a retry stamped
+# with the old generation 5 must not write over the current brightness.
+g3_setup
+export STUB_GEN_MV_NOOP=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MV_NOOP=0
+assert_eq "G3-09: mismatch returns 1" "1" "$g3_rc"
+assert_absent "G3-09: destination invalidated" "$RESTORE_GEN_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+schedule_restore_retries 5 0.5
+wait 2> /dev/null || true
+assert_file "G3-09: stale retry wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-09: stale retry issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+# G3-10. Caller matrix under a publish fault.
+g3_setup
+write_state 30
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_GEN_MV_FAIL=1
+restore_rc="$(run_fn_rc restore_state)"
+export STUB_GEN_MV_FAIL=0
+assert_eq "G3-10: restore_state defers" "2" "$restore_rc"
+assert_file "G3-10: state retained" "$STATE_FILE" "30"
+assert_absent "G3-10: no PENDING staged" "$RESTORE_PENDING_FILE"
+assert_file "G3-10: LED untouched" "$RAW_FILE" "10"
+assert_eq "G3-10: no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+g3_setup
+write_state 30
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_GEN_MV_FAIL=1
+run_fn handle_unblank
+export STUB_GEN_MV_FAIL=0
+wait 2> /dev/null || true
+assert_file "G3-10: handle_unblank kept state" "$STATE_FILE" "30"
+assert_file "G3-10: handle_unblank left LED" "$RAW_FILE" "10"
+assert_eq "G3-10: handle_unblank armed no guard write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'unblank guard' "$DAEMON_ERR"; then
+    bad "G3-10: a guard was armed despite the failed bump"
+else
+    ok "G3-10: no guard armed after failed bump"
+fi
+
+g3_setup
+write_handoff_resume
+: > "$SET_LOG"
+export STUB_GEN_MV_FAIL=1
+resume_rc="$(run_fn_rc handle_resume)"
+export STUB_GEN_MV_FAIL=0
+wait 2> /dev/null || true
+assert_eq "G3-10: resume(no state) defers" "2" "$resume_rc"
+assert_present "G3-10: resume(no state) kept flag" "$HANDOFF_RESUME_FILE"
+assert_eq "G3-10: resume(no state) wrote nothing" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+g3_setup
+write_state 30
+write_handoff_suspend 30
+write_handoff_resume
+printf '30\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+export STUB_GEN_MV_FAIL=1
+resume_rc="$(run_fn_rc handle_resume)"
+export STUB_GEN_MV_FAIL=0
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+wait 2> /dev/null || true
+assert_eq "G3-10: resume(active) defers" "2" "$resume_rc"
+assert_file "G3-10: resume(active) kept state" "$STATE_FILE" "30"
+assert_present "G3-10: resume(active) kept flag" "$HANDOFF_RESUME_FILE"
+assert_eq "G3-10: resume(active) wrote nothing" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+g3_setup
+write_state 30
+write_handoff_suspend 30
+write_handoff_resume
+printf '30\n' > "$RAW_FILE"
+: > "$SET_LOG"
+export STUB_GNOME_ACTIVE=fail STUB_FDO_ACTIVE=fail
+export STUB_GEN_MV_FAIL=1
+resume_rc="$(run_fn_rc handle_resume)"
+export STUB_GEN_MV_FAIL=0
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+wait 2> /dev/null || true
+assert_eq "G3-10: resume(unknown convergence) defers" "2" "$resume_rc"
+assert_file "G3-10: resume(unknown) kept state" "$STATE_FILE" "30"
+assert_present "G3-10: resume(unknown) kept flag" "$HANDOFF_RESUME_FILE"
+assert_eq "G3-10: resume(unknown) wrote nothing" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+
+# G3-11. Epoch barrier: a publish failure rotates the epoch, so a guard armed
+# before the failed bump is revoked even though the generation did not advance.
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+run_fn restore_state
+assert_file "G3-11: first restore established G6" "$RESTORE_GEN_FILE" "6"
+start_gated_guard guard_unblank 30
+assert_eq "G3-11: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+export STUB_GEN_MV_FAIL=1 STUB_GEN_MV_FAIL_DEST="$RESTORE_GEN_FILE"
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
+assert_eq "G3-11: failed bump returns 1" "1" "$g3_rc"
+assert_file "G3-11: generation stayed at 6" "$RESTORE_GEN_FILE" "6"
+printf '30\n' > "$PCT_FILE"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+release_guards
+assert_file "G3-11: revoked guard wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-11: revoked guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'retry epoch superseded' "$GUARD_ERR"; then
+    ok "G3-11: epoch revocation is logged"
+else
+    bad "G3-11: no epoch revocation log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-12. Evidence TTL: the LED/gsd witnesses age while the guard sleeps and
+# waits for WRITE_LOCK.  Inside the lock the guard must notice the age, release
+# the lock, re-probe and only then write.  The one-shot date fault fires on the
+# second get_brightness() (the last-chance re-read), i.e. after ev_at was taken.
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+export C640_KBD_GUARD_EVIDENCE_TTL=6
+: > "$TMP_DIR/g3-g312-count"
+rm -f "$TMP_DIR/g3-date-stale"
+export STUB_GEN_DATE_STALE="$TMP_DIR/g3-date-stale" STUB_GEN_DATE_STALE_SECS=10
+declare -f get_brightness | sed '1s/^get_brightness ()/real_get_brightness_g312 ()/' > "$TMP_DIR/g312-getbrightness.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/g312-getbrightness.def"
+_orig_get_brightness_g312="$(declare -f get_brightness)"
+# shellcheck disable=SC2120  # forwarding wrapper intentionally passes caller args through
+get_brightness() {
+    local n
+    n="$(cat "$TMP_DIR/g3-g312-count" 2> /dev/null || echo 0)"
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$TMP_DIR/g3-g312-count"
+    if [ "$n" -eq 2 ]; then
+        : > "$TMP_DIR/g3-date-stale"
+    fi
+    real_get_brightness_g312 "$@"
+}
+start_gated_guard guard_unblank 30
+assert_eq "G3-12: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+# Release one guard at a time so the one-shot time fault belongs to the first
+# guard's last-chance LED re-read, not to a concurrent second guard.
+: > "${STUB_SLEEP_RELEASE}.0.3"
+g3_wait_n=0
+while [ "$(grep -c 'Properties.Set' "$SET_LOG" 2> /dev/null || true)" -eq 0 ] && [ "$g3_wait_n" -lt 300 ]; do
+    /bin/sleep 0.02
+    g3_wait_n=$((g3_wait_n + 1))
+done
+if grep -q 'Properties.Set' "$SET_LOG"; then
+    ok "G3-12: first guard reached a D-Bus write"
+else
+    bad "G3-12: first guard never wrote"
+fi
+: > "${STUB_SLEEP_RELEASE}.0.9"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+eval "$_orig_get_brightness_g312"
+export STUB_GEN_DATE_STALE=''
+assert_file "G3-12: guard wrote after re-probe" "$RAW_FILE" "30"
+assert_eq "G3-12: exactly one re-set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "G3-12: one-shot time fault consumed" "$TMP_DIR/g3-date-stale"
+if grep -q 'evidence aged' "$GUARD_ERR"; then
+    ok "G3-12: stale evidence triggered a re-probe"
+else
+    bad "G3-12: no evidence-age log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-13. The guard's "already wrote" marker is published with the same atomic
+# helper: a rename failure must WARN instead of the old silent `|| true` chain
+# (which could leave no marker and let a second guard write twice).
+g3_setup
+rm -f "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+export STUB_GEN_MV_FAIL=1 STUB_GEN_MV_FAIL_DEST="$GUARD_WRITTEN_GEN_FILE"
+run_fn guard_unblank 30
+wait 2> /dev/null || true
+export STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
+assert_file "G3-13: physical re-set still happened" "$RAW_FILE" "30"
+assert_absent "G3-13: no unverified guard marker" "$GUARD_WRITTEN_GEN_FILE"
+if grep -q 'cannot publish generation marker' "$DAEMON_ERR"; then
+    ok "G3-13: marker publish failure is logged"
+else
+    bad "G3-13: no marker-publish warning (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-14. Marker cleanup failure must not be swallowed: the cycle is not
+# settled, rc=1, the markers stay and the in-memory mirror does not advance.
+g3_setup
+export STUB_GEN_RM_FAIL=1
+g3_bump_rc
+g3_rc="$G3_RC"
+export STUB_GEN_RM_FAIL=0
+assert_eq "G3-14: cleanup failure returns 1" "1" "$g3_rc"
+assert_file "G3-14: generation publish itself succeeded" "$RESTORE_GEN_FILE" "6"
+assert_file "G3-14: guard marker kept" "$GUARD_WRITTEN_GEN_FILE" "9"
+assert_present "G3-14: sentinel kept" "$SELF_WRITE_SENTINEL_FILE"
+# shellcheck disable=SC2154
+assert_eq "G3-14: in-memory mirror not advanced" "0" "$restore_gen"
+
+# --- Phase C fixer: epoch barrier coverage --------------------------------
+# A failed generation publish leaves the generation file unchanged, so ONLY
+# the rotated epoch can revoke work armed in the previous cycle.  Each case
+# below makes one epoch gate the FIRST witness and asserts its exact log, so
+# removing that gate (even when a later gate still prevents the write) fails.
+
+# G3-15. Retry, gate after sleep (1316): epoch rotates while the retry is
+# parked; generation stays 5.  No staging, no write, state retained.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-15" 5
+failed_bump_rotates_epoch
+assert_file "G3-15: failed publish pinned the generation" "$RESTORE_GEN_FILE" "5"
+assert_file "G3-15: failed publish rotated the epoch" "$RESTORE_RETRY_EPOCH_FILE" "2"
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_file "G3-15: stale retry wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-15: stale retry issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "G3-15: state kept for a later cycle" "$STATE_FILE" "30"
+assert_absent "G3-15: nothing staged into PENDING" "$RESTORE_PENDING_FILE"
+if grep -Fq 'restore retry +0.5s (gen=5): epoch superseded after sleep; retry cancelled' "$DAEMON_ERR"; then
+    ok "G3-15: after-sleep epoch gate is the witness"
+else
+    bad "G3-15: no after-sleep epoch log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-16. Retry, gate after probe (1332): the epoch rotates at GetActive,
+# between the after-sleep gate and the after-probe gate.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-16" 5
+: > "$STUB_EPOCH_ON_ACTIVE"
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_file "G3-16: epoch rotated at the probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-16: stale retry wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-16: stale retry issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "G3-16: state kept" "$STATE_FILE" "30"
+assert_absent "G3-16: nothing staged into PENDING" "$RESTORE_PENDING_FILE"
+if grep -Fq 'restore retry +0.5s (gen=5): epoch superseded after probe; retry cancelled' "$DAEMON_ERR"; then
+    ok "G3-16: after-probe epoch gate is the witness"
+else
+    bad "G3-16: no after-probe epoch log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-17. Retry, gate inside STATE_LOCK (1346): the epoch rotates when the
+# retry acquires the state lock, after the probe gate but before staging.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+arm_gated_retry "G3-17" 5
+: > "$STUB_EPOCH_ON_LOCK_FLAG"
+: > "$STUB_RETRY_RELEASE"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast
+assert_file "G3-17: epoch rotated at STATE_LOCK" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-17: stale retry wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-17: stale retry issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "G3-17: state kept" "$STATE_FILE" "30"
+assert_absent "G3-17: nothing staged into PENDING" "$RESTORE_PENDING_FILE"
+if grep -Fq 'restore retry +0.5s (gen=5): restoring brightness' "$DAEMON_ERR"; then
+    bad "G3-17: retry passed the inside-STATE_LOCK gate"
+else
+    ok "G3-17: inside-STATE_LOCK epoch gate cancelled before staging"
+fi
+
+# G3-18. Retry, gate inside WRITE_LOCK (1383): epoch rotates after PENDING
+# is staged and the retry is blocked on the write lock.  Must roll back.
+g3_setup
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+write_state 30
+printf '10\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+: > "$STUB_RETRY_STARTED"
+: > "$STUB_RETRY_GATE"
+rm -f "$STUB_RETRY_RELEASE"
+export STUB_SLEEP_MODE=gate C640_KBD_DEBUG=1
+hold_write_lock
+schedule_restore_retries 5 0.5 2> "$DAEMON_ERR"
+if wait_for_line "$STUB_RETRY_STARTED" "0.5"; then
+    ok "G3-18: retry reached the sleep gate"
+else
+    bad "G3-18: retry never reached the sleep gate"
+fi
+: > "$STUB_RETRY_RELEASE"
+if wait_for_file "$RESTORE_PENDING_FILE"; then
+    ok "G3-18: retry staged PENDING before WRITE_LOCK"
+else
+    bad "G3-18: retry did not stage PENDING"
+fi
+_bump_test_epoch
+: > "$SET_LOG"
+release_write_lock_holder
+export STUB_SLEEP_MODE=fast
+assert_file "G3-18: epoch rotated while WRITE_LOCK was held" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-18: stale retry wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-18: stale retry issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_file "G3-18: staged value rolled back to STATE_FILE" "$STATE_FILE" "30"
+assert_absent "G3-18: no PENDING orphan" "$RESTORE_PENDING_FILE"
+if grep -Fq 'restore retry +0.5s (gen=5): epoch superseded inside WRITE_LOCK; rolling staged value back' "$DAEMON_ERR"; then
+    ok "G3-18: inside-WRITE_LOCK epoch gate rolled PENDING back"
+else
+    bad "G3-18: no in-lock epoch log (stderr: $(cat "$DAEMON_ERR"))"
+fi
+
+# G3-19. Blank guard, gate after sleep (1938): a failed bump revokes a
+# pending G5 blank guard; the LED must stay at 30 (no forced 0).
+g3_setup
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+start_gated_guard guard_blank
+assert_eq "G3-19: both blank guards gated" "0.25,1.0," "$GUARD_STARTED"
+failed_bump_rotates_epoch
+assert_file "G3-19: generation pinned by failed publish" "$RESTORE_GEN_FILE" "5"
+assert_file "G3-19: epoch rotated by failed publish" "$RESTORE_RETRY_EPOCH_FILE" "2"
+release_guards
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_file "G3-19: revoked blank guard forced no 0" "$RAW_FILE" "30"
+assert_eq "G3-19: revoked blank guard issued no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'blank guard +0.25s: retry epoch superseded after sleep; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-19: after-sleep epoch gate is the witness"
+else
+    bad "G3-19: no after-sleep epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-20. Blank guard, gate after probe (1949): epoch rotates at GetActive.
+g3_setup
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+start_gated_guard guard_blank
+assert_eq "G3-20: both blank guards gated" "0.25,1.0," "$GUARD_STARTED"
+: > "$STUB_EPOCH_ON_ACTIVE"
+release_guards
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_file "G3-20: epoch rotated at the probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-20: revoked blank guard forced no 0" "$RAW_FILE" "30"
+assert_eq "G3-20: revoked blank guard issued no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'blank guard +0.25s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-20: after-probe epoch gate is the witness"
+else
+    bad "G3-20: no after-probe epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-21. Blank guard, gate inside WRITE_LOCK (1970): epoch rotates at the
+# LED read after the probe, before the guard takes the write lock.
+g3_setup
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+printf '5\n' > "$RESTORE_GEN_FILE"
+printf '1\n' > "$RESTORE_RETRY_EPOCH_FILE"
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+: > "$SET_LOG"
+start_gated_guard guard_blank
+assert_eq "G3-21: both blank guards gated" "0.25,1.0," "$GUARD_STARTED"
+: > "$STUB_EPOCH_ON_GET"
+release_guards
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+assert_file "G3-21: epoch rotated between probe and WRITE_LOCK" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-21: revoked blank guard forced no 0" "$RAW_FILE" "30"
+assert_eq "G3-21: revoked blank guard issued no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'blank guard +0.25s: retry epoch superseded inside WRITE_LOCK; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-21: inside-WRITE_LOCK epoch gate is the witness"
+else
+    bad "G3-21: no in-lock epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-22. Unblank guard, gate after sleep (2018): exact log (G3-11 only used
+# a generic grep, which a later gate could also satisfy).
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn restore_state
+assert_file "G3-22: initial restore established G6" "$RESTORE_GEN_FILE" "6"
+start_gated_guard guard_unblank 30
+assert_eq "G3-22: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+failed_bump_rotates_epoch
+assert_file "G3-22: generation pinned by failed publish" "$RESTORE_GEN_FILE" "6"
+assert_file "G3-22: epoch rotated by failed publish" "$RESTORE_RETRY_EPOCH_FILE" "2"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+release_guards
+assert_file "G3-22: revoked guard wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-22: revoked guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'unblank guard +0.3s: retry epoch superseded after sleep; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-22: after-sleep epoch gate is the witness"
+else
+    bad "G3-22: no after-sleep epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-23. Unblank guard, gate after probe (2027): epoch rotates at GetActive.
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn restore_state
+start_gated_guard guard_unblank 30
+assert_eq "G3-23: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+: > "$STUB_EPOCH_ON_ACTIVE"
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+release_guards
+assert_file "G3-23: epoch rotated at the probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-23: revoked guard wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-23: revoked guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'unblank guard +0.3s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-23: after-probe epoch gate is the witness"
+else
+    bad "G3-23: no after-probe epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-24. Unblank guard, gate during evidence re-probe (2121): the TTL path
+# releases WRITE_LOCK, re-probes ScreenSaver and MUST re-check the epoch
+# before using the refreshed gsd/LED evidence.
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+export C640_KBD_GUARD_EVIDENCE_TTL=6
+run_fn restore_state
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+: > "$TMP_DIR/g3-g324-count"
+rm -f "$TMP_DIR/g3-date-stale-324"
+export STUB_GEN_DATE_STALE="$TMP_DIR/g3-date-stale-324" STUB_GEN_DATE_STALE_SECS=10
+declare -f get_brightness | sed '1s/^get_brightness ()/real_get_brightness_g324 ()/' > "$TMP_DIR/g324-getbrightness.def"
+# shellcheck disable=SC1090
+source "$TMP_DIR/g324-getbrightness.def"
+_orig_get_brightness_g324="$(declare -f get_brightness)"
+# shellcheck disable=SC2120  # forwarding wrapper intentionally passes caller args through
+get_brightness() {
+    local n
+    n="$(cat "$TMP_DIR/g3-g324-count" 2> /dev/null || echo 0)"
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$TMP_DIR/g3-g324-count"
+    if [ "$n" -eq 2 ]; then
+        : > "$TMP_DIR/g3-date-stale-324"
+    fi
+    real_get_brightness_g324 "$@"
+}
+# Arm BEFORE forking: the guard subshell inherits the export, and the counter
+# file is reset after restore_state's own probe.
+: > "$STUB_EPOCH_ACTIVE_COUNT_FILE"
+export STUB_EPOCH_ON_NTH_ACTIVE=2
+start_gated_guard guard_unblank 30
+assert_eq "G3-24: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+: > "${STUB_SLEEP_RELEASE}.0.3"
+g3_wait_n=0
+while ! grep -Fq 'retry epoch superseded during evidence re-probe' "$GUARD_ERR" 2> /dev/null \
+    && [ "$g3_wait_n" -lt 300 ]; do
+    /bin/sleep 0.02
+    g3_wait_n=$((g3_wait_n + 1))
+done
+: > "${STUB_SLEEP_RELEASE}.0.9"
+wait 2> /dev/null || true
+export STUB_SLEEP_MODE=fast STUB_EPOCH_ON_NTH_ACTIVE=0 STUB_GEN_DATE_STALE=''
+eval "$_orig_get_brightness_g324"
+assert_file "G3-24: epoch rotated during the re-probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-24: stale evidence wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-24: re-probe guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'evidence aged' "$GUARD_ERR"; then
+    ok "G3-24: evidence TTL triggered the re-probe"
+else
+    bad "G3-24: no evidence-age log (stderr: $(cat "$GUARD_ERR"))"
+fi
+if grep -Fq 'unblank guard +0.3s: retry epoch superseded during evidence re-probe; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-24: re-probe epoch gate is the witness"
+else
+    bad "G3-24: no re-probe epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
+
+# G3-25. Unblank guard, gate inside WRITE_LOCK (2152): epoch rotates at the
+# first LED read after the probe, while gsd still asks for the saved value.
+g3_setup
+write_state 30
+printf '30\n' > "$RAW_FILE"
+printf '30\n' > "$PCT_FILE"
+run_fn restore_state
+printf '10\n' > "$RAW_FILE"
+: > "$SET_LOG"
+start_gated_guard guard_unblank 30
+assert_eq "G3-25: both unblank guards gated" "0.3,0.9," "$GUARD_STARTED"
+: > "$STUB_EPOCH_ON_GET"
+release_guards
+assert_file "G3-25: epoch rotated between probe and WRITE_LOCK" "$RESTORE_RETRY_EPOCH_FILE" "2"
+assert_file "G3-25: guard wrote nothing" "$RAW_FILE" "10"
+assert_eq "G3-25: guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Fq 'unblank guard +0.3s: retry epoch superseded inside WRITE_LOCK; guard cancelled' "$GUARD_ERR"; then
+    ok "G3-25: inside-WRITE_LOCK epoch gate is the witness"
+else
+    bad "G3-25: no in-lock epoch log (stderr: $(cat "$GUARD_ERR"))"
+fi
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
