@@ -419,9 +419,16 @@ publishes `c640-kbd-backlight.suspend` (one decimal integer, `0` valid); `post` 
 publishes `c640-kbd-backlight.resume` (`<epoch> <action>`). The root snapshot is **not
 consumed by the hook or the daemon and is never used for restore**; the daemon consumes
 only the two handoff files and its own `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`.
-Both handoff files are `0600`, chowned to the resolved session user and atomically
-`mv`-ed into `$XDG_RUNTIME_DIR`; `C640_KBD_HANDOFF_DIR` overrides the hook's
-directory. A blank-side handoff `0` is ignored when the daemon holds a different
+Both handoff files are `0600`, chowned to the resolved session user and published
+with a same-directory temp file plus `mv -T -f --` into `$XDG_RUNTIME_DIR`; a
+destination-entry guard (symlink/directory/special entry fails closed) and a
+parent-inode recheck apply, and there is **no `cp` or plain-`mv` fallback**
+(`unsafe destination entry` / `cannot publish ...`). The uid comes from
+`Session.User` (`User=<uid>` from `loginctl show-session`), never the User-object
+`UID=` key, and session IDs may be alphanumeric (e.g. `c1`).
+`C640_KBD_HANDOFF_DIR` overrides the hook's directory and is trusted by design
+(only `-d` is checked), but the final component is still protected.
+A blank-side handoff `0` is ignored when the daemon holds a different
 non-zero saved value, so the user's brightness survives a suspend started while
 the screen was blank — **except** when all three agree: a fresh last-user record
 `source=manual0` (within `C640_KBD_LAST_USER_TTL`), the cache value `0`, and an
@@ -462,12 +469,24 @@ its path. The lock order is `RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK`; nothing i
 `WRITE_LOCK` may take an outer lock (finalize, verify and generation bookkeeping all
 run after release). Slow D-Bus reads (the guard's LED readback) are done BEFORE taking
 `WRITE_LOCK`, so a 3s gdbus timeout cannot hold up a restore waiting for the lock.
-`bump_restore_gen()` reads, increments and atomically republishes the generation AND
-clears the guard markers inside `WRITE_LOCK`, then returns 0; on lock failure it
+`bump_restore_gen()` reads, increments and **fail-closed** republishes the generation
+AND clears the guard markers inside `WRITE_LOCK`, then returns 0; on lock failure it
 publishes nothing (no degraded out-of-lock write), returns 1, and every caller
-converts that into DEFER while keeping flag/handoff/state. `C640_KBD_GUARD_WRITTEN_GEN`
-overrides `c640-kbd-backlight.guard-written-gen`, the marker that lets only one of
-the two guards of a generation re-set the value.
+converts that into DEFER while keeping flag/handoff/state. Publishing uses
+same-directory `mktemp` → write → `chmod` → `mv -T` → readback with the bash `read`
+builtin: a non-regular destination is rejected and left untouched, while a readback
+  mismatch invalidates it,
+and the in-memory generation advances only after a verified publish **and** successful
+marker cleanup. `C640_KBD_RESTORE_GEN_FILE` overrides
+`c640-kbd-backlight.restore-gen`; `C640_KBD_GUARD_WRITTEN_GEN` overrides
+`c640-kbd-backlight.guard-written-gen`, the marker that lets only one of the two
+guards of a generation re-set the value. The retry/guard **epoch**
+(`C640_KBD_RESTORE_RETRY_EPOCH`, default `c640-kbd-backlight.retry-epoch`) is
+rotated under `WRITE_LOCK` on **both** success and failure: even when a generation
+publish fails, retries and guards armed in the old epoch are revoked. Armed work
+re-checks the epoch after sleep, after a slow tristate probe and again inside
+`WRITE_LOCK` before writing. Guard evidence (LED/gsd reads) older than
+`C640_KBD_GUARD_EVIDENCE_TTL` (default 6s) is re-probed instead of trusted.
 
 The optional +0.3/+0.9s unblank guard and the +0.25/+1.0s blank guard re-check the
 generation after sleeping and again inside `WRITE_LOCK` before writing; a superseded
@@ -592,16 +611,20 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 `C640_KBD_RESUME_PROBE_MAX` caps the **wall-clock** budget of post-thaw
 ScreenSaver polling (checked after each probe; worst case ≈ budget + one query,
 default 10s);
-`C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring on an unknown answer.
+`C640_KBD_RESUME_ALLOW_UNKNOWN=1` opts in to restoring on an unknown answer;
+`C640_KBD_GUARD_EVIDENCE_TTL` caps the age (seconds, default 6) of LED/gsd guard
+evidence before a guard re-probes. All physical writes are serialized by
+`C640_KBD_WRITE_LOCK` (default `$STATE_DIR/c640-kbd-backlight.write.lock`).
 
 **Test-only environment overrides** (no system files are touched): the daemon
 accepts `C640_KBD_SYSFS_BRIGHTNESS` / `C640_KBD_SYSFS_MAX` for a fake LED node and
 `C640_KBD_HANDOFF_SUSPEND` / `C640_KBD_HANDOFF_RESUME` /
 `C640_KBD_RESTORE_PENDING_FILE` / `C640_KBD_RESUME_LOCK` /
 `C640_KBD_LAST_USER_META_FILE` for staging/handoff paths, plus
-`C640_KBD_WRITE_LOCK`, `C640_KBD_GUARD_WRITTEN_GEN` and
-`C640_KBD_SELF_WRITE_SENTINEL` for the write-lock / guard-marker / reserved
-Tier-2 sentinel paths. The sleep hook accepts
+`C640_KBD_WRITE_LOCK`, `C640_KBD_RESTORE_GEN_FILE`,
+`C640_KBD_RESTORE_RETRY_EPOCH`, `C640_KBD_GUARD_WRITTEN_GEN` and
+`C640_KBD_SELF_WRITE_SENTINEL` for the write-lock / generation / retry-epoch /
+guard-marker / reserved Tier-2 sentinel paths. The sleep hook accepts
 `C640_KBD_SLEEP_SYSFS`, `C640_KBD_SLEEP_STATE_DIR`, `C640_KBD_HANDOFF_DIR` and
 `C640_KBD_RUN_USER_ROOT`; an explicit `C640_KBD_HANDOFF_DIR` bypasses loginctl
 selection and uid pinning, and the daemon uses the same value only for its
@@ -610,18 +633,23 @@ explicit-override mismatch warning (there is no cross-uid scan any more). Its ol
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 539 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 688 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
 zeros, wall-clock probe deadline, explicit handoff directory override mismatch, gsd-confirmed
 fresh-manual0 adoption, generation-stamped guard user-change protection, expired-retry
 in-lock generation gate with PENDING rollback, strictly monotonic generation bumps,
-fail-closed lock failures and single-read last-user cache) and the
-sleep-hook suite has 161 cases (pure handoff, `0600`/`chown`/atomic `mv`,
-`C640_KBD_HANDOFF_DIR`, single active local graphical session selection from
-loginctl properties with root-journal fail-closed warnings, uid pin and reuse,
-0700 runtime-dir gate, no LED writes). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 2137 cases, including corrupt and
+**fail-closed generation publish with readback, epoch barrier that revokes stale
+retries/guards, TTL evidence re-probe**, fail-closed lock failures and single-read
+last-user cache) and the
+sleep-hook suite has 234 cases (pure handoff, `0600`/`chown`/atomic `mv -T -f --`
+with destination-entry guard and no `cp` fallback, `C640_KBD_HANDOFF_DIR`, single active
+local graphical session selection from loginctl `Session.User` (`User=<uid>`, alphanumeric
+session IDs) with root-journal fail-closed warnings, uid pin and reuse,
+0700 runtime-dir gate, no LED writes). The separate
+`keyboard/tests/loginctl-contract-check.sh` is a read-only schema check (`CONTRACT OK`
+on a systemd host, `SKIP` otherwise — not a real-S3 test). The rollback suite
+(`tests/rollback-test.sh`, run as root) has 2233 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -630,15 +658,19 @@ lock with absolute-path/canonical/literal-symlink/inode/ancestor/parent-dir reje
 evidence (R15-R20), stale all-true record consumption with zero gpasswd and gpasswd failure
 rc 1, PAM original-line protection plus first-wins debconf selection / `/var/lib/pam`
 snapshot, `pam-auth-update --package` convergence and verified uninstall restoration
-(including a non-root/passwordless-`sudo` case), the whole-operation lock (OP1/OP2
+(including a non-root/passwordless-`sudo` case), an active fprintd inside a symlinked
+`common-*` failing install closed, `.common` lstat symlink-owner restore via
+`chown -h` + `mv -T`, and savedir tri-state entry-set verification with non-regular
+entries failing closed, the whole-operation lock (OP1/OP2
 FIFO-barrier regressions for deploy vs rollback, a real-installer barrier and fail-closed
 bodies), unique writer temps and checked `systemctl` restores. CI also runs a real-tool
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 539 cases
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 161 cases
-sudo bash tests/rollback-test.sh                       # 2137 cases (root)
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 cases
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 cases
+bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK / SKIP (read-only)
+sudo bash tests/rollback-test.sh                       # 2233 cases (root)
 ```
 
 ---
@@ -768,7 +800,7 @@ Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 | LED node permissions | 🟢 | `-rw-rw---- root plugdev` on `chromeos::kbd_backlight/brightness` after `udevadm trigger --subsystem-match=leds`; user write succeeds without sudo |
 | Daemon blank/unblank | 🟢 | `--test-blank` 2 → 0, `--test-unblank` 0 → 2, state file `0600` and removed |
 | Daemon event path | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → brightness 2 → 0 → 2 with **no `sudo` calls** in the user journal |
-| Sleep hook | 🟢 | **2026-10-31 OLD hook behaviour (historical only; no longer valid):** `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session). The hook is now a **pure handoff writer** that never writes brightness or deletes state; a full real S3 freeze/thaw cycle was validated later on 2026-11-22 — see [verification.md](../docs/verification.md) |
+| Sleep hook | 🟢 | **2026-10-31 OLD hook behaviour (historical only; no longer valid):** `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session). The hook is now a **pure handoff writer** that never writes brightness or deletes state; a full real S3 freeze/thaw cycle was observed on 2026-11-22 with the **old hook** (historical only); the current HEAD's selector/root boundary is **pending on the target machine** — see [verification.md](../docs/verification.md) |
 | `--check` | 🟢 | all green, including "backlight node writable by group plugdev (mode 660)" |
 
 **History (fixed 2026-10-31):** the earlier passive captures at `12:49`, `13:25`

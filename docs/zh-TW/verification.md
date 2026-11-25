@@ -64,21 +64,48 @@
 | keyd 選項 B | 🟢 | **2026-10-31 已安裝**（keyd 2.5.0-5，執行檔 `/usr/bin/keyd.rvaiya`），使用 `overloadt2(meta, capslock, 200)`。虛擬 uinput 測試（19:45:37，`keyboard/tests/keyd-dualrole-uinput.py`）PASS：輕點 Search→只有 `CAPSLOCK`（不送 `META`、無防護）、10 組 Search+頂排→`F1`-`F10`（現行測試現已預期 `[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護）、10 個頂排單按→各自媒體鍵、純長按 Search→乾淨的 `LEFTMETA` 放開且**沒有 `LEFTCTRL` 防護**。語法僅在 CI 以 keyd 2.6.0 驗證（`keyd check`）；行為只在本機以 2.5.0-5 驗證，其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知差異）。實體按鍵被動擷取（`18:14:47-18:15:18`）：單獨長按放開為乾淨 `LEFTMETA`（畫面確認 GNOME 總覽開啟）、輕點只送 `CAPSLOCK`、單按亮度/靜音/音量確實改變亮度與音量、Search+Back 送出 `F1`。journal 顯示 `match 0001:0001 (AT Translated Set 2 keyboard)` 與 `ignoring 0000:0006 (Video Bus)` |
 | hwdb DMI 命中（真實 modalias） | 🟢 | `udevadm test /sys/class/input/event2` 透過 `evdev:atkbd:` 查詢套用 `KEYBOARD_KEY_*`，即使韌體多了 `br0.0:efr0.0` 欄位仍命中；非 `atkbd` 查詢印 `No entry found from hwdb` 屬正常 |
 | 鍵盤背光 udev rule | 🟢 | `61-chromeos-kbd-backlight.rules` 於 2026-10-31 安裝；`TAG+="uaccess"` + `RUN+=chgrp plugdev` / `RUN+=chmod 0660` → `ls -l .../brightness` 為 `-rw-rw---- root plugdev`，`udevadm trigger --subsystem-match=leds` 後一般使用者可直接寫入，無需 sudo |
-| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——各次 re-review 修復後 539 個 daemon 案例全過（見下）；真實 S3 驗證見下 |
+| 鍵盤背光 daemon | 🟢 | 已安裝至 `/usr/local/bin/`；2026-10-31：`--test-blank` 2→0、`--test-unblank` 0→2，state 檔 `0600` 且會清除；`gdbus emit ... ScreenSaver.ActiveChanged true/false` → 2→0→2，使用者 journal **零 sudo 呼叫**。寫入鏈由單元測試驗證：單次 gsd-power `Properties.Set`、UPower 降級附 `[WARN]`、強制 legacy sysfs 路徑、存 0、覆寫非 0 現值、ScreenSaver active 延後還原、日誌出現在 stderr。Phase 6 新增後端重新探測（`RECOVERED`）、寫入+驗證 `set_brightness()` rc、即時讀數優先的 `save_state`、驗證後才消耗的暫存機制、三態延後與喚醒 handoff——各次 re-review 修復後 688 個 daemon 案例全過（見下）；2026-11-22 的真實 S3 結果屬舊 hook 的歷史證據，現行 HEAD **待目標機執行**（見下） |
 | 鍵盤背光 user service | 🟢 | `/etc/systemd/user/`，全域啟用且 **uid 1000 的服務為 active**（`systemctl --global is-enabled`、`systemctl --user is-active` 皆正常）；`StandardError=journal` 讓 daemon 日誌可由 `journalctl --user -u c640-kbd-backlight-sync.service` 查看 |
-| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；161 個 hook 案例全過。hook 現在只對單一 active local graphical session 寫 handoff（0 或多個候選在 root journal fail closed），且絕不建立／chmod／chown runtime dir。root 的 `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**——first-wins、不被消耗、也從不用於還原。**真實 S3 freeze/thaw 於 2026-11-22 驗證**（詳情見下） |
+| 鍵盤背光 sleep hook | 🟢 | `/usr/lib/systemd/system-sleep/`；2026-10-31 直接呼叫：`pre suspend` 存下 6、模擬 0 → `post suspend` 還原 6、state 清除。現已改為**純 handoff 寫入者**（不查 D-Bus／不寫 LED／不刪 state；`0600` + chown + 原子 `mv`；`C640_KBD_HANDOFF_DIR`）；234 個 hook 案例全過。hook 現在只對單一 active local graphical session 寫 handoff（0 或多個候選在 root journal fail closed），且絕不建立／chmod／chown runtime dir。root 的 `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**——first-wins、不被消耗、也從不用於還原。2026-11-22 的 freeze/thaw 結果為舊 hook 的歷史證據；**現行 HEAD 待目標機執行**（詳情見下） |
 
-#### 真實 S3 驗收（2026-11-22，完整 systemd freeze/thaw）
+#### 真實 S3 驗收 — 2026-11-22 為歷史紀錄；現行 HEAD 待執行（目標機）
 
-環境：systemd `259`、gnome-settings-daemon `50`、`rtcwake -m no -s 20` 搭配
-`systemctl suspend`（完整的 systemd sleep freeze/thaw 流程，不是直接呼叫 hook）。
-休眠前：state=`30`、亮度=`0`（螢幕已熄滅）、ScreenSaver=`true`。
+> [!IMPORTANT]
+> **本輪並未在 HP Pro c640 以最新 HEAD 重跑真實 S3。** 本輪只驗證了 loginctl
+> `Session.User` schema/selector（`loginctl show-session` 的 `User=<uid>`、
+> session ID 可為英數）在本機 systemd host 上的行為
+> （`keyboard/tests/loginctl-contract-check.sh` → `CONTRACT OK`），以及 stub 測試與 CI。
+> 非 systemd host 會印出 `SKIP`，這也**不是**通過。下方表格是第五輪（2026-11-22）
+> 由**舊 hook** 留下的硬體證據，**不能代替本輪驗收**。所有 ⚠️ 列都必須在目標機
+> 重跑，才能宣稱現行 HEAD 支援真實 S3。
 
-| 檢查項目 | 結果 | 證據 |
+| 檢查項目 | 結果（現行 HEAD） | 歷史證據（2026-11-22，舊 hook） |
 | :--- | :---: | :--- |
-| **分支 A — 喚醒後仍鎖定** | 🟢 | suspend entry `04:34:19` → exit `04:34:39`（第一次）與 `04:48:37` → `04:48:58`（第二次，`faa458e` 修復後）。ScreenSaver 仍 `true`；亮度 `2`（gsd-power resume 時的極低殘值，**未**回到 30）；`state=30` 保留；`handoff.suspend` 已消耗；`handoff.resume` 保留。journal：`ignoring blank-side suspend handoff 0; keeping saved user brightness 30`、`resume: ScreenSaver=active`、`resume deferred: ScreenSaver still active (saved=30)`。第一次（修復前）出現 `suspend handoff 0 overrides differing daemon state 30` → `state=0`，已由 `faa458e` 修正。 |
-| **分支 B — 解鎖後還原** | 🟢 | `loginctl unlock-session 2` → `ScreenSaver inactive -> restoring kbd backlight`、`unblank: resume flag present; routing through handle_resume`、`resume: ScreenSaver=inactive after 0s (saved=30)`、`restoring brightness 30`、`resume: restore complete; resume flag consumed`。亮度、gsd-power 與 UPower 三者皆 `30`；state 與兩個 handoff 檔全消耗。 |
-| **本機最後狀態** | 🟢 | 已重新鎖定、亮度/gsd/UPower 同步、service 全域與使用者層皆 enabled + active，`state=30`（測試用使用者亮度）。 |
+| **分支 A — 喚醒後仍鎖定** | ⚠️ **待執行（目標機）** | suspend entry `04:34:19` → exit `04:34:39`（第一次）與 `04:48:37` → `04:48:58`（第二次，`faa458e` 修復後）；ScreenSaver 仍 `true`、亮度 `2`、`state=30` 保留、`handoff.suspend` 已消耗、`handoff.resume` 保留；journal `ignoring blank-side suspend handoff 0; keeping saved user brightness 30`、`resume deferred: ScreenSaver still active (saved=30)`。 |
+| **分支 B — 解鎖後還原** | ⚠️ **待執行（目標機）** | `loginctl unlock-session 2` → `ScreenSaver inactive -> restoring kbd backlight`、`restoring brightness 30`；亮度、gsd-power 與 UPower 三者皆 `30`；state 與兩個 handoff 檔全消耗。 |
+| **本機最後狀態** | ⚠️ **待執行（目標機）** | 已重新鎖定、亮度/gsd/UPower 同步、service 全域與使用者層皆 enabled + active，`state=30`。 |
+
+**目標機待執行 checklist（必須在 HP Pro c640 以現行 HEAD 執行）：**
+
+1. `bash keyboard/tests/loginctl-contract-check.sh` → systemd host 應為 `CONTRACT OK`
+   （非 systemd 為 `SKIP`）；確認 `Session.User` 是 `User=<數字 uid>`、session ID 可為英數
+   （如 `c1`）。
+2. `rtcwake -m no -s 20` + `systemctl suspend`（真正的 systemd `PrepareForSleep`
+   freeze/thaw，**不是**直接呼叫 hook）；另外，手動盒蓋循環仍列為補充待測。
+3. root journal 出現 `selected session <id> on seat <seat> for uid <uid>`（來自
+   `Session.User`），且沒有 `session selection fail-closed:`、`unsafe destination entry`、
+   `cannot publish ...` 警告。
+4. 兩個 handoff 檔都存在於 session user 的 `$XDG_RUNTIME_DIR`（`0600`、owner 正確），
+   uid pin 為 root-only，且沒有 `/tmp` 降級。
+5. 仍鎖定時喚醒：`resume deferred: ScreenSaver still active`——亮度**不**還原、已存值保留。
+6. 解鎖：`restoring brightness N` 接著 `resume: restore complete; resume flag
+   consumed`；LED、gsd-power 與 UPower 一致，兩個 handoff 檔皆消耗。
+7. consume／最終狀態：state、resume flag 與 handoff 檔皆消失，service 全域與該 uid 皆
+   enabled + active。
+
+歷史環境（下方表格的來源）：systemd `259`、gnome-settings-daemon `50`、
+`rtcwake -m no -s 20` 搭配 `systemctl suspend`（完整的 systemd sleep freeze/thaw 流程，
+不是直接呼叫 hook）。休眠前：state=`30`、亮度=`0`（螢幕已熄滅）、ScreenSaver=`true`。
 
 > [!NOTE]
 > 這兩次使用 `rtcwake` + `systemctl suspend`，走的是與蓋蓋相同的 systemd
@@ -89,13 +116,18 @@
 
 | 測試套件 | 結果 | 範圍 |
 | :--- | :--- | :--- |
-| `keyboard/tests/kbd-backlight-daemon-test.sh` | **539 通過、0 失敗** | 以 stub 為基礎的單元測試 |
-| `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **161 通過、0 失敗** | 以 stub 為基礎的單元測試 |
-| `tests/rollback-test.sh` | **2137 通過、0 失敗** | 需 root |
+| `keyboard/tests/kbd-backlight-daemon-test.sh` | **688 通過、0 失敗** | 以 stub 為基礎的單元測試 |
+| `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **234 通過、0 失敗** | 以 stub 為基礎的單元測試 |
+| `tests/rollback-test.sh` | **2233 通過、0 失敗** | 需 root |
+| `keyboard/tests/loginctl-contract-check.sh` | **CONTRACT OK**（本機 systemd host） | 新的唯讀 schema 檢查：`Session.User` 為 `User=<數字 uid>`、`UID=` 只屬 User object、session ID 可為英數；非 systemd host 印出 `SKIP`——**不是**真實 S3 測試 |
 | `keyboard/tests/keyd-dualrole-uinput.py` | **22 PASS** | 2026-10-31 歷史 live run（22 PASS），真實 virtual uinput／非 stub——**並非目前 HEAD 的 live run**；`acbc3b9` 後 chord guard 預期已變更，HEAD 上只重跑自我測試 |
 
 出處：stub 測試套件為本機重跑；Python／診斷自我測試為 synthetic（合成）檢查；
 22 PASS 是 2026-10-31 的歷史 live run，並未在 HEAD 重跑。
+`loginctl-contract-check.sh` 已在本機 systemd host 執行並印出 `CONTRACT OK`
+（非 systemd host 必須印 `SKIP`，這**不是**通過）；它只檢查 `Session.User` schema，
+不執行 S3 週期、也不寫 handoff。CI 在 push 前的 `2588eb5` 全綠（7 個 workflows）；
+本輪 Phase A–E push（`b572f35`..`a4a3fcc`）必須重跑 workflows，本文**尚未確認**重新通過。
 
 Python／診斷自我測試：`check-top-row-hwdb.py` 回報 `SELF-TEST=PASS`、
 `keyd-dualrole-uinput.py` 涵蓋 34 個案例、`detect-hardware.sh` 執行 28 個斷言。
@@ -107,7 +139,9 @@ keyd 組合鍵案例現在明確把 `[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防
 要確認原始值，需停掉 keyd 後用 `--scan`（或不加 `--grab` 的 `evtest`）。
 
 **沒有新的真實 S3 run。** 上方 2026-11-22（第五輪）驗收表仍是唯一的硬體紀錄；
-第六至第十五次 re-review 只改程式碼，並以單元測試／CI 驗證。
+第六至**第十六次** re-review 只改程式碼，並以 stub／單元測試與 CI 驗證。尤其是新的
+`User=<uid>` selector 與 root handoff 寫入邊界，**尚未**在 HP Pro c640 以真實 S3
+驗證——請見上方的目標機 checklist。
 
 #### 第十四次 re-review — 修復摘要（2026-11-24）
 
@@ -152,12 +186,54 @@ keyd 組合鍵案例現在明確把 `[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防
   並移除 daemon 的跨 uid 掃描；daemon 現在只對 explicit `C640_KBD_HANDOFF_DIR` 覆寫不一致
   發出 WARN。
 
-目前總數：daemon **539 通過、0 失敗**、sleep hook **161 通過、0 失敗**、rollback
-**2137 通過、0 失敗**；keyd self-test **34 個案例**、`check-top-row-hwdb.py` `SELF-TEST=PASS`、
-`detect-hardware.sh` **28 個斷言**。仍**沒有新的真實 S3 run**——上方 2026-11-22 第五輪表格
+**第十五次當時的歷史總數**（已被下方第十六次取代）：daemon **539 通過、0 失敗**、
+sleep hook **161 通過、0 失敗**、rollback **2137 通過、0 失敗**；keyd self-test **34 個案例**、
+`check-top-row-hwdb.py` `SELF-TEST=PASS`、`detect-hardware.sh` **28 個斷言**。仍**沒有新的真實 S3 run**——上方 2026-11-22 第五輪表格
 不變；**22 PASS** 的 keyd virtual-uinput 是 2026-10-31 的歷史 live run（`acbc3b9` 後只重跑
 自我測試）；Tier 2 未實作。handoff 目標僅限單一 active local graphical session（見
 [COMPATIBILITY.md](COMPATIBILITY.md)）。
+
+#### 第十六次 re-review — 修復摘要（2026-11-25）
+
+本次 fork 在第十五次之後新增五個 commit：
+
+* `b572f35` — **sleep hook／Session User contract：** 從 `loginctl show-session` 的
+  `Session.User`（`User=<uid>`）讀取數字 uid，不再使用 User object 的 `UID=` 鍵；
+  session ID 接受英數（例如 `c1`，不限十進位），並把 `User` 加入缺漏屬性的排除清單。
+  新增唯讀的 `keyboard/tests/loginctl-contract-check.sh`（本機 systemd host 為
+  `CONTRACT OK`，非 systemd host 明確 `SKIP`——**不是**真實 S3 測試）。
+* `a0a8f00` — **PAM symlink fprintd fail closed：** 在任何 snapshot、backup、`sed`、
+  外部工具或 sudo 變更之前，都透過 `sudo` 探測每個 `common-*` 目標；若 symlinked
+  `common-*` 含**生效中**的 `pam_fprintd.so` 模組，安裝即 fail closed（非 0、
+  **不修改 PAM 或 selection**、不發布 first-wins snapshot）。無法讀取/grep 錯誤也
+  fail closed；不存在或 dangling 目標視為沒有生效模組。安裝後狀態的 postcondition
+  會檢查**實際的** `common-*` 位元組沒有生效的 fprintd（debconf selection 仍可能保留
+  已停用的記錄）。
+* `fca53c2` — **背光 generation／epoch／TTL：** generation 發布改為 fail closed
+  （同目錄 `mktemp` → 寫入 → `chmod` → `mv -T` → readback；目的地不符即移除；只有在
+  驗證過的發布**與** marker 清理都成功後，記憶體內的 generation 才前進）；retry/guard
+  epoch 在成功與失敗路徑都輪替，因此即使發布失敗也會吊銷舊 retry/guard；guard 證據
+  超過 `C640_KBD_GUARD_EVIDENCE_TTL`（預設 6 秒）即重新探測。**Tier 2 brightness signal
+  未實作。**
+* `4ac9b8f` — **PAM `.common` symlink owner ＋ savedir entries：** `.common` half 記錄每個
+  symlink 目標的 **lstat owner**，並以 `chown -h` + `mv -T -f --` 還原，不解引用連結目標。
+  savedir entry set（`absent`／`empty`／`nonempty`，附帶具 checksum 的 以 NUL 分隔並排序的 name+type
+  manifest）納入最終驗證；任何非 regular entry 即 fail closed。沒有 entries 行的 legacy
+  `.common` 降級為 WARN-only 的 best-effort 檢查
+  （`Legacy PAM snapshot has no savedir entry-set manifest ...`）。
+* `a4a3fcc` — **root handoff 寫入邊界：** handoff／root state 以 `mv -T -f --` 發布，
+  在暫存內容前後都做 destination entry guard（最終 component 必須不存在或為普通檔；
+  symlink／目錄／特殊檔即 fail closed 並記錄 `unsafe destination entry`／
+  `cannot publish ...`），並重新檢查父目錄 inode identity；**沒有 `cp`、也沒有一般
+  `mv` 降級**。`C640_KBD_HANDOFF_DIR` 依設計信任 caller（explicit override 只檢查 `-d`），
+  但最終 component 仍受保護。
+
+目前總數：daemon **688 通過、0 失敗**、sleep hook **234 通過、0 失敗**、rollback
+**2233 通過、0 失敗**；keyd self-test **34 個案例**、`check-top-row-hwdb.py` `SELF-TEST=PASS`、
+`detect-hardware.sh` **28 個斷言**、本機 contract check `CONTRACT OK`。CI 在 push 前的
+`2588eb5` 全綠（7 個 workflows），本輪 push 後必須重跑。**最新 HEAD 的真實 S3 待目標機
+執行**（見上方 checklist）；**22 PASS** 的 keyd virtual-uinput 是 2026-10-31 的歷史 live
+run，HEAD 上只重跑自我測試；Tier 2 未實作。
 
 #### 第六次 re-review 修復（2026-11-23，僅單元測試）
 
@@ -317,7 +393,7 @@ Commits: `751c609`, `6774033`, `69712a4`, `dab9436`.
   的明確傳參，且只在 sandbox snippet 內 export，後續 uninstall 不會繼承。新增
   **PAM-9** 回歸先注入 fail=1，再故意把父環境污染為 fail=0，驗證 rollback 乾淨完成、
   PAM 檔案位元組完全相同（+5 assertions，當時總數來到 **1392**；現行 rollback suite 為
-  **2137** 個案例）。
+  **2233** 個案例）。
 
 #### 第十二次 re-review 修復（2026-11-24，僅單元測試）
 
@@ -427,7 +503,7 @@ E2E 情境：詳見 .github/workflows/install-smoke.yml（baseline / sensitivity
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（539 daemon + 161 hook + 2137 rollback，最後一項需 root）；**完整真實 S3 freeze/thaw 已於 2026-11-22 驗證**（鎖定延後 + 解鎖還原，見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（688 daemon + 234 hook + 2233 rollback，最後一項需 root）；**2026-11-22** 的完整真實 S3 freeze/thaw（鎖定延後 + 解鎖還原）是舊 hook 的歷史證據——**現行 HEAD 待目標機執行**（見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -499,9 +575,14 @@ cat /sys/power/mem_sleep
   2026-11-24（第十四次 re-review——本次 fork：上方摘要的六個 commit；rollback suite
   1981 / daemon 460 / hook 84，0 失敗；2026-11-22 後仍無新真實 S3 run；keyd chord
   的 `LEFTCTRL` guard 現在視為預期，`MSC_SCAN` 仍為推論），
-  2026-11-25（第十五次 re-review——本次 fork：上方摘要的五個 commit；rollback suite
-  2137 / daemon 539 / hook 161，0 失敗；2026-11-22 後仍無新真實 S3 run；22 PASS keyd
-  live run 仍為歷史結果，`MSC_SCAN` 仍為推論，Tier 2 未實作）
+  2026-11-25（第十五次 re-review——本次 fork：上方摘要的五個 commit；**當時的歷史總數**：
+  rollback suite 2137 / daemon 539 / hook 161，0 失敗；2026-11-22 後仍無新真實 S3 run；
+  22 PASS keyd live run 仍為歷史結果，`MSC_SCAN` 仍為推論，Tier 2 未實作），
+  2026-11-25（第十六次 re-review——本次 fork：五個 commit `b572f35`、`a0a8f00`、`fca53c2`、
+  `4ac9b8f`、`a4a3fcc`（見上方摘要）；現行總數 rollback 2233 / daemon 688 / hook 234，
+  0 失敗；本機 contract check `CONTRACT OK`；push 前 `2588eb5` 的 7 個 workflows 全綠，
+  本輪 push 後需重跑；**新 selector／root 邊界尚未在目標機以真實 S3 驗證**；22 PASS keyd
+  live run 仍為歷史結果，Tier 2 未實作）
 * **OS / 核心**：Ubuntu 26.04 LTS；2026-10-31 鍵盤/背光 session 為 `7.0.0-38-generic`，2026-08 證據包為 `7.0.0-29-generic`
 * **韌體**：MrChromebox `2606.1`
 * **硬體**：HP Pro c640 Chromebook（`dratini`/`hatch`）

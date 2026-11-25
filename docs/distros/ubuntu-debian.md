@@ -105,8 +105,12 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > `pam-selection.saved` a root-owned `0700` directory of file copies), plus a third
 > root-owned `0700` `pam-selection.common` half recording every `common-*` / sudo
 > target's bytes, mode, owner, type, symlink target and absence and the savedir
-> directory metadata, with all reads/copies through `sudo` so a non-root caller
-> with passwordless `sudo` is supported. It backs up **all** existing
+> directory metadata (plus a checksummed entry-set manifest whose class is
+> `absent` / `empty` / `nonempty`; any non-regular savedir entry fails closed),
+> with all reads/copies through `sudo` so a non-root caller with passwordless
+> `sudo` is supported. For symlink targets the lstat owner of the link itself is
+> recorded and restored with `chown -h` + `mv -T -f --` (never dereferencing the
+> target). It backs up **all** existing
 > `common-*` bytes (not only fp-containing ones), strips only fp module lines,
 > then runs `pam-auth-update --package` itself so debconf and `/var/lib/pam`
 > converge to a stable "no fprintd" state and a later package-triggered run is a
@@ -119,6 +123,18 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > claims no byte guarantee; a missing `.saved` with a populated live savedir fails
 > closed (`manual recovery`); a semantic edit to `common-*` returns rc 1 and retains
 > all halves (`External content change detected`).
+>
+> **Symlinked `common-*` with an active fprintd module fails the install closed.**
+> Before any snapshot/backup/`sed`/tool call, every `common-*` is probed through
+> `sudo`: a symlink whose target has an active (non-commented) `pam_fprintd.so`
+> line cannot be repaired by `sed -i` without replacing the link, so the
+> installer exits non-zero and leaves **PAM files and the debconf selection
+> untouched** (no first-wins snapshot is published). Unreadable targets or grep
+> errors fail closed too; absent/dangling targets carry no active module. The
+> installed-state postcondition checks the **actual** `common-*` bytes for no
+> active fprintd — a disabled record kept in the debconf selection is not
+> sufficient. Replace the symlink with a regular file (or remove the fp line
+> under its real target deliberately) and re-run the installer.
 > Trade-off: a selection you change during installation is overwritten on
 > uninstall, and a manual `--enable fprintd` reintroduces the GDM race until
 > uninstall. If `common-auth` still has an fp line on an older install, remove

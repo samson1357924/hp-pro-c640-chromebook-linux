@@ -208,9 +208,14 @@
   > 以 `session selection fail-closed: ...` fail closed，選中的 uid 則記錄為
   > `selected session ... for uid ...`，在 `pre` 釘在 root-only `0600` 檔、`post` 沿用。
   > hook 絕不建立／chmod／chown `/run/user/<uid>`；不存在或不安全即 fail closed、不寫 handoff。
-  > daemon 不再掃描其他 uid 的 runtime dir：只有 explicit `C640_KBD_HANDOFF_DIR` 覆寫與自身
-  > 檔案不一致時才記錄 `[WARN] handoff directory mismatch`。跨 uid 診斷請查 root journal，
-  > 不要掃描 `/run/user`。
+  > uid 來自 `loginctl show-session` 的 **Session.User**（`User=<數字 uid>`），不是 User
+  > object 的 `UID=` 鍵；session ID 可為英數（如 `c1`），缺少 `User` 即排除該 session。
+  > 兩個 handoff 檔以同目錄暫存檔加 `mv -T -f --` 發布，並做 destination entry 與父目錄
+  > inode 檢查，**沒有 `cp`／一般 `mv` 降級**（`unsafe destination entry`、
+  > `cannot publish ...`）。explicit `C640_KBD_HANDOFF_DIR` 依設計信任 caller（只檢查 `-d`），
+  > 但最終 component 仍受保護。daemon 不再掃描其他 uid 的 runtime dir：只有 explicit
+  > `C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
+  > 跨 uid 診斷請查 root journal，不要掃描 `/run/user`。
 
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
@@ -220,6 +225,9 @@
   systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
   loginctl show-user "$USER" -p State       # 使用中?
+  # selector schema 的唯讀檢查（不跑 S3、不寫入）：
+  bash keyboard/tests/loginctl-contract-check.sh   # systemd host 為 CONTRACT OK，其他為 SKIP
+  loginctl show-session "$XDG_SESSION_ID" -p User  # 必須是 User=<數字 uid>，不是 UID=
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
@@ -272,6 +280,19 @@
     代表三態防護正常運作；請保留 state 並等待解鎖。
     `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 是明確的**風險接受**（可能在仍鎖定的螢幕下
     點亮鍵盤），預設關閉；`C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後的輪詢（預設 10 秒）。
+  * `bash keyboard/tests/loginctl-contract-check.sh` 是對 hook 所依賴 `loginctl` schema 的
+    **唯讀**檢查：以真正的 `loginctl` 確認 `Session.User` 為數字 `User=<uid>`（不是 session
+    的 `UID=` 鍵），且 `show-seat ActiveSession` 值為英數 session ID。systemd host 印出
+    `CONTRACT OK`，非 systemd host 印出明確的 `SKIP`（`SKIP` **不是**通過）。它**不執行
+    S3 週期、也不寫 handoff**，所以 `CONTRACT OK` 不代表現行 HEAD 已通過真實 S3——請先
+    執行 [verification.md §3](verification.md) 的目標機 checklist。若失敗，請檢查
+    `show-session` 是否缺少 `User`，或舊 hook 是否仍假設 session ID 必為十進位。
+  * `handoff skipped (fail-closed): unsafe destination entry <path>` 或
+    `... destination entry changed during write` 代表 handoff 最終 component 是 symlink、
+    目錄或特殊檔（或在暫存期間被替換）。`cannot publish <path>` 代表單次
+    `mv -T -f --` 發布失敗；暫存檔會被移除且**不嘗試 `cp`／一般 `mv` 降級**，因此不會
+    解引用惡意項目。請修正 runtime dir 中的該項目（移除 symlink／目錄）後重試 suspend
+    週期，並查 root journal 的確切路徑。
   * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` 代表
     休眠開始時螢幕已熄滅：hook 讀到的硬體 0 被正確忽略，解鎖後會還原使用者的亮度 N
     （已於真實 S3 週期驗證——見 [verification.md §3](verification.md)）。
@@ -489,6 +510,15 @@
     並要求 `manual recovery`。manifest record 已消耗加上 selection 相等並不算成功。
     若最後一個 `.common` half 在其他兩半已消耗後無法刪除，sidecar 會重建但狀態**無法自動重試**
     （`manual recovery is REQUIRED`），保留的檔案必須手動清理。
+  * `Symlinked /etc/pam.d/common-* contains an active pam_fprintd.so module line;
+    refusing to install because it cannot be stripped without replacing the link (the GDM
+    claim race would remain).` 是**安裝時**的 fail-closed preflight：在任何 snapshot、
+    backup、`sed`、外部工具或 sudo 變更之前，每個 `common-*` 都透過 `sudo` 探測；symlink
+    背後若有生效的 fp 模組，無法不解引用就移除，因此安裝以非 0 結束，且**不修改 PAM 檔
+    與 debconf selection**。無法讀取/grep 錯誤也 fail closed；不存在或 dangling 目標視為
+    沒有生效模組。請把 symlink 換成普通檔（或在其真實目標下手動移除 fp 行）後重跑安裝。
+    安裝成功後的 postcondition 會檢查**實際的** `common-*` 位元組沒有生效 fprintd——
+    debconf selection 中留有已停用記錄並不算數。
 
 ---
 
@@ -574,7 +604,12 @@
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
 
-  *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）*
+  *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）* 若某個
+  `common-*` 檔案是 **symlink**，其目標有生效的 `pam_fprintd.so` 行，`sed -i` 會
+  替換連結而非移除模組，因此安裝器會在碰到 PAM 或 debconf selection 之前 fail closed
+  （root journal 記錄 `Symlinked ... contains an active pam_fprintd.so module line;
+  refusing to install ...`）。請先修正 symlink 再重跑安裝；安裝後 postcondition 驗證的是
+  實際的 `common-*` 位元組，而不只是 selection。
 * **手動復原（舊安裝適用）**：按 `Esc` 取消失敗的解鎖回合再重新解鎖——
   新 worker 會乾淨地重新 Claim。或先執行 `sudo systemctl restart fprintd`
   再解鎖。

@@ -103,8 +103,11 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > `/var/lib/pam` 下每個已儲存的模組檔快照到 first-wins sidecar（`pam-selection` 檔案權限
 > `0644`；`pam-selection.saved` 是 root 擁有、`0700` 的檔案副本目錄），並額外發布第三個
 > root 擁有 `0700` 的 `pam-selection.common` half，記錄每個 `common-*`／sudo 目標的位元組、
-> mode、owner、type、symlink target、absence 與 savedir 目錄中繼資料；所有讀取/複製都
-> 經由 `sudo`，因此搭配 passwordless `sudo` 的非 root 呼叫端也支援），再備份**所有**現有的 `common-*`
+> mode、owner、type、symlink target、absence 與 savedir 目錄中繼資料（外加具 checksum 的
+> entry-set manifest，類別為 `absent`／`empty`／`nonempty`；任何非 regular 的 savedir
+> entry 皆 fail closed）；對 symlink 目標記錄的是連結本身的 lstat owner，並以
+> `chown -h` + `mv -T -f --` 還原（不解引用目標）。所有讀取/複製都經由 `sudo`，
+> 因此搭配 passwordless `sudo` 的非 root 呼叫端也支援），再備份**所有**現有的 `common-*`
 > 位元組（不只含 fp 者）、只移除 fp 模組行，然後自行執行一次
 > `pam-auth-update --package`，讓 debconf 與 `/var/lib/pam` 收斂到穩定的「無
 > fprintd」狀態，日後套件觸發的執行即為 no-op。uninstall 時，所有工具呼叫先結束，
@@ -114,6 +117,15 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > 並回 rc 1。沒有 `.common` 的 legacy sidecar 會明確 WARN 且不宣稱位元組保證；
 > `.saved` 缺失但 live savedir 非空則 fail closed（`manual recovery`）；對 `common-*`
 > 的語意變更（`External content change detected`）回 rc 1 並保留全部 half。
+>
+> **symlinked `common-*` 中有生效 fprintd 模組時安裝 fail closed。** 在任何 snapshot、
+> backup、`sed` 或外部工具呼叫之前，每個 `common-*` 都透過 `sudo` 探測：symlink 目標若
+> 有生效（非註解）的 `pam_fprintd.so` 行，`sed -i` 不解引用就無法移除它，因此安裝以非 0
+> 結束，且**PAM 檔與 debconf selection 完全不變**（不發布 first-wins snapshot）。
+> 無法讀取的目標或 grep 錯誤也 fail closed；不存在或 dangling 目標視為沒有生效模組。
+> 安裝後 postcondition 會檢查**實際的** `common-*` 位元組沒有生效 fprintd——selection 中
+> 留有已停用記錄並不算數。請把 symlink 換成普通檔（或在其真實目標下手動移除 fp 行）
+> 後重跑安裝。
 > **取捨**：安裝期間變更的 selection 會在
 > uninstall 時被覆寫，而手動 `--enable fprintd` 會讓 GDM 競賽恢復，直到 uninstall
 > 為止。若舊安裝的 `common-auth` 仍有 fp 行，請只移除該行，或重跑

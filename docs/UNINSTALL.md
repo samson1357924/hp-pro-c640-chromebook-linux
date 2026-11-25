@@ -106,6 +106,17 @@ above).` instead:
   consume-all removes the whole row, flag included. With no flag, an all-true snapshot still
   returns rc 3 ("never added by us": zero `gpasswd`, stale records consumed only when no udev
   rule needs the group) — the flag is never discarded just because the original was `true`.
+* **An active fprintd inside a symlinked `common-*` fails the install closed.** Before any
+  first-wins snapshot, manifest backup, `sed`, `pam-auth-update` call or sudo change, the
+  Debian/Ubuntu installer probes every `common-*` target through `sudo` and scans for an
+  **active** (non-commented) `pam_fprintd.so` module line. A symlinked `common-*` with such
+  a line cannot be stripped by `sed -i` without replacing the link, so install exits
+  non-zero and leaves **PAM files and the debconf selection completely untouched** (no
+  snapshot is published). Unreadable targets and grep errors also fail closed; absent or
+  dangling targets carry no active module. After a successful install the postcondition
+  verifies the **actual** `common-*` bytes contain no active fprintd — a disabled record
+  retained in the debconf selection is **not** sufficient. Fix the symlink/real target by
+  hand and re-run the installer.
 * **PAM file bytes come from rollback; the debconf selection is snapshotted, converged and
   restored.** `disable_pam_fingerprint()` performs **no sed and no direct edit** of
   `/etc/pam.d/sudo` (or any distro PAM file). All bytes come from the first backup via
@@ -117,7 +128,15 @@ above).` instead:
   so a non-root uninstall can restore it and a root-only `/var/lib/pam` is captured; it also
   publishes a **third half**, root-owned `0700` `pam-selection.common`, recording every
   `common-*` / sudo target's bytes, mode, lstat owner, type, symlink target and absence plus
-  the live savedir directory's presence/mode/owner. All three halves are first-wins.
+  the live savedir directory's presence/mode/owner. For a **symlink** target the recorded
+  owner is the **lstat owner of the link itself**, and restore stages a same-directory
+  link and uses **`chown -h` + `mv -T -f --`** so the link is never dereferenced.
+  All three halves are first-wins. The savedir entry set is recorded as a checksummed,
+  NUL-separated, sorted `name<TAB>type` manifest with a three-state class — `absent`, `empty` or
+  `nonempty` — and compared against the live directory in the final verification; any
+  **non-regular entry** (symlink, directory, FIFO/device) fails closed rather than being
+  silently skipped. A legacy `.common` with no entries line degrades to a WARN-only
+  best-effort check (`Legacy PAM snapshot has no savedir entry-set manifest ...`).
   (2) backs up **all** existing `common-*` files, not just
   fp-containing ones, because `--package` can rewrite any of them; (3) removes only the fp
   module lines with a direct `sed -i '/pam_fprintd\.so/d'`, immediately closing the GDM race;
@@ -126,7 +145,8 @@ above).` instead:
   `pam-auth-update --remove`, which deletes the debconf selection outright. On uninstall the
   order is: all external tool calls finish, then the original `common-*` / sudo state is
   re-applied from `.common`, then the **final verification** checks bytes/mode/owner/type/
-  link/absence, the savedir directory and the selection/seen values; only when all pass are
+  link/absence (including the lstat owner of restored symlinks), the savedir directory
+  **and its full entry set**, and the selection/seen values; only when all pass are
   the selection, `.saved` and `.common` halves consumed together. A consumed manifest record
   plus an equal selection is **not** sufficient for success. A failed restore keeps all three
   halves and returns rc 1; a corrupt manifest or a surviving record skips all debconf writes

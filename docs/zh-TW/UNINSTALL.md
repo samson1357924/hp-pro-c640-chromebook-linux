@@ -90,6 +90,14 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   consume-all 則連整列（含 flag）一起移除。沒有 flag 時，全 `true` 快照仍是 rc 3（「我們從未
   加入」：零次 gpasswd，只有沒有 udev rule 需要該 group 時才消耗過期紀錄）——flag 不會因為
   原始快照為 `true` 就被丟棄。
+* **symlinked `common-*` 中有生效 fprintd 時安裝 fail closed。** Debian/Ubuntu 安裝器在任何
+  first-wins snapshot、manifest 備份、`sed`、`pam-auth-update` 呼叫或 sudo 變更之前，都會
+  透過 `sudo` 探測每個 `common-*` 目標，並掃描**生效中**（非註解）的 `pam_fprintd.so` 模組行。
+  symlinked `common-*` 若有該行，`sed -i` 不解引用就無法移除模組，因此安裝以非 0 結束，
+  且**PAM 檔與 debconf selection 完全不變**（也不發布 snapshot）。無法讀取或 grep 錯誤
+  也 fail closed；不存在或 dangling 目標視為沒有生效模組。安裝成功後的 postcondition 會
+  驗證**實際的** `common-*` 位元組沒有生效 fprintd——debconf selection 中留有已停用記錄
+  **不算**通過。請手動修正 symlink／真實目標後重跑安裝。
 * **PAM 檔案位元組由 rollback 還原；debconf selection 則快照、收斂後還原。**
   `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
   或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，
@@ -99,14 +107,21 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   擁有的 `0700` 目錄）——first-wins、原子，所有讀取/複製都經由 `sudo`，讓非 root uninstall
   也能還原、root-only 的 `/var/lib/pam` 也能擷取；並發布**第三個 half**——root 擁有 `0700` 的
   `pam-selection.common`，記錄每個 `common-*`／sudo 目標的位元組、mode、lstat owner、type、
-  symlink target 與 absence，以及 live savedir 目錄的 presence/mode/owner。三個 half 都是
-  first-wins。(2) 備份**所有**現有的 `common-*` 檔，不只含 fp 者，因為
+  symlink target 與 absence，以及 live savedir 目錄的 presence/mode/owner。對 **symlink**
+  目標，記錄的是**連結本身的 lstat owner**，還原時先在同目錄暫存連結，再以
+  **`chown -h` + `mv -T -f --`** 取代，絕不解引用該連結。三個 half 都是 first-wins。
+  savedir entry set 會記錄成具 checksum 的 以 NUL 分隔並排序的 `name<TAB>type` manifest，並區分
+  `absent`／`empty`／`nonempty` 三態，於最終驗證與 live 目錄比對；任何**非 regular
+  entry**（symlink、目錄、FIFO／裝置）皆 fail closed，不會被悄悄略過。沒有 entries 行的
+  legacy `.common` 降級為 WARN-only 的 best-effort 檢查
+  （`Legacy PAM snapshot has no savedir entry-set manifest ...`）。(2) 備份**所有**現有的 `common-*` 檔，不只含 fp 者，因為
   `--package` 可能改寫任一個；(3) 直接以 `sed -i '/pam_fprintd\.so/d'` 只移除 fp 模組行，
   立即消除 GDM 競賽；(4) 自己先跑一次 `pam-auth-update --package`，讓 debconf 與
   `/var/lib/pam` 收斂到穩定的「無 fprintd」狀態，日後套件觸發的執行即為 no-op。它**絕不**
   呼叫 `pam-auth-update --remove`（該動作會直接刪除 debconf selection）。uninstall 時的順序
   是：所有外部工具呼叫先結束，再從 `.common` 重新套用原始 `common-*`／sudo 狀態，接著做
-  **最終驗證**——檢查 bytes/mode/owner/type/link/absence、savedir 目錄與 selection/seen；
+  **最終驗證**——檢查 bytes/mode/owner/type/link/absence（含還原後 symlink 的 lstat owner）、
+  savedir 目錄**與完整 entry set**、以及 selection/seen；
   全部通過才一次消耗 selection、`.saved` 與 `.common` 三個 half。「manifest record 已消耗 +
   selection 相等」**不算**成功。還原失敗保留三個 half 並回 rc 1；manifest 損毀或有紀錄殘留
   則完全不寫 debconf，保留快照供重試。若最後一個 `.common` half 在其他兩半已消耗後刪除失敗，

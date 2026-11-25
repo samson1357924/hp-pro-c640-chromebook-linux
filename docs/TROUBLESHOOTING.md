@@ -245,10 +245,17 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > fail closed in the **root journal** as `session selection fail-closed: ...`, while the
   > chosen uid is logged as `selected session ... for uid ...` and pinned in a root-only
   > `0600` file at `pre` (reused at `post`). It never creates, chmods or chowns
-  > `/run/user/<uid>`; a missing/insecure dir fails closed with no handoff. The daemon no
-  > longer scans other uids' runtime dirs: only an **explicit** `C640_KBD_HANDOFF_DIR`
-  > override that disagrees with its own file logs `[WARN] handoff directory mismatch`.
-  > For cross-uid diagnosis read the root journal, not a `/run/user` scan.
+  > `/run/user/<uid>`; a missing/insecure dir fails closed with no handoff. The uid is read
+  > from `loginctl show-session`'s **Session.User** (`User=<numeric uid>`), never the
+  > User-object `UID=` key, and session IDs may be alphanumeric (e.g. `c1`); a missing
+  > `User` rejects that session. Both handoff files are published with a same-directory
+  > temp file plus `mv -T -f --`, with destination-entry and parent-inode guards and **no
+  > `cp`/plain-`mv` fallback** (`unsafe destination entry`, `cannot publish ...`). An
+  > explicit `C640_KBD_HANDOFF_DIR` is trusted by design (only `-d` is checked) but its
+  > final component is still guarded. The daemon no longer scans other uids' runtime dirs:
+  > only an **explicit** `C640_KBD_HANDOFF_DIR` override that disagrees with its own file
+  > logs `[WARN] handoff directory mismatch`. For cross-uid diagnosis read the root
+  > journal, not a `/run/user` scan.
 
 * **Triage** (all gdbus queries below are read-only):
 
@@ -258,6 +265,9 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   systemctl --user is-active c640-kbd-backlight-sync.service  # needs graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
   loginctl show-user "$USER" -p State       # active?
+  # read-only schema check of the selector (no S3, no writes):
+  bash keyboard/tests/loginctl-contract-check.sh   # CONTRACT OK on systemd host, SKIP otherwise
+  loginctl show-session "$XDG_SESSION_ID" -p User  # must be User=<numeric uid>, never UID=
   udevadm test /sys/class/leds/chromeos::kbd_backlight  # check TAG+="uaccess" rule
   ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
@@ -313,6 +323,23 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     `C640_KBD_RESUME_ALLOW_UNKNOWN=1` is an explicit **risk acceptance** (may light the
     keyboard under a still-locked screen) and is off by default;
     `C640_KBD_RESUME_PROBE_MAX` caps the post-thaw poll (default 10s).
+  * `bash keyboard/tests/loginctl-contract-check.sh` is a **read-only** check of the exact
+    `loginctl` schema the hook relies on: with the real `loginctl` it confirms
+    `Session.User` is a numeric `User=<uid>` (never a session `UID=` key) and that
+    `show-seat ActiveSession` values are alphanumeric session IDs. It prints
+    `CONTRACT OK` on a running systemd host and an explicit `SKIP` on a non-systemd
+    host (`SKIP` is **not** a pass). It performs **no S3 cycle and no handoff write**,
+    so `CONTRACT OK` does **not** mean real S3 has been verified for this HEAD — run the
+    target-machine checklist in [verification.md §3](verification.md) before claiming that.
+    If it fails, check the `show-session` output for a missing `User` property or a
+    decimal-only session-ID assumption in an older hook.
+  * `handoff skipped (fail-closed): unsafe destination entry <path>` or
+    `... destination entry changed during write` means the final handoff component is a
+    symlink, directory or special entry (or changed while the temp file was being
+    written). `cannot publish <path>` means the single `mv -T -f --` publish failed; the
+    temp file is removed and **no `cp`/plain-`mv` fallback** is attempted, so a hostile
+    entry is never dereferenced. Fix the runtime dir entry (remove the symlink/dir) and
+    retry the suspend cycle; check the root journal for the exact path.
   * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` means the
     suspend started while the screen was blank: the hook's hardware 0 was correctly
     ignored so unlocking restores the user's brightness N (verified in a real S3 cycle —
@@ -577,6 +604,17 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     equal selection alone are not success. If the last `.common` half cannot be removed
     after the other two are gone, the sidecar is rebuilt but the state is **not retryable**
     (`manual recovery is REQUIRED`); the retained files must be cleaned up by hand.
+  * `Symlinked /etc/pam.d/common-* contains an active pam_fprintd.so module line;
+    refusing to install because it cannot be stripped without replacing the link (the GDM
+    claim race would remain).` is the **install-time** fail-closed preflight: before any
+    snapshot, backup, `sed`, tool call or sudo change, each `common-*` is probed through
+    `sudo`; an active fp module behind a symlink cannot be removed without replacing the
+    link, so install exits non-zero and leaves **PAM files and the debconf selection
+    untouched**. Unreadable targets/grep errors fail closed too; absent or dangling
+    targets carry no active module. Replace the symlink with a regular file (or remove
+    the fp line under its real target deliberately), then re-run the installer. After a
+    successful install the postcondition checks the **actual** `common-*` bytes for no
+    active fprintd — a disabled record left in the debconf selection is not sufficient.
 
 ---
 
@@ -671,7 +709,13 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   ```
 
   *(This also removes the previous race window for `sudo` — see section 8
-  for the single-stack rule.)*
+  for the single-stack rule.)* If a `common-*` file is a **symlink** whose target
+  has an active `pam_fprintd.so` line, `sed -i` would replace the link rather than
+  strip the module, so the installer fails closed before touching PAM or the
+  debconf selection (`Symlinked ... contains an active pam_fprintd.so module line;
+  refusing to install ...` in the root journal). Fix the symlink first, then re-run
+  the installer; the installed-state postcondition verifies the real `common-*`
+  bytes, not merely the selection.
 * **Manual recovery (if you are on an older install)**: press `Esc` to cancel
   the failed unlock round, then unlock again — the fresh workers re-claim
   cleanly. Or run `sudo systemctl restart fprintd` before unlocking.

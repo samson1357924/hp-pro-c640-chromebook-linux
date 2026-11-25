@@ -357,8 +357,13 @@ mktemp/寫入/驗證失敗才回 rc `2` 並保持 LED 亮著。
 （單一十進位整數，`0` 有效）；`post` 只發佈 `c640-kbd-backlight.resume`
 （`<epoch> <action>`）。root 快照**不被 hook 或 daemon 消耗，也從不用於還原**；
 daemon 只消費兩個 handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。
-兩個 handoff 檔都是 `0600`、chown 給解析出的 session user，並以原子
-`mv` 放進 `$XDG_RUNTIME_DIR`；`C640_KBD_HANDOFF_DIR` 可覆寫 hook 的目錄。當 daemon 持有
+兩個 handoff 檔都是 `0600`、chown 給解析出的 session user，並以同目錄暫存檔加
+`mv -T -f --` 發布到 `$XDG_RUNTIME_DIR`；發布前後都做 destination entry guard
+（symlink／目錄／特殊檔即 fail closed）並重查父目錄 inode，**沒有 `cp` 或一般
+`mv` 降級**（`unsafe destination entry`／`cannot publish ...`）。uid 來自
+`Session.User`（`loginctl show-session` 的 `User=<uid>`），不是 User object 的 `UID=`；
+session ID 可為英數（如 `c1`）。`C640_KBD_HANDOFF_DIR` 可覆寫 hook 的目錄且依設計
+信任 caller（只檢查 `-d`），但最終 component 仍受保護。當 daemon 持有
 不同的非零已存值時，blank-side 的 handoff `0` 會被忽略，讓使用者亮度在「已熄屏時
 休眠」後仍保留——**除非**三者同時成立：新鮮的 last-user `source=manual0`（TTL 內）、
 cache 值為 `0`、且 gsd 明確回報 pct `0`。gsd 空值仍是「無法確認」，該 `0` 照樣視為
@@ -391,11 +396,20 @@ bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume 
 `RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK`；持有 `WRITE_LOCK` 時不得再取外層鎖
 （finalize、verify 與 generation 維護都在釋放後做）。慢速 D-Bus 讀取（guard 的
 LED 讀回）在取得 `WRITE_LOCK` **之前**完成，因此 3 秒 gdbus timeout 不會拖住
-等待鎖的還原。`bump_restore_gen()` 在 `WRITE_LOCK` 內讀取、遞增並原子發佈
+等待鎖的還原。`bump_restore_gen()` 在 `WRITE_LOCK` 內讀取、遞增並以 **fail-closed** 方式發佈
 generation，同時清除 guard marker，成功回 0；鎖取得失敗時**完全不發佈**
 （不在鎖外降級寫入）、回 1，所有呼叫端都轉為 DEFER 並保留 flag/handoff/state。
-`C640_KBD_GUARD_WRITTEN_GEN` 可覆寫 `c640-kbd-backlight.guard-written-gen`：
-該 marker 讓同一 generation 的兩個 guard 只有一個能重設亮度。
+發佈程序是同目錄 `mktemp` → 寫入 → `chmod` → `mv -T` → 以 bash `read` builtin 讀回：
+目的地不是普通檔即拒絕並保持原狀，讀回不符才使該目的地失效；只有在驗證過的發布**與** marker
+清理都成功後，記憶體內的 generation 才前進。`C640_KBD_RESTORE_GEN_FILE` 可覆寫
+`c640-kbd-backlight.restore-gen`；`C640_KBD_GUARD_WRITTEN_GEN` 可覆寫
+`c640-kbd-backlight.guard-written-gen`，該 marker 讓同一 generation 的兩個 guard
+只有一個能重設亮度。retry/guard **epoch**（`C640_KBD_RESTORE_RETRY_EPOCH`，預設
+`c640-kbd-backlight.retry-epoch`）在 `WRITE_LOCK` 內於成功與失敗路徑都輪替：
+即使 generation 發布失敗，舊 epoch 的 retry/guard 仍會被吊銷。已排定的工作在
+sleep 後、慢速三態探測後，以及寫入前於 `WRITE_LOCK` 內都會再查一次 epoch。
+guard 證據（LED/gsd 讀值）超過 `C640_KBD_GUARD_EVIDENCE_TTL`（預設 6 秒）時會
+重新探測，而不是信任舊值。
 
 +0.3/+0.9s 的 unblank guard 與 +0.25/+1.0s 的 blank guard 會在 sleep 後以及
 `WRITE_LOCK` 內、寫入前再查一次 generation；過期 guard **完全不寫入**。
@@ -507,46 +521,56 @@ journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 `C640_KBD_SAVE_LOCK_WAIT` 限制 `save_state` 的 state lock 等待（預設 2 秒）；
 `C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後 ScreenSaver 輪詢的 **wall-clock 預算
 （每次探測後檢查；最壞 ≈ 預算 + 一次查詢）**（預設 10 秒）；
-`C640_KBD_RESUME_ALLOW_UNKNOWN=1` 選擇在答案未知時仍還原。
+`C640_KBD_RESUME_ALLOW_UNKNOWN=1` 選擇在答案未知時仍還原；
+`C640_KBD_GUARD_EVIDENCE_TTL` 限制 guard 證據的最大年齡（秒，預設 6），超過即重新探測。
+所有實體寫入都由 `C640_KBD_WRITE_LOCK`（預設 `$STATE_DIR/c640-kbd-backlight.write.lock`）序列化。
 
 **僅供測試的環境變數**（不碰系統檔案）：daemon 接受 `C640_KBD_SYSFS_BRIGHTNESS` /
 `C640_KBD_SYSFS_MAX` 指向假 LED 節點，以及 `C640_KBD_HANDOFF_SUSPEND` /
 `C640_KBD_HANDOFF_RESUME` / `C640_KBD_RESTORE_PENDING_FILE` /
 `C640_KBD_RESUME_LOCK` / `C640_KBD_LAST_USER_META_FILE` 覆寫暫存/handoff 路徑，
-另有 `C640_KBD_WRITE_LOCK`、`C640_KBD_GUARD_WRITTEN_GEN` 與
-`C640_KBD_SELF_WRITE_SENTINEL` 覆寫 write lock／guard marker／保留的 Tier 2
-sentinel 路徑；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
+另有 `C640_KBD_WRITE_LOCK`、`C640_KBD_RESTORE_GEN_FILE`、
+`C640_KBD_RESTORE_RETRY_EPOCH`、`C640_KBD_GUARD_WRITTEN_GEN` 與
+`C640_KBD_SELF_WRITE_SENTINEL` 覆寫 write lock／generation／retry epoch／
+guard marker／保留的 Tier 2 sentinel 路徑；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
 `C640_KBD_HANDOFF_DIR` 與 `C640_KBD_RUN_USER_ROOT`；explicit
 `C640_KBD_HANDOFF_DIR` 會跳過 loginctl 選擇與 uid 釘住，daemon 只用同一值做
 覆寫不一致 WARN（不再有跨 uid 掃描）。舊的 `C640_KBD_SLEEP_USER` /
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 539 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 688 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
 explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
 guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
-嚴格單調的 generation bump、fail-closed 鎖失敗與單次讀取的 last-user cache）；
-sleep hook 測試有 161 個案例（純 handoff、`0600`/`chown`/
-原子 `mv`、`C640_KBD_HANDOFF_DIR`、由 loginctl 屬性選出單一 active local graphical
-session 並在 root journal fail closed、uid 釘住與沿用、0700 runtime dir 檢查、不寫 LED）。
-rollback 測試（`tests/rollback-test.sh`，需 root）有 2137 個案例，包含損毀
+嚴格單調的 generation bump、**fail-closed generation 發布與讀回、epoch barrier 吊銷
+過期 retry/guard、TTL 證據重新探測**、fail-closed 鎖失敗與單次讀取的 last-user cache）；
+sleep hook 測試有 234 個案例（純 handoff、`0600`/`chown`/
+原子 `mv -T -f --` 與 destination entry guard、無 `cp` 降級、
+`C640_KBD_HANDOFF_DIR`、由 loginctl `Session.User`（`User=<uid>`、英數 session ID）
+選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
+0700 runtime dir 檢查、不寫 LED）。另有唯讀的
+`keyboard/tests/loginctl-contract-check.sh`（systemd host 為 `CONTRACT OK`、其他為 `SKIP`
+——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2233 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
 祖先/父目錄拒絕與 fd 8 釘住、跨元件 plugdev 歸屬（含選用的逐次安裝 `added_by_project`
 證據 R15–R20、all-true 過期紀錄零 gpasswd 消耗）與 gpasswd 失敗回 rc 1、PAM 原始行保護
 與 first-wins debconf selection／`/var/lib/pam` 快照、`pam-auth-update --package` 收斂及
-uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、整個操作鎖
+uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `common-*` 中的
+生效 fprintd 讓安裝 fail closed、`.common` 的 lstat symlink owner 以 `chown -h` +
+`mv -T` 還原、savedir 三態 entry set 驗證且非 regular entry fail closed、整個操作鎖
 （部署 vs rollback 的 OP1/OP2 FIFO barrier 回歸、真實安裝器 barrier 與 fail-closed body）、
 唯一 writer 暫存檔與 systemctl 還原檢查 rc。CI 另以真實工具在 Ubuntu 24.04 container
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 539 個案例
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 161 個案例
-sudo bash tests/rollback-test.sh                       # 2137 個案例（需 root）
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 個案例
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 個案例
+bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
+sudo bash tests/rollback-test.sh                       # 2233 個案例（需 root）
 ```
 
 ---
@@ -665,7 +689,7 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 | LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後 `chromeos::kbd_backlight/brightness` 為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
 | daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
 | daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
-| sleep hook | 🟢 | **2026-10-31 舊 hook 行為（僅供沿革參考，現已不適用）**：`pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（該 session 以直接呼叫驗證）。現行 hook 已改為**純 handoff 寫入者**，絕不寫亮度或刪 state；完整真實 S3 freeze/thaw 已於 2026-11-22 驗證——見 [verification.md](../docs/verification.md) |
+| sleep hook | 🟢 | **2026-10-31 舊 hook 行為（僅供沿革參考，現已不適用）**：`pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（該 session 以直接呼叫驗證）。現行 hook 已改為**純 handoff 寫入者**，絕不寫亮度或刪 state；2026-11-22 曾以**舊 hook** 觀察到完整真實 S3 freeze/thaw（僅為歷史證據）；現行 HEAD 的 selector／root 邊界**待目標機執行**——見 [verification.md](../docs/verification.md) |
 | `--check` | 🟢 | 全綠，含「backlight node writable by group plugdev (mode 660)」 |
 
 **沿革（2026-10-31 已修）：** 先前 `12:49`、`13:25`、`13:26` 的被動擷取出現
