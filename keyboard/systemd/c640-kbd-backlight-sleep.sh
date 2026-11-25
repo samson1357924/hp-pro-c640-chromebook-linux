@@ -31,9 +31,13 @@
 #   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<epoch> <action>", e.g.
 #                                                   "1763800000 suspend".
 # Both files are 0600, owned by the resolved session user when placed under
-# /run/user/<uid>, and atomically published (mktemp + printf + chmod + chown +
-# mv -f) so the daemon can never observe a half-written value. The daemon-side
-# paths are $XDG_RUNTIME_DIR/c640-kbd-backlight.{suspend,resume}.
+# /run/user/<uid>, and atomically published in the destination directory
+# (mktemp + printf + chmod + chown + `mv -T -f --`) so the daemon can never
+# observe a half-written value.  `-T` gives GNU rename semantics: the final
+# path component is never followed as a symlink nor treated as a directory
+# container.  There is deliberately NO cp fallback and NO /tmp mktemp
+# fallback: a failed publish fails closed instead of escaping the boundary.
+# The daemon-side paths are $XDG_RUNTIME_DIR/c640-kbd-backlight.{suspend,resume}.
 # Both files are written with a trailing "\n"; the daemon must trim it when
 # reading the value (e.g. `read` or command substitution already strips it).
 # The hook NEVER deletes the handoff files: after a successful restore the
@@ -65,7 +69,8 @@
 #
 # To prevent a pre/post split (different sessions, or a session disappearing
 # while user.slice is frozen), `pre` pins the chosen uid in root-only
-# $STATE_DIR/session-uid (0600, mktemp+mv).  `post` reads that file, validates
+# $STATE_DIR/session-uid (0600, mktemp + `mv -T -f --`, no cp fallback).
+# `post` reads that file, validates
 # the uid and its runtime dir, and reuses it without re-selecting.  A missing
 # or invalid file fails closed.  The hook never creates, chmods or chowns a
 # runtime dir; an absent/insecure /run/user/<uid> is a fail-closed condition.
@@ -158,10 +163,27 @@ save_state() {
     # (e.g. the screen was already blank when suspend started).
     mkdir -p "$STATE_DIR" 2> /dev/null || true
     chmod 700 "$STATE_DIR" 2> /dev/null || true
-    _tmp="$(mktemp "$STATE_DIR/.state.XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-sleep-XXXXXX")"
+    _tmp="$(mktemp "$STATE_DIR/.state.XXXXXX" 2> /dev/null || echo '')"
+    if [ -z "$_tmp" ]; then
+        log_warn "cannot create temporary root state file"
+        return 0
+    fi
     echo "$_curr" > "$_tmp" 2> /dev/null || true
     chmod 600 "$_tmp" 2> /dev/null || true
-    mv -f "$_tmp" "$STATE_FILE" 2> /dev/null || cp "$_tmp" "$STATE_FILE" 2> /dev/null || true
+    # Publish only when the final path component is absent or a regular file.
+    # -T prevents mv from following a symlink or using a directory as a
+    # container; there is no cp fallback that could dereference a symlink.
+    if [ -L "$STATE_FILE" ] || [ -d "$STATE_FILE" ] \
+        || { [ -e "$STATE_FILE" ] && [ ! -f "$STATE_FILE" ]; }; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "root state skipped (fail-closed): unsafe destination entry $STATE_FILE"
+        return 0
+    fi
+    if ! mv -T -f -- "$_tmp" "$STATE_FILE" 2> /dev/null; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "cannot publish root state $STATE_FILE"
+        return 0
+    fi
     rm -f "$_tmp" 2> /dev/null || true
 }
 
@@ -284,8 +306,7 @@ _write_cycle_uid() {
     _wuid="$1"
     mkdir -p "$STATE_DIR" 2> /dev/null || true
     chmod 700 "$STATE_DIR" 2> /dev/null || true
-    _tmp="$(mktemp "$STATE_DIR/.session-uid.XXXXXX" 2> /dev/null \
-        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-session-uid.XXXXXX" 2> /dev/null || echo '')"
+    _tmp="$(mktemp "$STATE_DIR/.session-uid.XXXXXX" 2> /dev/null || echo '')"
     if [ -z "$_tmp" ]; then
         log_warn "cannot create temporary cycle uid file"
         return 1
@@ -296,12 +317,16 @@ _write_cycle_uid() {
         return 1
     fi
     chmod 600 "$_tmp" 2> /dev/null || true
-    if ! mv -f "$_tmp" "$CYCLE_UID_FILE" 2> /dev/null; then
-        cp "$_tmp" "$CYCLE_UID_FILE" 2> /dev/null || {
-            rm -f "$_tmp" 2> /dev/null || true
-            log_warn "cannot publish cycle uid $_wuid"
-            return 1
-        }
+    if [ -L "$CYCLE_UID_FILE" ] || [ -d "$CYCLE_UID_FILE" ] \
+        || { [ -e "$CYCLE_UID_FILE" ] && [ ! -f "$CYCLE_UID_FILE" ]; }; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "cycle uid skipped (fail-closed): unsafe destination entry $CYCLE_UID_FILE"
+        return 1
+    fi
+    if ! mv -T -f -- "$_tmp" "$CYCLE_UID_FILE" 2> /dev/null; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "cannot publish cycle uid $_wuid"
+        return 1
     fi
     rm -f "$_tmp" 2> /dev/null || true
     chmod 600 "$CYCLE_UID_FILE" 2> /dev/null || true
@@ -388,10 +413,37 @@ resolve_handoff_dir() {
     log_info "$_phase handoff dir $HANDOFF_DIR for uid $_uid"
 }
 
+# Identity of a directory as (device:inode, mode, owner).  An empty result
+# means "not stat-able" and always fails closed.
+_dir_identity() {
+    stat -c '%d:%i %a %u:%g' "$1" 2> /dev/null || echo ''
+}
+
+# A publish target may only be absent or a regular file.  A symlink (even a
+# symlink to a directory), a real directory, or any other non-regular entry is
+# user-controlled state that root must not repoint, follow or replace.
+_handoff_dest_safe() {
+    _dest="$1"
+    [ ! -L "$_dest" ] || return 1
+    [ ! -d "$_dest" ] || return 1
+    [ ! -e "$_dest" ] || [ -f "$_dest" ] || return 1
+    return 0
+}
+
 # Atomically publish one handoff file. All failures are best-effort: warn
 # only, never propagate, so suspend/resume never blocks on a handoff write.
 # The runtime dir must already exist with the right owner/mode; never create
 # a root-owned 0755 stand-in for a user's /run/user/<uid> (finding #5).
+#
+# Root write boundary (finding #5, P2):
+#   - snapshot the parent dir identity before creating the temp file and
+#     re-check it immediately before the rename (no directory inode swap);
+#   - guard the destination entry both before and after the content is ready;
+#   - mktemp in the SAME directory (no /tmp fallback), then one
+#     `mv -T -f --` rename: -T never follows a final symlink and never treats
+#     a directory as a container;
+#   - NO cp and NO plain-mv fallback.  A failed rename removes the temp file,
+#     warns and fails closed instead of dereferencing an attacker's symlink.
 _atomic_write() {
     _file="$1"
     _content="$2"
@@ -403,8 +455,16 @@ _atomic_write() {
         log_warn "handoff skipped (fail-closed): $_dir missing/insecure for uid '${_uid:-<override>}'"
         return 0
     fi
-    _tmp="$(mktemp "$_dir/.c640-kbd-handoff.XXXXXX" 2> /dev/null \
-        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-handoff.XXXXXX" 2> /dev/null || echo "")"
+    _dir_id="$(_dir_identity "$_dir")"
+    if [ -z "$_dir_id" ]; then
+        log_warn "handoff skipped (fail-closed): cannot stat $_dir"
+        return 0
+    fi
+    if ! _handoff_dest_safe "$_file"; then
+        log_warn "handoff skipped (fail-closed): unsafe destination entry $_file"
+        return 0
+    fi
+    _tmp="$(mktemp "$_dir/.c640-kbd-handoff.XXXXXX" 2> /dev/null || echo '')"
     if [ -z "$_tmp" ]; then
         log_warn "cannot create temporary handoff file for $_file"
         return 0
@@ -421,12 +481,26 @@ _atomic_write() {
             chown "$_uid:$_gid" "$_tmp" 2> /dev/null || log_warn "cannot chown $_uid:$_gid on $_file"
         fi
     fi
-    # One rename publishes the complete file; the daemon never sees a partial
-    # line. cp is a last resort for filesystems without atomic rename.
-    if ! mv -f "$_tmp" "$_file" 2> /dev/null; then
-        cp "$_tmp" "$_file" 2> /dev/null || log_warn "cannot publish $_file"
+    # Re-check both boundaries after the content is ready: a user swapping
+    # the directory inode or the destination entry mid-write must not turn a
+    # legitimate publish into a write outside $_dir.
+    if ! _handoff_dest_safe "$_file"; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "handoff skipped (fail-closed): destination entry changed during write: $_file"
+        return 0
+    fi
+    if [ "$(_dir_identity "$_dir")" != "$_dir_id" ]; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "handoff skipped (fail-closed): $_dir changed during write"
+        return 0
+    fi
+    if ! mv -T -f -- "$_tmp" "$_file" 2> /dev/null; then
+        rm -f "$_tmp" 2> /dev/null || true
+        log_warn "cannot publish $_file"
+        return 0
     fi
     rm -f "$_tmp" 2> /dev/null || true
+    return 0
 }
 
 # pre: publish the brightness the daemon must restore after thaw. The value

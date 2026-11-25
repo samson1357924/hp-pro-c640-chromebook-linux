@@ -30,6 +30,9 @@ HOOK_ERR="$TMP_DIR/hook.err"
 CHMOD_LOG="$TMP_DIR/chmod.log"
 CHOWN_LOG="$TMP_DIR/chown.log"
 MKTEMP_LOG="$TMP_DIR/mktemp.log"
+MV_LOG="$TMP_DIR/mv.log"
+CP_LOG="$TMP_DIR/cp.log"
+STAT_COUNT="$TMP_DIR/stat-count"
 FALLBACK_DIR="$TMP_DIR/tmp-fallback"
 SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
@@ -108,6 +111,22 @@ assert_resume_flag() {
     else
         bad "$label (expected '<epoch> $action', got '$content')"
     fi
+}
+# A failed publish must not leave its temp file behind.
+assert_no_handoff_temp() {
+    local label="$1" dir="${2:-$HANDOFF_DIR}" found
+    found="$(find "$dir" -maxdepth 1 -name '.c640-kbd-handoff.*' -print -quit 2> /dev/null || echo '')"
+    if [ -n "$found" ]; then
+        bad "$label (left $found behind)"
+    else
+        ok "$label"
+    fi
+}
+# The destination guard must reject the entry before any handoff rename.
+assert_no_handoff_mv() {
+    local label="$1" calls
+    calls="$(grep -F '.c640-kbd-handoff.' "$MV_LOG" 2> /dev/null || echo '')"
+    assert_eq "$label" "" "$calls"
 }
 
 # --- stubs -----------------------------------------------------------------
@@ -308,8 +327,64 @@ cat > "$STUB_DIR/mktemp" << 'STUB'
 printf 'mktemp %s\n' "$*" >> "$STUB_MKTEMP_LOG"
 exec /usr/bin/mktemp "$@"
 STUB
+# Publishing must use `mv -T -f --`: -T gives GNU rename semantics (replace
+# the final path component; never follow a symlink, never treat a directory as
+# a container).  Log every call so the -T flag itself is falsifiable.  When
+# STUB_MV_FAIL=1, only the handoff rename fails - save_state and the cycle uid
+# keep working, so a test can observe a pure handoff-publish failure.
+cat > "$STUB_DIR/mv" << 'STUB'
+#!/bin/sh
+printf 'mv %s\n' "$*" >> "${STUB_MV_LOG:-/dev/null}"
+_fail=0
+for _arg in "$@"; do
+    case "$_arg" in
+        *.c640-kbd-handoff.*)
+            if [ "${STUB_MV_FAIL:-0}" = "1" ]; then
+                _fail=1
+            fi
+            ;;
+    esac
+done
+if [ "$_fail" = "1" ]; then
+    exit 1
+fi
+exec /bin/mv "$@"
+STUB
+# Any cp call is a bug: cp follows a user-controlled symlink and would
+# overwrite the victim outside the runtime directory.
+cat > "$STUB_DIR/cp" << 'STUB'
+#!/bin/sh
+printf 'cp %s\n' "$*" >> "${STUB_CP_LOG:-/dev/null}"
+exec /bin/cp "$@"
+STUB
+# Optional TOCTOU simulation for the -T sensitivity case.  On the Nth full
+# directory-identity stat (2 = the re-check just before the rename), replace
+# a regular destination with a symlink to an outside dir.  `mv -T` then
+# replaces that symlink in place; plain `mv -f` follows it and drops the temp
+# file into the outside dir.  With no STUB_RACE_AT this is pure passthrough.
+cat > "$STUB_DIR/stat" << 'STUB'
+#!/bin/sh
+_count_file="${STUB_STAT_COUNT_FILE:-/dev/null}"
+case "$*" in
+    *'%d:%i %a %u:%g'*)
+        _n=0
+        if [ -r "$_count_file" ]; then
+            _n="$(cat "$_count_file" 2> /dev/null || echo 0)"
+        fi
+        case "$_n" in '' | *[!0-9]*) _n=0 ;; esac
+        _n=$((_n + 1))
+        printf '%s' "$_n" > "$_count_file" 2> /dev/null || true
+        if [ "$_n" = "${STUB_RACE_AT:-0}" ] && [ -n "${STUB_RACE_LINK:-}" ]; then
+            rm -f "$STUB_RACE_LINK" 2> /dev/null || true
+            ln -s "$STUB_RACE_TARGET" "$STUB_RACE_LINK" 2> /dev/null || true
+        fi
+        ;;
+esac
+exec /bin/stat "$@"
+STUB
 chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/loginctl" \
-    "$STUB_DIR/chmod" "$STUB_DIR/chown" "$STUB_DIR/mktemp"
+    "$STUB_DIR/chmod" "$STUB_DIR/chown" "$STUB_DIR/mktemp" \
+    "$STUB_DIR/mv" "$STUB_DIR/cp" "$STUB_DIR/stat"
 
 # 0. Fixture schema self-check: the stub itself must emit the REAL loginctl
 #    session schema (User=<numeric uid>, never UID=).  Without this guard a
@@ -335,6 +410,10 @@ HOOK_HANDOFF_DIR="$HANDOFF_DIR"
 HOOK_SUDO_USER=""
 HOOK_TMPDIR=""
 STUB_FROZEN=0
+STUB_MV_FAIL=0
+STUB_RACE_AT=0
+STUB_RACE_LINK=""
+STUB_RACE_TARGET=""
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
 STUB_LOGINCTL_MODE=none
@@ -349,9 +428,17 @@ reset_case() {
     : > "$CHMOD_LOG"
     : > "$CHOWN_LOG"
     : > "$MKTEMP_LOG"
+    : > "$MV_LOG"
+    : > "$CP_LOG"
+    printf '0' > "$STAT_COUNT"
     rm -f "$STATE_DIR/state" "$STATE_DIR"/.state.* "$STATE_DIR/session-uid" \
         "$STATE_DIR"/.session-uid.* "$FAKE_SYSFS" "$FAKE_MAX"
-    rm -f "$SUSPEND_FILE" "$RESUME_FILE" "$HANDOFF_DIR"/.c640-kbd-handoff.*
+    # The boundary cases deliberately make the handoff path a symlink or a
+    # real directory; rm -f alone cannot clean those up for the next case.
+    rm -f "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
+    rm -rf "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
+    rm -f "$HANDOFF_DIR"/.c640-kbd-handoff.* 2> /dev/null || true
+    rm -rf "$TMP_DIR/boundary-target" "$TMP_DIR/boundary-victim"
     rm -rf "$RUN_USER_ROOT"
     mkdir -p "$RUN_USER_ROOT/$(id -u)"
     chmod 700 "$RUN_USER_ROOT/$(id -u)"
@@ -365,6 +452,10 @@ reset_case() {
     STUB_FDO_ACTIVE=false
     STUB_LOGINCTL_MODE=none
     STUB_UID_FIELD=User
+    STUB_MV_FAIL=0
+    STUB_RACE_AT=0
+    STUB_RACE_LINK=""
+    STUB_RACE_TARGET=""
 }
 
 run_hook() {
@@ -377,6 +468,13 @@ run_hook() {
         "STUB_CHMOD_LOG=$CHMOD_LOG"
         "STUB_CHOWN_LOG=$CHOWN_LOG"
         "STUB_MKTEMP_LOG=$MKTEMP_LOG"
+        "STUB_MV_LOG=$MV_LOG"
+        "STUB_CP_LOG=$CP_LOG"
+        "STUB_MV_FAIL=$STUB_MV_FAIL"
+        "STUB_STAT_COUNT_FILE=$STAT_COUNT"
+        "STUB_RACE_AT=$STUB_RACE_AT"
+        "STUB_RACE_LINK=$STUB_RACE_LINK"
+        "STUB_RACE_TARGET=$STUB_RACE_TARGET"
         "STUB_LOGINCTL_MODE=$STUB_LOGINCTL_MODE"
         "STUB_UID_FIELD=$STUB_UID_FIELD"
         "STUB_GNOME_ACTIVE=$STUB_GNOME_ACTIVE"
@@ -432,6 +530,9 @@ assert_mode "root state file is 0600" "600" "$STATE_DIR/state"
 assert_file "pre saves root state" "$STATE_DIR/state" "7"
 assert_file "pre publishes suspend handoff" "$SUSPEND_FILE" "7"
 assert_mode "suspend handoff is 0600" "600" "$SUSPEND_FILE"
+# The publish itself must be a GNU `mv -T -f --` rename, never cp.
+assert_log_matches "publish uses mv -T -f --" "$MV_LOG" '^mv -T -f -- .*\.c640-kbd-handoff\.'
+assert_empty_log "publish has no cp fallback" "$CP_LOG"
 printf '0\n' > "$FAKE_SYSFS"
 run_hook post suspend
 assert_file "post does NOT write sysfs" "$FAKE_SYSFS" "0"
@@ -937,6 +1038,134 @@ run_hook pre suspend
 assert_absent "ambiguous ids: no suspend handoff" "$RUN_USER_ROOT/$(id -u)/c640-kbd-backlight.suspend"
 assert_absent "ambiguous ids: no cycle uid pinned" "$STATE_DIR/session-uid"
 assert_file "ambiguous ids: root state still saved" "$STATE_DIR/state" "7"
+
+# 9q. ROOT WRITE BOUNDARY - destination is a symlink to an OUTSIDE directory.
+# Plain `mv -f` follows the final symlink and drops the temp into that dir
+# (rc 0, handoff missing under the expected name); `mv -T` would replace the
+# symlink.  Either way root would have written outside its boundary, so the
+# entry guard must reject it before any rename.
+reset_case
+_target="$TMP_DIR/boundary-target"
+mkdir -p "$_target"
+printf 'SENTINEL\n' > "$_target/sentinel"
+ln -s "$_target" "$SUSPEND_FILE"
+run_hook pre suspend
+if [ -L "$SUSPEND_FILE" ]; then
+    ok "symlink-to-dir: destination symlink left intact"
+else
+    bad "symlink-to-dir: destination symlink was replaced/followed"
+fi
+assert_eq "symlink-to-dir: outside dir still has only its sentinel" "1" \
+    "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_file "symlink-to-dir: sentinel untouched" "$_target/sentinel" "SENTINEL"
+assert_absent "symlink-to-dir: no handoff under the expected name in outside dir" \
+    "$_target/c640-kbd-backlight.suspend"
+assert_no_handoff_temp "symlink-to-dir: no temp in outside dir" "$_target"
+assert_no_handoff_temp "symlink-to-dir: no temp left in handoff dir"
+assert_no_handoff_mv "symlink-to-dir: guard rejected before rename"
+assert_empty_log "symlink-to-dir: cp never called" "$CP_LOG"
+assert_log_matches "symlink-to-dir: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
+assert_file "symlink-to-dir: root state still saved" "$STATE_DIR/state" "7"
+
+# The same boundary applies to the post-phase resume flag.
+reset_case
+_target="$TMP_DIR/boundary-target"
+mkdir -p "$_target"
+ln -s "$_target" "$RESUME_FILE"
+run_hook post suspend
+if [ -L "$RESUME_FILE" ]; then
+    ok "symlink-to-dir: resume destination symlink left intact"
+else
+    bad "symlink-to-dir: resume destination symlink was replaced/followed"
+fi
+assert_eq "symlink-to-dir: post wrote nothing into outside dir" "0" \
+    "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_no_handoff_temp "symlink-to-dir: no post temp in outside dir" "$_target"
+assert_no_handoff_mv "symlink-to-dir: post guard rejected before rename"
+assert_empty_log "symlink-to-dir: post never called cp" "$CP_LOG"
+assert_log_matches "symlink-to-dir: post fail-closed WARN" "$HOOK_ERR" 'unsafe destination entry'
+
+# Same destination, but swapped into a symlink AFTER the guard (TOCTOU): the
+# stub fires on the second directory-identity stat, i.e. immediately before
+# the rename.  `mv -T` replaces the symlink and publishes under the expected
+# name; plain `mv -f` would follow it and write into the outside directory.
+reset_case
+_target="$TMP_DIR/boundary-target"
+mkdir -p "$_target"
+printf 'SENTINEL\n' > "$_target/sentinel"
+STUB_RACE_AT=2
+STUB_RACE_LINK="$SUSPEND_FILE"
+STUB_RACE_TARGET="$_target"
+run_hook pre suspend
+if [ -L "$SUSPEND_FILE" ]; then
+    bad "TOCTOU: final path still follows the outside symlink"
+else
+    ok "TOCTOU: mv -T replaced the swapped symlink in place"
+fi
+assert_file "TOCTOU: handoff published under the expected name" "$SUSPEND_FILE" "7"
+assert_eq "TOCTOU: outside dir unchanged" "1" "$(find "$_target" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_file "TOCTOU: sentinel untouched" "$_target/sentinel" "SENTINEL"
+assert_no_handoff_temp "TOCTOU: no temp in outside dir" "$_target"
+assert_empty_log "TOCTOU: cp never called" "$CP_LOG"
+
+# 9r. ROOT WRITE BOUNDARY - destination is a regular symlink to an external
+# file.  The old cp fallback dereferenced it and overwrote the victim; the
+# guard must reject the symlink before rename, and cp must never be called
+# even if a rename later fails.
+reset_case
+_victim="$TMP_DIR/boundary-victim"
+printf 'ORIGINAL\n' > "$_victim"
+ln -s "$_victim" "$SUSPEND_FILE"
+run_hook pre suspend
+assert_file "symlink-to-file: external victim not overwritten" "$_victim" "ORIGINAL"
+if [ -L "$SUSPEND_FILE" ]; then
+    ok "symlink-to-file: destination symlink left intact"
+else
+    bad "symlink-to-file: destination symlink was replaced/followed"
+fi
+assert_no_handoff_mv "symlink-to-file: guard rejected before rename"
+assert_empty_log "symlink-to-file: cp never called" "$CP_LOG"
+assert_log_matches "symlink-to-file: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
+assert_no_handoff_temp "symlink-to-file: no temp left in handoff dir"
+
+rm -f "$SUSPEND_FILE"
+STUB_MV_FAIL=1
+run_hook pre suspend
+assert_absent "symlink-to-file: failed rename publishes no handoff" "$SUSPEND_FILE"
+assert_empty_log "symlink-to-file: no cp fallback after rename failure" "$CP_LOG"
+assert_no_handoff_temp "symlink-to-file: no temp after rename failure"
+
+# 9s. ROOT WRITE BOUNDARY - destination is a real directory.  mv -T would
+# fail-closed here, but the guard must reject it explicitly before renaming
+# (and must not leave a temp behind).
+reset_case
+mkdir -p "$SUSPEND_FILE"
+printf 'SENTINEL\n' > "$SUSPEND_FILE/keep"
+run_hook pre suspend
+if [ -d "$SUSPEND_FILE" ] && [ ! -L "$SUSPEND_FILE" ]; then
+    ok "real-dir: destination directory left intact"
+else
+    bad "real-dir: destination directory was replaced"
+fi
+assert_eq "real-dir: directory contents unchanged" "1" \
+    "$(find "$SUSPEND_FILE" -mindepth 1 -maxdepth 1 | wc -l)"
+assert_file "real-dir: sentinel untouched" "$SUSPEND_FILE/keep" "SENTINEL"
+assert_no_handoff_mv "real-dir: guard rejected before rename"
+assert_no_handoff_temp "real-dir: no temp left in handoff dir"
+assert_empty_log "real-dir: cp never called" "$CP_LOG"
+assert_log_matches "real-dir: fail-closed WARN names unsafe entry" "$HOOK_ERR" 'unsafe destination entry'
+
+# 9t. ROOT WRITE BOUNDARY - rename fails (STUB_MV_FAIL=1).  Fail closed with
+# no handoff, no cp fallback, a WARN and no leftover temp file.
+reset_case
+STUB_MV_FAIL=1
+run_hook pre suspend
+assert_absent "mv fail: no suspend handoff published" "$SUSPEND_FILE"
+assert_file "mv fail: root state still saved" "$STATE_DIR/state" "7"
+assert_log_matches "mv fail: rename was attempted" "$MV_LOG" '^mv -T -f -- .*\.c640-kbd-handoff\.'
+assert_log_matches "mv fail: WARN cannot publish" "$HOOK_ERR" 'cannot publish .*c640-kbd-backlight\.suspend'
+assert_empty_log "mv fail: no cp fallback" "$CP_LOG"
+assert_no_handoff_temp "mv fail: temp cleaned up"
 
 # 10. No resolvable session user: handoff is skipped, root state still saved.
 reset_case
