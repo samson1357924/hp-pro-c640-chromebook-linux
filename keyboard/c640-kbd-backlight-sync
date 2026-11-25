@@ -50,6 +50,18 @@ STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
 # STATE_FILE (i.e. $XDG_RUNTIME_DIR).
 HANDOFF_SUSPEND_FILE="${C640_KBD_HANDOFF_SUSPEND:-$STATE_DIR/c640-kbd-backlight.suspend}"
 HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.resume}"
+# Per-cycle identity gates (Phase C).  These live in the USER state dir, not
+# in the root sleep hook's private $STATE_DIR/cycle commit marker.  A cycle is
+# adopted only when its token is at least as new as cycle-begin (with a small
+# skew for pre vs. PrepareForSleep(true) ordering) and has not already been
+# recorded in adopted-cycle.  The env overrides are for the unit test.
+ADOPTED_CYCLE_FILE="${C640_KBD_ADOPTED_CYCLE:-$STATE_DIR/c640-kbd-backlight.adopted-cycle}"
+CYCLE_BEGIN_FILE="${C640_KBD_CYCLE_BEGIN:-$STATE_DIR/c640-kbd-backlight.cycle-begin}"
+C640_KBD_CYCLE_BEGIN_SKEW="${C640_KBD_CYCLE_BEGIN_SKEW:-5}"
+# A non-numeric skew must never weaken the freshness gate.
+case "$C640_KBD_CYCLE_BEGIN_SKEW" in
+    '' | *[!0-9]*) C640_KBD_CYCLE_BEGIN_SKEW=5 ;;
+esac
 # The root sleep hook publishes into the session user's XDG_RUNTIME_DIR, which
 # production normally resolves to the SAME directory this daemon reads.  The
 # only user-visible diagnostic kept here is an EXPLICIT C640_KBD_HANDOFF_DIR
@@ -1537,19 +1549,86 @@ _adopt_suspend_handoff_locked() {
         log "suspend handoff adoption deferred: restore in progress (staged value pending)"
         return 2
     fi
-    local raw val existing tmp lu src age
-    # Command substitution strips the hook's trailing newline; validate what
-    # remains strictly.  A bare "0" is a real value, not "no state".
+    local raw val existing tmp lu src age token tok_epoch begin_raw adopted resume_raw
+    # Strict per-cycle wire format: "<token> <value> published".  The legacy
+    # bare-integer handoff is REJECTED: without a token there is nothing to
+    # cross-check against a resume flag or an already-adopted cycle.
+    # Command substitution strips one trailing newline; extra lines are
+    # explicitly refused.  A value of 0 is still a real value.
     raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
     raw="${raw%$'\n'}"
-    if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
+    # Use [[:blank:]] (space/tab), NOT [[:space:]]: in bash the latter also
+    # matches CR, so "token 7\rpublished" would pass the parser and overwrite
+    # STATE_FILE (fail open on a torn/malformed handoff).
+    if [[ "$raw" == *$'\n'* ]] \
+        || ! [[ "$raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]]; then
         # The sampler calls handle_resume every 5s in a subshell; the
         # file-backed log_warn_once keeps a stale invalid handoff from
         # flooding the journal (an in-process array cannot do this).
         log_warn_once "suspend-handoff-invalid" "suspend handoff invalid ('$raw'); daemon state left unchanged"
-        return 1
+        return "$RC_FAIL"
     fi
-    val=$((10#$raw))
+    tok_epoch="${BASH_REMATCH[1]}"
+    token="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+    val=$((10#${BASH_REMATCH[4]}))
+
+    # Bound the epoch BEFORE arithmetic: $((10#<digits>)) wraps at 2^64, so a
+    # >=20-digit epoch (e.g. 2^64+<fresh epoch>) would alias a stale token to
+    # "fresh" and be adopted.  1-10 digits covers all real epoch values and
+    # cannot overflow; anything else fails closed.
+    if [[ ! "$tok_epoch" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "suspend handoff token epoch '$tok_epoch' out of range; daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+
+    # If post did publish a flag, its token must be the SAME cycle.  A stale
+    # suspend copy plus a stale/forged flag must never be adopted together.
+    # A missing flag is tolerated here (adopt-only callers still work); the
+    # login1(false) monitor has its own no-flag gate below.
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        resume_raw="$(cat "$HANDOFF_RESUME_FILE" 2> /dev/null || echo "")"
+        resume_raw="${resume_raw%$'\n'}"
+        if [[ "$resume_raw" == *$'\n'* ]] \
+            || ! [[ "$resume_raw" =~ ^${token}[[:blank:]]([0-9]+)[[:blank:]][A-Za-z]+$ ]]; then
+            log_warn "suspend/resume handoff token mismatch ('$resume_raw' vs '$token'); daemon state left unchanged"
+            return "$RC_FAIL"
+        fi
+    fi
+
+    # Freshness: PrepareForSleep(true) publishes the current epoch into
+    # cycle-begin and clears the stale handoff.  A handoff whose pre epoch is
+    # older than begin-skew belongs to a previous cycle.  `>=` (via -lt here)
+    # tolerates pre running slightly before the login1 signal; a clock jump
+    # only makes this gate more conservative (fail closed).
+    if [ ! -f "$CYCLE_BEGIN_FILE" ]; then
+        log_warn "cycle-begin file $CYCLE_BEGIN_FILE missing; suspend handoff not adopted"
+        return "$RC_FAIL"
+    fi
+    begin_raw="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo "")"
+    begin_raw="${begin_raw%$'\n'}"
+    # Same 1-10 digit bound as the token epoch: an oversized begin value wraps
+    # in 10#$begin_raw (2^64 -> 0), which would make every stale token pass the
+    # freshness check below.  Invalid/overflowing values fail closed.
+    if [[ ! "$begin_raw" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "cycle-begin file $CYCLE_BEGIN_FILE invalid ('$begin_raw'); suspend handoff not adopted"
+        return "$RC_FAIL"
+    fi
+    if ((10#$tok_epoch < 10#$begin_raw - C640_KBD_CYCLE_BEGIN_SKEW)); then
+        log_warn "suspend handoff token epoch $tok_epoch is stale (cycle-begin $begin_raw, skew $C640_KBD_CYCLE_BEGIN_SKEW); daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+
+    # Replay barrier: once this token has been adopted, a later copy of the
+    # same handoff must NOT overwrite a newer STATE_FILE again.
+    if [ -f "$ADOPTED_CYCLE_FILE" ]; then
+        adopted="$(cat "$ADOPTED_CYCLE_FILE" 2> /dev/null || echo "")"
+        adopted="${adopted%$'\n'}"
+        if [ "$adopted" = "$token" ]; then
+            log "suspend handoff token $token was already adopted; not rewriting daemon state"
+            return "$RC_DONE"
+        fi
+    fi
+
     existing="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
     # Branch A (screen already blank at suspend time): the hook reads the LED,
     # which is 0 because the screen blank turned it off.  That 0 is a hardware
@@ -1594,6 +1673,9 @@ _adopt_suspend_handoff_locked() {
                 log_warn "suspend handoff 0: generation bump failed; keeping handoff for retry"
                 return "$RC_DEFER"
             fi
+            if ! _publish_adopted_cycle "$token"; then
+                return "$RC_DEFER"
+            fi
             rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
             return 0
         fi
@@ -1601,29 +1683,31 @@ _adopt_suspend_handoff_locked() {
     if [ -n "$existing" ] && [ "$existing" != "$val" ]; then
         log "suspend handoff $val overrides differing daemon state $existing"
     fi
-    mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
-    tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX" 2> /dev/null || echo "")"
-    if [ -z "$tmp" ]; then
-        log_warn "cannot create temp file for suspend handoff adoption"
-        return 1
-    fi
-    if ! printf '%s\n' "$val" > "$tmp" 2> /dev/null; then
-        rm -f "$tmp" 2> /dev/null || true
-        log_warn "cannot write suspend handoff value to temp file"
-        return 1
-    fi
-    chmod 600 "$tmp" 2> /dev/null || true
-    if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
-        cp "$tmp" "$STATE_FILE" 2> /dev/null || true
-    fi
-    rm -f "$tmp" 2> /dev/null || true
-    if [ "$(cat "$STATE_FILE" 2> /dev/null || echo "")" != "$val" ]; then
+    # Same-directory atomic publish with readback; NO cp fallback that could
+    # fake a successful rename.  A failure keeps handoff/flag for retry.
+    if ! _atomic_publish_text "$val" "$STATE_FILE"; then
         log_warn "could not publish adopted brightness $val to $STATE_FILE"
-        return 1
+        return "$RC_FAIL"
     fi
     log "adopted suspend handoff brightness $val"
+    # Record the token BEFORE consuming the handoff: a reappearing copy of the
+    # same token is then a replay, not a second STATE_FILE overwrite.
+    if ! _publish_adopted_cycle "$token"; then
+        return "$RC_DEFER"
+    fi
     # Only the daemon consumes the handoff, and only after the value is ours.
     rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+    return 0
+}
+
+# Publish the adopted token with the SAME fail-closed text publisher as the
+# generation markers (no cp fallback).  Failure is retryable: keep the
+# handoff and the resume flag so the next sampler tick can try again.
+_publish_adopted_cycle() {
+    if ! _atomic_publish_text "$1" "$ADOPTED_CYCLE_FILE"; then
+        log_warn "cannot publish adopted-cycle marker $ADOPTED_CYCLE_FILE; keeping handoff for retry"
+        return "$RC_DEFER"
+    fi
     return 0
 }
 
@@ -2351,20 +2435,38 @@ monitor_login1() {
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
                 save_state || log_warn "prepare-for-sleep: save_state failed (rc=$?)"
-                # Drop a stale flag from any previous cycle; the hook's post
-                # phase will publish a fresh one after this resume.
-                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                # Drop BOTH stale handoff files of any previous cycle.  A
+                # stale suspend copy without a fresh root commit marker must
+                # never be adopted after this sleep.
+                rm -f "$HANDOFF_RESUME_FILE" "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+                if [ -e "$HANDOFF_RESUME_FILE" ] || [ -e "$HANDOFF_SUSPEND_FILE" ] \
+                    || [ -L "$HANDOFF_RESUME_FILE" ] || [ -L "$HANDOFF_SUSPEND_FILE" ]; then
+                    log_warn "prepare-for-sleep: stale handoff could not be cleared; this cycle will fail closed"
+                fi
+                # Remember when THIS sleep began.  The hook's pre token must
+                # be at least this new (minus skew) to be adoptable.
+                if ! _atomic_publish_text "$(date +%s)" "$CYCLE_BEGIN_FILE"; then
+                    log_warn "prepare-for-sleep: cannot publish cycle-begin; resume will fail closed"
+                fi
                 ;;
             *boolean\ false*)
                 log "PrepareForSleep false -> daemon adopts handoff and restores"
-                # The hook no longer probes D-Bus or writes brightness while
-                # user.slice is frozen.  It only published handoff files; the
-                # thawed daemon owns the single restore path now.
+                # Finding #2 main gate: the hook publishes the resume flag
+                # ONLY after its root commit marker verified the fresh suspend
+                # handoff.  No flag means pre failed (or was invalidated by
+                # PrepareForSleep(true)): do NOT adopt and do NOT write
+                # brightness.  The sampler/unblank/startup paths are already
+                # flag-gated; this is the previously unguarded path.
                 local rrc=0
-                handle_resume || rrc=$?
-                # rc=2 means deferred (retry via sampler/unblank), not failure.
-                if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
-                    log_warn "login1: resume handler failed (rc=$rrc)"
+                if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+                    log "login1: no resume flag; skipping adoption (pre did not commit a cycle)"
+                else
+                    # The thawed daemon owns the single restore path now.
+                    handle_resume || rrc=$?
+                    # rc=2 means deferred (retry via sampler/unblank), not failure.
+                    if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
+                        log_warn "login1: resume handler failed (rc=$rrc)"
+                    fi
                 fi
                 ;;
         esac
@@ -2432,6 +2534,9 @@ print_help() {
     echo "  C640_KBD_SYSFS_MAX=PATH        Override sysfs max_brightness path"
     echo "  C640_KBD_HANDOFF_SUSPEND=PATH  Override suspend handoff file (tests)"
     echo "  C640_KBD_HANDOFF_RESUME=PATH   Override resume handoff flag (tests)"
+    echo "  C640_KBD_ADOPTED_CYCLE=PATH    Override adopted-cycle marker (tests)"
+    echo "  C640_KBD_CYCLE_BEGIN=PATH      Override cycle-begin epoch file (tests)"
+    echo "  C640_KBD_CYCLE_BEGIN_SKEW=N    Seconds of pre/true ordering skew (default 5)"
     echo "  C640_KBD_RESUME_PROBE_MAX=N    Cap ScreenSaver polling after thaw (default 10s)"
     echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
     echo "  C640_KBD_SAVE_LOCK_WAIT=N      Bounded wait for the state lock on save (default 2s)"

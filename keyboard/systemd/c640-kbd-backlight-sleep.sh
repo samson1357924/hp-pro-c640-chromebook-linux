@@ -27,10 +27,21 @@
 #
 # HANDOFF CONTRACT (the Phase 4b daemon depends on this)
 # -----------------------------------------------------
-#   $XDG_RUNTIME_DIR/c640-kbd-backlight.suspend : one decimal integer, 0 valid.
-#   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<epoch> <action>", e.g.
-#                                                   "1763800000 suspend".
-# Both files are 0600, owned by the resolved session user (uid AND gid) when
+#   $XDG_RUNTIME_DIR/c640-kbd-backlight.suspend : "<token> <value> published"
+#                                                   e.g. "1763800123-4217-9f3ac1d0e2b4 7 published"
+#   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<token> <epoch> <action>", e.g.
+#                                                   "1763800123-4217-9f3ac1d0e2b4 1763800300 suspend"
+#   $STATE_DIR/cycle (ROOT-ONLY 0600)          : "<token> <dev:ino>"
+# The token is <epoch>-<pid>-<random_hex>, minted fresh by pre for EVERY cycle.
+# It binds the two user handoffs to one another and to the exact published
+# suspend inode: post refuses to publish a resume flag unless the root commit
+# marker exists, is 0600, carries the same token and dev:ino as the suspend
+# file, and the suspend file still says "published".  The root marker is the
+# LAST step of a successful pre; a failed pre leaves no marker, so a stale
+# handoff from a previous cycle can never be adopted after this resume.
+# The `<epoch>` in the resume flag is the POST time (not the token's pre epoch);
+# the daemon validates both independently.
+# Both handoff files are 0600, owned by the resolved session user (uid AND gid) when
 # placed under /run/user/<uid>.  Publication is performed by one inline
 # python3 helper using a pinned directory fd: O_DIRECTORY|O_NOFOLLOW on the
 # directory, O_CREAT|O_EXCL|O_NOFOLLOW for a same-directory temp, fchmod(0600),
@@ -39,7 +50,11 @@
 # `mv -T -f --` (the final path component is never followed as a symlink nor
 # treated as a directory container).  The helper re-verifies inode/owner/mode
 # after the rename and prints `OK dev:ino` on stdout; that record is the
-# published identity consumed by later phases.  There is deliberately NO cp
+# published identity consumed by later phases.  Callers capture it (e.g. into
+# PUBLISHED_IDENTITY) for binding but MUST printf it back to stdout so the
+# published inode remains observable to tests; pre therefore emits two OK
+# records (suspend, then root cycle marker) and post emits one (resume).
+# There is deliberately NO cp
 # fallback and NO /tmp mktemp fallback: a failed publish fails closed instead
 # of escaping the boundary, and cleanup only unlinks a temp that still has the
 # original inode.  python3 is therefore a runtime dependency of pre/post; if
@@ -78,6 +93,12 @@
 # To prevent a pre/post split (different sessions, or a session disappearing
 # while user.slice is frozen), `pre` pins the chosen uid in root-only
 # $STATE_DIR/session-uid (0600, mktemp + `mv -T -f --`, no cp fallback).
+# Before anything else, pre also invalidates the PREVIOUS cycle: it removes
+# the old user handoffs (both the pinned uid's runtime dir and an explicit
+# override dir) and the old root cycle marker, then verifies all of them are
+# absent.  The new root commit marker is written LAST, only after the suspend
+# handoff has been published successfully.  This hook never touches the
+# daemon's retry-epoch / restore-gen / adopted-cycle / cycle-begin files.
 # `post` reads that file, validates
 # the uid and its runtime dir, and reuses it without re-selecting.  A missing
 # or invalid file fails closed.  The hook never creates, chmods or chowns a
@@ -106,8 +127,15 @@ RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 HANDOFF_OWNER=""
 HANDOFF_GID=""
 CYCLE_UID_FILE="$STATE_DIR/session-uid"
+# Root-only commit marker for the current cycle: "<token> <dev:ino>".  It is
+# published by pre with the hook process' own uid/gid (0:0 in production),
+# which makes $STATE_DIR (0700, owner 0) a natural root-only boundary.
+CYCLE_FILE="$STATE_DIR/cycle"
 SUSPEND_HANDOFF="c640-kbd-backlight.suspend"
 RESUME_HANDOFF="c640-kbd-backlight.resume"
+# Literal newline for POSIX-sh trimming (dash has no $'\n').
+_NL='
+'
 
 log_info() {
     echo "[c640-kbd-backlight-sleep] $*" >&2
@@ -725,21 +753,231 @@ finally:
     return 0
 }
 
+# --- Per-cycle handoff identity (finding #2) -------------------------------
+# A token is <epoch>-<pid>-<random_hex>.  grep -E is used because this hook is
+# /bin/sh; the daemon has its own matching bash regex.
+_CYCLE_TOKEN_RE='^[0-9]+-[0-9]+-[0-9a-f]{6,12}$'
+
+_new_cycle_token() {
+    _te="$(date +%s 2> /dev/null || echo '')"
+    case "$_te" in '' | *[!0-9]*) return 1 ;; esac
+    _tr="$(od -An -N6 -tx1 /dev/urandom 2> /dev/null | tr -d ' \n' | cut -c1-12)"
+    case "$_tr" in
+        '' | *[!0-9a-f]*)
+            # Best-effort fallback; still fail closed if it cannot produce a
+            # valid 6..12 digit lowercase hex string.
+            _tr="$(awk -v seed="$_te.$$" 'BEGIN { srand(seed); printf "%06x", int(rand() * 16777215) }' 2> /dev/null || echo '')"
+            ;;
+    esac
+    case "$_tr" in '' | *[!0-9a-f]*) return 1 ;; esac
+    if [ "${#_tr}" -lt 6 ] || [ "${#_tr}" -gt 12 ]; then
+        return 1
+    fi
+    printf '%s-%s-%s\n' "$_te" "$$" "$_tr"
+}
+
+# Invalidate EVERY artifact of the previous cycle before minting a new token.
+# Only hook-owned files are touched: the pinned uid's user handoffs, an
+# explicit override dir's handoffs and the root commit marker.  The daemon's
+# retry-epoch / restore-gen / adopted-cycle / cycle-begin files are never
+# touched here (Phase D's coordination tokens are not ours to truncate).
+_invalidate_previous_cycle() {
+    _irc=0
+    _old="$(cat "$CYCLE_UID_FILE" 2> /dev/null || echo '')"
+    _old="${_old%$_NL}"
+    case "$_old" in
+        '' | *[!0-9]*) : ;;
+        *)
+            _old_dir="$RUN_USER_ROOT/$_old"
+            for _f in "$_old_dir/$SUSPEND_HANDOFF" "$_old_dir/$RESUME_HANDOFF"; do
+                if [ -L "$_f" ] || [ -d "$_f" ] \
+                    || { [ -e "$_f" ] && [ ! -f "$_f" ]; }; then
+                    log_warn "previous cycle handoff skipped (fail-closed): unsafe destination entry $_f"
+                    _irc=1
+                    continue
+                fi
+                rm -f "$_f" 2> /dev/null || _irc=1
+                if [ -e "$_f" ] || [ -L "$_f" ]; then
+                    log_warn "previous cycle handoff could not be invalidated: $_f"
+                    _irc=1
+                fi
+            done
+            ;;
+    esac
+    if [ -n "$HANDOFF_DIR" ]; then
+        for _f in "$HANDOFF_DIR/$SUSPEND_HANDOFF" "$HANDOFF_DIR/$RESUME_HANDOFF"; do
+            if [ -L "$_f" ] || [ -d "$_f" ] \
+                || { [ -e "$_f" ] && [ ! -f "$_f" ]; }; then
+                log_warn "previous cycle handoff skipped (fail-closed): unsafe destination entry $_f"
+                _irc=1
+                continue
+            fi
+            rm -f "$_f" 2> /dev/null || _irc=1
+            if [ -e "$_f" ] || [ -L "$_f" ]; then
+                log_warn "previous cycle handoff could not be invalidated: $_f"
+                _irc=1
+            fi
+        done
+    fi
+    if [ -L "$CYCLE_FILE" ] || [ -d "$CYCLE_FILE" ] \
+        || { [ -e "$CYCLE_FILE" ] && [ ! -f "$CYCLE_FILE" ]; }; then
+        log_warn "previous cycle commit marker skipped (fail-closed): unsafe destination entry $CYCLE_FILE"
+        _irc=1
+    else
+        rm -f "$CYCLE_FILE" 2> /dev/null || _irc=1
+        if [ -e "$CYCLE_FILE" ] || [ -L "$CYCLE_FILE" ]; then
+            log_warn "previous cycle commit marker could not be invalidated: $CYCLE_FILE"
+            _irc=1
+        fi
+    fi
+    if [ "$_irc" -ne 0 ]; then
+        log_warn "previous cycle invalidation failed; no new handoff will be published"
+        return 1
+    fi
+    return 0
+}
+
+# Read the root-only commit marker produced by the LAST successful pre.
+# Sets CYCLE_TOKEN / CYCLE_IDENTITY.  0644, symlinks, directories, extra
+# newlines and extra columns are all refused.
+_read_cycle_commit() {
+    CYCLE_TOKEN=""
+    CYCLE_IDENTITY=""
+    if [ ! -f "$CYCLE_FILE" ] || [ -L "$CYCLE_FILE" ]; then
+        log_warn "resume handoff skipped (fail-closed): missing/unsafe cycle marker $CYCLE_FILE"
+        return 1
+    fi
+    _cmode="$(stat -c %a "$CYCLE_FILE" 2> /dev/null || echo '')"
+    if [ "$_cmode" != 600 ]; then
+        log_warn "resume handoff skipped (fail-closed): $CYCLE_FILE is not 0600"
+        return 1
+    fi
+    _c="$(cat "$CYCLE_FILE" 2> /dev/null || echo '')"
+    _c="${_c%$_NL}"
+    case "$_c" in *"$_NL"*)
+        log_warn "resume handoff skipped (fail-closed): cycle marker has extra lines"
+        return 1
+        ;;
+    esac
+    case "$_c" in *' '*) : ;; *)
+        log_warn "resume handoff skipped (fail-closed): invalid cycle marker '$_c'"
+        return 1
+        ;;
+    esac
+    CYCLE_TOKEN="${_c%% *}"
+    CYCLE_IDENTITY="${_c#* }"
+    if [ "$_c" != "$CYCLE_TOKEN $CYCLE_IDENTITY" ] \
+        || ! printf '%s\n' "$CYCLE_TOKEN" | grep -Eq "$_CYCLE_TOKEN_RE" \
+        || ! printf '%s\n' "$CYCLE_IDENTITY" | grep -Eq '^[0-9]+:[0-9]+$'; then
+        log_warn "resume handoff skipped (fail-closed): invalid cycle marker '$_c'"
+        CYCLE_TOKEN=""
+        CYCLE_IDENTITY=""
+        return 1
+    fi
+    return 0
+}
+
+# post may publish its flag only when the root marker, the suspend handoff
+# and the ACTUAL suspend inode all agree on the same token / identity.
+# Sets the global _token used in the resume record.
+_verify_cycle_commit() {
+    _token=""
+    _read_cycle_commit || return 1
+    if [ -z "$HANDOFF_DIR" ] || [ ! -f "$HANDOFF_DIR/$SUSPEND_HANDOFF" ] \
+        || [ -L "$HANDOFF_DIR/$SUSPEND_HANDOFF" ]; then
+        log_warn "resume handoff skipped (fail-closed): suspend handoff missing/unsafe"
+        return 1
+    fi
+    _sf="$HANDOFF_DIR/$SUSPEND_HANDOFF"
+    _s="$(cat "$_sf" 2> /dev/null || echo '')"
+    _s="${_s%$_NL}"
+    case "$_s" in
+        *"$_NL"*)
+            log_warn "resume handoff skipped (fail-closed): suspend handoff has extra lines"
+            return 1
+            ;;
+        *' published') : ;;
+        *)
+            log_warn "resume handoff skipped (fail-closed): invalid suspend handoff '$_s'"
+            return 1
+            ;;
+    esac
+    _body="${_s% published}"
+    case "$_body" in *' '*) : ;; *)
+        log_warn "resume handoff skipped (fail-closed): invalid suspend handoff '$_s'"
+        return 1
+        ;;
+    esac
+    _stoken="${_body%% *}"
+    _svalue="${_body#* }"
+    if [ "$_body" != "$_stoken $_svalue" ] \
+        || ! printf '%s\n' "$_stoken" | grep -Eq "$_CYCLE_TOKEN_RE" \
+        || ! printf '%s\n' "$_svalue" | grep -Eq '^[0-9]+$' \
+        || [ "$_stoken" != "$CYCLE_TOKEN" ]; then
+        log_warn "resume handoff skipped (fail-closed): suspend/cycle token mismatch"
+        return 1
+    fi
+    _ino="$(stat -c '%d:%i' "$_sf" 2> /dev/null || echo '')"
+    if [ "$_ino" != "$CYCLE_IDENTITY" ]; then
+        log_warn "resume handoff skipped (fail-closed): suspend inode $_ino != cycle marker $CYCLE_IDENTITY"
+        return 1
+    fi
+    _token="$CYCLE_TOKEN"
+    return 0
+}
+
 # pre: publish the brightness the daemon must restore after thaw. The value
 # is the raw root reading (0 valid), NOT clamped here - clamping belongs to
-# the daemon's single-writer set_brightness path.
+# the daemon's single-writer set_brightness path.  The root commit marker is
+# written LAST: no marker means no committed cycle for post/daemon to adopt.
 publish_suspend_handoff() {
+    _invalidate_previous_cycle || return 1
     resolve_handoff_dir pre
     [ -n "$HANDOFF_DIR" ] || return 0
     _curr="$(_read_current)"
     case "$_curr" in
         '' | *[!0-9]*)
             log_warn "unreadable brightness; suspend handoff skipped"
-            return 0
+            return 1
             ;;
     esac
-    _publish_handoff "$HANDOFF_DIR/$SUSPEND_HANDOFF" "$_curr" \
-        "$HANDOFF_OWNER" "$HANDOFF_GID"
+    _token="$(_new_cycle_token)" || {
+        log_warn "cannot mint cycle token; suspend handoff skipped"
+        return 1
+    }
+    # PUBLISHED_IDENTITY is captured for binding, but the Phase B stdout
+    # contract is preserved by printing it back below.
+    if ! PUBLISHED_IDENTITY="$(_publish_handoff "$HANDOFF_DIR/$SUSPEND_HANDOFF" \
+        "$_token $_curr published" "$HANDOFF_OWNER" "$HANDOFF_GID")"; then
+        return 1
+    fi
+    printf '%s\n' "$PUBLISHED_IDENTITY"
+    _ident="${PUBLISHED_IDENTITY#OK }"
+    if [ "$_ident" = "$PUBLISHED_IDENTITY" ] \
+        || ! printf '%s\n' "$_ident" | grep -Eq '^[0-9]+:[0-9]+$'; then
+        log_warn "invalid published identity '$PUBLISHED_IDENTITY'; cycle not committed"
+        return 1
+    fi
+    _hook_uid="$(id -u 2> /dev/null || echo '')"
+    _hook_gid="$(id -g 2> /dev/null || echo '')"
+    case "$_hook_uid" in '' | *[!0-9]*)
+        log_warn "cannot resolve hook uid for cycle commit marker"
+        return 1
+        ;;
+    esac
+    case "$_hook_gid" in '' | *[!0-9]*)
+        log_warn "cannot resolve hook gid for cycle commit marker"
+        return 1
+        ;;
+    esac
+    if ! _commit_out="$(_publish_handoff "$CYCLE_FILE" "$_token $_ident" \
+        "$_hook_uid" "$_hook_gid")"; then
+        rm -f "$CYCLE_FILE" "$HANDOFF_DIR/$SUSPEND_HANDOFF" 2> /dev/null || true
+        log_warn "cycle commit marker publish failed; suspend handoff rolled back"
+        return 1
+    fi
+    printf '%s\n' "$_commit_out"
+    return 0
 }
 
 # post: only drop the resume flag. No brightness read/write, no state change,
@@ -748,10 +986,14 @@ write_resume_handoff() {
     _action="${1:-suspend}"
     resolve_handoff_dir post
     [ -n "$HANDOFF_DIR" ] || return 0
+    _verify_cycle_commit || return 1
     _epoch="$(date +%s 2> /dev/null || echo 0)"
     case "$_epoch" in '' | *[!0-9]*) _epoch=0 ;; esac
-    _publish_handoff "$HANDOFF_DIR/$RESUME_HANDOFF" "$_epoch $_action" \
-        "$HANDOFF_OWNER" "$HANDOFF_GID"
+    if ! PUBLISHED_IDENTITY="$(_publish_handoff "$HANDOFF_DIR/$RESUME_HANDOFF" \
+        "$_token $_epoch $_action" "$HANDOFF_OWNER" "$HANDOFF_GID")"; then
+        return 1
+    fi
+    printf '%s\n' "$PUBLISHED_IDENTITY"
 }
 
 main() {

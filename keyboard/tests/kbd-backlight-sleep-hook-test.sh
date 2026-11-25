@@ -38,6 +38,9 @@ HOOK_MARKER_DIR="$TMP_DIR/publish-markers"
 FALLBACK_DIR="$TMP_DIR/tmp-fallback"
 SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
+CYCLE_FILE="$STATE_DIR/cycle"
+C640_TEST_TOKEN="1763800000-1000-a1b2c3d4e5f6"
+C640_OLD_TOKEN="1763700000-1000-001122334455"
 # The independent oracle runs with the runner's ORIGINAL PATH and the real
 # interpreter, never with the stub PATH used to drive the hook.  Capture both
 # before any stub is installed (the hook's own python3 is stubbed below).
@@ -112,14 +115,72 @@ assert_no_bus_or_led_writes() {
     assert_empty_log "sudo never called ($tag)" "$SUDO_LOG"
     assert_empty_log "ectool never called ($tag)" "$ECTOOL_LOG"
 }
+# Resume wire format is now "<token> <epoch> <action>".  This helper only
+# validates the flag; use resume_token() to read the token for cross-checking.
 assert_resume_flag() {
-    local label="$1" action="$2" content
-    content="$(cat "$RESUME_FILE" 2> /dev/null || echo '<missing>')"
-    if [[ "$content" =~ ^[0-9]+[[:space:]]"$action"$ ]]; then
+    local label="$1" action="$2" file="${3:-$RESUME_FILE}" content
+    content="$(cat "$file" 2> /dev/null || echo '<missing>')"
+    if [[ "$content" =~ ^[0-9]+-[0-9]+-[0-9a-f]{6,12}[[:space:]][0-9]+[[:space:]]"$action"$ ]]; then
         ok "$label"
     else
-        bad "$label (expected '<epoch> $action', got '$content')"
+        bad "$label (expected '<token> <epoch> $action', got '$content')"
     fi
+}
+
+resume_token() {
+    local file="${1:-$RESUME_FILE}" content
+    content="$(cat "$file" 2> /dev/null || echo '')"
+    if [[ "$content" =~ ^([0-9]+-[0-9]+-[0-9a-f]{6,12})[[:space:]][0-9]+[[:space:]][A-Za-z]+$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Suspend wire format: "<token> <value> published".  This helper only validates
+# the handoff; use suspend_token() to read the token for comparison with the
+# root marker / resume flag.
+assert_suspend_handoff() {
+    local label="$1" value="$2" file="${3:-$SUSPEND_FILE}" content token val
+    content="$(cat "$file" 2> /dev/null || echo '<missing>')"
+    if [[ "$content" =~ ^([0-9]+-[0-9]+-[0-9a-f]{6,12})[[:space:]]([0-9]+)[[:space:]]published$ ]]; then
+        token="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        if [ "$val" = "$value" ]; then
+            ok "$label"
+            return 0
+        fi
+    fi
+    bad "$label (expected '<token> $value published', got '$content')"
+}
+
+suspend_token() {
+    local file="${1:-$SUSPEND_FILE}" content
+    content="$(cat "$file" 2> /dev/null || echo '')"
+    if [[ "$content" =~ ^([0-9]+-[0-9]+-[0-9a-f]{6,12})[[:space:]][0-9]+[[:space:]]published$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Root commit marker: "<token> <dev:ino>".
+assert_cycle_marker() {
+    local label="$1" token="$2" file="${3:-$CYCLE_FILE}" content
+    content="$(cat "$file" 2> /dev/null || echo '<missing>')"
+    if [ "$content" = "$token $(stat -c '%d:%i' "$SUSPEND_FILE" 2> /dev/null || echo '<missing>')" ]; then
+        ok "$label"
+    else
+        bad "$label (expected '$token <suspend dev:ino>', got '$content')"
+    fi
+}
+
+# Prime a committed cycle for POST-only cases (no pre in that case): write a
+# suspend handoff plus its matching root commit marker without going through
+# save_state, so root-state assertions stay meaningful.
+prime_cycle() {
+    local value="${1:-7}" token="${2:-$C640_TEST_TOKEN}" file="${3:-$SUSPEND_FILE}" ident
+    mkdir -p "$HANDOFF_DIR"
+    printf '%s %s published\n' "$token" "$value" > "$file"
+    ident="$(stat -c '%d:%i' "$file")"
+    printf '%s %s\n' "$token" "$ident" > "$CYCLE_FILE"
+    chmod 600 "$CYCLE_FILE"
 }
 # A failed publish must not leave its temp file behind.
 assert_no_handoff_temp() {
@@ -147,16 +208,19 @@ assert_text_matches() {
         bad "$label (no match for '$pattern' in: $text)"
     fi
 }
-# dev:ino of the last recorded successful publish; Phase C consumes the same
-# `OK dev:ino` record as PUBLISHED_IDENTITY.
+# dev:ino of the Nth recorded successful publish (1 = first).  pre now emits
+# TWO `OK dev:ino` records (suspend, then root cycle marker), so `tail -n1`
+# would bind to the wrong inode.  Phase C consumes the same records as
+# PUBLISHED_IDENTITY.
 published_identity() {
+    local nth="${1:-1}"
     sed -n 's/^OK \([0-9][0-9]*:[0-9][0-9]*\)$/\1/p' "$PUBLISH_OUT" \
-        2> /dev/null | tail -n1
+        2> /dev/null | sed -n "${nth}p"
 }
 assert_publish_identity() {
-    local label="$1" file="$2" expected actual
+    local label="$1" file="$2" nth="${3:-1}" expected actual
     expected="$(stat -c '%d:%i' "$file" 2> /dev/null || echo '<missing>')"
-    actual="$(published_identity)"
+    actual="$(published_identity "$nth")"
     assert_eq "$label" "$expected" "$actual"
 }
 # Independent oracle: a separate python3 program under the CLEAN_PATH reads
@@ -538,12 +602,19 @@ reset_case() {
     rm -f "$HOOK_MARKER_DIR/fchmod" "$HOOK_MARKER_DIR/fchown"
     printf '0' > "$STAT_COUNT"
     rm -f "$STATE_DIR/state" "$STATE_DIR"/.state.* "$STATE_DIR/session-uid" \
-        "$STATE_DIR"/.session-uid.* "$FAKE_SYSFS" "$FAKE_MAX"
+        "$STATE_DIR"/.session-uid.* "$CYCLE_FILE" "$STATE_DIR"/.cycle.* \
+        "$FAKE_SYSFS" "$FAKE_MAX"
+    # The root marker publisher requires the state dir to be 0700 and owned
+    # by the hook process (the test runner), same as production root:0.
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
     # The boundary cases deliberately make the handoff path a symlink or a
     # real directory; rm -f alone cannot clean those up for the next case.
     rm -f "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
     rm -rf "$SUSPEND_FILE" "$RESUME_FILE" 2> /dev/null || true
-    rm -f "$HANDOFF_DIR"/.c640-kbd-handoff.* 2> /dev/null || true
+    rm -f "$CYCLE_FILE" 2> /dev/null || true
+    rm -rf "$CYCLE_FILE" 2> /dev/null || true
+    rm -f "$HANDOFF_DIR"/.c640-kbd-handoff.* "$STATE_DIR"/.c640-kbd-* \
+        2> /dev/null || true
     # 9ag chmods the pinned dir to 0755; restore 0700 so later cases start
     # from the same clean state (even though the override path skips the check).
     if [ -d "$HANDOFF_DIR" ]; then
@@ -650,17 +721,17 @@ run_hook pre suspend
 assert_mode "root state dir is 0700" "700" "$STATE_DIR"
 assert_mode "root state file is 0600" "600" "$STATE_DIR/state"
 assert_file "pre saves root state" "$STATE_DIR/state" "7"
-assert_file "pre publishes suspend handoff" "$SUSPEND_FILE" "7"
+assert_suspend_handoff "pre publishes suspend handoff" "7"
 assert_mode "suspend handoff is 0600" "600" "$SUSPEND_FILE"
 # The publish is now an fd-pinned rename; its success record is `OK dev:ino`.
 assert_log_matches "publish records OK dev:ino" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
-assert_publish_identity "publish identity matches published inode" "$SUSPEND_FILE"
+assert_publish_identity "publish identity matches published inode" "$SUSPEND_FILE" 1
 assert_empty_log "publish has no cp fallback" "$CP_LOG"
 printf '0\n' > "$FAKE_SYSFS"
 run_hook post suspend
 assert_file "post does NOT write sysfs" "$FAKE_SYSFS" "0"
 assert_file "post does NOT consume root state" "$STATE_DIR/state" "7"
-assert_file "post does NOT change suspend handoff" "$SUSPEND_FILE" "7"
+assert_suspend_handoff "post does NOT change suspend handoff" "7"
 assert_resume_flag "post publishes <epoch> suspend flag" "suspend"
 assert_mode "resume handoff is 0600" "600" "$RESUME_FILE"
 assert_no_bus_or_led_writes "pre/post delegate"
@@ -709,7 +780,7 @@ reset_case
 printf '0\n' > "$FAKE_SYSFS"
 run_hook pre suspend
 assert_file "0: root state" "$STATE_DIR/state" "0"
-assert_file "0: suspend handoff" "$SUSPEND_FILE" "0"
+assert_suspend_handoff "0: suspend handoff" "0"
 printf '5\n' > "$FAKE_SYSFS"
 run_hook post suspend
 assert_file "0: post does not write sysfs" "$FAKE_SYSFS" "5"
@@ -717,8 +788,10 @@ assert_file "0: state retained" "$STATE_DIR/state" "0"
 assert_resume_flag "0: resume flag written" "suspend"
 
 # 6. No state file: post still publishes the flag and never touches brightness.
+#    Prime a committed cycle directly so no root state file is created by pre.
 reset_case
 printf '9\n' > "$FAKE_SYSFS"
+prime_cycle 9
 run_hook post suspend
 assert_file "no state: brightness untouched" "$FAKE_SYSFS" "9"
 assert_absent "no state: no root state created" "$STATE_DIR/state"
@@ -729,12 +802,12 @@ assert_resume_flag "no state: resume flag written" "suspend"
 reset_case
 printf '70\n' > "$FAKE_SYSFS"
 run_hook pre suspend
-assert_file "clamp: handoff stores raw 70" "$SUSPEND_FILE" "70"
+assert_suspend_handoff "clamp: handoff stores raw 70" "70"
 assert_file "clamp: root state stores raw 70" "$STATE_DIR/state" "70"
 printf '0\n' > "$FAKE_SYSFS"
 printf '50\n' > "$FAKE_MAX"
 run_hook post suspend
-assert_file "clamp: handoff unchanged after post" "$SUSPEND_FILE" "70"
+assert_suspend_handoff "clamp: handoff unchanged after post" "70"
 assert_file "clamp: post does not clamp/write" "$FAKE_SYSFS" "0"
 
 # 8. ectool is a READ source in pre only; post must never invoke it.
@@ -742,7 +815,7 @@ reset_case
 rm -f "$FAKE_SYSFS"
 run_hook pre suspend
 assert_file "ectool: pre reads via ectool" "$STATE_DIR/state" "100"
-assert_file "ectool: handoff stores ectool reading" "$SUSPEND_FILE" "100"
+assert_suspend_handoff "ectool: handoff stores ectool reading" "100"
 : > "$ECTOOL_LOG"
 run_hook post suspend
 assert_no_bus_or_led_writes "ectool post"
@@ -757,7 +830,7 @@ HOOK_HANDOFF_DIR=""
 STUB_LOGINCTL_MODE=real
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "loginctl: suspend handoff in uid runtime dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "loginctl: suspend handoff in uid runtime dir" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_mode "loginctl: suspend handoff 0600" "600" "$_user_dir/c640-kbd-backlight.suspend"
 assert_owner "loginctl: suspend handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.suspend"
 assert_file "loginctl: pre pins the chosen uid root-only" "$STATE_DIR/session-uid" "$(id -u)"
@@ -767,7 +840,7 @@ assert_mode "loginctl: cycle uid file is 0600" "600" "$STATE_DIR/session-uid"
 # evidence is the `OK dev:ino` record plus the real stat mode/owner above;
 # failpoints 9u/9y make the fchown/fchmod steps independently falsifiable.
 assert_log_matches "loginctl: suspend publish identity recorded" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
-assert_publish_identity "loginctl: suspend identity matches inode" "$_user_dir/c640-kbd-backlight.suspend"
+assert_publish_identity "loginctl: suspend identity matches inode" "$_user_dir/c640-kbd-backlight.suspend" 1
 assert_log_matches "loginctl: selected session/seat logged" "$HOOK_ERR" "selected session 3 on seat seat0 for uid $(id -u)"
 assert_log_matches "loginctl: handoff path logged" "$HOOK_ERR" "pre handoff dir $_user_dir for uid $(id -u)"
 assert_log_matches "loginctl: show-session consulted" "$LOGINCTL_LOG" '^loginctl show-session 3$'
@@ -781,7 +854,7 @@ assert_file "loginctl: state retained" "$STATE_DIR/state" "7"
 assert_mode "loginctl: resume handoff 0600" "600" "$_user_dir/c640-kbd-backlight.resume"
 assert_owner "loginctl: resume handoff chowned to session user" "$(id -u):$(id -g)" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "loginctl: resume publish identity recorded" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
-assert_publish_identity "loginctl: resume identity matches inode" "$_user_dir/c640-kbd-backlight.resume"
+assert_publish_identity "loginctl: resume identity matches inode" "$_user_dir/c640-kbd-backlight.resume" 3
 assert_log_matches "loginctl: post handoff path logged" "$HOOK_ERR" "post handoff dir $_user_dir for uid $(id -u)"
 if grep -q 'list-sessions --no-legend' "$LOGINCTL_LOG"; then
     ok "loginctl list-sessions --no-legend consulted"
@@ -804,17 +877,13 @@ mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
 chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "idle-ssh: handoff in local graphical user's dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "idle-ssh: handoff in local graphical user's dir" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_absent "idle-ssh: no handoff in idle SSH user's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
 assert_log_matches "idle-ssh: show-session checked both sessions" "$LOGINCTL_LOG" '^loginctl show-session 4$'
 assert_log_matches "idle-ssh: selected session 3 on seat0" "$HOOK_ERR" "selected session 3 on seat seat0 for uid $(id -u)"
 printf '0\n' > "$FAKE_SYSFS"
 run_hook post suspend
-if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
-    ok "idle-ssh: resume flag written for graphical user"
-else
-    bad "idle-ssh: no valid resume flag in graphical user's dir ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
-fi
+assert_resume_flag "idle-ssh: resume flag written for graphical user" "suspend" "$_user_dir/c640-kbd-backlight.resume"
 assert_absent "idle-ssh: no resume flag in SSH user's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.resume"
 assert_mode "idle-ssh: resume handoff only in graphical dir" "600" "$_user_dir/c640-kbd-backlight.resume"
 assert_empty_log "idle-ssh: no gdbus calls" "$GDBUS_LOG"
@@ -828,7 +897,7 @@ mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
 chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "greeter+user: handoff in the user session dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "greeter+user: handoff in the user session dir" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_absent "greeter+user: no handoff in greeter's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
 assert_log_matches "greeter+user: show-session checked greeter" "$LOGINCTL_LOG" '^loginctl show-session 5$'
 assert_log_matches "greeter+user: selected the user session" "$HOOK_ERR" "selected session 6 on seat seat0 for uid $(id -u)"
@@ -867,11 +936,7 @@ run_hook pre suspend
 STUB_LOGINCTL_MODE=pre-post-other
 : > "$HOOK_ERR"
 run_hook post suspend
-if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
-    ok "pre/post split: resume flag uses pre's uid dir"
-else
-    bad "pre/post split: no valid resume flag in pre's uid dir ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
-fi
+assert_resume_flag "pre/post split: resume flag uses pre's uid dir" "suspend" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "pre/post split: WARN reports the changed session" "$HOOK_ERR" 'session changed since pre'
 assert_absent "pre/post split: no resume flag in the new session's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.resume"
 
@@ -885,7 +950,7 @@ mkdir -p "$RUN_USER_ROOT/$_nobody_uid"
 chmod 700 "$RUN_USER_ROOT/$_nobody_uid"
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "SUDO_USER hint: handoff still in graphical user's dir" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "SUDO_USER hint: handoff still in graphical user's dir" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_absent "SUDO_USER hint: no handoff in SUDO_USER's dir" "$RUN_USER_ROOT/$_nobody_uid/c640-kbd-backlight.suspend"
 
 # 9g. Runtime dir validation: pre/post must never create, chmod or chown a
@@ -981,7 +1046,7 @@ HOOK_HANDOFF_DIR=""
 STUB_LOGINCTL_MODE=seat-active
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "gate seat ActiveSession: handoff written" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "gate seat ActiveSession: handoff written" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_log_matches "gate seat ActiveSession: chose the seat's active session" "$HOOK_ERR" "selected session 41 on seat seat0 for uid $(id -u)"
 assert_log_matches "gate seat ActiveSession: second session was examined" "$LOGINCTL_LOG" '^loginctl show-session 42$'
 assert_log_matches "gate seat ActiveSession: show-seat consulted" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
@@ -1043,11 +1108,7 @@ run_hook pre suspend
 STUB_LOGINCTL_MODE=closing
 : > "$HOOK_ERR"
 run_hook post suspend
-if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
-    ok "post verification (0 candidates): resume flag still written"
-else
-    bad "post verification (0 candidates): no resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
-fi
+assert_resume_flag "post verification (0 candidates): resume flag still written" "suspend" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "post verification (0 candidates): pinned uid still used" "$HOOK_ERR" 'verification only; pinned uid still used'
 if grep -q 'no handoff' "$HOOK_ERR"; then
     bad "post verification (0 candidates): misleading 'no handoff' log"
@@ -1063,11 +1124,7 @@ run_hook pre suspend
 STUB_LOGINCTL_MODE=ambiguous
 : > "$HOOK_ERR"
 run_hook post suspend
-if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
-    ok "post verification (2 candidates): resume flag still written"
-else
-    bad "post verification (2 candidates): no resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
-fi
+assert_resume_flag "post verification (2 candidates): resume flag still written" "suspend" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "post verification (2 candidates): pinned uid still used" "$HOOK_ERR" 'verification only; pinned uid still used'
 if grep -q 'no handoff' "$HOOK_ERR"; then
     bad "post verification (2 candidates): misleading 'no handoff' log"
@@ -1120,7 +1177,7 @@ STUB_LOGINCTL_MODE=c-prefix
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 assert_eq "c-prefix id: _session_uid resolves uid" "$(id -u)" "$(_probe_session_uid)"
 run_hook pre suspend
-assert_file "c-prefix id: suspend handoff written" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "c-prefix id: suspend handoff written" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_file "c-prefix id: uid pinned in pre" "$STATE_DIR/session-uid" "$(id -u)"
 assert_log_matches "c-prefix id: selected session c1 on seat seat0" "$HOOK_ERR" "selected session c1 on seat seat0 for uid $(id -u)"
 assert_log_matches "c-prefix id: show-session c1 consulted" "$LOGINCTL_LOG" '^loginctl show-session c1$'
@@ -1128,11 +1185,7 @@ assert_log_matches "c-prefix id: show-seat ActiveSession consulted" "$LOGINCTL_L
 printf '0\n' > "$FAKE_SYSFS"
 : > "$HOOK_ERR"
 run_hook post suspend
-if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
-    ok "c-prefix id: post wrote resume flag using pinned uid"
-else
-    bad "c-prefix id: no valid resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
-fi
+assert_resume_flag "c-prefix id: post wrote resume flag using pinned uid" "suspend" "$_user_dir/c640-kbd-backlight.resume"
 assert_log_matches "c-prefix id: post used pinned uid dir" "$HOOK_ERR" "post handoff dir $_user_dir for uid $(id -u)"
 
 # 9o. Negative session-ID cases: special characters, reserved aliases and
@@ -1190,6 +1243,9 @@ reset_case
 _target="$TMP_DIR/boundary-target"
 mkdir -p "$_target"
 ln -s "$_target" "$RESUME_FILE"
+# Post verifies the commit marker before it publishes; give it a committed
+# cycle so the resume destination guard is the step under test.
+prime_cycle 7
 _target_before="$(snapshot_dir "$_target")"
 _handoff_before="$(snapshot_dir "$HANDOFF_DIR")"
 run_hook post suspend
@@ -1220,8 +1276,8 @@ else
 fi
 assert_snapshot_same "dir-swap: new dir at original path stays empty" \
     "$HANDOFF_DIR" "$_replacement_before"
-assert_file "dir-swap: pinned-dir handoff content" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}" "7"
-assert_publish_identity "dir-swap: identity matches pinned inode" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}"
+assert_suspend_handoff "dir-swap: pinned-dir handoff content" "7" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}"
+assert_publish_identity "dir-swap: identity matches pinned inode" "$HANDOFF_DIR.swapped/${SUSPEND_FILE##*/}" 1
 assert_no_handoff_temp "dir-swap: no temp in pinned dir" "$HANDOFF_DIR.swapped"
 assert_no_handoff_temp "dir-swap: no temp in replacement dir" "$HANDOFF_DIR"
 assert_empty_log "dir-swap: cp never called" "$CP_LOG"
@@ -1417,6 +1473,8 @@ assert_snapshot_same "python3 missing: handoff dir unchanged" "$HANDOFF_DIR" "$_
 assert_log_matches "python3 missing: WARN names interpreter" "$HOOK_ERR" 'python3 unavailable'
 assert_no_handoff_temp "python3 missing: no temp created"
 assert_file "python3 missing: root state still saved" "$STATE_DIR/state" "7"
+# Prime a committed cycle so post reaches its own publisher and fails there.
+prime_cycle 7
 : > "$HOOK_ERR"
 run_hook post suspend
 assert_absent "python3 missing: no resume handoff" "$RESUME_FILE"
@@ -1462,12 +1520,12 @@ STUB_LOGINCTL_MODE=real
 HOOK_FAILPOINT='root-creator'
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-assert_file "root-creator: handoff content" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_suspend_handoff "root-creator: handoff content" "7" "$_user_dir/c640-kbd-backlight.suspend"
 assert_owner "root-creator: owner is resolved uid:gid" "$(id -u):$(id -g)" \
     "$_user_dir/c640-kbd-backlight.suspend"
 assert_log_matches "root-creator: records OK dev:ino" "$PUBLISH_OUT" '^OK [0-9]+:[0-9]+$'
 assert_publish_identity "root-creator: identity matches inode" \
-    "$_user_dir/c640-kbd-backlight.suspend"
+    "$_user_dir/c640-kbd-backlight.suspend" 1
 assert_no_handoff_temp "root-creator: no temp left" "$_user_dir"
 
 # 9ae. FAILPOINT `post-mode`: published entry keeps its inode but its mode is
@@ -1527,16 +1585,180 @@ assert_empty_log "no user: no sudo calls" "$SUDO_LOG"
 reset_case
 run_hook pre suspend
 run_hook post suspend
+_h10_first_token="$(resume_token)"
 run_hook post hibernate
 lines="$(wc -l < "$RESUME_FILE" 2> /dev/null || echo 0)"
 assert_eq "post twice: resume flag has exactly one line" "1" "$lines"
 assert_resume_flag "post twice: last action wins" "hibernate"
+assert_eq "H10: token unchanged across two posts" "$_h10_first_token" "$(resume_token)"
+assert_eq "H10: resume token matches this cycle's suspend token" "$(suspend_token)" "$(resume_token)"
 assert_mode "post twice: resume flag still 0600" "600" "$RESUME_FILE"
 if [ -n "$(find "$HANDOFF_DIR" -maxdepth 1 -name '.c640-kbd-handoff.*' -print -quit 2> /dev/null)" ]; then
     bad "post left a temporary handoff file behind"
 else
     ok "post left no temporary handoff files"
 fi
+
+# --- Phase C: per-cycle handoff identity (finding #2) ----------------------
+
+# H1. A normal cycle binds suspend handoff, root commit marker and resume flag
+#     to the same freshly minted token and the exact published suspend inode.
+reset_case
+run_hook pre suspend
+H1_TOKEN="$(suspend_token)"
+assert_suspend_handoff "H1: suspend carries the new wire format" "7"
+assert_cycle_marker "H1: root marker binds token to suspend inode" "$H1_TOKEN"
+assert_mode "H1: root marker is 0600" "600" "$CYCLE_FILE"
+assert_publish_identity "H1: marker identity is the 2nd publish" "$CYCLE_FILE" 2
+assert_eq "H1: pre emits two OK records" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+run_hook post suspend
+assert_resume_flag "H1: post publishes resume flag" "suspend"
+assert_eq "H1: resume token equals suspend token" "$H1_TOKEN" "$(resume_token)"
+assert_publish_identity "H1: resume identity is the 3rd publish" "$RESUME_FILE" 3
+
+# H2. Unreadable brightness: pre publishes nothing (so no commit marker) and
+#     post therefore refuses to publish a flag.
+reset_case
+printf '' > "$FAKE_SYSFS"
+run_hook pre suspend
+assert_absent "H2: unreadable brightness has no suspend handoff" "$SUSPEND_FILE"
+assert_absent "H2: unreadable brightness has no commit marker" "$CYCLE_FILE"
+assert_log_matches "H2: unreadable brightness warned" "$HOOK_ERR" 'unreadable brightness'
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H2: post publishes no flag" "$RESUME_FILE"
+assert_log_matches "H2: post fails closed without a marker" "$HOOK_ERR" 'cycle marker'
+
+# H3. suspend publish failure: no handoff, no marker, no OK, root state kept.
+reset_case
+HOOK_FAILPOINT=rename
+run_hook pre suspend
+assert_absent "H3: no suspend handoff after publish failure" "$SUSPEND_FILE"
+assert_absent "H3: no commit marker after publish failure" "$CYCLE_FILE"
+assert_no_handoff_publish "H3: no OK record"
+assert_no_handoff_temp "H3: no temp left behind"
+assert_file "H3: root state retained" "$STATE_DIR/state" "7"
+assert_log_matches "H3: publish failure reason recorded" "$HOOK_ERR" 'injected rename failure'
+
+# H4. A previous cycle's handoffs + marker are invalidated BEFORE a new token
+#     is minted, including the handoffs in the pinned uid's runtime dir.
+reset_case
+_old_uid=424242
+mkdir -p "$RUN_USER_ROOT/$_old_uid"
+chmod 700 "$RUN_USER_ROOT/$_old_uid"
+printf '%s 7 published\n' "$C640_OLD_TOKEN" > "$RUN_USER_ROOT/$_old_uid/c640-kbd-backlight.suspend"
+printf '%s suspend\n' "$C640_OLD_TOKEN" > "$RUN_USER_ROOT/$_old_uid/c640-kbd-backlight.resume"
+printf '%s 1:1\n' "$C640_OLD_TOKEN" > "$CYCLE_FILE"
+chmod 600 "$CYCLE_FILE"
+printf '%s\n' "$_old_uid" > "$STATE_DIR/session-uid"
+printf '%s 7 published\n' "$C640_OLD_TOKEN" > "$SUSPEND_FILE"
+printf '%s suspend\n' "$C640_OLD_TOKEN" > "$RESUME_FILE"
+run_hook pre suspend
+H4_TOKEN="$(suspend_token)"
+assert_absent "H4: old pinned-uid suspend removed" "$RUN_USER_ROOT/$_old_uid/c640-kbd-backlight.suspend"
+assert_absent "H4: old pinned-uid resume removed" "$RUN_USER_ROOT/$_old_uid/c640-kbd-backlight.resume"
+assert_absent "H4: old override-dir resume flag removed" "$RESUME_FILE"
+if [ "$H4_TOKEN" != "$C640_OLD_TOKEN" ]; then
+    ok "H4: new token differs from the old cycle's token"
+else
+    bad "H4: token was reused ($H4_TOKEN)"
+fi
+assert_suspend_handoff "H4: new cycle value" "7"
+assert_eq "H4: marker uses the new token" "$H4_TOKEN" "$(cut -d' ' -f1 "$CYCLE_FILE")"
+run_hook post suspend
+assert_eq "H4: post uses the new token" "$H4_TOKEN" "$(resume_token)"
+
+# H5. A tampered suspend token must stop post from publishing a flag.
+reset_case
+run_hook pre suspend
+H5_TOKEN="$(suspend_token)"
+printf '%s 7 published\n' "$C640_OLD_TOKEN" > "$SUSPEND_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H5: token tamper publishes no flag" "$RESUME_FILE"
+assert_log_matches "H5: token mismatch warned" "$HOOK_ERR" 'token mismatch'
+assert_eq "H5: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+assert_suspend_handoff "H5: tampered value still well formed" "7"
+assert_eq "H5: marker still binds the original token" "$H5_TOKEN" "$(cut -d' ' -f1 "$CYCLE_FILE")"
+
+# H6. Replacing the suspend file with a DIFFERENT inode carrying the same
+#     token must be caught by the dev:ino binding in the root marker.
+reset_case
+run_hook pre suspend
+H6_TOKEN="$(suspend_token)"
+rm -f "$SUSPEND_FILE"
+printf '%s 7 published\n' "$H6_TOKEN" > "$SUSPEND_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H6: inode swap publishes no flag" "$RESUME_FILE"
+assert_log_matches "H6: inode mismatch warned" "$HOOK_ERR" 'suspend inode .* != cycle marker'
+assert_eq "H6: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+assert_suspend_handoff "H6: swapped handoff is well formed" "7"
+
+# H7. Root marker must be a regular 0600 file with strict content.
+reset_case
+run_hook pre suspend
+chmod 644 "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (0644): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (0644): mode rejected" "$HOOK_ERR" "$CYCLE_FILE is not 0600"
+assert_eq "H7 (0644): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+reset_case
+run_hook pre suspend
+cp "$CYCLE_FILE" "$TMP_DIR/marker-copy"
+rm -f "$CYCLE_FILE"
+ln -s "$TMP_DIR/marker-copy" "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (symlink): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (symlink): unsafe marker rejected" "$HOOK_ERR" 'missing/unsafe cycle marker'
+assert_eq "H7 (symlink): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+reset_case
+run_hook pre suspend
+printf 'garbage\n' > "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (bad format): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (bad format): strict parser rejected" "$HOOK_ERR" 'invalid cycle marker'
+assert_eq "H7 (bad format): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+# H8. Two cycles in the same second still get distinct tokens; each resume
+#     flag matches its own suspend handoff, and the old flag is invalidated.
+reset_case
+run_hook pre suspend
+H8_T1="$(suspend_token)"
+run_hook post suspend
+assert_eq "H8: first resume uses first token" "$H8_T1" "$(resume_token)"
+run_hook pre suspend
+H8_T2="$(suspend_token)"
+if [ "$H8_T1" != "$H8_T2" ]; then
+    ok "H8: token differs within the same second"
+else
+    bad "H8: token reused within the same second"
+fi
+assert_absent "H8: second pre removed the old resume flag" "$RESUME_FILE"
+assert_cycle_marker "H8: second marker binds the new token" "$H8_T2"
+run_hook post suspend
+assert_eq "H8: second resume uses second token" "$H8_T2" "$(resume_token)"
+
+# H9. commit marker publish failure rolls back the just-published suspend
+#     handoff (state dir is not 0700 for the hook uid).  The suspend OK record
+#     remains in PUBLISH_OUT; only the marker is missing.
+reset_case
+run_hook pre suspend
+chmod 755 "$STATE_DIR"
+rm -f "$CYCLE_FILE"
+: > "$HOOK_ERR"
+: > "$PUBLISH_OUT"
+run_hook pre suspend
+assert_absent "H9: suspend handoff rolled back" "$SUSPEND_FILE"
+assert_absent "H9: no commit marker" "$CYCLE_FILE"
+assert_eq "H9: suspend publish record retained" "1" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+assert_log_matches "H9: rollback warned" "$HOOK_ERR" 'cycle commit marker publish failed'
+assert_log_matches "H9: marker publish failure warned" "$HOOK_ERR" 'missing/insecure'
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

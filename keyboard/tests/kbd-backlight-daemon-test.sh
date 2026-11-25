@@ -73,6 +73,18 @@ STUB_ACTIVE_SEQ_FILE="$TMP_DIR/active-seq"
 HANDOFF_DIR="$TMP_DIR/handoff"
 HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
+# Phase C per-cycle identity files (user-side, distinct from the root hook's
+# private commit marker).  Must be exported BEFORE sourcing the daemon.
+ADOPTED_CYCLE_FILE="$HANDOFF_DIR/c640-kbd-backlight.adopted-cycle"
+CYCLE_BEGIN_FILE="$HANDOFF_DIR/c640-kbd-backlight.cycle-begin"
+export C640_KBD_ADOPTED_CYCLE="$ADOPTED_CYCLE_FILE"
+export C640_KBD_CYCLE_BEGIN="$CYCLE_BEGIN_FILE"
+export C640_KBD_CYCLE_BEGIN_SKEW=5
+# Fixed token for all legacy handoff cases: many existing cases only care
+# about the value, so they keep working with the strict new wire format.
+C640_TEST_TOKEN="1763800000-1000-a1b2c3d4e5f6"
+C640_OLD_TOKEN="1763700000-1000-001122334455"
+C640_FOREIGN_TOKEN="1763800000-1000-ffeeddccbbaa"
 # An EXPLICIT C640_KBD_HANDOFF_DIR override is the only hook-side directory
 # the daemon diagnoses: a handoff there that differs from the daemon's own
 # path is a test/configuration error worth a user-visible WARN.  By default
@@ -125,6 +137,15 @@ assert_present() {
         ok "$label"
     else
         bad "$label (file missing)"
+    fi
+}
+assert_log_matches() {
+    local label="$1" file="$2" pattern="$3" actual
+    actual="$(/bin/cat "$file" 2> /dev/null || echo '')"
+    if printf '%s\n' "$actual" | grep -Eq -- "$pattern"; then
+        ok "$label"
+    else
+        bad "$label (no match for '$pattern' in: $actual)"
     fi
 }
 
@@ -632,6 +653,7 @@ reset_case() {
         "$RESTORE_GEN_FILE" "$RESTORE_PENDING_FILE" "$D_STATE_DIR"/*.restore-pending \
         "$D_STATE_DIR"/*.meta "$FAKE_SYSFS" "$FAKE_MAX" "$RAW_FILE" "$PCT_FILE" \
         "$HANDOFF_SUSPEND_FILE" "$HANDOFF_RESUME_FILE" "$HOOK_SUSPEND_FILE" \
+        "$ADOPTED_CYCLE_FILE" "$CYCLE_BEGIN_FILE" \
         "$HOOK_HANDOFF_DIR"/c640-kbd-backlight.resume "$D_STATE_DIR"/*.resume.lock
     # Finding #4 state: write lock, guard marker, Tier-2 sentinel and the
     # controllable sleep gate.  Without this cleanup a gated guard from a
@@ -667,7 +689,7 @@ reset_case() {
     export STUB_GEN_DATE_STALE='' STUB_GEN_DATE_STALE_SECS=10
     export TMPDIR="$ORIG_TMPDIR"
     rm -f "$RESTORE_RETRY_EPOCH_FILE" "$D_STATE_DIR"/.c640-kbd-gen-* \
-        "$ORIG_TMPDIR"/.c640-kbd-gen-* 2> /dev/null || true
+        "$HANDOFF_DIR"/.c640-kbd-gen-* "$ORIG_TMPDIR"/.c640-kbd-gen-* 2> /dev/null || true
     printf '99\n' > "$FAKE_SYSFS"
     printf '100\n' > "$FAKE_MAX"
     printf '%s\n' "$STUB_KBD_RAW" > "$RAW_FILE"
@@ -700,14 +722,42 @@ write_state() {
 
 # Phase 4b helpers: the hook writes these with a trailing newline and never
 # deletes them; only a successful daemon adoption/restore consumes them.
+# Phase C: the suspend handoff is "<token> <value> published", the resume flag
+# is "<token> <epoch> <action>", and a fresh cycle-begin makes the fixed
+# token's epoch current.  A fixed token keeps the pre-existing value-focused
+# cases unchanged while still exercising the strict parser / gates.
 write_handoff_suspend() {
     mkdir -p "$HANDOFF_DIR"
+    printf '%s %s published\n' "$C640_TEST_TOKEN" "$1" > "$HANDOFF_SUSPEND_FILE"
+    printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+    rm -f "$ADOPTED_CYCLE_FILE"
+}
+
+write_handoff_suspend_token() {
+    mkdir -p "$HANDOFF_DIR"
+    printf '%s %s published\n' "$1" "$2" > "$HANDOFF_SUSPEND_FILE"
+    printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+    rm -f "$ADOPTED_CYCLE_FILE"
+}
+
+# Legacy single-integer wire format: must be REJECTED by the strict parser.
+# Keep a VALID cycle-begin so the only possible rejection is the parser: if the
+# begin file were missing, a parser mutation accepting legacy would still fail
+# on the freshness gate and the state assertions would be vacuous.
+write_handoff_suspend_legacy() {
+    mkdir -p "$HANDOFF_DIR"
     printf '%s\n' "$1" > "$HANDOFF_SUSPEND_FILE"
+    printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+    rm -f "$ADOPTED_CYCLE_FILE"
 }
 
 write_handoff_resume() {
     mkdir -p "$HANDOFF_DIR"
-    printf '%s suspend\n' "$(date +%s)" > "$HANDOFF_RESUME_FILE"
+    printf '%s %s %s\n' "$C640_TEST_TOKEN" "$(date +%s)" "${1:-suspend}" > "$HANDOFF_RESUME_FILE"
+}
+
+write_resume_token() {
+    printf '%s %s %s\n' "$1" "$(date +%s)" "${2:-suspend}" > "$HANDOFF_RESUME_FILE"
 }
 
 run_fn() {
@@ -4209,6 +4259,288 @@ if grep -Fq 'unblank guard +0.3s: retry epoch superseded inside WRITE_LOCK; guar
 else
     bad "G3-25: no in-lock epoch log (stderr: $(cat "$GUARD_ERR"))"
 fi
+
+# --- Phase C: per-cycle handoff identity (finding #2) ----------------------
+
+# D1. Strict token handoff is adopted; the legacy single-integer format is
+#     rejected without touching daemon state or consuming the handoff.
+reset_case
+write_state 9
+write_handoff_suspend 7
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D1: token handoff adopted" "0" "$rc"
+assert_file "D1: STATE_FILE updated" "$STATE_FILE" "7"
+assert_absent "D1: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+assert_file "D1: adopted-cycle records the token" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+
+reset_case
+write_state 9
+write_handoff_suspend_legacy 7
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D1 (legacy): rejected with FAIL" "1" "$rc"
+assert_file "D1 (legacy): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D1 (legacy): handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D1 (legacy): no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D1 (legacy): invalid handoff warned" "$DAEMON_ERR" 'suspend handoff invalid'
+
+# D2. A resume flag from a different token must not be adopted with this
+#     suspend handoff: zero state overwrite, zero brightness writes.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_resume_token "$C640_FOREIGN_TOKEN" suspend
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "D2: token mismatch returns FAIL" "1" "$rc"
+assert_file "D2: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D2: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D2: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_eq "D2: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "D2: token mismatch logged" "$DAEMON_ERR" 'token mismatch'
+
+# D3. Strict parser: missing 'published', extra column, uppercase hex and a
+#     trailing CR are all refused.
+reset_case
+write_state 9
+printf '%s 7\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D3 (no published): rejected" "1" "$rc"
+assert_file "D3 (no published): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D3 (no published): handoff retained" "$HANDOFF_SUSPEND_FILE"
+
+reset_case
+write_state 9
+printf '%s 7 published extra\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D3 (extra column): rejected" "1" "$rc"
+assert_file "D3 (extra column): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D3 (extra column): handoff retained" "$HANDOFF_SUSPEND_FILE"
+
+reset_case
+write_state 9
+printf '%s 7 published\n' "${C640_TEST_TOKEN^^}" > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D3 (uppercase hex): rejected" "1" "$rc"
+assert_file "D3 (uppercase hex): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D3 (uppercase hex): handoff retained" "$HANDOFF_SUSPEND_FILE"
+
+reset_case
+write_state 9
+printf '%s 7 published\r\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D3 (trailing CR): rejected" "1" "$rc"
+assert_file "D3 (trailing CR): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D3 (trailing CR): handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D3: strict parser warned" "$DAEMON_ERR" 'suspend handoff invalid'
+
+# D3 (CR separator).  [[:space:]] in bash matches CR too, so "token 7\rpublished"
+# used to satisfy the strict parser and overwrite STATE_FILE.  Separators must
+# be literal spaces only; the handoff must be refused and kept intact.
+reset_case
+write_state 9
+printf '%s 7\rpublished\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D3 (CR separator): rejected" "1" "$rc"
+assert_file "D3 (CR separator): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D3 (CR separator): handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D3 (CR separator): no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D3 (CR separator): invalid handoff warned" "$DAEMON_ERR" 'suspend handoff invalid'
+
+# D4. A token older than cycle-begin minus skew is a previous cycle.
+reset_case
+write_state 9
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D4: stale token epoch rejected" "1" "$rc"
+assert_file "D4: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D4: stale handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D4: staleness logged" "$DAEMON_ERR" 'is stale'
+
+# D4 (integer overflow).  10#$begin_raw wraps at 2^64: an oversized begin
+# (2^64 -> 0) would make even the OLD token look fresh and be adopted.  The
+# 1-10 digit bound must reject it and leave all state untouched.
+reset_case
+write_state 9
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+printf '18446744073709551616\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D4 (huge begin): rejected" "1" "$rc"
+assert_file "D4 (huge begin): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D4 (huge begin): handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D4 (huge begin): no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D4 (huge begin): invalid begin logged" "$DAEMON_ERR" 'cycle-begin file .* invalid'
+
+# D4 (token epoch overflow).  2^64 + the current epoch wraps back to a fresh
+# epoch in 10#$tok_epoch; without the digit bound a stale cycle is adopted.
+reset_case
+write_state 9
+printf '18446744075473351616-1000-a1b2c3d4e5f6 7 published\n' > "$HANDOFF_SUSPEND_FILE"
+printf '1763800000\n' > "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D4 (huge token epoch): rejected" "1" "$rc"
+assert_file "D4 (huge token epoch): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D4 (huge token epoch): handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D4 (huge token epoch): no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D4 (huge token epoch): out of range logged" "$DAEMON_ERR" 'out of range'
+
+# D5. Missing cycle-begin fails closed (pre vs. PrepareForSleep not tracked).
+reset_case
+write_state 9
+write_handoff_suspend 7
+rm -f "$CYCLE_BEGIN_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D5: missing cycle-begin rejected" "1" "$rc"
+assert_file "D5: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D5: handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D5: missing begin logged" "$DAEMON_ERR" 'cycle-begin file .* missing'
+
+# D6a. THE finding #2 regression: an old non-zero handoff with a newer daemon
+#      state must cause zero overwrite and zero Properties.Set.  First through
+#      login1(false) with NO resume flag (pre did not commit); then directly
+#      through handle_resume with a stale pre epoch.
+reset_case
+write_state 9
+write_handoff_suspend 7
+cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+printf '   boolean false\n'
+STUB
+chmod +x "$STUB_DIR/dbus-monitor"
+: > "$DAEMON_ERR"
+: > "$SET_LOG"
+run_fn monitor_login1
+assert_file "D6a (login1): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_eq "D6a (login1): zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D6a (login1): suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D6a (login1): no-flag gate logged" "$DAEMON_ERR" 'no resume flag'
+rm -f "$STUB_DIR/dbus-monitor"
+
+reset_case
+write_state 9
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+: > "$DAEMON_ERR"
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "D6a (stale): returns FAIL" "1" "$rc"
+assert_file "D6a (stale): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_eq "D6a (stale): zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D6a (stale): suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D6a (stale): staleness logged" "$DAEMON_ERR" 'is stale'
+
+# D6b. Same, but someone forged a flag carrying the OLD token: the resume /
+#      suspend cross-check must still block the overwrite.
+reset_case
+write_state 9
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+write_resume_token "$C640_TEST_TOKEN" suspend
+: > "$DAEMON_ERR"
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "D6b: forged flag returns FAIL" "1" "$rc"
+assert_file "D6b: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_eq "D6b: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D6b: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D6b: token mismatch logged" "$DAEMON_ERR" 'token mismatch'
+
+# D7. A reappearing copy of an already-adopted token must not overwrite a
+#     newer STATE_FILE (replay barrier).
+reset_case
+write_state 9
+write_handoff_suspend 7
+run_fn adopt_suspend_handoff
+write_state 100
+printf '%s 7 published\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+: > "$DAEMON_ERR"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D7: replay returns DONE without work" "0" "$rc"
+assert_file "D7: newer STATE_FILE not overwritten" "$STATE_FILE" "100"
+assert_present "D7: replay handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_log_matches "D7: replay logged" "$DAEMON_ERR" 'already adopted'
+
+# D8. A staged restore defers adoption WITHOUT writing adopted-cycle; the same
+#     token can then be adopted once PENDING disappears.
+reset_case
+write_state 9
+printf '7\n' > "$RESTORE_PENDING_FILE"
+write_handoff_suspend 7
+write_handoff_resume
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D8: PENDING defers (rc 2)" "2" "$rc"
+assert_absent "D8: adopted-cycle not written while deferred" "$ADOPTED_CYCLE_FILE"
+assert_present "D8: handoff retained while deferred" "$HANDOFF_SUSPEND_FILE"
+rm -f "$RESTORE_PENDING_FILE"
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D8: retry after PENDING succeeds" "0" "$rc"
+assert_file "D8: adopted-cycle written on success" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+
+# D9. PrepareForSleep(true) clears stale handoffs and refreshes cycle-begin;
+#     (false) only adopts when post actually published a flag.
+reset_case
+write_handoff_suspend 7
+write_handoff_resume
+printf '1\n' > "$CYCLE_BEGIN_FILE"
+cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+printf '   boolean true\n'
+STUB
+chmod +x "$STUB_DIR/dbus-monitor"
+: > "$DAEMON_ERR"
+run_fn monitor_login1
+assert_absent "D9 (true): stale suspend handoff cleared" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D9 (true): stale resume flag cleared" "$HANDOFF_RESUME_FILE"
+_begin="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo '')"
+if [[ "$_begin" =~ ^[0-9]+$ ]] && [ "$_begin" -gt 1 ]; then
+    ok "D9 (true): cycle-begin refreshed to the new sleep epoch"
+else
+    bad "D9 (true): cycle-begin not refreshed ('$_begin')"
+fi
+assert_log_matches "D9 (true): saving logged" "$DAEMON_ERR" 'PrepareForSleep true'
+rm -f "$STUB_DIR/dbus-monitor"
+
+reset_case
+write_state 30
+write_handoff_suspend 30
+write_handoff_resume
+cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+printf '   boolean false\n'
+STUB
+chmod +x "$STUB_DIR/dbus-monitor"
+: > "$DAEMON_ERR"
+: > "$SET_LOG"
+run_fn monitor_login1
+assert_file "D9 (false, flag present): adopted brightness restored" "$RAW_FILE" "30"
+assert_absent "D9 (false, flag present): resume flag consumed" "$HANDOFF_RESUME_FILE"
+rm -f "$STUB_DIR/dbus-monitor"
+wait 2> /dev/null || true
+
+# D10. adopted-cycle publish failure defers: handoff and flag are kept and no
+#      brightness is written.  The value has already been published to
+#      STATE_FILE at that point; the retry re-publishes it and then records
+#      the token, so no brightness write happens twice.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_handoff_resume
+export STUB_GEN_MV_FAIL=1 STUB_GEN_MV_FAIL_DEST="$ADOPTED_CYCLE_FILE"
+: > "$DAEMON_ERR"
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+export STUB_GEN_MV_FAIL=0 STUB_GEN_MV_FAIL_DEST=''
+assert_eq "D10: DEFER on adopted-cycle publish failure" "2" "$rc"
+assert_file "D10: adopted value in STATE_FILE" "$STATE_FILE" "7"
+assert_present "D10: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D10: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_eq "D10: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "D10: publish failure logged" "$DAEMON_ERR" 'cannot publish adopted-cycle'
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then
