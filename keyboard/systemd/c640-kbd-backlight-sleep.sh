@@ -48,9 +48,16 @@
 # idle SSH session that heuristic picked the SSH user (often nobody, 65534).
 # Only loginctl's real properties are authoritative:
 #   show-session <id>: Active=yes, Remote=no, Class=user,
-#                      Type=wayland|x11, State != closing, numeric UID
+#                      Type=wayland|x11, State != closing, numeric Session.User
 #   show-seat <seat> -p ActiveSession: the session must be its seat's active
 #                      session (this also resolves the multi-seat case)
+# The uid comes from the Session object's User property, which is of type
+# (uo) and is printed by loginctl as `User=<numeric uid>` (NOT `UID=`;
+# UID= belongs to the User object / logind's private state file and must not
+# be parsed here).  Session IDs are strings, not just decimal numbers:
+# systemd's session_id_valid() accepts [A-Za-z0-9]+, so IDs such as `c1` are
+# legal; only empty/special-character values and the `self`/`auto` aliases are
+# skipped before calling show-session.
 # Exactly one such candidate is required; 0 or >1 is FAIL-CLOSED (journal
 # WARN, root state still saved, no handoff from pre and no flag from post).
 # Greeter/background/tty sessions are never selected.  SUDO_USER is ignored:
@@ -214,7 +221,11 @@ _session_uid() {
     _chosen=""
     _desc=""
     for _id in $_ids; do
-        case "$_id" in '' | *[!0-9]*) continue ;; esac
+        # Session IDs are ALPHANUMERIC strings (systemd session_id_valid()),
+        # not decimal-only: c1 and similar are legal.  Reject empty values,
+        # anything outside [A-Za-z0-9] (also prevents glob expansion) and the
+        # reserved self/auto aliases before any loginctl call.
+        case "$_id" in '' | *[!A-Za-z0-9]* | self | auto) continue ;; esac
         _seen=$((_seen + 1))
         _props="$(loginctl show-session "$_id" 2> /dev/null || true)"
         _active="$(_session_prop "$_props" Active)"
@@ -223,7 +234,11 @@ _session_uid() {
         _type="$(_session_prop "$_props" Type)"
         _state="$(_session_prop "$_props" State)"
         _seat="$(_session_prop "$_props" Seat)"
-        _suid="$(_session_prop "$_props" UID)"
+        # Session.User is typed (uo); loginctl show-session prints the numeric
+        # uid as `User=<uid>`.  `UID=` is a User-object property (and logind's
+        # private state file), not a session property: it is NOT parseable
+        # here and was the cause of the original no-handoff blocker.
+        _suid="$(_session_prop "$_props" User)"
         # IDLE=yes / CLASS=active are NOT session activity indicators.  Only
         # these explicit properties describe an active local graphical USER.
         [ "$_active" = yes ] || continue

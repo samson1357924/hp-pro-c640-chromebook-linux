@@ -158,30 +158,36 @@ STUB
 # from `show-seat <seat> -p ActiveSession` (Key=Value, no --value).  Each mode
 # models a realistic host; an idle SSH session is Active=no/Remote=yes and a
 # greeter is Class=greeter, neither of which may own the handoff.
+# STUB_UID_FIELD defaults to the real schema `User=`; the legacy-UID
+# sensitivity case flips ONLY that key to `UID=`, leaving every other
+# property in the PASS state, so the hook's schema choice is falsifiable.
 cat > "$STUB_DIR/loginctl" << 'STUB'
 #!/bin/sh
 printf 'loginctl %s\n' "$*" >> "${STUB_LOGINCTL_LOG:-/dev/null}"
 _mode="${STUB_LOGINCTL_MODE:-none}"
+_field="${STUB_UID_FIELD:-User}"
 _me="$(id -u)"
 _nobody="$(id -u nobody)"
 
 _graphical() { # id uid seat type state
-    printf 'Id=%s\nName=%s\nUID=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=user\nActive=yes\nRemote=no\nState=%s\n' \
-        "$1" "$1" "$2" "$3" "$4" "$5"
+    printf 'Id=%s\nName=%s\n%s=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=user\nActive=yes\nRemote=no\nState=%s\n' \
+        "$1" "$1" "$_field" "$2" "$3" "$4" "$5"
 }
 # Single-property override helper for the load-bearing gate cases: every
 # property except the one under test stays in the PASS state, and the session
 # IS its seat's ActiveSession.  That makes exactly one gate responsible for
 # exclusion, so removing that gate must change the outcome.
 _props() { # id uid seat type class active remote state
-    printf 'Id=%s\nName=%s\nUID=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=%s\nActive=%s\nRemote=%s\nState=%s\n' \
-        "$1" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    printf 'Id=%s\nName=%s\n%s=%s\nSeat=%s\nTTY=tty7\nType=%s\nClass=%s\nActive=%s\nRemote=%s\nState=%s\n' \
+        "$1" "$1" "$_field" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
 }
 _idle_ssh() { # id uid
-    printf 'Id=%s\nName=%s\nUID=%s\nSeat=seat0\nTTY=pts/0\nType=tty\nClass=user\nActive=no\nRemote=yes\nState=idle\n' "$1" "$1" "$2"
+    printf 'Id=%s\nName=%s\n%s=%s\nSeat=seat0\nTTY=pts/0\nType=tty\nClass=user\nActive=no\nRemote=yes\nState=idle\n' \
+        "$1" "$1" "$_field" "$2"
 }
 _greeter() { # id uid
-    printf 'Id=%s\nName=%s\nUID=%s\nSeat=seat0\nTTY=tty2\nType=x11\nClass=greeter\nActive=yes\nRemote=no\nState=active\n' "$1" "$1" "$2"
+    printf 'Id=%s\nName=%s\n%s=%s\nSeat=seat0\nTTY=tty2\nType=x11\nClass=greeter\nActive=yes\nRemote=no\nState=active\n' \
+        "$1" "$1" "$_field" "$2"
 }
 
 _cmd="${1:-}"
@@ -204,6 +210,7 @@ if [ "$_cmd" = "show-session" ]; then
         greeter-active:50) _greeter 50 "$_me" ;;
         greeter-active:51) _graphical 51 "$_me" seat0 x11 active ;;
         type-tty:60) _props 60 "$_me" seat0 tty user yes no active ;;
+        c-prefix:c1) _graphical c1 "$_me" seat0 wayland active ;;
     esac
     exit 0
 fi
@@ -220,6 +227,7 @@ if [ "$_cmd" = "show-seat" ]; then
         seat-active:seat0) printf 'Name=seat0\nActiveSession=41\n' ;;
         greeter-active:seat0) printf 'Name=seat0\nActiveSession=50\n' ;;
         type-tty:seat0) printf 'Name=seat0\nActiveSession=60\n' ;;
+        c-prefix:seat0) printf 'Name=seat0\nActiveSession=c1\n' ;;
     esac
     exit 0
 fi
@@ -253,6 +261,19 @@ case "$_mode" in
         printf '51 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
     type-tty)
         printf '60 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    c-prefix)
+        # systemd's session_id_valid() also accepts c-prefixed IDs.
+        printf 'c1 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
+    ambiguous-ids)
+        # Malformed / reserved IDs.  show-session must NEVER be called for
+        # any of them and _session_uid must fail closed with 0 candidates.
+        printf 'c;1 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf '../x %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf 'self %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        printf 'auto %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me"
+        # A whitespace-bearing raw ID: list-sessions column splitting leaves
+        # "c" as the first field; show-session must not see the raw value.
+        printf 'c 1 %s %s seat0 %s user tty7 no 2026-11-25 08:00\n' "$_me" "$(id -nu)" "$_me" ;;
 esac
 exit 0
 STUB
@@ -290,6 +311,23 @@ STUB
 chmod +x "$STUB_DIR/gdbus" "$STUB_DIR/sudo" "$STUB_DIR/ectool" "$STUB_DIR/loginctl" \
     "$STUB_DIR/chmod" "$STUB_DIR/chown" "$STUB_DIR/mktemp"
 
+# 0. Fixture schema self-check: the stub itself must emit the REAL loginctl
+#    session schema (User=<numeric uid>, never UID=).  Without this guard a
+#    future edit could silently move the stub and the hook to the same wrong
+#    schema and make all the resolution cases self-confirming green.
+_fixture_props="$(PATH="$STUB_DIR:$PATH" STUB_LOGINCTL_MODE=real \
+    "$STUB_DIR/loginctl" show-session 3 2> /dev/null || true)"
+if printf '%s\n' "$_fixture_props" | grep -Eq '^User=[0-9]+$'; then
+    ok "fixture schema: stub show-session prints numeric User="
+else
+    bad "fixture schema: no numeric User= in stub output ($_fixture_props)"
+fi
+if printf '%s\n' "$_fixture_props" | grep -Eq '^UID='; then
+    bad "fixture schema: stub must not print UID= ($_fixture_props)"
+else
+    ok "fixture schema: stub does not print UID="
+fi
+
 # --- harness ----------------------------------------------------------------
 # Empty HOOK_HANDOFF_DIR means "unset": the hook must resolve /run/user/<uid>
 # itself (used by the loginctl-resolution and no-user cases).
@@ -300,6 +338,7 @@ STUB_FROZEN=0
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
 STUB_LOGINCTL_MODE=none
+STUB_UID_FIELD=User
 
 reset_case() {
     : > "$HOOK_ERR"
@@ -325,6 +364,7 @@ reset_case() {
     STUB_GNOME_ACTIVE=false
     STUB_FDO_ACTIVE=false
     STUB_LOGINCTL_MODE=none
+    STUB_UID_FIELD=User
 }
 
 run_hook() {
@@ -338,6 +378,7 @@ run_hook() {
         "STUB_CHOWN_LOG=$CHOWN_LOG"
         "STUB_MKTEMP_LOG=$MKTEMP_LOG"
         "STUB_LOGINCTL_MODE=$STUB_LOGINCTL_MODE"
+        "STUB_UID_FIELD=$STUB_UID_FIELD"
         "STUB_GNOME_ACTIVE=$STUB_GNOME_ACTIVE"
         "STUB_FDO_ACTIVE=$STUB_FDO_ACTIVE"
         "STUB_FROZEN=$STUB_FROZEN"
@@ -358,6 +399,23 @@ run_hook() {
     env -u SUDO_USER -u C640_KBD_SLEEP_USER -u C640_KBD_SLEEP_UID \
         -u C640_KBD_SLEEP_BUS -u C640_KBD_SLEEP_DELAY \
         "${env_args[@]}" "$HOOK" "$@" 2>> "$HOOK_ERR"
+}
+
+# Source the hook read-only and call its session resolver directly, so the
+# return value of _session_uid itself is testable (not only its downstream
+# handoff side effects).  The stub's loginctl is on PATH and logs every call.
+_probe_session_uid() {
+    (
+        export PATH="$STUB_DIR:$PATH"
+        export C640_KBD_SLEEP_SOURCE_ONLY=1
+        export C640_KBD_RUN_USER_ROOT="$RUN_USER_ROOT"
+        export STUB_LOGINCTL_MODE="$STUB_LOGINCTL_MODE"
+        export STUB_UID_FIELD="$STUB_UID_FIELD"
+        export STUB_LOGINCTL_LOG="$LOGINCTL_LOG"
+        # shellcheck source=../systemd/c640-kbd-backlight-sleep.sh
+        . "$HOOK"
+        _session_uid
+    ) 2>> "$HOOK_ERR"
 }
 
 if [ ! -f "$HOOK" ]; then
@@ -725,7 +783,9 @@ HOOK_HANDOFF_DIR=""
 STUB_LOGINCTL_MODE=real
 _user_dir="$RUN_USER_ROOT/$(id -u)"
 run_hook pre suspend
-chmod 644 "$STATE_DIR/session-uid"
+# Tolerate a missing pin under a broken hook: the assertions below must still
+# run (and fail) instead of aborting the whole suite via `set -e`.
+chmod 644 "$STATE_DIR/session-uid" 2> /dev/null || true
 : > "$HOOK_ERR"
 run_hook post suspend
 assert_absent "cycle uid 0644: no resume flag" "$_user_dir/c640-kbd-backlight.resume"
@@ -806,6 +866,77 @@ else
     ok "tmp fallback: _atomic_write never used a /tmp stand-in mktemp"
 fi
 assert_log_matches "tmp fallback: fail-closed WARN" "$HOOK_ERR" 'handoff skipped \(fail-closed\)'
+
+# 9m. Sensitivity for the finding #1 schema bug: flip ONLY the uid key from
+#     the real `User=` to the legacy `UID=`.  Every other property (including
+#     Active/Remote/Class/Type/Seat/State and show-seat) stays in the PASS
+#     state, so a hook that reads the wrong key must fail closed here while
+#     all the real-schema cases above stay green.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=real
+STUB_UID_FIELD=UID
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+run_hook pre suspend
+assert_file "legacy-UID schema: root state still saved" "$STATE_DIR/state" "7"
+assert_absent "legacy-UID schema: no suspend handoff" "$_user_dir/c640-kbd-backlight.suspend"
+assert_absent "legacy-UID schema: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_log_matches "legacy-UID schema: 0-candidate WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+assert_log_matches "legacy-UID schema: show-session still consulted" "$LOGINCTL_LOG" '^loginctl show-session 3$'
+printf '0\n' > "$FAKE_SYSFS"
+run_hook post suspend
+assert_absent "legacy-UID schema: no resume flag" "$_user_dir/c640-kbd-backlight.resume"
+
+# 9n. Session IDs are strings, not decimal-only: systemd's session_id_valid()
+#     accepts [A-Za-z0-9]+, e.g. c1.  The hook must call show-session c1,
+#     accept ActiveSession=c1, select it, pin the uid in pre and write the
+#     resume flag in post.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=c-prefix
+_user_dir="$RUN_USER_ROOT/$(id -u)"
+assert_eq "c-prefix id: _session_uid resolves uid" "$(id -u)" "$(_probe_session_uid)"
+run_hook pre suspend
+assert_file "c-prefix id: suspend handoff written" "$_user_dir/c640-kbd-backlight.suspend" "7"
+assert_file "c-prefix id: uid pinned in pre" "$STATE_DIR/session-uid" "$(id -u)"
+assert_log_matches "c-prefix id: selected session c1 on seat seat0" "$HOOK_ERR" "selected session c1 on seat seat0 for uid $(id -u)"
+assert_log_matches "c-prefix id: show-session c1 consulted" "$LOGINCTL_LOG" '^loginctl show-session c1$'
+assert_log_matches "c-prefix id: show-seat ActiveSession consulted" "$LOGINCTL_LOG" '^loginctl show-seat seat0 -p ActiveSession$'
+printf '0\n' > "$FAKE_SYSFS"
+: > "$HOOK_ERR"
+run_hook post suspend
+if grep -Eq '^[0-9]+ suspend$' "$_user_dir/c640-kbd-backlight.resume"; then
+    ok "c-prefix id: post wrote resume flag using pinned uid"
+else
+    bad "c-prefix id: no valid resume flag ($(cat "$_user_dir/c640-kbd-backlight.resume" 2> /dev/null))"
+fi
+assert_log_matches "c-prefix id: post used pinned uid dir" "$HOOK_ERR" "post handoff dir $_user_dir for uid $(id -u)"
+
+# 9o. Negative session-ID cases: special characters, reserved aliases and
+#     whitespace-bearing IDs must never be passed to `loginctl show-session`,
+#     and _session_uid must fail closed with 0 candidates / no handoff.
+reset_case
+HOOK_HANDOFF_DIR=""
+STUB_LOGINCTL_MODE=ambiguous-ids
+assert_eq "ambiguous ids: _session_uid returns empty" "" "$(_probe_session_uid)"
+assert_log_matches "ambiguous ids: 0-candidate WARN" "$HOOK_ERR" 'session selection fail-closed: no active local graphical user session'
+for _bad_id in 'c;1' '../x' 'self' 'auto' 'c 1'; do
+    if grep -Fqx "loginctl show-session $_bad_id" "$LOGINCTL_LOG"; then
+        bad "ambiguous ids: show-session called for bad id '$_bad_id'"
+    else
+        ok "ambiguous ids: show-session never called for '$_bad_id'"
+    fi
+done
+if grep -Eq '^loginctl show-session .*[[:space:]]' "$LOGINCTL_LOG"; then
+    bad "ambiguous ids: show-session called with a whitespace-bearing id"
+else
+    ok "ambiguous ids: show-session never called with whitespace in id"
+fi
+: > "$HOOK_ERR"
+run_hook pre suspend
+assert_absent "ambiguous ids: no suspend handoff" "$RUN_USER_ROOT/$(id -u)/c640-kbd-backlight.suspend"
+assert_absent "ambiguous ids: no cycle uid pinned" "$STATE_DIR/session-uid"
+assert_file "ambiguous ids: root state still saved" "$STATE_DIR/state" "7"
 
 # 10. No resolvable session user: handoff is skipped, root state still saved.
 reset_case
