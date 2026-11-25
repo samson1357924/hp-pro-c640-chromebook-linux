@@ -183,10 +183,17 @@ esac
 case "$*" in
     *GetActive*)
         # One-shot / Nth-probe epoch rotation: fires between a caller's
-        # after-sleep gate and its after-probe gate.
-        if [ -n "${STUB_EPOCH_ON_ACTIVE:-}" ] && [ -e "$STUB_EPOCH_ON_ACTIVE" ]; then
-            rm -f "$STUB_EPOCH_ON_ACTIVE"
-            _rotate_test_epoch
+        # after-sleep gate and its after-probe gate. The one-shot flag is
+        # claimed with a single rename: two concurrent gated guards could both
+        # pass an [ -e ] check and rotate the epoch twice (G3-23 parallel
+        # flake). Only the process that wins the mv rotates; the claim is
+        # per-PID so a loser can never remove a winner's marker.
+        if [ -n "${STUB_EPOCH_ON_ACTIVE:-}" ]; then
+            _claim="${STUB_EPOCH_ON_ACTIVE}.claimed.$$"
+            if mv -- "$STUB_EPOCH_ON_ACTIVE" "$_claim" 2> /dev/null; then
+                _rotate_test_epoch
+                rm -f -- "$_claim"
+            fi
         fi
         _epoch_on_nth_active
         case "$*" in
@@ -261,20 +268,32 @@ case "$*" in
         # Finding #4 "last check" injection: bump the generation on the FIRST
         # brightness read after STUB_BUMP_FLAG is armed.  A guard that decides
         # to write must notice this inside its WRITE_LOCK critical section.
-        if [ -f "${STUB_BUMP_FLAG:-/nonexistent}" ]; then
-            rm -f "${STUB_BUMP_FLAG}" 2> /dev/null || true
-            g="$(cat "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || echo 0)"
-            case "$g" in
-                '' | *[!0-9]*) g=0 ;;
-            esac
-            printf '%s\n' "$((g + 1))" > "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || true
-            printf 'BUMP-ON-GET %s\n' "$*" >> "$STUB_GDBUS_LOG"
+        # The one-shot flag is claimed by a single rename: two concurrent
+        # gated guards could both pass an [ -f ] check and bump twice (the
+        # same race fixed for STUB_EPOCH_ON_ACTIVE).  Only the process that
+        # wins the mv injects; the claim is per-PID so a loser can never
+        # remove a winner's marker.
+        if [ -n "${STUB_BUMP_FLAG:-}" ]; then
+            _claim="${STUB_BUMP_FLAG}.claimed.$$"
+            if mv -- "$STUB_BUMP_FLAG" "$_claim" 2> /dev/null; then
+                g="$(cat "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || echo 0)"
+                case "$g" in
+                    '' | *[!0-9]*) g=0 ;;
+                esac
+                printf '%s\n' "$((g + 1))" > "${RESTORE_GEN_FILE:-/nonexistent}" 2> /dev/null || true
+                printf 'BUMP-ON-GET %s\n' "$*" >> "$STUB_GDBUS_LOG"
+                rm -f -- "$_claim"
+            fi
         fi
         # Rotate the epoch on the first LED read after the probe: the guard's
-        # inside-WRITE_LOCK epoch gate is then the only witness left.
-        if [ -n "${STUB_EPOCH_ON_GET:-}" ] && [ -e "$STUB_EPOCH_ON_GET" ]; then
-            rm -f "$STUB_EPOCH_ON_GET"
-            _rotate_test_epoch
+        # inside-WRITE_LOCK epoch gate is then the only witness left.  Same
+        # atomic claim as above, so parallel guards cannot rotate twice.
+        if [ -n "${STUB_EPOCH_ON_GET:-}" ]; then
+            _claim="${STUB_EPOCH_ON_GET}.claimed.$$"
+            if mv -- "$STUB_EPOCH_ON_GET" "$_claim" 2> /dev/null; then
+                _rotate_test_epoch
+                rm -f -- "$_claim"
+            fi
         fi
         printf '(%s,)\n' "$(cat "$STUB_RAW_FILE" 2> /dev/null || printf '%s' "${STUB_KBD_RAW:-42}")"
         exit 0
@@ -343,14 +362,17 @@ case "$wait_secs" in
 esac
 # Epoch fault injection at the retry's STATE_LOCK acquisition (fd 202, -n):
 # after the after-sleep and after-probe gates, before the inside-lock gate.
+# Atomic rename claim: a parallel retry must not rotate the epoch twice.
 if [ "$op" = "n" ] && [ "$fd" = "${STUB_EPOCH_ON_LOCK_FD:-none}" ] \
-    && [ -n "${STUB_EPOCH_ON_LOCK_FLAG:-}" ] \
-    && [ -e "$STUB_EPOCH_ON_LOCK_FLAG" ]; then
-    rm -f "$STUB_EPOCH_ON_LOCK_FLAG"
-    _ep="${C640_KBD_RESTORE_RETRY_EPOCH:-/nonexistent}"
-    _e="$(cat "$_ep" 2> /dev/null || echo 0)"
-    case "$_e" in '' | *[!0-9]*) _e=0 ;; esac
-    printf '%s\n' "$((_e + 1))" > "$_ep" 2> /dev/null || true
+    && [ -n "${STUB_EPOCH_ON_LOCK_FLAG:-}" ]; then
+    _claim="${STUB_EPOCH_ON_LOCK_FLAG}.claimed.$$"
+    if mv -- "$STUB_EPOCH_ON_LOCK_FLAG" "$_claim" 2> /dev/null; then
+        _ep="${C640_KBD_RESTORE_RETRY_EPOCH:-/nonexistent}"
+        _e="$(cat "$_ep" 2> /dev/null || echo 0)"
+        case "$_e" in '' | *[!0-9]*) _e=0 ;; esac
+        printf '%s\n' "$((_e + 1))" > "$_ep" 2> /dev/null || true
+        rm -f -- "$_claim"
+    fi
 fi
 # 50 polls per second (0.02s each).
 polls=$((wait_secs * 50))
@@ -614,10 +636,17 @@ reset_case() {
     # Finding #4 state: write lock, guard marker, Tier-2 sentinel and the
     # controllable sleep gate.  Without this cleanup a gated guard from a
     # previous case can wedge every later case.
+    # One-shot injection flags and the per-PID claim markers left by their
+    # atomic mv renames (a winner killed mid-injection leaves one behind).
+    # $TMP_DIR is test-private, so the catch-all glob is safe and also covers
+    # the date-stale flag whose path varies from case to case.
     rm -f "$WRITE_LOCK_FILE" "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL_FILE" \
         "$STUB_SLEEP_STARTED" "$STUB_SLEEP_RELEASE" "$STUB_SLEEP_RELEASE".* \
-        "$STUB_BUMP_FLAG" \
-        "$STUB_EPOCH_ON_ACTIVE" "$STUB_EPOCH_ON_GET" "$STUB_EPOCH_ON_LOCK_FLAG" \
+        "$STUB_BUMP_FLAG" "$STUB_BUMP_FLAG".claimed.* \
+        "$STUB_EPOCH_ON_ACTIVE" "$STUB_EPOCH_ON_ACTIVE".claimed.* \
+        "$STUB_EPOCH_ON_GET" "$STUB_EPOCH_ON_GET".claimed.* \
+        "$STUB_EPOCH_ON_LOCK_FLAG" "$STUB_EPOCH_ON_LOCK_FLAG".claimed.* \
+        "$TMP_DIR"/*.claimed.* \
         "$STUB_EPOCH_ACTIVE_COUNT_FILE" \
         "$STUB_RETRY_GATE" "$STUB_RETRY_RELEASE" "$STUB_RETRY_STARTED" \
         "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE" \
@@ -778,11 +807,15 @@ cat() {
 date() {
     # One-shot "time jumped" injection for the guard evidence TTL: the first
     # +%s query with the marker present returns a time far in the future.
-    if [ "${1:-}" = "+%s" ] && [ -n "${STUB_GEN_DATE_STALE:-}" ] \
-        && [ -e "$STUB_GEN_DATE_STALE" ]; then
-        rm -f "$STUB_GEN_DATE_STALE"
-        builtin printf '%s\n' "$(($(command date +%s) + ${STUB_GEN_DATE_STALE_SECS:-10}))"
-        return 0
+    # Claim it by an atomic rename (command mv bypasses the G3 mv fault stub):
+    # two gated guards must not both pass an [ -e ] check and inject twice.
+    if [ "${1:-}" = "+%s" ] && [ -n "${STUB_GEN_DATE_STALE:-}" ]; then
+        _claim="${STUB_GEN_DATE_STALE}.claimed.$$"
+        if command mv -- "$STUB_GEN_DATE_STALE" "$_claim" 2> /dev/null; then
+            command rm -f -- "$_claim"
+            builtin printf '%s\n' "$(($(command date +%s) + ${STUB_GEN_DATE_STALE_SECS:-10}))"
+            return 0
+        fi
     fi
     command date "$@"
 }
@@ -4017,7 +4050,9 @@ export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
 assert_file "G3-20: epoch rotated at the probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
 assert_file "G3-20: revoked blank guard forced no 0" "$RAW_FILE" "30"
 assert_eq "G3-20: revoked blank guard issued no write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
-if grep -Fq 'blank guard +0.25s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
+# Either gated delay can reach the probe gate first; the witness is the
+# after-probe gate itself, not a specific delay.
+if grep -Eq 'blank guard (\+0\.25|\+1\.0)s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
     ok "G3-20: after-probe epoch gate is the witness"
 else
     bad "G3-20: no after-probe epoch log (stderr: $(cat "$GUARD_ERR"))"
@@ -4085,7 +4120,9 @@ release_guards
 assert_file "G3-23: epoch rotated at the probe" "$RESTORE_RETRY_EPOCH_FILE" "2"
 assert_file "G3-23: revoked guard wrote nothing" "$RAW_FILE" "10"
 assert_eq "G3-23: revoked guard issued no D-Bus write" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
-if grep -Fq 'unblank guard +0.3s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
+# Either gated delay can reach the probe gate first; the witness is the
+# after-probe gate itself, not a specific delay.
+if grep -Eq 'unblank guard (\+0\.3|\+0\.9)s: retry epoch superseded after probe; guard cancelled' "$GUARD_ERR"; then
     ok "G3-23: after-probe epoch gate is the witness"
 else
     bad "G3-23: no after-probe epoch log (stderr: $(cat "$GUARD_ERR"))"

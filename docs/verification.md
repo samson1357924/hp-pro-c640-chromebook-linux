@@ -21,7 +21,7 @@
 | **Desktop** | GNOME (gnome-shell + GDM), Wayland |
 | **Audio stack** | PipeWire `1.6.2`, WirePlumber `0.5.13`, alsa-ucm-conf `1.2.15.3` |
 | **Fingerprint stack** | fprintd `1.94.5`, libfprint-2 `1.95.1` (custom build with `crfpmoc`) |
-| **Evidence bundle** | `c640-diagnostic-20260815_152233.tar.gz` (collected 2026-08-15) |
+| **Evidence bundle** | `c640-diagnostic-20260815_152248.tar.gz` (collected 2026-08-15) |
 
 ---
 
@@ -125,7 +125,7 @@ brightness = `0` (screen already blank), ScreenSaver = `true`.
 | :--- | :--- | :--- |
 | `keyboard/tests/kbd-backlight-daemon-test.sh` | **688 passed, 0 failed** | stub-based unit suite |
 | `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **234 passed, 0 failed** | stub-based unit suite |
-| `tests/rollback-test.sh` | **2233 passed, 0 failed** | root required |
+| `tests/rollback-test.sh` | **2248 passed, 0 failed** | root required |
 | `keyboard/tests/loginctl-contract-check.sh` | **CONTRACT OK** (local systemd host) | new read-only schema check: `Session.User` = `User=<numeric uid>`, `UID=` only on the User object, alphanumeric session IDs; prints `SKIP` on a non-systemd host — **not** a real-S3 test |
 | `keyboard/tests/keyd-dualrole-uinput.py` | **22 PASS** | 2026-10-31 historical live run (22 PASS), real virtual uinput / not a stub — **not a current-HEAD live run**; after `acbc3b9` the chord-guard expectation changed and only the self-test was re-run on HEAD |
 
@@ -253,7 +253,7 @@ This fork adds five commits on top of the fifteenth re-review:
   protected.
 
 Current totals: daemon **688 passed, 0 failed**, sleep hook **234 passed, 0 failed**,
-rollback **2233 passed, 0 failed**; keyd self-test **34 cases**,
+rollback **2248 passed, 0 failed**; keyd self-test **34 cases**,
 `check-top-row-hwdb.py` `SELF-TEST=PASS`, `detect-hardware.sh` **28 assertions**,
 contract check `CONTRACT OK` locally. CI was green (7 workflows) at the pre-push
 commit `2588eb5`; the workflows must be re-run after this push. **Real S3 on the
@@ -448,7 +448,7 @@ Commits: `751c609`, `6774033`, `69712a4`, `dab9436`.
   uninstall cannot inherit it. New **PAM-9** regression injects fail=1 first, then
   deliberately poisons the parent environment with fail=0 and verifies a clean
   rollback with byte-identical PAM files (+5 assertions, bringing the total to
-  **1392** at that point; the current rollback suite is **2233** cases).
+  **1392** at that point; the current rollback suite is **2248** cases).
 
 #### Twelfth re-review fixes (2026-11-24, unit-tested)
 
@@ -568,7 +568,7 @@ as "provided for your distro, verify on your own hardware":
 | **keyd keyboard config** | `keyboard/keyd/cros.conf` | 🟢 installed 2026-10-31; `overloadt2` verified with the virtual uinput test (tap→CapsLock, hold→bare Meta, Search+top row→F1-F10) and with real-key passive capture on the same day |
 | **PipeWire phantom-jack patch** | `audio/patches/acp-phantom-jack.patch` | ❌ current PipeWire 1.6.2 already handles jack state (patch is for older versions) |
 | **Touchscreen / touchpad** | stock kernel drivers (`elan_i2c`) | ⚠️ modules present (`i2c-ELAN0000/0001`), but **no functional gesture test in evidence** |
-| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (688 daemon + 234 hook + 2233 rollback, the last as root); the **2026-11-22** full real S3 freeze/thaw (locked defer + unlocked restore) is historical evidence from the old hook — **current HEAD is pending on the target machine** (see §3) |
+| **Keyboard backlight sync (ScreenBlank)** | `keyboard/c640-kbd-backlight-sync`, `61-chromeos-kbd-backlight.rules`, `c640-kbd-backlight-sync.service`, `c640-kbd-backlight-sleep.sh` | 🟢 installed + hardware-verified 2026-10-31 (event-driven `gdbus`/`ScreenSaver` 2→0→2, `--test-blank`/`--test-unblank` PASS, sysfs `0660 root:plugdev`, sleep hook save/restore 6→0→6 — a pre-refactor direct invocation; the current hook is a pure handoff writer — see §3). CI asserts deployed daemon/unit/hook are byte-identical to the repo and runs shell unit tests (688 daemon + 234 hook + 2248 rollback, the last as root); the **2026-11-22** full real S3 freeze/thaw (locked defer + unlocked restore) is historical evidence from the old hook — **current HEAD is pending on the target machine** (see §3) |
 | **Sleep-wake via key/fingerprint** | stock ACPI | ⚠️ lid-open S3 resume verified (journal `PM: suspend exit`); key/fingerprint wake untested |
 | **Known issue — dark panel after lid open** | i915 PSR/FBC/GuC quirks (see §15) | 🟡 quirk installed but **did not fix it**: screen stays dark until a keypress after lid-open S3 resume — user accepted, remedies still open |
 | **Arch / Fedora / openSUSE / NixOS packaging** | `fingerprint/packaging/PKGBUILD`, `*.spec`, distro docs | ❌ only **Ubuntu 26.04** hardware-tested; CI runs the installer's source build in Arch/Fedora/Ubuntu containers, but the `PKGBUILD`/`.spec` packaging definitions themselves are **not exercised by CI** |
@@ -655,7 +655,7 @@ cat /sys/power/mem_sleep
   real-S3 run since 2026-11-22; 22 PASS keyd live run remains historical, `MSC_SCAN` still
   inferred, Tier 2 not implemented),
   2026-11-25 (sixteenth re-review — this fork: five commits `b572f35`, `a0a8f00`, `fca53c2`,
-  `4ac9b8f`, `a4a3fcc` summarized above; current totals rollback 2233 / daemon 688 / hook 234,
+  `4ac9b8f`, `a4a3fcc` summarized above; current totals rollback 2248 / daemon 688 / hook 234,
   0 failures; local contract check `CONTRACT OK`; 7 workflows green at pre-push `2588eb5`,
   re-run pending after this push; **new selector/root boundary not verified by real S3 on the
   target machine**; 22 PASS keyd live run remains historical, Tier 2 not implemented)

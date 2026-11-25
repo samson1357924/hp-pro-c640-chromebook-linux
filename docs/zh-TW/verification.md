@@ -20,7 +20,7 @@
 | **桌面環境** | GNOME (gnome-shell + GDM)，Wayland |
 | **音訊堆疊** | PipeWire `1.6.2`、WirePlumber `0.5.13`、alsa-ucm-conf `1.2.15.3` |
 | **指紋堆疊** | fprintd `1.94.5`、libfprint-2 `1.95.1`（內建 `crfpmoc` 的自訂建置） |
-| **證據包** | `c640-diagnostic-20260815_152233.tar.gz`（2026-08-15 收集） |
+| **證據包** | `c640-diagnostic-20260815_152248.tar.gz`（2026-08-15 收集） |
 
 ---
 
@@ -118,7 +118,7 @@
 | :--- | :--- | :--- |
 | `keyboard/tests/kbd-backlight-daemon-test.sh` | **688 通過、0 失敗** | 以 stub 為基礎的單元測試 |
 | `keyboard/tests/kbd-backlight-sleep-hook-test.sh` | **234 通過、0 失敗** | 以 stub 為基礎的單元測試 |
-| `tests/rollback-test.sh` | **2233 通過、0 失敗** | 需 root |
+| `tests/rollback-test.sh` | **2248 通過、0 失敗** | 需 root |
 | `keyboard/tests/loginctl-contract-check.sh` | **CONTRACT OK**（本機 systemd host） | 新的唯讀 schema 檢查：`Session.User` 為 `User=<數字 uid>`、`UID=` 只屬 User object、session ID 可為英數；非 systemd host 印出 `SKIP`——**不是**真實 S3 測試 |
 | `keyboard/tests/keyd-dualrole-uinput.py` | **22 PASS** | 2026-10-31 歷史 live run（22 PASS），真實 virtual uinput／非 stub——**並非目前 HEAD 的 live run**；`acbc3b9` 後 chord guard 預期已變更，HEAD 上只重跑自我測試 |
 
@@ -229,7 +229,7 @@ sleep hook **161 通過、0 失敗**、rollback **2137 通過、0 失敗**；key
   但最終 component 仍受保護。
 
 目前總數：daemon **688 通過、0 失敗**、sleep hook **234 通過、0 失敗**、rollback
-**2233 通過、0 失敗**；keyd self-test **34 個案例**、`check-top-row-hwdb.py` `SELF-TEST=PASS`、
+**2248 通過、0 失敗**；keyd self-test **34 個案例**、`check-top-row-hwdb.py` `SELF-TEST=PASS`、
 `detect-hardware.sh` **28 個斷言**、本機 contract check `CONTRACT OK`。CI 在 push 前的
 `2588eb5` 全綠（7 個 workflows），本輪 push 後必須重跑。**最新 HEAD 的真實 S3 待目標機
 執行**（見上方 checklist）；**22 PASS** 的 keyd virtual-uinput 是 2026-10-31 的歷史 live
@@ -393,7 +393,7 @@ Commits: `751c609`, `6774033`, `69712a4`, `dab9436`.
   的明確傳參，且只在 sandbox snippet 內 export，後續 uninstall 不會繼承。新增
   **PAM-9** 回歸先注入 fail=1，再故意把父環境污染為 fail=0，驗證 rollback 乾淨完成、
   PAM 檔案位元組完全相同（+5 assertions，當時總數來到 **1392**；現行 rollback suite 為
-  **2233** 個案例）。
+  **2248** 個案例）。
 
 #### 第十二次 re-review 修復（2026-11-24，僅單元測試）
 
@@ -503,7 +503,7 @@ E2E 情境：詳見 .github/workflows/install-smoke.yml（baseline / sensitivity
 | **keyd 鍵盤設定** | `keyboard/keyd/cros.conf` | 🟢 2026-10-31 已安裝；`overloadt2` 以虛擬 uinput 測試（輕點→CapsLock、長按→乾淨 Meta、Search+頂排→F1-F10）與同日實體按鍵被動擷取驗證 |
 | **PipeWire phantom-jack 修補** | `audio/patches/acp-phantom-jack.patch` | ❌ 目前 PipeWire 1.6.2 已內建處理（patch 供舊版使用） |
 | **觸控螢幕 / 觸控板** | 內建核心驅動（`elan_i2c`） | ⚠️ 模組存在（`i2c-ELAN0000/0001`），但**無手勢測試證據** |
-| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（688 daemon + 234 hook + 2233 rollback，最後一項需 root）；**2026-11-22** 的完整真實 S3 freeze/thaw（鎖定延後 + 解鎖還原）是舊 hook 的歷史證據——**現行 HEAD 待目標機執行**（見 §3） |
+| **鍵盤背光同步（ScreenBlank）** | `keyboard/c640-kbd-backlight-sync`、`61-chromeos-kbd-backlight.rules`、`c640-kbd-backlight-sync.service`、`c640-kbd-backlight-sleep.sh` | 🟢 2026-10-31 已安裝並實機驗證（事件驅動 `gdbus`/`ScreenSaver` 2→0→2、`--test-blank`/`--test-unblank` PASS、sysfs `0660 root:plugdev`、sleep hook 存還原 6→0→6——重構前的直接呼叫結果；現行 hook 為純 handoff 寫入者，見 §3）。CI 檢查部署的 daemon/unit/hook 與 repo 完全一致並執行 shell 單元測試（688 daemon + 234 hook + 2248 rollback，最後一項需 root）；**2026-11-22** 的完整真實 S3 freeze/thaw（鎖定延後 + 解鎖還原）是舊 hook 的歷史證據——**現行 HEAD 待目標機執行**（見 §3） |
 | **按鍵/指紋喚醒休眠** | 內建 ACPI | ⚠️ 開蓋 S3 喚醒已驗證（journal `PM: suspend exit`）；按鍵/指紋喚醒未測試 |
 | **已知問題 — 開蓋後黑屏** | i915 PSR/FBC/GuC 調校（見 §15） | 🟡 調校已安裝但**未解決**：開蓋 S3 喚醒後螢幕仍黑到按鍵才亮——使用者已接受，對策仍未定案 |
 | **Arch / Fedora / openSUSE / NixOS 打包** | `fingerprint/packaging/PKGBUILD`、`*.spec`、發行版文件 | ❌ 僅 **Ubuntu 26.04** 實測；CI 會在 Arch/Fedora/Ubuntu 容器執行安裝器的原始碼建置，但 **PKGBUILD/`.spec` 打包定義本身並未由 CI 驗證** |
@@ -579,7 +579,7 @@ cat /sys/power/mem_sleep
   rollback suite 2137 / daemon 539 / hook 161，0 失敗；2026-11-22 後仍無新真實 S3 run；
   22 PASS keyd live run 仍為歷史結果，`MSC_SCAN` 仍為推論，Tier 2 未實作），
   2026-11-25（第十六次 re-review——本次 fork：五個 commit `b572f35`、`a0a8f00`、`fca53c2`、
-  `4ac9b8f`、`a4a3fcc`（見上方摘要）；現行總數 rollback 2233 / daemon 688 / hook 234，
+  `4ac9b8f`、`a4a3fcc`（見上方摘要）；現行總數 rollback 2248 / daemon 688 / hook 234，
   0 失敗；本機 contract check `CONTRACT OK`；push 前 `2588eb5` 的 7 個 workflows 全綠，
   本輪 push 後需重跑；**新 selector／root 邊界尚未在目標機以真實 S3 驗證**；22 PASS keyd
   live run 仍為歷史結果，Tier 2 未實作）

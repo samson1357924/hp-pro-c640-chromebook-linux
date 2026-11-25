@@ -552,7 +552,7 @@ sleep hook 測試有 234 個案例（純 handoff、`0600`/`chown`/
 選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
 0700 runtime dir 檢查、不寫 LED）。另有唯讀的
 `keyboard/tests/loginctl-contract-check.sh`（systemd host 為 `CONTRACT OK`、其他為 `SKIP`
-——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2233 個案例，包含損毀
+——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2248 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
@@ -570,7 +570,7 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 個案例
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 個案例
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
-sudo bash tests/rollback-test.sh                       # 2233 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 2248 個案例（需 root）
 ```
 
 ---

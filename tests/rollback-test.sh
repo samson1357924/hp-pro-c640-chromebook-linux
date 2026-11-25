@@ -13616,6 +13616,75 @@ EOF
     done
 }
 
+# PAM-64 (final re-review P1): a genuinely fresh install with NO live savedir
+# and NO sidecar must publish all three halves with an ABSENT entry set. With
+# allow_absent=1, find on a missing directory returns a valid zero-record
+# buffer; classifying that as empty:0 used to break the 0:absent | 1:empty |
+# 1:nonempty invariant, abort the snapshot and strand the whole install.
+# PAM-41/no_savedir only reached this state AFTER a first install, whose
+# sidecar short-circuits the second run before _pam_snapshot_common_state().
+test_pam_64_fresh_install_without_savedir() {
+    local s state log
+
+    s="$(setup_pam_sandbox fresh-no-savedir)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    local before sel_before
+    sel_before="$(pam_selection "$s")"
+    # Fresh state: remove the whole directory and any pre-existing sidecar /
+    # snapshots. Nothing may short-circuit the first-wins publication path.
+    rm -rf "$s/savedir" "$s/manifest"/pam-selection*
+    # Capture the oracle AFTER removing savedir: an absent savedir must stay
+    # absent after uninstall (there are no profile bytes to restore).
+    # pam_stack_fingerprint ends with a `-f` probe whose last iteration is
+    # false for a missing savedir; `|| true` keeps the captured bytes valid.
+    before="$(pam_stack_fingerprint "$s" || true)"
+    [ ! -e "$s/savedir" ] && ok \
+        || fail "PAM-64: the live savedir fixture was really removed"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-64: no sidecar before the fresh install"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-64: fresh install with no savedir/sidecar rc 0"
+    [ -f "$s/manifest/pam-selection.common/state" ] && ok \
+        || fail "PAM-64: .common/state published"
+
+    # Independent oracle: read the manifest state DIRECTLY from the sandbox
+    # (never through lib/pam.sh) and require the authoritative triplet.
+    state="$(cat "$s/manifest/pam-selection.common/state" 2> /dev/null || echo MISSING)"
+    assert_contains 'savedir-present=0' "$state" \
+        "PAM-64: state records the absent live savedir"
+    assert_contains 'savedir-entries=absent:0:-' "$state" \
+        "PAM-64: state records absent:0:- (not empty:0)"
+    assert_not_contains 'savedir-entries=empty:0' "$state" \
+        "PAM-64: no empty entry-set classification"
+    assert_eq "600:0:0" \
+        "$(stat -c '%a:%u:%g' -- "$s/manifest/pam-selection.common/savedir.entries" 2> /dev/null || echo MISSING)" \
+        "PAM-64: absent entry-set manifest is published root:0600"
+    assert_eq "0" \
+        "$(wc -c < "$s/manifest/pam-selection.common/savedir.entries" 2> /dev/null || echo MISSING)" \
+        "PAM-64: absent entry-set manifest is empty"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_not_contains 'Inconsistent savedir snapshot' "$log" \
+        "PAM-64: no inconsistent-snapshot refusal"
+
+    : > "$s/tool.log"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-64: uninstall rc 0 with an absent savedir"
+    assert_eq "$sel_before" "$(pam_selection "$s")" \
+        "PAM-64: original selection restored"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-64: full stack restored byte-for-byte"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-64: sidecar consumed"
+    [ ! -e "$s/manifest/pam-selection.common" ] && ok \
+        || fail "PAM-64: .common consumed"
+}
+
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -13679,6 +13748,7 @@ test_pam_60_symlink_owner_restored
 test_pam_61_savedir_entry_set_fail_closed
 test_pam_63_symlink_to_dir_restore_uses_mv_T
 test_pam_62_converge_rc_compatibility
+test_pam_64_fresh_install_without_savedir
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

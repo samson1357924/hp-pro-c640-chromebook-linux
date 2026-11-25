@@ -950,7 +950,17 @@ _pam_snapshot_common_state() {
         log_error "Could not enumerate the $_PAM_SAVED_DIR entry set; refusing to snapshot an incomplete saved profile directory."
         rc=1
     }
-    if [ -n "$entries_list" ]; then
+    # The directory probe above is the AUTHORITATIVE savedir state. An absent
+    # directory yields a valid, zero-record buffer from allow_absent=1; that is
+    # an ABSENT entry set, never an EMPTY one (which means "directory exists
+    # but holds no profiles"). Keep the empty manifest file so the reader can
+    # still verify it, but record absent:0:- so the 0:absent case below and the
+    # final savedir entry-set check agree with the published filesystem state.
+    if [ "$saved_present" -eq 0 ]; then
+        entries_class="absent"
+        entries_count=0
+        entries_sha="-"
+    elif [ -n "$entries_list" ]; then
         entries_count="$(_pam_count_nul_records "$entries_list")"
         entries_sha="$(sha256sum -- "$entries_list" | awk '{print $1}')"
         if [ "$entries_count" -eq 0 ]; then
@@ -958,6 +968,8 @@ _pam_snapshot_common_state() {
         else
             entries_class="nonempty"
         fi
+    fi
+    if [ -n "$entries_list" ]; then
         if ! sudo install -m 600 -- "$entries_list" "$stage/savedir.entries"; then
             log_error "Could not install the savedir entry-set manifest into the common snapshot."
             rc=1

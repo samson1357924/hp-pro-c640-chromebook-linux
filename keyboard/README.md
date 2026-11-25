@@ -649,7 +649,7 @@ session IDs) with root-journal fail-closed warnings, uid pin and reuse,
 0700 runtime-dir gate, no LED writes). The separate
 `keyboard/tests/loginctl-contract-check.sh` is a read-only schema check (`CONTRACT OK`
 on a systemd host, `SKIP` otherwise — not a real-S3 test). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 2233 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 2248 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -670,7 +670,7 @@ Ubuntu 24.04 container E2E for the PAM round-trip.
 bash keyboard/tests/kbd-backlight-daemon-test.sh       # 688 cases
 bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 234 cases
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK / SKIP (read-only)
-sudo bash tests/rollback-test.sh                       # 2233 cases (root)
+sudo bash tests/rollback-test.sh                       # 2248 cases (root)
 ```
 
 ---
