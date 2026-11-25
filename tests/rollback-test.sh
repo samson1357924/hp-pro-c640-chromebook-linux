@@ -9504,6 +9504,21 @@ for _a in "$@"; do
     [ "$_a" = "-i" ] && _mutation=1
 done
 [ "$_mutation" = "1" ] && printf '%s\n' "$*" >> "${STUB_SED_LOG:?PAM sed stub missing log}"
+# Phase A mutation seam: corrupt a line-deleting sed by appending ONE extra
+# deletion, so T2 must detect the lost non-fp line.
+if [ "${STUB_SED_CORRUPT:-0}" = "1" ] && [ "$_mutation" = "1" ]; then
+    _has_d=0
+    for _a in "$@"; do
+        case "$_a" in *d) _has_d=1 ;; esac
+    done
+    if [ "$_has_d" = "1" ]; then
+        # sed's LAST argument is the target file; insert one extra deletion.
+        _n=$#
+        _m=$((_n - 1))
+        _file="${!_n}"
+        set -- "${@:1:_m}" -e '2d' "$_file"
+    fi
+fi
 for _a in "$@"; do
     case "$_a" in
         /etc/pam.d/*|*/etc/pam.d/*)
@@ -9834,6 +9849,27 @@ fi
 exec /usr/bin/python3 "$@"
 EOF
 
+    # Phase A P2 (T2 parse->snapshot drift): the strip helper captures the
+    # dev:inode with `stat -c %d:%i` immediately before snapshotting. Mutate the
+    # LIVE file at that exact point so the byte-compare must notice the drift.
+    cat > "$s/stub/stat" << 'EOF'
+#!/usr/bin/env bash
+if [ "${STUB_STAT_DRIFT:-0}" = "1" ] && [ ! -e "${STUB_STAT_DRIFT_MARK:?}" ]; then
+    for _a in "$@"; do
+        if [ "$_a" = '%d:%i' ]; then
+            for _p in "$@"; do
+                case "$_p" in
+                    */common-auth)
+                        printf '%s\n' "$_p" > "$STUB_STAT_DRIFT_MARK"
+                        printf 'auth required pam_drift.so\n' >> "$_p"
+                        ;;
+                esac
+            done
+        fi
+    done
+fi
+exec /usr/bin/stat "$@"
+EOF
     chmod +x "$s/stub/"*
     PAM_TEST_SANDBOXES+=("$s")
     printf '%s\n' "$s"
@@ -9894,10 +9930,13 @@ EOF
     esac
     case "$common_mode" in
         fp)
+            # Phase A P1: fp is BEFORE the jump source, so the `success=1`
+            # landing (pam_permit.so) is identical with and without fp.
             cat > "$s/pam/common-auth" << 'EOF'
-auth [success=1 default=ignore] pam_unix.so nullok
 auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
 auth requisite pam_deny.so
+auth required pam_permit.so
 EOF
             ;;
         *) ;; # no common-auth file in the sandbox
@@ -9911,9 +9950,15 @@ EOF
 pam_write_full_stack() {
     local s="$1" t
     mkdir -p "$s/savedir" "$s/pam"
-    printf 'Module: unix\n[success=1 default=ignore]\tpam_unix.so nullok\nModule: fprintd\n[success=end default=ignore]\tpam_fprintd.so max-tries=1 timeout=10\n' \
+    # Phase A P1: the standard Debian shape puts the fp profile BEFORE the
+    # `[success=1 default=ignore]` pam_unix jump source. The landing is the
+    # non-fp pam_permit.so both before and after removing fp, so this fixture
+    # exercises the intended strip/convergence behaviour without changing
+    # authentication control flow. Every module in common-auth is declared in
+    # savedir/auth so the tool's diff_profiles() model still succeeds.
+    printf 'Module: unix\n[success=1 default=ignore]\tpam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\nModule: fprintd\n[success=end default=ignore]\tpam_fprintd.so max-tries=1 timeout=10\n' \
         > "$s/savedir/auth"
-    printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth sufficient pam_fprintd.so\n' \
+    printf 'auth sufficient pam_fprintd.so\nauth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n' \
         > "$s/pam/common-auth"
     printf '# sudo PAM - no fingerprint line\n@include common-auth\n@include common-account\n' \
         > "$s/pam/sudo"
@@ -9971,6 +10016,7 @@ pam_record_count() {
 # the sandbox snippet so a re-inject fault cannot leak into later cases.
 run_pam_install() {
     local sandbox="$1" distro="$2" fail_rollback="${3:-0}" rewrite_common="${4:-0}" reinject_fp="${5:-0}"
+    local sed_corrupt="${6:-0}" stat_drift="${7:-0}"
     export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     export CROS_ENABLEMENT_PAM_SAVED_DIR="$sandbox/savedir"
     export CROS_ENABLEMENT_PAM_SELECTION_FILE="$sandbox/manifest/pam-selection"
@@ -9983,11 +10029,13 @@ run_pam_install() {
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_DEBCONF_SEEN="$2/debconf/seen"
         export STUB_FAIL_ROLLBACK_PY="$4" STUB_PAM_REWRITE_COMMON="$5" STUB_PAM_REINJECT_FP="$6"
+        export STUB_SED_CORRUPT="$7" STUB_STAT_DRIFT="$8"
+        export STUB_STAT_DRIFT_MARK="$2/stat-drift.mark"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         configure_pam_fingerprint
         printf "%s\n" "$?" > "$2/install.rc"
-    ' "$distro" "$fail_rollback" "$rewrite_common" "$reinject_fp"
+    ' "$distro" "$fail_rollback" "$rewrite_common" "$reinject_fp" "$sed_corrupt" "$stat_drift"
 }
 
 # Uninstall step: mirror _uninstall_fp_body() ordering — rollback FIRST, then
@@ -10333,8 +10381,8 @@ test_pam_8_all_common_files_tracked_and_converged() {
         "PAM-8: exactly one --package convergence call on install"
     assert_eq "0" "$(grep -cF -- 'pam-auth-update --remove' "$s/tool.log")" \
         "PAM-8: --remove is never called"
-    assert_eq "1" "$(grep -cF -- '/pam_fprintd\.so/d' "$s/sed.log")" \
-        "PAM-8: one direct fp strip on common-auth"
+    assert_eq "1" "$(grep -cE '^-i -e [0-9]+(,[0-9]+)?d ' "$s/sed.log")" \
+        "PAM-8: one direct, line-numbered fp strip on common-auth"
     assert_eq "3" "$sed_after_install" \
         "PAM-8: three install sed calls (1 common strip + 2 sudo)"
     assert_eq "6" "$(pam_record_count "$s")" \
@@ -13176,12 +13224,28 @@ test_pam_57_final_verify_rejects_common_and_savedir_mismatches() {
     done
 }
 
-# Independent root-side oracle: an ACTIVE pam_fprintd.so module line in the
-# given file. Deliberately the same shape as the product's regex, but it reads
-# the sandbox file directly (never through lib/pam.sh) so a fail-open mutation
-# of the product's grep cannot make the assertion vacuous.
+# Independent root-side oracle. tests/pam_rule_oracle.py is a standalone Python
+# parser: it NEVER sources lib/pam.sh, so a fail-open mutation of the product's
+# awk parser/sed cannot make the assertion vacuous. active-fp rc 0 = an active
+# fp MODULE exists, 1 = none, 2 = unreadable/uncertain (never "safe").
+_PAM_ORACLE="$REPO_ROOT/tests/pam_rule_oracle.py"
 _pam_common_active_fp() {
-    grep -E -q -- '^[[:space:]]*[^#[:space:]].*pam_fprintd\.so' "$1"
+    python3 "$_PAM_ORACLE" active-fp "$1"
+}
+_pam_oracle_nonfp() {
+    python3 "$_PAM_ORACLE" nonfp "$1"
+}
+_pam_oracle_fp_lines() {
+    python3 "$_PAM_ORACLE" fp-lines "$1"
+}
+_pam_oracle_expected() {
+    python3 "$_PAM_ORACLE" strip "$1"
+}
+_pam_oracle_uncertain() {
+    python3 "$_PAM_ORACLE" uncertain "$1"
+}
+_pam_oracle_landings() {
+    python3 "$_PAM_ORACLE" landings "$1"
 }
 
 # PAM-58 (re-review #16 finding #2): a symlinked common-* with an ACTIVE
@@ -13685,6 +13749,740 @@ test_pam_64_fresh_install_without_savedir() {
         || fail "PAM-64: .common consumed"
 }
 
+# ---------------------------------------------------------------------------
+# Re-review #17 finding #1: PAM-aware parser regressions (PAM-65..76).
+# Every case uses the INDEPENDENT Python oracle (never lib/pam.sh) both to prove
+# positive detection (a real fp module exists / is gone) and negative byte
+# preservation (unrelated auth rules survive byte-for-byte).
+# ---------------------------------------------------------------------------
+
+# PAM-65: a trailing inline comment mentioning pam_fprintd.so must NOT make a
+# pam_unix.so rule a fingerprint rule (the original P1 blocker).
+test_pam_65_inline_comment_is_not_a_module() {
+    local s before expected actual log
+    s="$(setup_pam_sandbox inline-comment)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable
+EOF
+    python3 "$_PAM_ORACLE" active-fp "$s/pam/common-auth" && ok \
+        || fail "PAM-65: the fixture really has one active fp module"
+    cp -a "$s/pam/common-auth" "$s/before"
+    before="$(cat "$s/pam/common-auth")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-65: install rc 0 with an inline fp comment"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-65: the real fp module survived"
+    else
+        ok
+    fi
+    expected="$(_pam_oracle_expected "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-65: the pam_unix rule with its inline comment is byte-identical"
+    assert_contains "fallback when pam_fprintd.so unavailable" "$actual" \
+        "PAM-65: the unrelated rule was not deleted"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "non-fp bytes verified byte-identical" "$log" \
+        "PAM-65: T2 preservation is logged"
+    assert_eq "$before" "$(cat "$s/before")" "PAM-65: fixture copy untouched"
+}
+
+# PAM-66: module ARGUMENTS that mention pam_fprintd.so are not a module path.
+test_pam_66_module_args_are_not_a_module() {
+    local s expected actual
+    s="$(setup_pam_sandbox module-args)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth required pam_unix.so use_first_pass pam_fprintd.so fallback
+EOF
+    cp -a "$s/pam/common-auth" "$s/before"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-66: install rc 0"
+    expected="$(_pam_oracle_expected "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-66: the argument-only mention survives byte-for-byte"
+    assert_contains "use_first_pass pam_fprintd.so fallback" "$actual" \
+        "PAM-66: module args were preserved"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-66: the real fp module survived"
+    else
+        ok
+    fi
+}
+
+# PAM-67: absolute module path is a real fp rule; pure comments and inline
+# comments on other rules are preserved in the same file.
+test_pam_67_absolute_path_and_mixed_comments() {
+    local s expected actual
+    s="$(setup_pam_sandbox absolute-path)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+# pam_fprintd.so is documented in this comment
+auth [success=end default=ignore] /lib/security/pam_fprintd.so max-tries=1 timeout=10
+auth required pam_unix.so nullok # pam_fprintd.so fallback
+EOF
+    cp -a "$s/pam/common-auth" "$s/before"
+    assert_eq "2" "$(_pam_oracle_fp_lines "$s/before")" \
+        "PAM-67: oracle locates the absolute-path fp rule at line 2"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-67: install rc 0"
+    expected="$(_pam_oracle_expected "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-67: only the absolute fp rule was removed"
+    assert_contains "is documented in this comment" "$actual" \
+        "PAM-67: the pure comment survived"
+    assert_contains "pam_fprintd.so fallback" "$actual" \
+        "PAM-67: the inline comment on pam_unix survived"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-67: absolute-path fp module survived"
+    else
+        ok
+    fi
+}
+
+# PAM-68: bracketed control with multiple spaces/tabs is parsed as ONE field.
+test_pam_68_extended_control_and_spaces() {
+    local s expected actual
+    s="$(setup_pam_sandbox extended-control)"
+    pam_write_full_stack "$s"
+    printf 'auth    [success=end   default=ignore]    pam_fprintd.so\n' \
+        > "$s/pam/common-auth"
+    printf 'auth\trequired\tpam_unix.so\t# pam_fprintd.so\n' \
+        >> "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/before"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-68: install rc 0"
+    expected="$(_pam_oracle_expected "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-68: bracketed control rule removed, spaced pam_unix rule preserved"
+    assert_eq "$(printf 'auth\trequired\tpam_unix.so\t# pam_fprintd.so')" "$actual" \
+        "PAM-68: tabs and inline comment are byte-identical"
+}
+
+# PAM-69: a backslash-continued fp rule is one logical rule; BOTH physical
+# lines are removed by the single per-file sed call.
+test_pam_69_continuation_rule() {
+    local s expected actual
+    s="$(setup_pam_sandbox continuation)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=end \
+    default=ignore] pam_fprintd.so
+auth required pam_unix.so nullok # pam_fprintd.so
+EOF
+    cp -a "$s/pam/common-auth" "$s/before"
+    assert_eq "1" "$(_pam_oracle_fp_lines "$s/before")" \
+        "PAM-69: oracle reports the continued rule at line 1"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-69: install rc 0"
+    expected="$(_pam_oracle_expected "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-69: exactly the two continued physical lines were removed"
+    assert_eq "auth required pam_unix.so nullok # pam_fprintd.so" "$actual" \
+        "PAM-69: the non-fp line survives byte-for-byte"
+    assert_eq "1" "$(grep -cE '^-i -e 1,2d ' "$s/sed.log")" \
+        "PAM-69: one sed -i call with the exact 1,2d range"
+}
+
+# PAM-70: uncertain syntax fails closed BEFORE any write (zero mutations).
+test_pam_70_uncertain_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox uncertain-fail-closed)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore pam_fprintd.so
+auth required pam_unix.so
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" && ok \
+        || fail "PAM-70: oracle must classify this fixture as uncertain"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-70: uncertain syntax makes install non-zero"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-70: common-auth is byte-identical (zero writes)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-70: no sed mutation at all"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-70: no sidecar may be published"
+    [ ! -e "$s/manifest/pam-selection.saved" ] && ok \
+        || fail "PAM-70: no saved-profile snapshot may be published"
+    [ ! -e "$s/manifest/pam-selection.common" ] && ok \
+        || fail "PAM-70: no common-state snapshot may be published"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Uncertain PAM rule syntax" "$log" \
+        "PAM-70: fail-closed reason is explicit"
+}
+
+# PAM-71: a custom (unmanaged) numeric-jump stack whose jump target would
+# change identity after fp removal is rejected before any write. The control
+# with the pam-auth-update marker is accepted (the tool rewrites its jumps).
+test_pam_71_custom_jump_fails_closed() {
+    local s control before sed_before log
+    s="$(setup_pam_sandbox custom-jump)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+auth required pam_deny.so
+auth required pam_permit.so
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" && ok \
+        || fail "PAM-71: oracle must classify the custom jump stack as unsafe"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-71: custom jump stack fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-71: original stack is byte-identical (recoverable, zero writes)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-71: no sed mutation"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-71: no sidecar published for a custom stack"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Uncertain PAM rule syntax" "$log" \
+        "PAM-71: jump-target refusal is explicit"
+
+    control="$(setup_pam_sandbox custom-jump-managed-control)"
+    pam_write_full_stack "$control"
+    # Phase A: use the standard Debian shape whose landing is stable. The
+    # marker is present but NO LONGER disables the jump check.
+    cat > "$control/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+auth required pam_deny.so
+auth required pam_permit.so
+# end of pam-auth-update config
+EOF
+    _pam_oracle_uncertain "$control/pam/common-auth" \
+        && fail "PAM-71/control: managed stack must not be classified uncertain" \
+        || ok
+    assert_contains "auth:pam_permit.so" \
+        "$(python3 "$_PAM_ORACLE" landings "$control/pam/common-auth")" \
+        "PAM-71/control: baseline jump lands on pam_permit, not END"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian
+    assert_eq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-71/control: managed stack installs rc 0"
+    # Phase A P2: rc 0 alone is not enough -- the jump endpoint must still be
+    # correct AFTER convergence.
+    assert_contains "auth:pam_permit.so" \
+        "$(python3 "$_PAM_ORACLE" landings "$control/pam/common-auth")" \
+        "PAM-71/control: convergence kept the jump landing on pam_permit"
+    assert_not_contains "END" \
+        "$(python3 "$_PAM_ORACLE" landings "$control/pam/common-auth")" \
+        "PAM-71/control: no jump drifted to END"
+    assert_contains "jump endpoint is unchanged" \
+        "$(cat "$control/log.txt" 2> /dev/null || echo '')" \
+        "PAM-71/control: verified jump endpoints are claimed explicitly"
+}
+
+# PAM-72: with no fp rule at all, install must preserve every common-* byte.
+test_pam_72_no_fp_bytes_preserved() {
+    local s before after sed_after
+    s="$(setup_pam_sandbox no-fp-preserve)"
+    pam_write_initial_files "$s" none none
+    pam_write_selection "$s" 'unix'
+    cat > "$s/pam/common-auth" << 'EOF'
+auth required pam_unix.so nullok
+auth required pam_deny.so # pam_fprintd.so fallback documented
+EOF
+    before="$(file_hex "$s/pam/common-auth")"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-72: fixture must have no active fp module"
+    else
+        ok
+    fi
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-72: install rc 0"
+    after="$(file_hex "$s/pam/common-auth")"
+    assert_eq "$before" "$after" "PAM-72: common-auth bytes are unchanged"
+    sed_after="$(wc -l < "$s/sed.log")"
+    assert_eq "2" "$sed_after" "PAM-72: only the two sudo sed calls ran"
+    assert_eq "0" "$(grep -cE '^-i -e [0-9]+(,[0-9]+)?d ' "$s/sed.log")" \
+        "PAM-72: no common-* line-deletion sed call"
+    assert_contains "No pam_fprintd line" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-72: nothing-to-strip path is logged"
+}
+
+# PAM-73: a symlinked common-* whose target has only an inline fp comment is
+# allowed and left byte-identical (PAM-58 still rejects a real fp module).
+test_pam_73_symlink_with_inline_comment_allowed() {
+    local s target state_before target_hex log
+    s="$(setup_pam_sandbox symlink-comment-ok)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    cp -a "$s/pam/common-auth" "$s/target"
+    python3 "$_PAM_ORACLE" strip "$s/target" > "$s/target.stripped"
+    mv "$s/target.stripped" "$s/target"
+    printf 'auth required pam_unix.so nullok # pam_fprintd.so fallback\n' \
+        >> "$s/target"
+    ln -sfn "$s/target" "$s/pam/common-auth"
+    if _pam_common_active_fp "$s/target"; then
+        fail "PAM-73: target must have no active fp module"
+    else
+        ok
+    fi
+    [ -L "$s/pam/common-auth" ] && ok || fail "PAM-73: fixture is a symlink"
+    state_before="$(pam_common_state "$s")"
+    target_hex="$(file_hex "$s/target")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-73: symlink with only a comment installs rc 0"
+    assert_eq "$target_hex" "$(file_hex "$s/target")" \
+        "PAM-73: symlink target bytes unchanged"
+    [ -L "$s/pam/common-auth" ] && ok || fail "PAM-73: symlink was preserved"
+    # sudo bytes legitimately change (the project line is installed); compare
+    # the symlink row only.
+    assert_eq "$(printf '%s\n' "$state_before" | grep '^common-auth')" \
+        "$(pam_common_state "$s" | grep '^common-auth')" \
+        "PAM-73: common-auth symlink lstat state unchanged"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_not_contains "Symlinked" "$log" \
+        "PAM-73: no symlink refusal for a comment-only file"
+}
+
+# PAM-74: "immediately no fp" is NOT the same as "convergence verified". A
+# failing tool keeps install rc 0 (PAM-16/62) but must log NOT verified and must
+# not claim a later --package is a no-op.
+test_pam_74_immediate_vs_converged() {
+    local s control log
+    s="$(setup_pam_sandbox immediate-not-verified)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, fprintd'
+    cat > "$s/stub/pam-auth-update" << 'EOF'
+#!/usr/bin/env bash
+printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 1
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-74: failing convergence still returns install rc 0"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-74: immediate strip must still have removed the fp module"
+    else
+        ok
+    fi
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Immediate state check" "$log" \
+        "PAM-74: immediate no-fp state is logged separately"
+    assert_contains "NOT verified" "$log" \
+        "PAM-74: convergence is explicitly NOT verified"
+    assert_contains "convergence returned rc" "$log" \
+        "PAM-74: the real rc is still classified/warned (PAM-62)"
+    assert_not_contains "convergence verified (rc 0)" "$log" \
+        "PAM-74: no false convergence claim"
+    assert_not_contains "is a no-op" "$log" \
+        "PAM-74: no claim that a later --package must be a no-op"
+
+    control="$(setup_pam_sandbox immediate-converged)"
+    pam_write_full_stack "$control"
+    pam_write_selection "$control" 'unix, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian
+    assert_eq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-74/control: working tool install rc 0"
+    log="$(cat "$control/log.txt" 2> /dev/null || echo '')"
+    assert_contains "convergence verified (rc 0)" "$log" \
+        "PAM-74/control: successful convergence is logged as verified"
+}
+
+# PAM-75: the postcondition uses the module path, not the substring. Re-inject
+# a comment-only mention -> pass; re-inject an absolute-path module -> fail.
+test_pam_75_postcondition_module_path() {
+    local s control log
+    s="$(setup_pam_sandbox postcondition-comment-only)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, fprintd'
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+printf '%s\\n' 'auth required pam_unix.so nullok # pam_fprintd.so fallback' \\
+    >> "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-75/comment: a comment-only re-injection must not fail the claim"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-75/comment: oracle must still report no active fp module"
+    else
+        ok
+    fi
+    assert_contains "Verified no active pam_fprintd.so" \
+        "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+        "PAM-75/comment: postcondition passed"
+
+    control="$(setup_pam_sandbox postcondition-abs-fp)"
+    pam_write_full_stack "$control"
+    pam_write_selection "$control" 'unix, fprintd'
+    cp -a "$control/stub/pam-auth-update" "$control/stub/pam-auth-update.orig"
+    cat > "$control/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$control/stub/pam-auth-update.orig" "\$@"
+printf '%s\\n' 'auth sufficient /lib/security/pam_fprintd.so' \\
+    >> "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+EOF
+    chmod +x "$control/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian
+    assert_neq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-75/absolute: re-injected absolute-path fp module fails the claim"
+    if _pam_common_active_fp "$control/pam/common-auth"; then
+        ok
+    else
+        fail "PAM-75/absolute: oracle must detect the re-injected module"
+    fi
+    log="$(cat "$control/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Post-install verification failed" "$log" \
+        "PAM-75/absolute: postcondition failure is explicit"
+    [ -f "$control/manifest/pam-selection" ] && ok \
+        || fail "PAM-75/absolute: snapshots retained for uninstall"
+}
+
+# PAM-76: the sudo half has the same inline-comment false positive. Comment
+# lines mentioning fprintd/rust_fp must survive; only real module lines go.
+test_pam_76_sudo_inline_comment_survives() {
+    local s before sed_after after
+    s="$(setup_pam_sandbox sudo-inline-comment)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - comments mentioning modules are documentation
+auth required pam_unix.so # pam_fprintd.so fallback
+auth required pam_unix.so # legacy rust_fp.so module documented
+auth sufficient pam_fprintd.so
+@include common-auth
+EOF
+    before="$(file_hex "$s/pam/sudo")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-76: install rc 0"
+    sed_after="$(wc -l < "$s/sed.log")"
+    assert_eq "2" "$sed_after" \
+        "PAM-76: sudo still uses exactly 2 sed calls (PAM-2)"
+    after="$(cat "$s/pam/sudo")"
+    assert_contains "auth required pam_unix.so # pam_fprintd.so fallback" "$after" \
+        "PAM-76: pam_unix rule with inline comment survived"
+    assert_contains "auth required pam_unix.so # legacy rust_fp.so module documented" "$after" \
+        "PAM-76: rust_fp inline comment survived"
+    assert_eq "0" "$(grep -cFx -- 'auth sufficient pam_fprintd.so' "$s/pam/sudo")" \
+        "PAM-76: the real fp module line was removed"
+    assert_contains "auth sufficient pam_fprintd.so max-tries=1 timeout=10" "$after" \
+        "PAM-76: the project line was inserted"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-76: uninstall rc 0"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-76: original sudo bytes restored byte-for-byte"
+}
+
+# PAM-77 (CI only, real pam-auth-update): see .github/workflows/install-smoke.yml
+# "PAM-77 real-tool custom-stack guard".
+
+# ---------------------------------------------------------------------------
+# Re-review #17 Phase A: P1 control-flow fail-closed, P2 T2/T3/sudo/convergence
+# regressions. Every assertion uses the independent oracle or raw sandbox
+# bytes, never lib/pam.sh's own parser.
+# ---------------------------------------------------------------------------
+
+# PAM-78 (P1): a jump whose landing becomes END after fp removal must fail
+# closed BEFORE any write, even on a pam-auth-update-managed stack.
+test_pam_78_jump_to_end_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox jump-to-end)"
+    pam_write_full_stack "$s"
+    # success=1 skips pam_deny.so and lands on pam_fprintd.so; removing fp
+    # moves the landing to END -- control flow changes.
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth requisite pam_deny.so
+auth sufficient pam_fprintd.so
+# end of pam-auth-update config
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" && ok \
+        || fail "PAM-78: oracle must classify module->END as unsafe"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-78: landing->END fails closed on a managed stack"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-78: stack bytes unchanged (zero writes)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-78: no sed mutation"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-78: no sidecar published"
+    [ ! -e "$s/manifest/pam-selection.common" ] && ok \
+        || fail "PAM-78: no common-state snapshot published"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "numeric jump target identity changes" "$log" \
+        "PAM-78: fail-closed reason is explicit"
+}
+
+# PAM-79 (P2/T2 sensitivity): corrupt sed must be caught by the byte-compare.
+test_pam_79_t2_catches_corrupt_sed() {
+    local s before log
+    s="$(setup_pam_sandbox t2-corrupt-sed)"
+    pam_write_full_stack "$s"
+    before="$(file_hex "$s/pam/common-auth")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian 0 0 0 1 0
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-79: corrupt sed makes install non-zero"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-79: original stack restored byte-for-byte"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Non-fingerprint PAM bytes changed" "$log" \
+        "PAM-79: T2 byte-compare named the reason"
+    assert_contains "original bytes restored" "$log" \
+        "PAM-79: safe restore is logged"
+}
+
+# PAM-80 (P2/T2): a change between parse and snapshot must fail closed BEFORE
+# sed (drift guard), leaving the original file byte-identical.
+test_pam_80_parse_snapshot_drift_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox t2-drift)"
+    pam_write_full_stack "$s"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian 0 0 0 0 1
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-80: parse->snapshot drift fails closed"
+    # The injected drift line is external, so the file is NOT byte-identical;
+    # what matters is that the product performed no strip and left the fp rule.
+    assert_eq "1" "$(grep -cFx -- 'auth sufficient pam_fprintd.so' "$s/pam/common-auth")" \
+        "PAM-80: the active fp rule was not stripped"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-80: no sed mutation at all"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed between PAM parse and snapshot" "$log" \
+        "PAM-80: drift reason is explicit"
+}
+
+# PAM-81 (P2/T3): a non-fp rule removed and replaced by a rule with a different
+# control/path can no longer hide behind the old `type:basename` key. The tool
+# stub performs the rewrite during convergence so the postcondition sees it.
+test_pam_81_t3_keyed_multiset() {
+    local s log
+    s="$(setup_pam_sandbox t3-keyed)"
+    pam_write_full_stack "$s"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    lines = fh.readlines()
+# Remove the baseline jump rule; insert a same-basename rule with a
+# DIFFERENT control/path. The old subsequence check accepted this.
+lines = [ln for ln in lines if 'pam_unix.so' not in ln]
+lines.insert(0, 'auth required pam_unix.so\n')
+with open(p, 'w') as fh:
+    fh.writelines(lines)
+PY
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-81: modified non-fp rule is rejected"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed during convergence" "$log" \
+        "PAM-81: T3 failure is explicit"
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-81: snapshots retained for manual recovery"
+}
+
+# PAM-82 (P2/sudo): a continued fp module line in sudo is removed by the SAME
+# parser (both physical lines), with exactly two sed calls and no residue.
+test_pam_82_sudo_continuation_stripped() {
+    local s before sed_after after
+    s="$(setup_pam_sandbox sudo-continuation)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - continued stale fp module
+auth sufficient pam_fprintd.so \
+   max-tries=1
+auth required pam_unix.so
+@include common-auth
+EOF
+    before="$(file_hex "$s/pam/sudo")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-82: install rc 0"
+    sed_after="$(wc -l < "$s/sed.log")"
+    assert_eq "2" "$sed_after" "PAM-82: exactly two sudo sed calls (PAM-2)"
+    after="$(cat "$s/pam/sudo")"
+    assert_eq "0" "$(grep -cFx -- '   max-tries=1' "$s/pam/sudo")" \
+        "PAM-82: orphan continuation argument line was removed too"
+    assert_eq "0" "$(grep -cFx -- 'auth sufficient pam_fprintd.so' "$s/pam/sudo")" \
+        "PAM-82: no stale fp module left in sudo"
+    assert_contains "auth required pam_unix.so" "$after" \
+        "PAM-82: unrelated sudo rule survived"
+    assert_contains "auth sufficient pam_fprintd.so max-tries=1 timeout=10" "$after" \
+        "PAM-82: project line inserted"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall "$s" debian
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-82: original sudo bytes restored"
+}
+
+# PAM-83 (P2/sudo diagnostic): uncertain sudo syntax fails closed with zero
+# writes; no orphan argument line may be left behind.
+test_pam_83_sudo_uncertain_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox sudo-uncertain)"
+    pam_write_initial_files "$s" none none
+    printf '# sudo PAM - unterminated continuation is uncertain\nauth sufficient pam_fprintd.so \\\n' \
+        > "$s/pam/sudo"
+    before="$(file_hex "$s/pam/sudo")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-83: uncertain sudo syntax fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-83: sudo bytes unchanged"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-83: no sudo sed mutation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Uncertain PAM rule syntax" "$log" \
+        "PAM-83: fail-closed reason is explicit"
+}
+
+# PAM-84 (P2/T2, independent oracle): product strip output equals the oracle's
+# byte-exact strip for a file with no trailing newline (P3 syntax alignment).
+test_pam_84_no_trailing_newline_parity() {
+    local s expected actual
+    s="$(setup_pam_sandbox no-trailing-newline)"
+    pam_write_full_stack "$s"
+    printf 'auth sufficient pam_fprintd.so\nauth required pam_unix.so nullok' \
+        > "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/before"
+    expected="$(python3 "$_PAM_ORACLE" strip "$s/before")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-84: install rc 0 without trailing newline"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-84: product strip matches the independent oracle byte-for-byte"
+}
+
+# PAM-85 (P3): man7-legal -auth/-session type prefixes are parsed identically.
+test_pam_85_negative_type_prefix_parity() {
+    local s
+    s="$(setup_pam_sandbox negative-type)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+-auth required pam_unix.so nullok
+-session optional pam_permit.so
+auth requisite pam_deny.so
+EOF
+    cp -a "$s/pam/common-auth" "$s/before"
+    _pam_oracle_uncertain "$s/pam/common-auth" \
+        && fail "PAM-85: -auth/-session types must not be uncertain" || ok
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-85: install rc 0 with -auth/-session prefixes"
+    assert_eq "$(python3 "$_PAM_ORACLE" strip "$s/before")" \
+        "$(cat "$s/pam/common-auth")" \
+        "PAM-85: only the fp line was removed"
+}
+
+# PAM-86 (P3): @include entries count as stack entries for jump arithmetic in
+# both parsers; product and oracle must strip the same bytes.
+test_pam_86_include_counts_in_jumps() {
+    local s expected actual
+    s="$(setup_pam_sandbox include-jump)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+@include common-auth-extra
+auth [success=1 default=ignore] pam_unix.so nullok
+auth requisite pam_deny.so
+auth required pam_permit.so
+EOF
+    cp -a "$s/pam/common-auth" "$s/before"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-86: install rc 0 with @include in the stack"
+    expected="$(python3 "$_PAM_ORACLE" strip "$s/before")"
+    actual="$(cat "$s/pam/common-auth")"
+    assert_eq "$expected" "$actual" \
+        "PAM-86: product and oracle agree on the stripped bytes"
+}
+
+# PAM-87 (P2/PAM-70/71 visibility): uncertain syntax and an unsafe jump both
+# leave zero manifest records and an empty tool log.
+test_pam_87_zero_write_visibility() {
+    local s
+    for mode in uncertain unsafe-jump; do
+        s="$(setup_pam_sandbox "zero-write-$mode")"
+        pam_write_full_stack "$s"
+        if [ "$mode" = uncertain ]; then
+            printf 'auth [success=1 default=ignore pam_fprintd.so\n' \
+                > "$s/pam/common-auth"
+        else
+            printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth sufficient pam_fprintd.so\n' \
+                > "$s/pam/common-auth"
+        fi
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-87/$mode: install non-zero"
+        assert_eq "0" "$(pam_record_count "$s")" \
+            "PAM-87/$mode: zero manifest records"
+        assert_eq "" "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+            "PAM-87/$mode: tool log stays empty"
+    done
+}
+
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -13749,6 +14547,188 @@ test_pam_61_savedir_entry_set_fail_closed
 test_pam_63_symlink_to_dir_restore_uses_mv_T
 test_pam_62_converge_rc_compatibility
 test_pam_64_fresh_install_without_savedir
+test_pam_65_inline_comment_is_not_a_module
+test_pam_66_module_args_are_not_a_module
+test_pam_67_absolute_path_and_mixed_comments
+test_pam_68_extended_control_and_spaces
+test_pam_69_continuation_rule
+test_pam_70_uncertain_fails_closed
+test_pam_71_custom_jump_fails_closed
+test_pam_72_no_fp_bytes_preserved
+test_pam_73_symlink_with_inline_comment_allowed
+test_pam_74_immediate_vs_converged
+test_pam_75_postcondition_module_path
+test_pam_76_sudo_inline_comment_survives
+test_pam_78_jump_to_end_fails_closed
+test_pam_79_t2_catches_corrupt_sed
+test_pam_80_parse_snapshot_drift_fails_closed
+test_pam_81_t3_keyed_multiset
+test_pam_82_sudo_continuation_stripped
+test_pam_83_sudo_uncertain_fails_closed
+test_pam_84_no_trailing_newline_parity
+test_pam_85_negative_type_prefix_parity
+test_pam_86_include_counts_in_jumps
+# PAM-88 (P2): a tool that shifts a numeric jump's landing AFTER the direct
+# strip must fail the postcondition even though it only ADDED a non-fp rule
+# (all baseline keys remain present). This pins the jump endpoint field of T3.
+test_pam_88_convergence_jump_drift_fails_closed() {
+    local s log before_landing after_landing
+    s="$(setup_pam_sandbox convergence-jump-drift)"
+    pam_write_full_stack "$s"
+    before_landing="$(python3 "$_PAM_ORACLE" landings "$s/pam/common-auth")"
+    assert_contains "auth:pam_permit.so" "$before_landing" \
+        "PAM-88: baseline landing is pam_permit"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+# The tool adds an innocent-looking rule BEFORE the jump source: success=1
+# now skips pam_deny instead of reaching pam_permit.
+/usr/bin/sed -i '2i auth required pam_admin_shift.so' "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-88: convergence jump drift fails closed"
+    after_landing="$(python3 "$_PAM_ORACLE" landings "$s/pam/common-auth")"
+    assert_contains "auth:pam_deny.so" "$after_landing" \
+        "PAM-88: the tool really shifted the landing"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "jump endpoint changed" "$log" \
+        "PAM-88: stale jump endpoint is named as the reason"
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-88: snapshots retained for manual recovery"
+}
+
+# PAM-89 (P2/T3): a pure ORDER swap of two non-fp rules during convergence.
+# Both swapped rules are after the numeric-jump landing, carry no jump of their
+# own, and keep identical keyed descriptors, so the multiset (comm) check still
+# passes. Only a monotonic cursor can reject the reorder. Mutation: removing
+# the cursor (restoring the old used[] arbitrary pairing) makes this case fail.
+test_pam_89_t3_order_matters() {
+    local s log
+    s="$(setup_pam_sandbox t3-order)"
+    pam_write_full_stack "$s"
+    # After the direct strip the stack is:
+    #   unix(jump src) / deny(landing) / permit / echo / wheel
+    # Swapping the last two changes no landing, so no descriptor changes.
+    cat >> "$s/pam/common-auth" << 'EOF'
+auth optional pam_echo.so
+auth optional pam_wheel.so
+EOF
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    lines = fh.readlines()
+i = next(i for i, ln in enumerate(lines) if 'pam_echo.so' in ln)
+j = next(i for i, ln in enumerate(lines) if 'pam_wheel.so' in ln)
+assert i != j
+lines[i], lines[j] = lines[j], lines[i]
+with open(p, 'w') as fh:
+    fh.writelines(lines)
+PY
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-89: a pure non-fp rule reorder fails closed"
+    # Raw-byte proof that the tool really swapped, without dropping a rule.
+    assert_eq "auth optional pam_wheel.so" \
+        "$(grep -F 'pam_wheel.so' "$s/pam/common-auth" | head -n 1)" \
+        "PAM-89: the tool really moved pam_wheel ahead of pam_echo"
+    assert_eq "auth optional pam_echo.so" \
+        "$(grep -F 'pam_echo.so' "$s/pam/common-auth" | head -n 1)" \
+        "PAM-89: pam_echo survived, so only the order changed"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "non-fp rule order changed" "$log" \
+        "PAM-89: the order failure is named explicitly"
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-89: snapshots retained for manual recovery"
+}
+
+# PAM-90 (P2/sudo fail-open): a pre-existing canonical project line must NOT
+# skip the stale-fp verification. With a second, real pam_fprintd.so line in
+# sudo, install must fail closed and leave the file untouched. Mutation:
+# keeping _pam_verify_sudo_no_fp inside the else branch only -> rc 0 and this
+# case fails.
+test_pam_90_sudo_canonical_stale_fp_fails_closed() {
+    local s c before sed_before log
+    # Control: canonical line alone is still a valid, no-op install.
+    c="$(setup_pam_sandbox sudo-canonical-control)"
+    pam_write_initial_files "$c" exact none
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$c/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$c/pam" \
+        run_pam_install "$c" debian
+    assert_eq "0" "$(cat "$c/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-90/control: canonical-only sudo installs rc 0"
+    assert_eq "0" "$(wc -l < "$c/sed.log")" \
+        "PAM-90/control: no sudo sed mutation needed"
+
+    s="$(setup_pam_sandbox sudo-canonical-stale-fp)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/sudo" << 'EOF'
+# sudo PAM - canonical project line plus a stale fp module
+auth sufficient pam_fprintd.so max-tries=1 timeout=10
+auth sufficient pam_fprintd.so
+@include common-auth
+@include common-account
+EOF
+    before="$(file_hex "$s/pam/sudo")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-90: canonical line must not mask a stale fp module"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-90: sudo bytes unchanged (fail closed, no silent edit)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-90: no sudo sed mutation"
+    assert_eq "1" "$(grep -cFx -- 'auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$s/pam/sudo")" \
+        "PAM-90: canonical line survived"
+    assert_eq "1" "$(grep -cFx -- 'auth sufficient pam_fprintd.so' "$s/pam/sudo")" \
+        "PAM-90: stale fp line was NOT silently accepted"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "already configured" "$log" \
+        "PAM-90: the already-configured branch really ran"
+    assert_contains "an active fingerprint module remains" "$log" \
+        "PAM-90: the stale fp fail-closed reason is explicit"
+}
+
+test_pam_87_zero_write_visibility
+test_pam_88_convergence_jump_drift_fails_closed
+test_pam_89_t3_order_matters
+test_pam_90_sudo_canonical_stale_fp_fails_closed
+
+# PAM-91 (P3): END -> END is NOT a landing change. A stack whose numeric jump
+# already lands on END both before and after fp removal must still install rc 0
+# (P1 must not over-correct into rejecting a safe no-op).
+test_pam_91_end_to_end_landing_accepted() {
+    local s
+    s="$(setup_pam_sandbox end-to-end-landing)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" \
+        && fail "PAM-91: oracle must classify END->END as safe" || ok
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-91: an unchanged END landing installs rc 0"
+    assert_eq "auth [success=1 default=ignore] pam_unix.so nullok" \
+        "$(cat "$s/pam/common-auth")" \
+        "PAM-91: only the fp line was removed"
+    assert_eq "0" "$(grep -cF 'pam_fprintd.so' "$s/pam/common-auth")" \
+        "PAM-91: no active fp module remains"
+}
+test_pam_91_end_to_end_landing_accepted
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

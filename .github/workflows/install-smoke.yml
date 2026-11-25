@@ -596,6 +596,60 @@ jobs:
           seen_roundtrip true
           seen_roundtrip false
 
+          # Re-review #17 finding #1 / PAM-77: a custom stack with a numeric
+          # jump whose landing MODULE would change after removing fprintd must
+          # be refused by the REAL code path BEFORE any publication or write.
+          # The marker-free fixture is not a pam-auth-update-managed stack, so
+          # convergence cannot repair its jumps.
+          echo "== PAM-77 real-tool custom jump stack guard =="
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "sidecar survived the previous round-trip"; exit 1; }
+          custom_stack=/tmp/pam-e2e-custom-common-auth
+          cat > "$custom_stack" <<'PAEOF'
+          auth [success=1 default=ignore] pam_unix.so nullok
+          auth sufficient pam_fprintd.so
+          auth required pam_deny.so
+          auth required pam_permit.so
+          PAEOF
+          cp -a "$custom_stack" /etc/pam.d/common-auth
+          # P3: pin the REASON, not just the non-zero rc, so a future mutation
+          # that fails closed for an unrelated reason cannot satisfy this guard.
+          pam77_log=/tmp/pam-e2e-pam77-reason.log
+          : > "$pam77_log"
+          custom_rc=0
+          configure_pam_fingerprint 2>>"$pam77_log" || custom_rc=$?
+          cat "$pam77_log" >&2
+          if [ "$custom_rc" -eq 0 ]; then
+            echo "::error::PAM-77 custom jump stack was silently accepted"
+            exit 1
+          fi
+          grep -qF "numeric jump target identity changes" "$pam77_log" \
+            || { echo "::error::PAM-77 fail-closed reason was not the numeric jump target change"; exit 1; }
+          echo "PAM-77 fail-closed reason pinned: numeric jump target identity changes"
+          cmp -s /etc/pam.d/common-auth "$custom_stack" \
+            || { echo "::error::PAM-77 custom stack bytes were modified"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "::error::PAM-77 selection sidecar was published"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection.saved \
+            || { echo "::error::PAM-77 saved-profile snapshot was published"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection.common \
+            || { echo "::error::PAM-77 common-state snapshot was published"; exit 1; }
+          echo "PAM-77 custom stack refused: rc=$custom_rc, bytes identical, no sidecar"
+
+          # Restore the pristine baseline and prove the normal real-tool
+          # round-trip still succeeds after the refusal (no poisoned state).
+          cp -a /root/baseline/etc/pam.d/common-auth /etc/pam.d/common-auth
+          compare_with_baseline
+          configure_pam_fingerprint
+          test -f /var/lib/cros-enablement/pam-selection
+          pam-auth-update --package
+          rollback_component "fingerprint"
+          disable_pam_fingerprint
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "::error::PAM-77 sidecar survived the restored round-trip"; exit 1; }
+          echo "PAM-77 restored baseline round-trip OK"
+
           echo "== non-root (passwordless sudo) uninstall with REAL tools =="
           # Restore the pristine baseline before the second round-trip.
           cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
