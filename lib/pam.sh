@@ -66,9 +66,100 @@ _PAM_COMMON_MAGIC='# cros-enablement: PAM common/sudo state snapshot (first-wins
 # race, and its snapshot must survive even though our install fails (P2-3).
 _PAM_COMMON_PUBLISHED=0
 
+# A pam_fprintd.so MODULE line: a leading '#' comments out the whole line, so
+# that is not active. The regex is deliberately conservative — a trailing
+# inline comment that merely mentions pam_fprintd.so on an active line still
+# matches and is stripped/fails closed; this is safe (never silently keeps a
+# module) and matches the unanchored strip sed below. Every probe goes through
+# sudo: an unprivileged grep on a root-only common-* file exits 2, which the
+# old `grep -q ... || continue` silently treated as "no fp" — the exact
+# fail-open this preflight closes.
+_PAM_COMMON_FP_ACTIVE_RE='^[[:space:]]*[^#[:space:]].*pam_fprintd\.so'
+
+# rc 0 = symlink, 1 = not a symlink, 2 = probe error (never "no").
+_pam_common_path_is_link() {
+    local rc=0
+    sudo test -L "$1" 2> /dev/null
+    rc=$?
+    case "$rc" in
+        0 | 1) return "$rc" ;;
+        *) return 2 ;;
+    esac
+}
+
+# rc 0 = exists, 1 = absent (test -e also reports dangling symlinks as absent),
+# 2 = probe error (never "absent").
+_pam_common_path_exists() {
+    local rc=0
+    sudo test -e "$1" 2> /dev/null
+    rc=$?
+    case "$rc" in
+        0 | 1) return "$rc" ;;
+        *) return 2 ;;
+    esac
+}
+
+# $1=path. rc 0 = active line found, 1 = none, 2 = unreadable/grep error.
+_pam_grep_active_fprintd() {
+    local rc=0
+    sudo test -r "$1" 2> /dev/null || return 2
+    sudo grep -E -q -- "$_PAM_COMMON_FP_ACTIVE_RE" "$1" 2> /dev/null
+    rc=$?
+    case "$rc" in
+        0 | 1) return "$rc" ;;
+        *) return 2 ;;
+    esac
+}
+
+# Preflight for the GDM claim race. MUST run at the very top of the Debian
+# branch, before any snapshot publication, backup, sed, tool call or sudo
+# change: a symlinked common-* with an active fp module cannot be repaired by
+# our sed (sed -i would replace the link), so installing would leave the race
+# in place while claiming sudo-only fingerprint. On rc 1 the caller aborts
+# WITHOUT publishing a first-wins snapshot. rc 0 only means "scanned";
+# _PAM_COMMON_FP_FOUND then tells whether a REGULAR file needs stripping.
+# Absent/dangling targets carry no active module (PAM-52); unreadable targets
+# and grep errors fail closed.
+_pam_common_fp_scan() {
+    local base file is_link=0 exists=0 grep_rc=0
+    _PAM_COMMON_FP_FOUND=0
+    for base in "${_PAM_COMMON_BASES[@]}"; do
+        file="$_PAM_DIR/$base"
+        is_link=0
+        exists=0
+        grep_rc=0
+        _pam_common_path_is_link "$file" || is_link=$?
+        if [ "$is_link" -eq 2 ]; then
+            log_error "Could not probe whether $file is a symlink; failing closed."
+            return 1
+        fi
+        _pam_common_path_exists "$file" || exists=$?
+        case "$exists" in
+            2)
+                log_error "Could not probe $file; failing closed."
+                return 1
+                ;;
+            1) continue ;;
+        esac
+        _pam_grep_active_fprintd "$file" || grep_rc=$?
+        case "$grep_rc" in
+            2)
+                log_error "Could not read $file through sudo while scanning for pam_fprintd.so; failing closed."
+                return 1
+                ;;
+            1) continue ;;
+        esac
+        if [ "$is_link" -eq 0 ]; then
+            log_error "Symlinked $file contains an active pam_fprintd.so module line; refusing to install because it cannot be stripped without replacing the link (the GDM claim race would remain)."
+            return 1
+        fi
+        _PAM_COMMON_FP_FOUND=1
+    done
+    return 0
+}
+
 _pam_backup_common_files() {
     local base file
-    _PAM_COMMON_FP_FOUND=0
     for base in "${_PAM_COMMON_BASES[@]}"; do
         file="$_PAM_DIR/$base"
         # A dangling symlink is still an original target: use the same
@@ -76,10 +167,8 @@ _pam_backup_common_files() {
         [ -e "$file" ] || [ -L "$file" ] || continue
         # Every common-* can be rewritten by --package, so every existing one
         # must be rollback-tracked byte-for-byte, not only those with fp lines.
+        # fp detection is the preflight's job (and must precede ANY backup).
         backup_file_manifest_aware "$file" "fingerprint" || return $?
-        if [ ! -L "$file" ] && grep -qF -- 'pam_fprintd.so' "$file"; then
-            _PAM_COMMON_FP_FOUND=1
-        fi
     done
     return 0
 }
@@ -1207,14 +1296,17 @@ _pam_restore_saved_dir_snapshot() {
     return "$rc"
 }
 
+# rc 0 = converged, 1 = tool failed, 2 = tool unavailable. A non-zero rc is
+# reported by the caller as a WARNING but never fails the install: the
+# first-wins snapshot is kept so uninstall can converge later (PAM-16).
 _pam_converge_profiles() {
     if ! command -v pam-auth-update > /dev/null 2>&1; then
         log_warn "pam-auth-update is unavailable; keeping the selection snapshot for uninstall convergence."
-        return 0
+        return 2
     fi
     if ! sudo pam-auth-update --package; then
         log_warn "pam-auth-update --package failed; keeping the selection snapshot for uninstall convergence."
-        return 0
+        return 1
     fi
     log_info "pam-auth-update --package converged the debconf selection and saved profiles (no fprintd)."
     return 0
@@ -1684,12 +1776,30 @@ _pam_restore_debian_selection() {
 _PAM_COMMON_FP_SED_EXPR='/pam_fprintd\.so/d'
 
 _pam_strip_fprintd_from_common_files() {
-    local base file
+    local base file is_link=0 exists=0 grep_rc=0
     for base in "${_PAM_COMMON_BASES[@]}"; do
         file="$_PAM_DIR/$base"
-        [ -e "$file" ] || [ -L "$file" ] || continue
-        grep -qF -- 'pam_fprintd.so' "$file" 2> /dev/null || continue
-        if [ -L "$file" ]; then
+        is_link=0
+        exists=0
+        grep_rc=0
+        _pam_common_path_is_link "$file" || is_link=$?
+        _pam_common_path_exists "$file" || exists=$?
+        if [ "$is_link" -eq 2 ] || [ "$exists" -eq 2 ]; then
+            log_error "Could not probe $file through sudo; refusing to strip pam_fprintd.so."
+            return 1
+        fi
+        [ "$exists" -eq 0 ] || continue # absent or dangling symlink
+        _pam_grep_active_fprintd "$file" || grep_rc=$?
+        case "$grep_rc" in
+            2)
+                log_error "Could not read $file through sudo; refusing to strip pam_fprintd.so."
+                return 1
+                ;;
+            1) continue ;;
+        esac
+        # Second line of defence: the preflight already rejected a symlinked
+        # file with an active module, but the file could have changed since.
+        if [ "$is_link" -eq 0 ]; then
             log_error "Refusing to sed a symlinked $file (would replace the link); original bytes are rollback-tracked and the file must be edited manually."
             return 1
         fi
@@ -1697,12 +1807,39 @@ _pam_strip_fprintd_from_common_files() {
             log_error "Could not strip pam_fprintd.so from $file; original backup stays tracked for rollback"
             return 1
         fi
-        if grep -qF -- 'pam_fprintd.so' "$file"; then
-            log_error "pam_fprintd.so still present in $file after strip; refusing to continue"
-            return 1
-        fi
+        grep_rc=0
+        _pam_grep_active_fprintd "$file" || grep_rc=$?
+        case "$grep_rc" in
+            1) ;;
+            2)
+                log_error "Could not verify the pam_fprintd.so strip in $file through sudo; refusing to continue."
+                return 1
+                ;;
+            0)
+                log_error "An active pam_fprintd.so module is still present in $file after strip; refusing to continue."
+                return 1
+                ;;
+        esac
         log_info "Removed pam_fprintd.so line(s) from $file; original bytes are tracked for rollback."
     done
+    return 0
+}
+
+# Installed-state postcondition (after sudo setup): the necessary condition
+# for the "sudo-only fingerprint" claim is that NO active pam_fprintd.so
+# module remains in the actual common-* files. Deliberately do NOT compare
+# the debconf selection string for 'fprintd': a disabled-but-remembered
+# selection is a legal state (PAM-1/2/9) and is exactly what uninstall must
+# restore. A failure keeps all snapshot halves for uninstall and makes the
+# install return non-zero.
+_pam_verify_installed_no_fprintd() {
+    local scan_rc=0
+    _pam_common_fp_scan || scan_rc=$?
+    if [ "$scan_rc" -ne 0 ] || [ "$_PAM_COMMON_FP_FOUND" -ne 0 ]; then
+        log_error "Post-install verification failed: an active pam_fprintd.so module remains in a Debian common-* PAM file (or could not be ruled out); refusing to claim sudo-only fingerprint."
+        return 1
+    fi
+    log_info "Verified no active pam_fprintd.so module remains in Debian common-* PAM files (sudo-only fingerprint)."
     return 0
 }
 
@@ -1716,9 +1853,15 @@ _configure_pam_fingerprint_body() {
 
     local sudo_pam="$_PAM_SUDO_PATH"
     local fp_line="$_PAM_FP_SUDO_LINE"
+    local converge_rc=0
 
     case "$DISTRO_FAMILY" in
         debian)
+            # Fail-closed preflight FIRST: before the first-wins snapshot,
+            # backup, sed, tool call or sudo change. A symlinked common-* with
+            # an active fp module cannot be repaired here; abort without
+            # publishing anything so a later retry starts from clean state.
+            _pam_common_fp_scan || return $?
             # IMPORTANT: do NOT use `pam-auth-update --enable fprintd` here.
             # That profile injects pam_fprintd into /etc/pam.d/common-auth,
             # which is included by gdm-password. On unlock GDM forks the
@@ -1745,7 +1888,13 @@ _configure_pam_fingerprint_body() {
             # Converge debconf + /var/lib/pam to the no-fprintd state NOW, so a
             # later package-triggered --package is a no-op. The snapshot above
             # is the only authority for restoring the original selection.
-            _pam_converge_profiles
+            # A missing/failing tool is only a warning (rc 2/1): keep the
+            # snapshot and let uninstall converge (PAM-16).
+            converge_rc=0
+            _pam_converge_profiles || converge_rc=$?
+            if [ "$converge_rc" -ne 0 ]; then
+                log_warn "PAM profile convergence returned rc $converge_rc; install continues and every snapshot half is kept for uninstall."
+            fi
 
             if [ -f "$sudo_pam" ]; then
                 if grep -qFx -- "$fp_line" "$sudo_pam"; then
@@ -1766,6 +1915,11 @@ _configure_pam_fingerprint_body() {
             else
                 log_warn "$sudo_pam not found; sudo fingerprint not configured."
             fi
+            # Final installed-state postcondition: prove the actual common-*
+            # files have no active fprintd module, not merely that our sed
+            # returned 0. On failure do NOT consume any snapshot half and make
+            # the install return non-zero.
+            _pam_verify_installed_no_fprintd || return $?
             ;;
         fedora)
             # NOTE: authselect's with-fingerprint profile injects

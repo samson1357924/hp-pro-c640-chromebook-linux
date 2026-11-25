@@ -9689,6 +9689,14 @@ while [ "$_n" -le "$_repeats" ]; do
     _reconcile || exit $?
     _n=$((_n + 1))
 done
+
+# STUB_PAM_REINJECT_FP models an external actor (or a misbehaving tool)
+# re-adding an ACTIVE pam_fprintd.so module AFTER the product's direct strip.
+# The installed-state postcondition must reject that (PAM-59); the debconf
+# selection is deliberately NOT the oracle here.
+if [ "${STUB_PAM_REINJECT_FP:-0}" = "1" ] && [ -f "$_dir/common-auth" ]; then
+    printf '%s\n' 'auth sufficient pam_fprintd.so' >> "$_dir/common-auth"
+fi
 exit 0
 EOF
 
@@ -9959,8 +9967,10 @@ pam_record_count() {
 # $4 = per-call STUB_PAM_REWRITE_COMMON flag (default 0), same isolation reason
 # as PAM-9: do not rely on a prefix assignment that a future `export` could
 # leak into later cases.
+# $5 = per-call STUB_PAM_REINJECT_FP flag (default 0, PAM-59); set ONLY inside
+# the sandbox snippet so a re-inject fault cannot leak into later cases.
 run_pam_install() {
-    local sandbox="$1" distro="$2" fail_rollback="${3:-0}" rewrite_common="${4:-0}"
+    local sandbox="$1" distro="$2" fail_rollback="${3:-0}" rewrite_common="${4:-0}" reinject_fp="${5:-0}"
     export CROS_ENABLEMENT_PAM_SUDO_PATH CROS_ENABLEMENT_PAM_DIR
     export CROS_ENABLEMENT_PAM_SAVED_DIR="$sandbox/savedir"
     export CROS_ENABLEMENT_PAM_SELECTION_FILE="$sandbox/manifest/pam-selection"
@@ -9972,12 +9982,12 @@ run_pam_install() {
         export STUB_SED_LOG="$2/sed.log" STUB_TOOL_LOG="$2/tool.log"
         export STUB_DEBCONF_PROFILES="$2/debconf/profiles"
         export STUB_DEBCONF_SEEN="$2/debconf/seen"
-        export STUB_FAIL_ROLLBACK_PY="$4" STUB_PAM_REWRITE_COMMON="$5"
+        export STUB_FAIL_ROLLBACK_PY="$4" STUB_PAM_REWRITE_COMMON="$5" STUB_PAM_REINJECT_FP="$6"
         source "$1/lib/pam.sh"
         DISTRO_FAMILY="$3" DISTRO_ID="$3"
         configure_pam_fingerprint
         printf "%s\n" "$?" > "$2/install.rc"
-    ' "$distro" "$fail_rollback" "$rewrite_common"
+    ' "$distro" "$fail_rollback" "$rewrite_common" "$reinject_fp"
 }
 
 # Uninstall step: mirror _uninstall_fp_body() ordering — rollback FIRST, then
@@ -12501,9 +12511,18 @@ test_pam_44_type_and_absence_variants() {
     local s before state_before state_after
     s="$(setup_pam_sandbox type-variants)"
     pam_write_full_stack "$s"
-    pam_write_selection "$s" 'unix, systemd, fprintd'
+    # This test is ONLY the plain type/absence variant. The full-stack fixture
+    # declares an enabled fprintd profile; keeping it would make --package
+    # legitimately rewrite the savedir/selection on uninstall and turn this
+    # into a second fp-symlink case (owned by PAM-58). Make the fixture
+    # self-consistent: no active fp module anywhere and no fprintd selection.
+    pam_write_selection "$s" 'unix, systemd'
+    /usr/bin/sed -i -e '/pam_fprintd\.so/d' -e '/^Module: fprintd$/d' "$s/savedir/auth"
     # common-auth becomes a symlink to a regular file with the ORIGINAL bytes.
+    # Use /usr/bin/sed so the harness's sed.log stays a record of the product's
+    # mutations only.
     cp -a "$s/pam/common-auth" "$s/common-auth.target"
+    /usr/bin/sed -i '/pam_fprintd\.so/d' "$s/common-auth.target"
     ln -sfn "$s/common-auth.target" "$s/pam/common-auth"
     # common-session becomes a DANGLING symlink (covered again in PAM-52).
     ln -sfn "$s/no-such-target" "$s/pam/common-session"
@@ -13145,6 +13164,198 @@ test_pam_57_final_verify_rejects_common_and_savedir_mismatches() {
     done
 }
 
+# Independent root-side oracle: an ACTIVE pam_fprintd.so module line in the
+# given file. Deliberately the same shape as the product's regex, but it reads
+# the sandbox file directly (never through lib/pam.sh) so a fail-open mutation
+# of the product's grep cannot make the assertion vacuous.
+_pam_common_active_fp() {
+    grep -E -q -- '^[[:space:]]*[^#[:space:]].*pam_fprintd\.so' "$1"
+}
+
+# PAM-58 (re-review #16 finding #2): a symlinked common-* with an ACTIVE
+# pam_fprintd.so module must fail closed BEFORE any publication/mutation.
+# The control uses identical bytes in a regular file and installs rc 0.
+test_pam_58_symlinked_active_fp_fails_closed() {
+    local s control before stack_before state_before log
+
+    # Control: same content, regular file -> strip succeeds, install rc 0.
+    control="$(setup_pam_sandbox symlink-fp-control)"
+    pam_write_full_stack "$control"
+    pam_write_selection "$control" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian
+    assert_eq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-58/control: identical bytes in a regular file install rc 0"
+    if _pam_common_active_fp "$control/pam/common-auth"; then
+        fail "PAM-58/control: no active fp module may remain after install"
+    else
+        ok
+    fi
+
+    # Symlink to a regular file WITH an active fp module: preflight must abort.
+    s="$(setup_pam_sandbox symlink-fp-active)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    cp -a "$s/pam/common-auth" "$s/common-auth.target"
+    ln -sfn "$s/common-auth.target" "$s/pam/common-auth"
+    before="$(pam_stack_fingerprint "$s")"
+    state_before="$(pam_common_state "$s")"
+    # Independent oracle: the seam really is a symlink and its target really
+    # holds an active module (a vacuous test would pass without the bug).
+    [ -L "$s/pam/common-auth" ] && ok || fail "PAM-58: fixture must be a symlink"
+    if _pam_common_active_fp "$s/common-auth.target"; then
+        ok
+    else
+        fail "PAM-58: fixture target must hold an active fp module"
+    fi
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-58: symlinked active fp install fails closed"
+    assert_eq "$state_before" "$(pam_common_state "$s")" \
+        "PAM-58: PAM/common bytes, type, link target and mode unchanged"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-58: savedir and debconf selection bytes unchanged"
+    assert_eq "0" "$(pam_record_count "$s")" \
+        "PAM-58: no manifest record (no backup was taken)"
+    assert_eq "" "$(cat "$s/sed.log" 2> /dev/null || echo MISSING)" \
+        "PAM-58: no sed mutation"
+    assert_eq "" "$(cat "$s/tool.log" 2> /dev/null || echo MISSING)" \
+        "PAM-58: no pam-auth-update/debconf tool call"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-58: no first-wins sidecar may be published"
+    [ ! -e "$s/manifest/pam-selection.saved" ] && ok \
+        || fail "PAM-58: no saved-profile snapshot may be published"
+    [ ! -e "$s/manifest/pam-selection.common" ] && ok \
+        || fail "PAM-58: no common-state snapshot may be published"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Symlinked" "$log" \
+        "PAM-58: the symlink is named in the fail-closed reason"
+    assert_contains "active pam_fprintd.so module line" "$log" \
+        "PAM-58: the active-module reason is explicit"
+
+    # Root-only common-* from a REAL uid-1000 caller: a non-privileged grep
+    # would return rc 2 and (in the old code) be read as "no fp". The install
+    # must still strip through sudo, and the root-side oracle proves it.
+    s="$(setup_pam_sandbox root-only-common-fp)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    _pam_nonroot_prepare "$s"
+    _pam_nonroot_script "$s" install
+    _pam_nonroot_script "$s" uninstall
+    chown 0:0 "$s/pam/common-auth"
+    chmod 0600 "$s/pam/common-auth"
+    before="$(pam_stack_fingerprint "$s")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install_nonroot "$s" debian
+    assert_eq "0" "$(cat "$s/userout/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-58/root-only: a non-root caller strips root-only common-auth"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        fail "PAM-58/root-only: active fp survived a non-privileged grep (fail-open)"
+    else
+        ok
+    fi
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_uninstall_nonroot "$s" debian
+    assert_eq "0" "$(cat "$s/userout/disable.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-58/root-only: uninstall still restores the root-only file"
+    assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+        "PAM-58/root-only: full stack restored byte-for-byte"
+}
+
+# PAM-59: the installed-state postcondition is about the ACTUAL common-* files,
+# not the sed return code and not the debconf selection string. A tool that
+# re-injects an active module after our strip must make install non-zero while
+# leaving every snapshot half intact for uninstall.
+test_pam_59_installed_state_postcondition() {
+    local s control log
+
+    control="$(setup_pam_sandbox postcondition-control)"
+    pam_write_full_stack "$control"
+    pam_write_selection "$control" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian 0 0 0
+    assert_eq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-59/control: no re-injection -> install rc 0"
+    if _pam_common_active_fp "$control/pam/common-auth"; then
+        fail "PAM-59/control: no active fp module may remain"
+    else
+        ok
+    fi
+
+    s="$(setup_pam_sandbox postcondition-reinject)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian 0 0 1
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-59: re-injected fp module makes install non-zero"
+    if _pam_common_active_fp "$s/pam/common-auth"; then
+        ok
+    else
+        fail "PAM-59: the stub must really have re-injected the module"
+    fi
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-59: selection snapshot retained"
+    [ -d "$s/manifest/pam-selection.saved" ] && ok \
+        || fail "PAM-59: saved-profile snapshot retained"
+    [ -f "$s/manifest/pam-selection.common/state" ] && ok \
+        || fail "PAM-59: common-state snapshot retained"
+    assert_contains "fprintd" "$(cat "$s/manifest/pam-selection" 2> /dev/null || echo MISSING)" \
+        "PAM-59: the snapshot still records fprintd for uninstall restore"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Post-install verification failed" "$log" \
+        "PAM-59: postcondition failure is explicit"
+    assert_contains "active pam_fprintd.so module remains" "$log" \
+        "PAM-59: the offending actual file state is named"
+}
+
+# PAM-62: a missing/failing pam-auth-update is still only a warning (rc 2/1).
+# After a successful strip the install returns 0 even though the debconf
+# selection still records fprintd, and uninstall still restores everything.
+test_pam_62_converge_rc_compatibility() {
+    local s mode before
+
+    for mode in missing failing; do
+        s="$(setup_pam_sandbox converge-$mode)"
+        pam_write_full_stack "$s"
+        pam_write_selection "$s" 'unix, systemd, fprintd'
+        before="$(pam_stack_fingerprint "$s")"
+        if [ "$mode" = missing ]; then
+            mv "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.off"
+        else
+            cat > "$s/stub/pam-auth-update" << 'EOF'
+#!/usr/bin/env bash
+printf 'pam-auth-update %s\n' "$*" >> "${STUB_TOOL_LOG:?PAM tool stub missing log}"
+exit 1
+EOF
+            chmod +x "$s/stub/pam-auth-update"
+        fi
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_install "$s" debian
+        assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-62/$mode: install rc 0 despite convergence rc"
+        if _pam_common_active_fp "$s/pam/common-auth"; then
+            fail "PAM-62/$mode: active fp must be stripped even without a working tool"
+        else
+            ok
+        fi
+        assert_contains "fprintd" "$(cat "$s/debconf/profiles" 2> /dev/null || echo MISSING)" \
+            "PAM-62/$mode: a disabled-but-recorded selection is legal"
+        [ -f "$s/manifest/pam-selection" ] && ok \
+            || fail "PAM-62/$mode: snapshot kept for uninstall convergence"
+        assert_contains "convergence returned rc" "$(cat "$s/log.txt" 2> /dev/null || echo '')" \
+            "PAM-62/$mode: the convergence rc is classified and warned"
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+            run_pam_uninstall "$s" debian
+        assert_eq "0" "$(cat "$s/disable.rc" 2> /dev/null || echo MISSING)" \
+            "PAM-62/$mode: uninstall rc 0"
+        assert_eq "$before" "$(pam_stack_fingerprint "$s")" \
+            "PAM-62/$mode: full stack restored byte-for-byte"
+    done
+}
+
 test_pam_1_preexisting_exact_line_survives
 test_pam_2_preexisting_other_fp_lines_survive
 test_pam_3_no_fp_line_roundtrip
@@ -13202,6 +13413,9 @@ test_pam_54_foreign_common_survives_failed_publish
 test_pam_55_common_snapshot_dir_is_root_only_0700
 test_pam_56_common_consume_failure_is_manual_recovery
 test_pam_57_final_verify_rejects_common_and_savedir_mismatches
+test_pam_58_symlinked_active_fp_fails_closed
+test_pam_59_installed_state_postcondition
+test_pam_62_converge_rc_compatibility
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"
