@@ -140,7 +140,37 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > `numeric jump target identity changes ...`）。若必須手動編輯，請檢查 module-path 欄位並
 > 於事後驗證非 fp 位元組。「沒有生效 fp 模組」與「收斂已驗證」是不同事實
 > （`convergence NOT verified yet`）。
+>
+> **第十九次 re-review（per-group 模型／argsfp／強制復原）：**安裝器現在為每個
+> management group 建立**獨立 handler stack**、展開 `@include`、把 substack 視為不透明
+> frame，並在任何編輯之前於未建模 substack 可能影響 numeric jump 或 transformation、或拓撲
+> 無法解析／不支援時 fail closed
+> （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+> `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`、
+> `Removing the fingerprint rule ... would change a per-management-group stack or its
+> numeric jump target ...`）。每個保留規則都帶 `argsfp`——完整模組 argument vector 的單射
+> 指紋；non-fp postcondition 是**零新增** gate（allowlist 預設為空），外部工具新增／改寫
+> 規則會 fail closed
+> （`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`）。
+> 若後續驗證失敗，安裝器會先從保留的 snapshot 強制還原 `common-*`／sudo 再回 rc 1
+> （`PAM transaction failed after mutation; force-restoring common-*/sudo ...`）。
+> 無法證明安全的自訂堆疊請讓安裝器拒絕，不要手動猜測修改。
 
 ```bash
 sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```
+
+> [!NOTE]
+> **鍵盤背光升級窗：**root commitment marker 為
+> `<token> <dev:ino> <value>`（三欄；legacy 兩欄 marker 直接 fail closed），resume flag
+> 為 `<token> <epoch> <action> <committed_value>`（四欄；legacy 三欄 flag 仍可被 daemon
+> 讀取，第四欄為權威）。hook 與 daemon 必須**從同一套件部署**。`python3` 在 `pre`／`post`
+> 的發布與單一 fd byte-exact 驗證兩階段都是執行期依賴；缺少時不發布 handoff（fail closed）。
+>
+> **真機觀察（唯讀，2026-11-26）：**本機（DMI `Google`／`Dratini`／`HP` board、coreboot
+> `MrChromebox-2606.1`、hostname `ubuntu-c640`、kernel `7.0.0-44`；
+> `/sys/class/leds/chromeos::kbd_backlight` 為 `max=100`／目前 `30`、daemon 執行中）安裝的
+> `/usr/local/bin/c640-kbd-backlight-sync` 仍對應 `a03e4a0`，**早於第十九次 re-review 四項
+> fix（唯讀稽核時點的觀察）**——CI 的 byte-identical 檢查不是本機事實。螢幕黑掉時背光仍亮是已知 **Tier 2**
+> 限制（idle-dim／idle-brightness 搭配 ScreenSaver 仍 inactive；IdleMonitor 未實作），
+> 非本輪 regression；現行 HEAD 的真實 S3／lock-unlock 仍 pending。

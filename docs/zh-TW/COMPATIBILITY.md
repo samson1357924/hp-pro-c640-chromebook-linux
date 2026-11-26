@@ -21,7 +21,7 @@ HP Pro c640 Chromebook (開發代號：**Google `dratini`**，Baseboard：**`hat
 | **GPU / 內顯** | Intel UHD Graphics 620 | `i915` | ⚠️ **驅動已綁定** | 顯示開箱即用；**VA-API 4K 60fps 解碼未量測**。 |
 | **視訊鏡頭** | 720p HD Camera (附隱私蓋) | `uvcvideo` | ⚠️ **驅動已綁定** | 標準 USB UVC 鏡頭；**擷取未測試**。 |
 | **雙 Type-C 輸出** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **充電正常** | PD 充電節點存在；**DP 1.2 螢幕輸出未驗證**。 |
-| **鍵盤頂排按鍵與背光同步** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync`（user service + system-sleep）+ `61-chromeos-kbd-backlight.rules` | 🟢 **頂排＋雙重角色＋背光皆已驗證（2026-10-31）** | 頂排 hwdb 映射的 AT 掃描碼 `0x3b`-`0x44` 是由 hwdb 轉換後 `EVIOCGKEY` 對照標準 AT 表推論（不是 ChromeOS action 掃描碼）；`check-top-row-hwdb.py` 在實體鍵盤上確認 11 條 `EVIOCGKEYCODE` 全數相符（只證明核心映射表 — 原始 `MSC_SCAN` 未捕獲，確認需停掉 keyd 後用 `--scan`），實體按鍵被動擷取也確認按鍵以 hwdb 轉換後的 `EV_KEY` 送達桌面。keyd 雙重角色 Search：虛擬 uinput 測試 PASS — 輕點 CapsLock（無 Meta、無防護）、**單獨長按** Super 無 `LEFTCTRL` 防護、Super+頂排 F1–F10（10 組全過，`[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護屬預期）、10 個頂排單按各自媒體鍵；實體被動擷取確認單獨長按會開 GNOME 總覽、單按可調亮度/音量/靜音。背光於螢幕熄滅自動關閉/恢復（`ScreenSaver.ActiveChanged` 2→0→2，無 sudo）與 sleep hook 發布 S3 handoff 檔（由解凍後的使用者 daemon 還原）皆已驗證；sysfs `0660 root:plugdev`。2026-11-22 曾以**舊 hook** 觀察到完整 S3 freeze/thaw（`rtcwake` + `systemctl suspend`）——僅為歷史證據；**現行 HEAD（新 selector／root 邊界）待目標機執行**，手動盒蓋循環仍為補充待測。**keyd 版本範圍：**語法僅在 CI 以 2.6.0 驗證（`keyd check`）；tap/hold/防護行為只在實機以 2.5.0-5 驗證；其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知行為差異）。 |
+| **鍵盤頂排按鍵與背光同步** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync`（user service + system-sleep）+ `61-chromeos-kbd-backlight.rules` | 🟢 **頂排＋雙重角色＋背光皆已驗證（2026-10-31）** | 頂排 hwdb 映射的 AT 掃描碼 `0x3b`-`0x44` 是由 hwdb 轉換後 `EVIOCGKEY` 對照標準 AT 表推論（不是 ChromeOS action 掃描碼）；`check-top-row-hwdb.py` 在實體鍵盤上確認 11 條 `EVIOCGKEYCODE` 全數相符（只證明核心映射表 — 原始 `MSC_SCAN` 未捕獲，確認需停掉 keyd 後用 `--scan`），實體按鍵被動擷取也確認按鍵以 hwdb 轉換後的 `EV_KEY` 送達桌面。keyd 雙重角色 Search：虛擬 uinput 測試 PASS — 輕點 CapsLock（無 Meta、無防護）、**單獨長按** Super 無 `LEFTCTRL` 防護、Super+頂排 F1–F10（10 組全過，`[meta:M]` 圖層的 `LEFTCTRL` 組合鍵防護屬預期）、10 個頂排單按各自媒體鍵；實體被動擷取確認單獨長按會開 GNOME 總覽、單按可調亮度/音量/靜音。背光於螢幕熄滅自動關閉/恢復（`ScreenSaver.ActiveChanged` 2→0→2，無 sudo）與 sleep hook 發布 S3 handoff 檔（由解凍後的使用者 daemon 還原）皆已驗證；sysfs `0660 root:plugdev`。2026-11-22 曾以**舊 hook** 觀察到完整 S3 freeze/thaw（`rtcwake` + `systemctl suspend`）——僅為歷史證據；**現行 HEAD（新 selector／root 邊界）待目標機執行**，手動盒蓋循環仍為補充待測。**keyd 版本範圍：**語法僅在 CI 以 2.6.0 驗證（`keyd check`）；tap/hold/防護行為只在實機以 2.5.0-5 驗證；其它版本未驗證（上游 2.6.x 對 `overloadt2` 有已知行為差異）。本機安裝的 daemon 仍對應 `a03e4a0`（早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察）），螢幕黑掉時背光仍維持 30——已知 Tier 2 限制、非本輪 regression；見下方真機觀察。 |
 | **待機休眠** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 盒蓋週期已驗證** | 預設 S3 `deep`；2026-08-18 實測真實盒蓋週期。**按鍵/指紋喚醒未測試**；開蓋後螢幕需按鍵才亮（見 [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)）。 |
 
 ### Sleep hook handoff 支援範圍
@@ -65,16 +65,44 @@ root system-sleep hook 只在下列條件下發布 S3 handoff 檔：
 
 > [!IMPORTANT]
 > **真實 S3 狀態：**下方的 2026-11-22 完整 freeze/thaw 結果是舊 hook 的歷史證據。
-> 新的 `Session.User` selector 與 root 寫入邊界目前只經本機 contract check、stub 測試與
-> CI 驗證——**尚未在 HP Pro c640 以現行 HEAD 重跑真實 S3**（待目標機執行）。
-> 請見 [verification.md §3](verification.md) 的 checklist。
+> 新的 `Session.User` selector、root 寫入邊界與第十九次 payload／login1 修正目前只經本機
+> contract check、stub 測試與 CI 驗證——**尚未在 HP Pro c640 以現行 HEAD 重跑真實 S3**
+> （待目標機執行；已授權，排在本輪 push 後）。請見 [verification.md §3](verification.md) 的 checklist。
+
+#### 真機觀察（唯讀，2026-11-26）
+
+先前「本環境無 HP c640 硬體」的說法**已更正**。本機唯讀檢查顯示 DMI
+`sys_vendor=Google`、`product_name=Dratini`、`board_vendor=HP`，coreboot
+`MrChromebox-2606.1`、hostname `ubuntu-c640`、kernel `7.0.0-44`；
+`/sys/class/leds/chromeos::kbd_backlight` 存在（`max=100`、目前 `30`），且使用者 daemon
+正在執行。不過 `/usr/local/bin/c640-kbd-backlight-sync` 對應舊 commit `a03e4a0`，
+**早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察）**——因此 CI 的「installed == repo」byte-identical 檢查
+**不是本機事實**。使用者回報螢幕黑掉時鍵盤背光仍維持 `30`。工作假說是已知
+**Tier 2** 限制（daemon 只把 `ScreenSaver.ActiveChanged` 當 blank 觸發；Wayland 的
+`idle-dim=true`／`idle-brightness=30` 可能讓螢幕黑掉而 ScreenSaver 仍 inactive；
+IdleMonitor／brightness-signal 支援未實作且預設關閉），**不是本輪 regression**。
+現行 HEAD 的真實 S3／lock-unlock 仍 pending。
+
+#### 升級窗（第十七次 ↔ 第十九次 re-review）
+
+suspend/resume payload 合約改了兩個欄位：root cycle marker 從兩欄
+（`<token> <dev:ino>`）變三欄（`<token> <dev:ino> <value>`），resume flag 從三欄
+（`<token> <epoch> <action>`）變四欄（`<token> <epoch> <action> <committed_value>`）。
+legacy 兩欄 marker 現在**直接拒絕**（fail closed）；legacy 三欄 resume flag 仍被 daemon
+**接受**，有第四欄時以其為權威，suspend／committed 不符時警告。**hook 與 daemon 必須
+同包升級**：新 hook 配舊 daemon 可能發布舊 parser 讀不了的 flag；舊 hook 配新 daemon
+則走 legacy 路徑、失去 committed value 證明。`python3` 在 `pre`／`post` 的發布與驗證
+兩階段都是執行期依賴。
 
 #### Fail closed 訊息與處置（第十七次 re-review）
 
 | 訊息（root／user journal） | 意義 | 處置 |
 | :--- | :--- | :--- |
-| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration`／`numeric jump target identity changes after removing fingerprint module` | 自訂 PAM stack 無法安全解析，或移除 fp 模組會改變 numeric jump 落點。 | 安裝在任何 PAM 編輯**之前**以非 0 結束；snapshot 與 debconf 均不變。請手動檢查自訂 stack 後重跑——不要用 substring `sed` 代替。 |
+| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration`／`Removing the fingerprint rule ... would change a per-management-group stack or its numeric jump target ...`／`Unsupported PAM include target ...`／`Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`／`PAM stack transformation is not provably safe for <label> (rc N): UNSUPPORTED PAM topology: ...` | 自訂 stack 無法在 per-management-group 模型中安全解析、拓撲無法解析／不支援（例如未建模 substack 可能影響 numeric jump 或 transformation），或移除 fp 模組會改變 numeric jump 落點；`@include` 會展開，不影響 numeric jump／transformation 的 substack 視為不透明 frame、不拒絕。 | 安裝在任何 PAM 編輯**之前**以非 0 結束；snapshot 與 debconf 均不變。請手動檢查 stack 後重跑——不要用 substring `sed` 代替。 |
+| `a non-fprintd PAM rule or a numeric jump endpoint changed during convergence`／`Refusing to modify <file>: the sudo '<label>' anchor is missing`／`PAM transaction failed after mutation; force-restoring common-*/sudo from the first-wins snapshot ...` | 外部工具新增／改寫規則（模組 argument 的 `argsfp` 指紋改變），或 mutation 後驗證失敗。 | addition allowlist 預設為空，新增規則即 fail closed；mutation 後會先從保留的 snapshot **強制還原**再回 rc 1（該路徑保留、不消耗 snapshot）。請手動還原預期政策後重跑。 |
 | `suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、`suspend handoff token epoch ... stale` | handoff 不屬於本次 suspend cycle（過期副本、偽造 flag 或 `pre` 失敗）。 | daemon 保持已存亮度不變；視為 handoff 失敗而非還原。重跑 S3 週期；見 [verification.md](verification.md) §3。 |
+| `resume handoff skipped (fail-closed): invalid cycle marker ...`、`suspend inode ... != cycle marker ...`、`suspend/cycle value mismatch ...`（TOKEN/VALUE/INODE/STRUCT/IO） | 使用了 legacy 兩欄 root marker，或 suspend bytes 在 `pre` 後被改動（同 inode 改值或 inode 替換）。`post` 從**單一**釘住 fd 逐位元組讀取，拒絕發布 resume flag。 | 不接受該 handoff。請以同一套件還原 hook／daemon 並重跑 S3 週期。legacy 三欄 resume flag 仍被 daemon 接受，committed value 為權威。 |
+| `keeping committed cycle handoff`／`prepare-for-sleep: cannot anchor cycle-begin to token ...; resume will fail closed` | 延後的 `PrepareForSleep(true)` 在 `pre`／`post` commit 本輪之後才送達。 | true handler 保留可證明為現行的 handoff，並把 `cycle-begin` 重新錨定到 token epoch（非 wall-clock 時間）；真正過期的成對檔案仍會移除。沒有 resume flag 時，`PrepareForSleep(false)` 經 `restore_from_local_state()` 還原本機 daemon state，不 adopt handoff。 |
 | `retry epoch invalidation failed; all brightness writers fail closed`／`retry epoch channel unhealthy; all brightness writers fail closed` | 連原地撤銷 epoch 也失敗（`COORDINATION_UNHEALTHY`），過期 witness 不可信。引用的 log 字串為逐字輸出，實際強制範圍僅限後續 gate。 | 每個後續 gate fail closed。修好 runtime state 目錄後重啟使用者 daemon。範圍僅限後續 gate；已進入 `WRITE_LOCK` 的 writer 無法回溯，可能仍完成一次寫入；state 目錄完全不可寫時持久 marker 無法建立，撤銷前已 fork 的 worker 只看到 in-process flag。此為非阻塞殘留，此降級狀態下不宣稱回溯撤銷。 |
 | `evidence clock unavailable; evidence expired`／`evidence clock moved backwards; evidence expired` | monotonic 時鐘來源無法讀取或回撥，guard witness 年齡未知。 | guard 重新探測；仍無法驗證即 fail closed、不寫入。檢查 `/proc/uptime`／`C640_KBD_MONOTONIC_FILE`。 |
 | `handoff skipped (fail-closed): python3 unavailable; cannot publish <file>` | hook 執行環境缺少 `python3`。 | 在目標機安裝 `python3`；在此之前不發布 handoff（fail closed、不還原）。 |

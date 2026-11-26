@@ -21,7 +21,7 @@ Lake-U platform):
 | **GPU / Integrated Graphics** | Intel UHD Graphics 620 | `i915` | ⚠️ **Driver bound** | Display works out of the box; **VA-API 4K 60fps decode not measured**. |
 | **Webcam** | 720p HD Camera (with privacy shutter) | `uvcvideo` | ⚠️ **Driver bound** | Standard USB UVC camera; **capture not tested**. |
 | **Dual Type-C Output** | 2x USB-C 3.2 Gen 1 (PD + DP) | `typec` / `xhci_pci` | ⚠️ **Charging works** | PD charging nodes present; **DP 1.2 display output not verified**. |
-| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Top-row + dual-role + backlight verified (2026-10-31)** | Top-row hwdb maps AT scancodes `0x3b`-`0x44` inferred from post-hwdb `EVIOCGKEY` against the standard AT table (not the ChromeOS action scancodes); `check-top-row-hwdb.py` confirmed all 11 `EVIOCGKEYCODE` entries on the real keyboard (kernel map only — raw `MSC_SCAN` was not captured; confirm with `--scan` after stopping keyd), and a real-key passive capture confirmed the presses reach the desktop as post-hwdb `EV_KEY`. keyd dual-role Search: virtual uinput test PASS for tap CapsLock (no Meta/guard), **lone hold** Super with no `LEFTCTRL` guard, Super+TopRow F1–F10 (all ten; the `[meta:M]` layer's `LEFTCTRL` chord guard is expected here) and each top-row key alone; real-key passive capture confirmed lone hold → GNOME overview and single presses → brightness/volume/mute. Backlight auto-off/restore on screen blank verified (`ScreenSaver.ActiveChanged` 2→0→2, no sudo) and sleep hook publishes S3 handoff files (thawed user daemon performs the restore) verified; sysfs `0660 root:plugdev`. A full S3 freeze/thaw was observed 2026-11-22 (`rtcwake` + `systemctl suspend`) with the **old hook** — historical evidence only; **the current HEAD (new selector/root boundary) is pending on the target machine**, and a manual lid-close cycle remains a supplementary to-test. **keyd version scope:** syntax validated in CI with 2.6.0 (`keyd check` only); tap/hold/guard behaviour validated on the device with 2.5.0-5 only; other versions unverified (upstream 2.6.x has known `overloadt2` behaviour differences). |
+| **Keyboard Top-Row Keys & Backlight Sync** | ChromeOS Top-Row + `chromeos::kbd_backlight` | `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` (user service + system-sleep) + `61-chromeos-kbd-backlight.rules` | 🟢 **Top-row + dual-role + backlight verified (2026-10-31)** | Top-row hwdb maps AT scancodes `0x3b`-`0x44` inferred from post-hwdb `EVIOCGKEY` against the standard AT table (not the ChromeOS action scancodes); `check-top-row-hwdb.py` confirmed all 11 `EVIOCGKEYCODE` entries on the real keyboard (kernel map only — raw `MSC_SCAN` was not captured; confirm with `--scan` after stopping keyd), and a real-key passive capture confirmed the presses reach the desktop as post-hwdb `EV_KEY`. keyd dual-role Search: virtual uinput test PASS for tap CapsLock (no Meta/guard), **lone hold** Super with no `LEFTCTRL` guard, Super+TopRow F1–F10 (all ten; the `[meta:M]` layer's `LEFTCTRL` chord guard is expected here) and each top-row key alone; real-key passive capture confirmed lone hold → GNOME overview and single presses → brightness/volume/mute. Backlight auto-off/restore on screen blank verified (`ScreenSaver.ActiveChanged` 2→0→2, no sudo) and sleep hook publishes S3 handoff files (thawed user daemon performs the restore) verified; sysfs `0660 root:plugdev`. A full S3 freeze/thaw was observed 2026-11-22 (`rtcwake` + `systemctl suspend`) with the **old hook** — historical evidence only; **the current HEAD (new selector/root boundary) is pending on the target machine**, and a manual lid-close cycle remains a supplementary to-test. **keyd version scope:** syntax validated in CI with 2.6.0 (`keyd check` only); tap/hold/guard behaviour validated on the device with 2.5.0-5 only; other versions unverified (upstream 2.6.x has known `overloadt2` behaviour differences). On the local host the installed daemon matches `a03e4a0`, which predates all four nineteenth-re-review fixes (observed at the time of the read-only audit), and the backlight stays at 30 when the screen blacks out — a known Tier 2 limitation, not a regression; see the real-machine observation below. |
 | **Standby / Sleep** | S0ix Modern Standby + ACPI S3 | `s2idle` + `deep` | 🟢 **S3 lid cycle verified** | S3 `deep` default; real lid-close cycle tested 2026-08-18. **Key/fingerprint wake untested**; panel stays dark on lid open until a keypress (see [TROUBLESHOOTING.md §15](TROUBLESHOOTING.md)). |
 
 ### Sleep-hook handoff support scope
@@ -73,17 +73,50 @@ The root system-sleep hook publishes S3 handoff files only under these condition
 
 > [!IMPORTANT]
 > **Real S3 status:** the 2026-11-22 full freeze/thaw result below is historical evidence
-> from the old hook. The new `Session.User` selector and root write boundary have only
-> been validated by the local contract check, stub suites and CI — **they have NOT been
-> re-run on real S3 on the HP Pro c640 with this HEAD** (pending on the target machine).
+> from the old hook. The new `Session.User` selector, root write boundary and the
+> 19th-re-review payload/login1 fixes have only been validated by the local contract check,
+> stub suites and CI — **they have NOT been re-run on real S3 on the HP Pro c640 with this
+> HEAD** (pending on the target machine; authorised and scheduled after this push).
 > See the checklist in [verification.md §3](verification.md).
+
+#### Real-machine observation (read-only, 2026-11-26)
+
+The earlier "no HP c640 hardware available" wording is **superseded**. Read-only checks on
+the local host show DMI `sys_vendor=Google`, `product_name=Dratini`, `board_vendor=HP`,
+coreboot `MrChromebox-2606.1`, hostname `ubuntu-c640` and kernel `7.0.0-44`;
+`/sys/class/leds/chromeos::kbd_backlight` exists (`max=100`, current `30`) and the user
+daemon is running. However `/usr/local/bin/c640-kbd-backlight-sync` matches old commit
+`a03e4a0` — **predates all four nineteenth-re-review fixes (observed at the time of the
+read-only audit)** — so CI's "installed == repo" byte-identical assertion is **not a local
+fact**. The user reported the keyboard backlight
+staying at `30` when the screen goes black: the working hypothesis is the known **Tier 2**
+limitation (only `ScreenSaver.ActiveChanged` is a blank trigger; Wayland `idle-dim=true` /
+`idle-brightness=30` can blank the screen while ScreenSaver stays inactive; IdleMonitor /
+brightness-signal support is not implemented and is off by default), **not a regression**
+from this round. Real S3 / lock-unlock on HEAD remains pending.
+
+#### Upgrade window (17th ↔ 19th re-review)
+
+The suspend/resume payload contract changed in two fields: the root cycle marker went from
+two columns (`<token> <dev:ino>`) to three (`<token> <dev:ino> <value>`), and the resume flag
+from three (`<token> <epoch> <action>`) to four (`<token> <epoch> <action>
+<committed_value>`). A legacy two-column marker is now **refused** (fail closed); a legacy
+three-column resume flag is still **accepted** by the daemon, which treats the fourth
+column as authoritative when present and warns on a suspend/committed mismatch. **Upgrade
+the hook and the daemon as one package** — a new hook with an old daemon can publish a flag
+the old parser cannot read, and an old hook with a new daemon falls back to the legacy path
+without committed-value proof. `python3` is a runtime dependency of both publication and
+verification in `pre`/`post`.
 
 #### Fail-closed messages and handling (17th re-review)
 
 | Message (root/user journal) | Meaning | Handling |
 | :--- | :--- | :--- |
-| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration` / `numeric jump target identity changes after removing fingerprint module` | A custom PAM stack could not be parsed safely, or removing an fp module would change a numeric-jump landing. | Install exits non-zero **before any PAM edit**; no snapshot or debconf change. Review the custom stack by hand and re-run — do not substitute a substring `sed`. |
+| `Uncertain PAM rule syntax in <file> ... refusing to modify PAM configuration` / `Removing the fingerprint rule ... would change a per-management-group stack or its numeric jump target ...` / `Unsupported PAM include target ...` / `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration` / `PAM stack transformation is not provably safe for <label> (rc N): UNSUPPORTED PAM topology: ...` | A custom stack could not be parsed in the per-management-group model, topology is unresolvable/unsupported (e.g. an unmodelled substack that can affect a numeric jump or the transformation), or removing an fp rule would change a numeric-jump landing; `@include` is expanded and a substack without numeric-jump/transformation impact is treated as an opaque frame, not refused. | Install exits non-zero **before any PAM edit**; no snapshot or debconf change. Review the stack by hand and re-run — do not substitute a substring `sed`. |
+| `a non-fprintd PAM rule or a numeric jump endpoint changed during convergence` / `Refusing to modify <file>: the sudo '<label>' anchor is missing` / `PAM transaction failed after mutation; force-restoring common-*/sudo from the first-wins snapshot ...` | An external tool added/rewrote a rule (the `argsfp` fingerprint of its module arguments changed), or a later verification failed after mutation. | The zero-addition allowlist is empty by default, so an added rule fails closed; after mutation the retained snapshot is **force-restored** before rc 1 (snapshot kept, not consumed). Restore the intended policy by hand and re-run. |
 | `suspend/resume handoff token mismatch ...`, `cycle-begin file ... not adopted`, `suspend handoff token epoch ... stale` | The handoff does not belong to this suspend cycle (stale copy, forged flag or a failed `pre`). | The daemon leaves the saved brightness unchanged; treat it as a failed handoff, not a restore. Re-run the S3 cycle; see [verification.md](verification.md) §3. |
+| `resume handoff skipped (fail-closed): invalid cycle marker ...`, `suspend inode ... != cycle marker ...`, `suspend/cycle value mismatch ...` (TOKEN/VALUE/INODE/STRUCT/IO) | The legacy two-column root marker was used, or the suspend bytes changed after `pre` (same-inode value rewrite or inode swap). `post` reads every byte from **one** pinned fd and refuses to publish a resume flag. | Do not accept the handoff. Restore the installed hook/daemon pair from the same package and retry the S3 cycle. A legacy three-column resume flag is still accepted by the daemon, with the committed value authoritative. |
+| `keeping committed cycle handoff` / `prepare-for-sleep: cannot anchor cycle-begin to token ...; resume will fail closed` | A delayed `PrepareForSleep(true)` arrived after `pre`/`post` committed this cycle. | The true handler keeps a provably current handoff and re-anchors `cycle-begin` to the token epoch (not wall-clock time); a genuinely stale pair is still removed. With no resume flag, `PrepareForSleep(false)` restores local daemon state via `restore_from_local_state()` without adopting a handoff. |
 | `retry epoch invalidation failed; all brightness writers fail closed` / `retry epoch channel unhealthy; all brightness writers fail closed` | Even in-place epoch revocation failed (`COORDINATION_UNHEALTHY`); stale witnesses cannot be trusted. The quoted log wording is verbatim; the enforced scope is subsequent gates only. | Every subsequent gate fails closed. Fix the runtime state directory and restart the user daemon. Scope: the marker blocks subsequent gates only. A writer already inside the `WRITE_LOCK` critical section cannot be recalled and may still complete one write; if the state directory is completely unwritable the persistent marker cannot be created, so workers forked before revocation only see the in-process flag. These are non-blocking residuals — no retroactive cancellation is claimed in this degraded state. |
 | `evidence clock unavailable; evidence expired` / `evidence clock moved backwards; evidence expired` | The monotonic clock source is unreadable or moved backwards, so guard witness age is unknown. | The guard re-probes; if still unverifiable it fails closed with no write. Check `/proc/uptime` / `C640_KBD_MONOTONIC_FILE`. |
 | `handoff skipped (fail-closed): python3 unavailable; cannot publish <file>` | `python3` is missing from the hook's runtime environment. | Install `python3` on the target; until then no handoff is published (fail closed, no restore). |

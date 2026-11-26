@@ -109,6 +109,22 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   postcondition 會重新驗證非 fp 規則順序與 jump 落點。「目前沒有生效 fp 模組」與「收斂已
   驗證」是**不同的事實**：收斂失敗會如實記錄（`convergence NOT verified yet`），也不能單獨
   證明 jump 落點保持穩定。
+* **依 management group 個別建模、argument 指紋與強制復原（第十九次 re-review）。** awk
+  解析器現在只輸出原始 rule facts；`lib/pam_stack_model.py` 為每個 management group
+  建立獨立 handler stack、展開 `@include`、把 substack 視為不透明 frame，並在未建模 substack
+  可能影響 numeric jump 或 transformation、或拓撲無法解析／不支援時於任何編輯**之前 fail closed**
+  （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+  `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`、
+  `Removing the fingerprint rule ... would change a per-management-group stack or its
+  numeric jump target ...`）。每個保留規則都帶 `argsfp`——完整 argument vector 的單射
+  hex 指紋；non-fp postcondition 是**零新增** gate（allowlist 預設為空），因此外部工具
+  新增或改寫規則會 fail closed
+  （`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`）。
+  若 mutation 後 T3 或 sudo 驗證失敗，安裝器會先從保留的 snapshot **強制還原**
+  `common-*`／sudo 再回 rc 1
+  （`PAM transaction failed after mutation; force-restoring common-*/sudo from the
+  first-wins snapshot ...`）；該路徑保留、不消耗 snapshot，強制還原失敗則回
+  `manual recovery required`。
 * **PAM 檔案位元組由 rollback 還原；debconf selection 則快照、收斂後還原。**
   `disable_pam_fingerprint()` **不對 `/etc/pam.d/sudo`（或任何發行版 PAM 檔）執行 sed
   或直接修改**。所有位元組都由 `rollback_component("fingerprint")` 從第一份備份還原，
@@ -232,6 +248,20 @@ rollback 只有在某筆紀錄的整個動作都確認成功後才會消耗它�
   > 若當初使用 `--with-keyd` 安裝，也會移除 `/etc/keyd/cros.conf` 與
   > 舊版指向 `cros.conf` 的 `/etc/keyd/default.conf` symlink（有安裝前備份時會
   > 還原），並停用 `keyd` 服務。
+  >
+  > **升級窗：**root commitment marker 為 `<token> <dev:ino> <value>`（三欄；legacy
+  > 兩欄 marker 直接 fail closed），resume flag 為
+  > `<token> <epoch> <action> <committed_value>`（四欄；legacy 三欄 flag 仍被 daemon
+  > 接受，第四欄存在時為權威）。hook 與 daemon **必須同包升級**：新 hook 配舊 daemon
+  > 可能發布舊 parser 讀不了的 flag。`python3` 在 `pre`／`post` 的發布與單一 fd
+  > byte-exact 驗證兩階段都是執行期依賴。
+  >
+  > **真機觀察（唯讀，2026-11-26）：**本機是 HP c640 類裝置（DMI `Google`／`Dratini`／
+  > `HP` board、coreboot `MrChromebox-2606.1`、hostname `ubuntu-c640`、kernel
+  > `7.0.0-44`；LED 節點存在、`max=100`／目前 `30`），但
+  > `/usr/local/bin/c640-kbd-backlight-sync` 仍對應 `a03e4a0`（早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察））。
+  > 螢幕黑掉時背光仍亮是已知 **Tier 2** 限制，非本輪 regression；現行 HEAD 的真實
+  > S3／lock-unlock 仍 pending。
 
 * **僅移除電源管理調校**（logind 設定、休眠輔助、TLP 設定、thermald 服務啟用）：
 

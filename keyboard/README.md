@@ -204,6 +204,25 @@ remain for retry)` and returns rc 1 instead of claiming success.
   selection before consuming the snapshot. See [UNINSTALL.md](../docs/UNINSTALL.md) for the
   Tier 2 backup, the admin-override trade-off, the read-only stale-record check and the
   authselect/pam-config limits.
+* **PAM stacks are modelled per management group (19th re-review).** The awk parser emits
+  raw rule facts only; `lib/pam_stack_model.py` builds a **separate handler stack** for
+  auth/account/password/session, expands `@include`, treats substack as an opaque frame,
+  and fails closed **before any edit** when an unmodelled substack can affect a numeric
+  jump or the transformation, or when topology is unresolvable/unsupported.
+  (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+  `Removing the fingerprint rule ... would change a per-management-group stack or its
+  numeric jump target ...`). Instance identity includes group/instance/control/path/args and
+  the jump target — never a file-global module index — and sudo strip+insert share one
+  preflight with exactly one canonical line. An independent libpam oracle (`ctypes`
+  `pam_start_confdir` in an isolated service dir plus a fake module tracing argv) compares
+  pre/post decision rc and trace; a missing symbol/compiler fails the CI gate instead of
+  being silently skipped. Every retained rule also carries `argsfp`, an injective hex
+  fingerprint of the complete argument vector (normalised only where libpam normalises;
+  unsupported escapes fail closed). The non-fp postcondition is a **zero-addition** gate:
+  the addition allowlist is empty by default, so a rule added by an external tool fails
+  closed. If a later verification fails, the installer **force-restores** `common-*` / sudo
+  from the retained snapshot before returning rc 1 (`PAM transaction failed after mutation;
+  force-restoring common-*/sudo from the first-wins snapshot ...`).
 
 All install callers save the rollback rc, complete their remaining cleanup and return
 that rc last, so `set -e` cannot abort cleanup when a rollback fails.
@@ -416,13 +435,23 @@ the `post` phase, so the hook never queries a user/session D-Bus, never writes t
 and never deletes state. `pre` writes `/run/c640-kbd-backlight/state` as a **single-shot
 diagnostic snapshot of the first suspend in a boot** (first-wins, kept until reboot) and
 publishes `c640-kbd-backlight.suspend` as `<token> <value> published` (`0` valid);
-`post` only publishes `c640-kbd-backlight.resume` as `<token> <epoch> <action>`.
+`post` only publishes `c640-kbd-backlight.resume` as
+`<token> <epoch> <action> <committed_value>` (19th re-review: the fourth column is
+new; a legacy three-column flag is still accepted by the daemon, which treats the
+fourth column as authoritative and warns if it disagrees with the suspend copy).
 The root snapshot is **not consumed by the hook or the daemon and is never used for
 restore**; the daemon consumes only the two handoff files and its own
 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`. `<token>` is
 `<epoch>-<pid>-<random_hex>`, minted fresh by `pre` for every cycle; a root-only
-`0600` cycle marker (`<token> <dev:ino>`) is the last step of a successful `pre`,
-and both handoffs plus their inode are cross-checked by `post` and the daemon.
+`0600` cycle marker (`<token> <dev:ino> <value>` — **three columns** since the
+19th re-review; a legacy two-column marker fails closed) is the last step of a
+successful `pre`. `post` verifies the suspend bytes through **one** pinned
+directory fd + `O_NOFOLLOW` descriptor (fstat plus a byte-exact read from that same
+fd of `<token> <value> published\n`), so neither a same-inode value rewrite nor
+an inode swap with identical text can smuggle a different value through. The
+stdout contract stays `OK dev:ino` × 2 from `pre` and × 1 from `post` — the
+verifier prints no `OK` record. Both handoffs plus their inode and committed
+value are cross-checked by `post` and the daemon.
 Both handoff files are `0600`, chowned to the resolved session user (uid **and**
 gid) and published by an inline `python3` writer with a pinned directory fd:
 `O_DIRECTORY|O_NOFOLLOW` on the dir, an `O_EXCL|O_NOFOLLOW` `0600` temp with
@@ -470,6 +499,20 @@ current brightness already equals the saved value, otherwise defer.
 — this accepts the risk of lighting a still-locked screen and is off by default.
 `handle_unblank()` routes through `handle_resume()` whenever a resume flag is present,
 avoiding a double write.
+
+**Cycle-aware login1 cleanup (19th re-review):** a delayed `PrepareForSleep(true)` may
+arrive after the hook's `pre`/`post` commit, so the true handler no longer deletes both
+handoffs unconditionally. Causal commit proof wins: a resume flag whose token matches the
+live suspend handoff (and whose committed value agrees) proves this cycle even if a rolled
+back clock or a poisoned future `cycle-begin` would make the token look old. Only a handoff
+that cannot be parsed or is provably older than `cycle-begin - skew` is dropped. A kept
+cycle is re-anchored to the **token epoch** (never wall-clock time) and logs
+`keeping committed cycle handoff`. When there is no resume flag,
+`PrepareForSleep(false)` calls `restore_from_local_state()` instead of doing nothing: it
+restores the daemon's own saved brightness (under `RESUME_LOCK`) without adopting a
+handoff, touching the handoff files or writing an adopted-cycle marker. D11–D14 cover the
+delayed-true interleaving, the no-flag fallback, token mismatch not being a delete reason,
+genuinely stale cleanup and the no-fresh-handoff case.
 
 **Physical write serialisation and generation gate (Tier 1):** every physical
 `SetBrightness`/gsd `Properties.Set` is wrapped in `WRITE_LOCK` (flock fd 209),
@@ -642,7 +685,7 @@ explicit-override mismatch warning (there is no cross-uid scan any more). Its ol
 `_DELAY` bus-probe overrides are ignored (no D-Bus and no delay in the hook).
 
 **Unit tests (no root, no real sysfs/D-Bus):** stub tools live first on `PATH`;
-all state is in a temp dir. The daemon suite has 875 cases (write chain, re-probe,
+all state is in a temp dir. The daemon suite has 976 cases (write chain, re-probe,
 staging/verify, tristate, resume result codes/retry, save-before-blank, single-sample
 blank, invalid-state self-heal, mutation-covered empty-gsd-pct, unconfirmed sampler
 zeros, wall-clock probe deadline, explicit handoff directory override mismatch, gsd-confirmed
@@ -651,15 +694,19 @@ in-lock generation gate with PENDING rollback, strictly monotonic generation bum
 **fail-closed generation publish with readback, epoch barrier that revokes stale
 retries/guards, TTL evidence re-probe**, fail-closed lock failures and single-read
 last-user cache) and the
-sleep-hook suite has 372 cases (pure handoff, `0600`/`chown` with the fd-pinned
+sleep-hook suite has 398 cases locally (review-time CI was 369/3, all H6 — only the pushed
+HEAD's CI is authoritative): pure handoff, `0600`/`chown` with the fd-pinned
 inline-`python3` publisher (dir-fd `os.rename` plus inode/owner/mode verification,
-no `cp`/plain-`mv` fallback), cycle-token and inode binding, `C640_KBD_HANDOFF_DIR`, single active
+no `cp`/plain-`mv` fallback), cycle-token and inode binding, three-column root marker
+with committed value and single-fd byte-exact verify, four-column resume flag with
+legacy three-column compatibility, deterministic H6 inode-reuse and same-inode
+value-rewrite fixtures, `C640_KBD_HANDOFF_DIR`, single active
 local graphical session selection from loginctl `Session.User` (`User=<uid>`, alphanumeric
 session IDs) with root-journal fail-closed warnings, uid pin and reuse,
 0700 runtime-dir gate, no LED writes). The separate
 `keyboard/tests/loginctl-contract-check.sh` is a read-only schema check (`CONTRACT OK`
 on a systemd host, `SKIP` otherwise — not a real-S3 test). The rollback suite
-(`tests/rollback-test.sh`, run as root) has 2395 cases, including corrupt and
+(`tests/rollback-test.sh`, run as root) has 2508 cases, including corrupt and
 field-type-invalid manifest fail-closed, the pre-mutation rollback gate, pseudo-target
 skipping, unknown-state fail-closed, absent-target first-backup restore, atomic restores
 that keep the target on a failed swap, missing-backup rc 1, the root-only `0600` holder
@@ -677,10 +724,10 @@ bodies), unique writer temps and checked `systemctl` restores. CI also runs a re
 Ubuntu 24.04 container E2E for the PAM round-trip.
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 875 cases
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 cases
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 976 cases
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 398 cases (CI authoritative)
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK / SKIP (read-only)
-sudo bash tests/rollback-test.sh                       # 2395 cases (root)
+sudo bash tests/rollback-test.sh                       # 2508 cases (root)
 ```
 
 #### Handoff publication and coordination contract (17th re-review)
@@ -700,6 +747,19 @@ sudo bash tests/rollback-test.sh                       # 2395 cases (root)
   out-of-range epoch or failed `pre` never overwrites the saved value
   (`suspend/resume handoff token mismatch ...`, `cycle-begin file ... not adopted`,
   `suspend handoff token epoch ... stale`). Same-cycle DEFER retries keep the token.
+* **Payload binding (19th re-review; upgrade window).** The root commitment marker is now
+  `<token> <dev:ino> <value>` (three columns) and the resume flag is
+  `<token> <epoch> <action> <committed_value>` (four columns); a **legacy two-column
+  marker is refused** (`resume handoff skipped (fail-closed): invalid cycle marker ...`) and
+  a legacy three-column resume flag is still accepted by the daemon, with the committed
+  column authoritative when present. `post` reads the suspend bytes from **one** pinned fd
+  and compares them byte-for-byte with `<token> <value> published\n`; TOKEN/VALUE/INODE/
+  STRUCT/IO mismatches all fail closed (`resume handoff skipped (fail-closed): suspend
+  inode ... != cycle marker ...`, `suspend/cycle value mismatch ...`). `python3` remains the
+  runtime dependency for both publication and verification — its absence is fail closed in
+  either phase. **Hook and daemon must be upgraded as one package**: an old hook with a new
+  daemon loses the committed-value proof (legacy path), and a new hook with an old daemon
+  can publish a four-column flag the old parser does not understand.
 * **Common-mode failure boundary.** When generation and epoch publishes fail together the
   epoch is revoked **in place** so retries/guards armed in the old cycle cannot survive. If
   that revocation also fails, a persistent `COORDINATION_UNHEALTHY` marker makes **every
@@ -842,7 +902,7 @@ Environment: Ubuntu 26.04 LTS, kernel `7.0.0-38-generic`, `keyd 2.5.0-5`
 | LED node permissions | 🟢 | `-rw-rw---- root plugdev` on `chromeos::kbd_backlight/brightness` after `udevadm trigger --subsystem-match=leds`; user write succeeds without sudo |
 | Daemon blank/unblank | 🟢 | `--test-blank` 2 → 0, `--test-unblank` 0 → 2, state file `0600` and removed |
 | Daemon event path | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → brightness 2 → 0 → 2 with **no `sudo` calls** in the user journal |
-| Sleep hook | 🟢 | **2026-10-31 OLD hook behaviour (historical only; no longer valid):** `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session). The hook is now a **pure handoff writer** that never writes brightness or deletes state; a full real S3 freeze/thaw cycle was observed on 2026-11-22 with the **old hook** (historical only); the current HEAD's selector/root boundary is **pending on the target machine** — see [verification.md](../docs/verification.md) |
+| Sleep hook | 🟢 | **2026-10-31 OLD hook behaviour (historical only; no longer valid):** `pre suspend` saved 6, simulated 0, `post suspend` restored 6, state file removed (hook invoked directly in that session). The hook is now a **pure handoff writer** that never writes brightness or deletes state; a full real S3 freeze/thaw cycle was observed on 2026-11-22 with the **old hook** (historical only); the current HEAD's selector/root boundary and the 19th-re-review payload/login1 fixes are **pending on the target machine** — see [verification.md](../docs/verification.md). On this host the installed daemon still matches `a03e4a0`, which predates all four nineteenth-re-review fixes (observed at the time of the read-only audit); the backlight staying on when the screen blacks out is a known Tier 2 limitation, not a regression |
 | `--check` | 🟢 | all green, including "backlight node writable by group plugdev (mode 660)" |
 
 **History (fixed 2026-10-31):** the earlier passive captures at `12:49`, `13:25`

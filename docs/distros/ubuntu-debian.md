@@ -150,7 +150,42 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 > `numeric jump target identity changes ...`). If you edit by hand, check the module-path
 > field and verify the non-fp bytes afterwards. "No active fp module" and "convergence
 > verified" are separate facts (`convergence NOT verified yet`).
+>
+> **19th re-review (per-group model / argsfp / forced recovery):** the installer now models
+> a **separate handler stack per management group**, expands `@include`, treats substack as
+> an opaque frame, and fails closed **before editing anything** when an unmodelled substack
+> can affect a numeric jump or the transformation, or when topology is
+> unresolvable/unsupported. (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+> `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`,
+> `Removing the fingerprint rule ... would change a per-management-group stack or its
+> numeric jump target ...`). Every retained rule carries `argsfp`, an injective fingerprint
+> of the complete module argument vector; the non-fp postcondition is a **zero-addition**
+> gate (empty allowlist by default), so an external tool adding/rewriting a rule fails closed
+> (`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`). If a
+> later verification fails, the installer force-restores `common-*` / sudo from the retained
+> snapshot before rc 1 (`PAM transaction failed after mutation; force-restoring
+> common-*/sudo ...`). Do not hand-edit a custom stack you cannot prove safe — let the
+> installer refuse it.
 
 ```bash
 sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```
+
+> [!NOTE]
+> **Keyboard backlight upgrade window:** the root commitment marker is
+> `<token> <dev:ino> <value>` (3 columns; legacy 2-column markers fail closed) and the
+> resume flag is `<token> <epoch> <action> <committed_value>` (4 columns; legacy 3-column
+> flags stay readable by the daemon, with the committed value authoritative). Deploy the
+> hook and daemon **from the same package**. `python3` is a runtime dependency of both
+> publication and the single-fd byte-exact verification in `pre`/`post`; without it no
+> handoff is published (fail closed).
+>
+> **Real-machine observation (read-only, 2026-11-26):** on the local host (DMI
+> `Google` / `Dratini` / `HP` board, coreboot `MrChromebox-2606.1`, hostname `ubuntu-c640`,
+> kernel `7.0.0-44`; `/sys/class/leds/chromeos::kbd_backlight` with `max=100` / current `30`,
+> daemon running) the installed `/usr/local/bin/c640-kbd-backlight-sync` still matches
+> `a03e4a0` — **predates all four nineteenth-re-review fixes (observed at the time of the
+> read-only audit)** — CI's byte-identical assertion is not a local fact. The backlight staying
+> on when the screen blacks out is a known **Tier 2** limitation (idle-dim/idle-brightness
+> with ScreenSaver inactive; IdleMonitor not
+> implemented), not a regression; real S3 / lock-unlock on HEAD is still pending.

@@ -174,6 +174,22 @@ remain for retry)` 並回傳 rc 1，而不是謊稱成功。
   `debconf-set-selections` + `--package` 還原並驗證 selection 後才消耗快照。
   Debian 的 Tier 2 備份、管理員覆寫取捨、唯讀的 stale-record 檢查與 authselect/pam-config
   限制見 [UNINSTALL.md](../docs/UNINSTALL.md)。
+* **PAM stack 依 management group 個別建模（第十九次 re-review）。** awk 解析器現在只輸出
+  原始 rule facts；`lib/pam_stack_model.py` 為 auth/account/password/session 建立**各自的**
+  handler stack、展開 `@include`、把 substack 視為不透明 frame，並在任何編輯**之前**於
+  未建模 substack 可能影響 numeric jump 或 transformation、或拓撲無法解析／不支援時 fail closed
+  （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+  `Removing the fingerprint rule ... would change a per-management-group stack or its numeric
+  jump target ...`）。instance identity 含 group/instance/control/path/args 與 jump 落點，
+  絕不是整份檔案共用的 module index；sudo strip+insert 共用單一 preflight，canonical 行
+  必須恰好一條。獨立 libpam oracle（`ctypes` `pam_start_confdir` 指向隔離 service dir，
+  搭配記錄 argv 的 fake module）黑盒比較 pre/post 的決策 rc 與 trace；缺少 symbol/compiler
+  時 CI gate 失敗，不靜默跳過。每個保留規則還帶 `argsfp`——完整 argument vector 的單射
+  hex 指紋（只在 libpam 會正規化處正規化；不支援 escape 即 fail closed）。non-fp
+  postcondition 是**零新增** gate：addition allowlist 預設為空，外部工具新增的規則會
+  fail closed。若後續驗證失敗，安裝器會先從保留的 snapshot **強制還原** `common-*`／sudo
+  再回 rc 1（`PAM transaction failed after mutation; force-restoring common-*/sudo from the
+  first-wins snapshot ...`）。
 
 所有安裝 caller 會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e` 在
 rollback 失敗時提前中止收尾。
@@ -355,11 +371,17 @@ mktemp/寫入/驗證失敗才回 rc `2` 並保持 LED 亮著。
 `pre` 寫入 `/run/c640-kbd-backlight/state` 作為**本次開機第一次 suspend 的單次診斷快照**
 （first-wins，保留到重開機），並發佈 `c640-kbd-backlight.suspend`
 （`<token> <value> published`，`0` 有效）；`post` 只發佈
-`c640-kbd-backlight.resume`（`<token> <epoch> <action>`）。root 快照**不被 hook 或
-daemon 消耗，也從不用於還原**；daemon 只消費兩個 handoff 檔與自己的
-`$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。`<token>` 是
+`c640-kbd-backlight.resume`（`<token> <epoch> <action> <committed_value>`；第十九次
+新增第四欄，daemon 仍相容三欄 legacy flag，並以第四欄為權威，與 suspend copy 不符時
+警告）。root 快照**不被 hook 或 daemon 消耗，也從不用於還原**；daemon 只消費兩個
+handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。`<token>` 是
 `<epoch>-<pid>-<random_hex>`，由 `pre` 每次鑄造；root-only `0600` cycle marker
-（`<token> <dev:ino>`）是成功 `pre` 的最後一步，兩個 handoff 與 inode 都會由
+（`<token> <dev:ino> <value>`——第十九次起為**三欄**，legacy 兩欄 marker 直接 fail
+closed）是成功 `pre` 的最後一步。`post` 透過**單一**釘住的 directory fd + `O_NOFOLLOW`
+descriptor 驗證 suspend bytes（fstat 加上從同一 fd 對
+`<token> <value> published\n` 做 byte-exact 比對），因此同 inode 改值或相同文字的
+inode 替換都無法混入不同值。stdout contract 不變：`pre` 兩筆、`post` 一筆
+`OK dev:ino`，verifier 不印任何 `OK`。兩個 handoff 與 inode、committed value 都會由
 `post`／daemon 交叉比對。兩個 handoff 檔都是 `0600`、chown 給解析出的 session user
 （uid **與** gid），並由 inline `python3` writer 釘住 directory fd 發布：對目錄用
 `O_DIRECTORY|O_NOFOLLOW`，暫存檔用 `O_EXCL|O_NOFOLLOW` 的 `0600` 檔搭配
@@ -397,6 +419,17 @@ bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume 
 `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 可選擇在答案仍為 unknown 時還原——這等於接受
 點亮仍鎖定螢幕的風險，預設關閉。只要有 resume flag，`handle_unblank()` 就會路由到
 `handle_resume()`，避免雙重寫入。
+
+**cycle-aware login1 清理（第十九次 re-review）**：延後的 `PrepareForSleep(true)` 可能在
+hook 的 `pre`／`post` commit 之後才送達，因此 true handler 不再無條件刪除兩個 handoff。
+因果 commit proof 優先：resume flag 的 token 與 live suspend handoff 相符（且 committed
+value 一致）即證明屬於本 cycle，即使時鐘回撥或中毒的未來 `cycle-begin` 讓 token 看似過期。
+只有無法解析或可證明比 `cycle-begin - skew` 更舊的 handoff 才丟棄。保留的 cycle 以
+**token epoch** 重新錨定（絕非 wall-clock 時間），並記錄 `keeping committed cycle handoff`。
+沒有 resume flag 時，`PrepareForSleep(false)` 改呼叫 `restore_from_local_state()`：在
+`RESUME_LOCK` 下還原 daemon 自己的已存亮度，不 adopt handoff、不碰 handoff 檔、不寫
+adopted-cycle marker。D11–D14 涵蓋延遲 true 交錯、無 flag fallback、token 不符不當作
+刪檔理由、真正過期清理與無新 handoff 的案例。
 
 **實體寫入序列化與 generation gate（Tier 1）**：每次實體
 `SetBrightness`／gsd `Properties.Set` 都在 `WRITE_LOCK`（flock fd 209）內，包含
@@ -547,21 +580,24 @@ guard marker／保留的 Tier 2 sentinel 路徑；sleep hook 接受 `C640_KBD_SL
 `_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
 
 **單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
-所有狀態都在暫存目錄。daemon 測試有 875 個案例（寫入鏈、重新探測、暫存/驗證、
+所有狀態都在暫存目錄。daemon 測試有 976 個案例（寫入鏈、重新探測、暫存/驗證、
 三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
 經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
 explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
 guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
 嚴格單調的 generation bump、**fail-closed generation 發布與讀回、epoch barrier 吊銷
 過期 retry/guard、TTL 證據重新探測**、fail-closed 鎖失敗與單次讀取的 last-user cache）；
-sleep hook 測試有 372 個案例（純 handoff、`0600`/`chown` 搭配
+sleep hook 測試本機有 398 個案例（review 時點 CI 為 369/3，全為 H6——僅以 push 出去的
+HEAD 的 CI 為準）（純 handoff、`0600`/`chown` 搭配
 fd 釘住的 inline `python3` 發布器（directory-fd `os.rename` 與 inode／owner／mode
-驗證、無 `cp`／一般 `mv` 降級）、cycle token 與 inode 綁定、
+驗證、無 `cp`／一般 `mv` 降級）、cycle token 與 inode 綁定、三欄 root marker 搭配
+committed value 與單一 fd byte-exact 驗證、四欄 resume flag 與三欄 legacy 相容、
+deterministic H6 inode reuse／同 inode 改值 fixture、
 `C640_KBD_HANDOFF_DIR`、由 loginctl `Session.User`（`User=<uid>`、英數 session ID）
 選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
 0700 runtime dir 檢查、不寫 LED）。另有唯讀的
 `keyboard/tests/loginctl-contract-check.sh`（systemd host 為 `CONTRACT OK`、其他為 `SKIP`
-——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2395 個案例，包含損毀
+——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2508 個案例，包含損毀
 與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
 unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
 找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
@@ -576,10 +612,10 @@ uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `
 執行 PAM 來回 E2E。
 
 ```bash
-bash keyboard/tests/kbd-backlight-daemon-test.sh       # 875 個案例
-bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 372 個案例
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 976 個案例
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 398 個案例（以 CI 為準）
 bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
-sudo bash tests/rollback-test.sh                       # 2395 個案例（需 root）
+sudo bash tests/rollback-test.sh                       # 2508 個案例（需 root）
 ```
 
 #### Handoff 發布與協調合約（第十七次 re-review）
@@ -597,6 +633,17 @@ sudo bash tests/rollback-test.sh                       # 2395 個案例（需 ro
   epoch 超出範圍或 `pre` 失敗都不覆蓋已存值
   （`suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、
   `suspend handoff token epoch ... stale`）。同一 cycle 的 DEFER 重試保留 token。
+* **Payload binding（第十九次 re-review；升級窗）。** root commitment marker 現在是
+  `<token> <dev:ino> <value>`（三欄），resume flag 是
+  `<token> <epoch> <action> <committed_value>`（四欄）；**legacy 兩欄 marker 直接拒絕**
+  （`resume handoff skipped (fail-closed): invalid cycle marker ...`），而 legacy 三欄
+  resume flag 仍被 daemon 接受，第四欄存在時以其為權威。`post` 從**單一**釘住 fd 讀取
+  suspend bytes，並與 `<token> <value> published\n` 逐位元組比對；TOKEN/VALUE/INODE/
+  STRUCT/IO 任一不符即 fail closed（`resume handoff skipped (fail-closed): suspend inode
+  ... != cycle marker ...`、`suspend/cycle value mismatch ...`）。`python3` 在發布與驗證
+  兩階段都是執行期依賴，缺失即 fail closed。**hook 與 daemon 必須同包升級**：舊 hook 配
+  新 daemon 會失去 committed value 證明（走 legacy 路徑），新 hook 配舊 daemon 則可能
+  發布舊 parser 無法解的第四欄 flag。
 * **共同故障邊界。** generation 與 epoch 發布同時失敗時，epoch 會**原地**撤銷，讓舊週期
   armed 的 retry/guard 無法存活；若連撤銷也失敗，持久的 `COORDINATION_UNHEALTHY` marker 讓
   **每個後續 gate** fail closed。**重啟**時 marker 會強制先鑄造新 nonce 再清除，讓在舊數字
@@ -722,7 +769,7 @@ sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
 | LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後 `chromeos::kbd_backlight/brightness` 為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
 | daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
 | daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
-| sleep hook | 🟢 | **2026-10-31 舊 hook 行為（僅供沿革參考，現已不適用）**：`pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（該 session 以直接呼叫驗證）。現行 hook 已改為**純 handoff 寫入者**，絕不寫亮度或刪 state；2026-11-22 曾以**舊 hook** 觀察到完整真實 S3 freeze/thaw（僅為歷史證據）；現行 HEAD 的 selector／root 邊界**待目標機執行**——見 [verification.md](../docs/verification.md) |
+| sleep hook | 🟢 | **2026-10-31 舊 hook 行為（僅供沿革參考，現已不適用）**：`pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（該 session 以直接呼叫驗證）。現行 hook 已改為**純 handoff 寫入者**，絕不寫亮度或刪 state；2026-11-22 曾以**舊 hook** 觀察到完整真實 S3 freeze/thaw（僅為歷史證據）；現行 HEAD 的 selector／root 邊界與第十九次 payload／login1 修正**待目標機執行**——見 [verification.md](../docs/verification.md)。本機安裝的 daemon 仍對應 `a03e4a0`（早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察））；螢幕黑掉時背光仍亮是已知 Tier 2 限制，非本輪 regression |
 | `--check` | 🟢 | 全綠，含「backlight node writable by group plugdev (mode 660)」 |
 
 **沿革（2026-10-31 已修）：** 先前 `12:49`、`13:25`、`13:26` 的被動擷取出現

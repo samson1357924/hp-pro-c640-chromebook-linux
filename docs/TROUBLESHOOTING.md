@@ -231,12 +231,17 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   > A session-bus probe from the root hook therefore always fails or times out;
   > the hook is now a **pure handoff
   > writer**: `pre` publishes `c640-kbd-backlight.suspend` as `<token> <value> published` (`0` valid),
-  > `post` publishes `c640-kbd-backlight.resume` as `<token> <epoch> <action>`,
+  > `post` publishes `c640-kbd-backlight.resume` as
+  > `<token> <epoch> <action> <committed_value>` (4th column added in the 19th re-review;
+  > a legacy 3-column flag is still accepted, with the committed value authoritative),
   > chowned to the session user (uid + gid), published by a pinned-fd `python3`
   > writer into `$XDG_RUNTIME_DIR`
   > (`C640_KBD_HANDOFF_DIR` overrides it). `<token>` is a fresh
   > `<epoch>-<pid>-<random_hex>` minted by `pre` per cycle and bound to a
-  > root-only `0600` cycle marker plus the published suspend inode. It never writes the LED, deletes state or
+  > root-only `0600` cycle marker (`<token> <dev:ino> <value>` — 3 columns; a legacy
+  > 2-column marker is refused) plus the published suspend inode. `post` verifies the
+  > suspend bytes from **one** pinned fd with a byte-exact read of
+  > `<token> <value> published\n`. It never writes the LED, deletes state or
   > queries D-Bus. The thawed **user daemon** is the only writer: it adopts the handoff
   > on `PrepareForSleep(false)` from the **system** bus (not frozen) and restores via
   > gsd-power → UPower → legacy. Do not reintroduce root-side session-bus probing
@@ -278,6 +283,24 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   still cannot verify. In all cases the daemon **degrades to refusing writes** rather than
   trusting stale witnesses; none of this is a real-S3 verification.
 
+* **Nineteenth-re-review fail-closed messages:**
+  `resume handoff skipped (fail-closed): invalid cycle marker ...` means a legacy
+  two-column root marker was found instead of `<token> <dev:ino> <value>`;
+  `suspend inode ... != cycle marker ...`, `suspend/cycle value mismatch ...` and
+  the TOKEN/VALUE/STRUCT/IO verdicts mean the suspend bytes changed after `pre` — `post`
+  reads every byte from one pinned fd and refuses to publish a resume flag. Restore the
+  hook and daemon from the **same package** (upgrade window: 3-column marker / 4-column
+  flag; legacy 3-column flags stay readable, legacy 2-column markers do not).
+  `keeping committed cycle handoff` is informational: a delayed `PrepareForSleep(true)`
+  kept this cycle instead of deleting it; with no flag, `PrepareForSleep(false)` now calls
+  `restore_from_local_state()` and restores local saved brightness without adopting a
+  handoff. For PAM, `Uncertain PAM rule syntax ...`, `Unsupported PAM include target ...`
+  and `Unsupported PAM stack topology in common-* files ...` refuse the install **before
+  any edit**; `a non-fprintd PAM rule or a numeric jump endpoint changed during convergence`
+  means the zero-addition `argsfp` gate rejected an external-tool change, and
+  `PAM transaction failed after mutation; force-restoring common-*/sudo ...` means the
+  retained snapshot was force-restored before rc 1.
+
 * **Triage** (all gdbus queries below are read-only):
 
   ```bash
@@ -294,7 +317,7 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
   # read-only handoff files (only present across a suspend/resume cycle):
   cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # "<token> <value> published", 0 valid
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action>"
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action> <committed_value>"
   # read-only D-Bus probes (no writes, safe while the daemon runs):
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -322,6 +345,17 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
     handoff files for lid close (`suspend`), but the thawed user daemon owns the restore,
     so keep it enabled; idle blank needs IdleMonitor: see `keyboard/README.md`
     `C640_KBD_ENABLE_IDLEMONITOR=1`.
+  * **Screen blacks out but the backlight stays on (real-machine observation,
+    2026-11-26):** on the local host (DMI `Google` / `Dratini` / `HP` board, coreboot
+    `MrChromebox-2606.1`, hostname `ubuntu-c640`, kernel `7.0.0-44`, LED node
+    `max=100` / current `30`, daemon running) the user saw the keyboard backlight stay
+    at `30` after the screen went black. This is the known **Tier 2** limitation, not a
+    regression: the daemon only treats `ScreenSaver.ActiveChanged` as a blank trigger,
+    while Wayland `idle-dim=true` / `idle-brightness=30` can blank the screen with
+    ScreenSaver still inactive; the brightness-signal / IdleMonitor path is not
+    implemented (off by default). The installed daemon also matches `a03e4a0`, which predates
+    all four nineteenth-re-review fixes (observed at the time of the read-only audit). Real S3 /
+    lock-unlock on HEAD is still pending.
   * For `brightness` permission denied: check `groups` includes `plugdev`, or `udevadm trigger --subsystem-match=leds`.
   * On Ubuntu 26.04 the LED attribute is only writable if the udev rule applied its
     `RUN+=chgrp plugdev` + `RUN+=chmod 0660` (verified: `-rw-rw---- root plugdev`).
@@ -335,8 +369,11 @@ when installing and using Linux on the **HP Pro c640 Chromebook (Google
   * Flicker/oscillation: check the read-only queries above. If gsd-power's
     `Brightness` percent and UPower's raw value disagree, the daemon logs
     `[WARN] gsd-power set ... forcing UPower + property refresh`; keep the
-    deployed daemon/unit byte-identical to the repo (the smoke test asserts this)
-    and avoid other tools writing the LED directly. If ScreenSaver is `true` or
+    deployed daemon/unit byte-identical to the repo (the smoke test asserts this
+    in CI — on the local host the installed daemon is still `a03e4a0`, which predates all
+    four nineteenth-re-review fixes (observed at the time of the read-only audit), so
+    reinstall from this branch before drawing conclusions) and avoid other tools writing
+    the LED directly. If ScreenSaver is `true` or
     `unknown` during restore, deferral is expected — wait for the `+0.5s/+1.5s/+3s`
     retries or unlock the session. The hook no longer probes the session bus at all.
   * `resume deferred: ScreenSaver still active` / `... unknown ... deferring restore`

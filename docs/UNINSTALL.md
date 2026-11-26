@@ -130,6 +130,24 @@ above).` instead:
   endpoints. "No active fp module now" and "convergence verified" are **separate facts**:
   a convergence failure is logged honestly (`convergence NOT verified yet`) and does not by
   itself prove the jump endpoints stayed stable.
+* **Per-management-group stacks, argument fingerprints and force recovery (19th
+  re-review).** The awk parser emits raw rule facts only; `lib/pam_stack_model.py` builds a
+  separate handler stack per management group, expands `@include`, treats substack as an
+  opaque frame, and fails closed when an unmodelled substack can affect a numeric jump or
+  the transformation, or when topology is unresolvable/unsupported.
+  (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+  `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`,
+  `Removing the fingerprint rule ... would change a per-management-group stack or its
+  numeric jump target ...`) — always **before any edit**. Every retained rule carries
+  `argsfp`, an injective hex fingerprint of the complete argument vector; the non-fp
+  postcondition is a **zero-addition** gate (allowlist empty by default), so an external
+  tool adding or rewriting a rule fails closed
+  (`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`).
+  If T3 or the sudo verification fails after mutation, the installer **force-restores**
+  `common-*` / sudo from the retained snapshot before returning rc 1
+  (`PAM transaction failed after mutation; force-restoring common-*/sudo from the
+  first-wins snapshot ...`); the snapshot is retained, not consumed on that path, and a
+  failed forced restore returns `manual recovery required`.
 * **PAM file bytes come from rollback; the debconf selection is snapshotted, converged and
   restored.** `disable_pam_fingerprint()` performs **no sed and no direct edit** of
   `/etc/pam.d/sudo` (or any distro PAM file). All bytes come from the first backup via
@@ -279,6 +297,22 @@ above).` instead:
   > and any legacy `/etc/keyd/default.conf` symlink that pointed to `cros.conf`
   > (restoring the pre-install backup when one exists) and disables the `keyd`
   > service.
+  >
+  > **Upgrade window:** the root commitment marker is `<token> <dev:ino> <value>`
+  > (3 columns; a legacy 2-column marker fails closed) and the resume flag is
+  > `<token> <epoch> <action> <committed_value>` (4 columns; a legacy 3-column flag is
+  > still accepted by the daemon, with the committed value authoritative when present).
+  > Upgrade the hook and daemon **as one package** — a new hook with an old daemon can
+  > publish a flag the old parser cannot read. `python3` is a runtime dependency of
+  > `pre`/`post` for both publication and the single-fd byte-exact verification.
+  >
+  > **Real-machine observation (read-only, 2026-11-26):** the local host is an HP c640
+  > class device (DMI `Google` / `Dratini` / `HP` board, coreboot `MrChromebox-2606.1`,
+  > hostname `ubuntu-c640`, kernel `7.0.0-44`; LED node present, `max=100` / current `30`),
+  > but `/usr/local/bin/c640-kbd-backlight-sync` still matches `a03e4a0`, which predates
+  > all four nineteenth-re-review fixes (observed at the time of the read-only audit).
+  > The backlight staying on when the screen blacks out is a known **Tier 2** limitation,
+  > not a regression; real S3 / lock-unlock on HEAD remains pending.
 
 * **Remove only the power management tweaks** (logind config, suspend
   helpers, TLP config, thermald service enablement):

@@ -196,11 +196,13 @@
   > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)）。
   > 因此從 root hook 查詢 session bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
   > `c640-kbd-backlight.suspend`（`<token> <value> published`，`0` 有效），`post` 發佈
-  > `c640-kbd-backlight.resume`（`<token> <epoch> <action>`），兩者皆 `0600` + chown 給
-  > session user（uid 與 gid），由釘住 directory fd 的 `python3` writer 發布到
+  > `c640-kbd-backlight.resume`（`<token> <epoch> <action> <committed_value>`；第十九次
+  > 新增第四欄，legacy 三欄 flag 仍被接受且 committed value 為權威），兩者皆 `0600` +
+  > chown 給 session user（uid 與 gid），由釘住 directory fd 的 `python3` writer 發布到
   > `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。`<token>` 是 `pre` 每輪新鑄的
-  > `<epoch>-<pid>-<random_hex>`，並綁定到 root-only `0600` cycle marker 與已發布的
-  > suspend inode。
+  > `<epoch>-<pid>-<random_hex>`，並綁定到 root-only `0600` cycle marker
+  > （`<token> <dev:ino> <value>`；三欄，legacy 兩欄 marker 直接拒絕）與已發布的
+  > suspend inode。`post` 從**單一**釘住 fd 對 `<token> <value> published\n` 做 byte-exact 讀取驗證。
   > 它絕不寫 LED、不刪 state、不查 D-Bus。唯一寫入者是 thaw 後的**使用者 daemon**：
   > 它在 **system** bus（未被凍結）收到 `PrepareForSleep(false)` 時 adopt handoff，
   > 再經 gsd-power → UPower → legacy 還原。請勿把舊的 root 端 session bus 探測
@@ -234,6 +236,22 @@
   expired` 代表 monotonic TTL（`/proc/uptime`）不可信，guard 會重新探測，仍無法驗證即 fail
   closed。以上情況 daemon 皆**降級為拒絕寫入**，而非信任過期 witness；這些都不是真實 S3 驗證。
 
+* **第十九次 re-review 的 fail closed 訊息：**
+  `resume handoff skipped (fail-closed): invalid cycle marker ...` 代表找到 legacy 兩欄
+  root marker，而非 `<token> <dev:ino> <value>`；`suspend inode ... != cycle marker ...`、
+  `suspend/cycle value mismatch ...` 與 TOKEN/VALUE/STRUCT/IO verdict 代表 suspend bytes 在
+  `pre` 後被改動——`post` 從單一釘住 fd 逐位元組讀取，拒絕發布 resume flag。請以**同一套件**
+  還原 hook 與 daemon（升級窗：三欄 marker／四欄 flag；legacy 三欄 flag 仍可讀，兩欄
+  marker 不行）。`keeping committed cycle handoff` 是資訊訊息：延後的
+  `PrepareForSleep(true)` 保留了本輪而非刪除；沒有 flag 時 `PrepareForSleep(false)` 改呼叫
+  `restore_from_local_state()`，只還原本機已存亮度、不 adopt handoff。PAM 方面，
+  `Uncertain PAM rule syntax ...`、`Unsupported PAM include target ...`、
+  `Unsupported PAM stack topology in common-* files ...` 會在任何編輯**之前**拒絕安裝；
+  `a non-fprintd PAM rule or a numeric jump endpoint changed during convergence` 代表
+  零新增 `argsfp` gate 拒絕外部工具的變更；
+  `PAM transaction failed after mutation; force-restoring common-*/sudo ...` 代表保留的
+  snapshot 在回 rc 1 前被強制還原。
+
 * **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
@@ -250,7 +268,7 @@
   cat /sys/class/leds/chromeos::kbd_backlight/brightness
   # 唯讀 handoff 檔（僅在休眠/喚醒週期間存在）：
   cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # "<token> <value> published"，0 有效
-  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action>"
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action> <committed_value>"
   # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
   gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
   gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
@@ -277,6 +295,14 @@
   * KDE/Sway 上 `ScreenSaver available: no` 時，`system-sleep` 仍會在盒蓋
     `suspend` 時發佈 handoff 檔，但還原由 thaw 後的使用者 daemon 負責，請保持啟用；
     閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
+  * **螢幕黑掉但背光仍亮（真機觀察，2026-11-26）：**在本機（DMI `Google`／`Dratini`／
+    `HP` board、coreboot `MrChromebox-2606.1`、hostname `ubuntu-c640`、kernel `7.0.0-44`、
+    LED 節點 `max=100`／目前 `30`、daemon 執行中）使用者觀察到螢幕黑掉後鍵盤背光仍維持
+    `30`。這是已知 **Tier 2** 限制，不是 regression：daemon 只把
+    `ScreenSaver.ActiveChanged` 當 blank 觸發，而 Wayland 的
+    `idle-dim=true`／`idle-brightness=30` 可能讓螢幕黑掉但 ScreenSaver 仍 inactive；
+    brightness-signal／IdleMonitor 路徑未實作（預設關閉）。安裝的 daemon 亦對應 `a03e4a0`，
+    早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察）。現行 HEAD 的真實 S3／lock-unlock 仍 pending。
   * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
   * Ubuntu 26.04 上，LED 屬性只有在 udev 規則的 `RUN+=chgrp plugdev` +
     `RUN+=chmod 0660` 生效時才可寫（實測為 `-rw-rw---- root plugdev`）。
@@ -290,7 +316,9 @@
   * 閃爍/震盪：檢查上面的唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
     UPower raw 值不一致，daemon 會記錄
     `[WARN] gsd-power set ... forcing UPower + property refresh`；請確認部署的
-    daemon/unit 與 repo 完全一致（smoke 測試會檢查），並避免其他工具直接寫 LED。
+    daemon/unit 與 repo 完全一致（smoke 測試會檢查；但本機安裝的 daemon 仍是
+    `a03e4a0`，早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察），下結論前請先從本分支重新安裝），並避免其他工具
+    直接寫 LED。
     若還原時 ScreenSaver 為 `true` 或 `unknown`，延後是預期行為——等待
     `+0.5s/+1.5s/+3s` 重試或解鎖工作階段。hook 已完全不再探測 session bus。
   * `resume deferred: ScreenSaver still active`／`... unknown ... deferring restore`
