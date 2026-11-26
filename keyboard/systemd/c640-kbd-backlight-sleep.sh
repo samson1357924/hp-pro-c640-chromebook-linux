@@ -29,16 +29,23 @@
 # -----------------------------------------------------
 #   $XDG_RUNTIME_DIR/c640-kbd-backlight.suspend : "<token> <value> published"
 #                                                   e.g. "1763800123-4217-9f3ac1d0e2b4 7 published"
-#   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<token> <epoch> <action>", e.g.
-#                                                   "1763800123-4217-9f3ac1d0e2b4 1763800300 suspend"
-#   $STATE_DIR/cycle (ROOT-ONLY 0600)          : "<token> <dev:ino>"
+#   $XDG_RUNTIME_DIR/c640-kbd-backlight.resume  : "<token> <epoch> <action> <committed_value>", e.g.
+#                                                   "1763800123-4217-9f3ac1d0e2b4 1763800300 suspend 7"
+#   $STATE_DIR/cycle (ROOT-ONLY 0600)          : "<token> <dev:ino> <value>"
+#                                                   e.g. "1763800123-4217-9f3ac1d0e2b4 27:1048944 7"
 # The token is <epoch>-<pid>-<random_hex>, minted fresh by pre for EVERY cycle.
 # It binds the two user handoffs to one another and to the exact published
 # suspend inode: post refuses to publish a resume flag unless the root commit
-# marker exists, is 0600, carries the same token and dev:ino as the suspend
-# file, and the suspend file still says "published".  The root marker is the
-# LAST step of a successful pre; a failed pre leaves no marker, so a stale
-# handoff from a previous cycle can never be adopted after this resume.
+# marker exists, is 0600, carries the same token, dev:ino AND committed value
+# as the suspend file, and the suspend file still says "published".  A legacy
+# two-column marker is refused (fail closed).  post verifies the suspend bytes
+# through ONE pinned directory fd + O_NOFOLLOW opened descriptor (fstat plus a
+# byte-exact read from that same fd), so a same-inode value rewrite or an
+# inode swap with identical text cannot smuggle a different value through.
+# The root marker is the LAST step of a successful pre; a failed pre leaves no
+# marker, so a stale handoff from a previous cycle can never be adopted after
+# this resume.  The committed value is carried in the resume flag so the daemon
+# can treat it as authoritative even if the suspend copy is later tampered.
 # The `<epoch>` in the resume flag is the POST time (not the token's pre epoch);
 # the daemon validates both independently.
 # Both handoff files are 0600, owned by the resolved session user (uid AND gid) when
@@ -54,6 +61,8 @@
 # PUBLISHED_IDENTITY) for binding but MUST printf it back to stdout so the
 # published inode remains observable to tests; pre therefore emits two OK
 # records (suspend, then root cycle marker) and post emits one (resume).
+# The suspend verifier NEVER prints an `OK ` record: its verdict is a separate
+# internal channel, so the stdout contract above stays exactly 2/2/1.
 # There is deliberately NO cp
 # fallback and NO /tmp mktemp fallback: a failed publish fails closed instead
 # of escaping the boundary, and cleanup only unlinks a temp that still has the
@@ -127,7 +136,7 @@ RUN_USER_ROOT="${C640_KBD_RUN_USER_ROOT:-/run/user}"
 HANDOFF_OWNER=""
 HANDOFF_GID=""
 CYCLE_UID_FILE="$STATE_DIR/session-uid"
-# Root-only commit marker for the current cycle: "<token> <dev:ino>".  It is
+# Root-only commit marker for the current cycle: "<token> <dev:ino> <value>".  It is
 # published by pre with the hook process' own uid/gid (0:0 in production),
 # which makes $STATE_DIR (0700, owner 0) a natural root-only boundary.
 CYCLE_FILE="$STATE_DIR/cycle"
@@ -838,11 +847,14 @@ _invalidate_previous_cycle() {
 }
 
 # Read the root-only commit marker produced by the LAST successful pre.
-# Sets CYCLE_TOKEN / CYCLE_IDENTITY.  0644, symlinks, directories, extra
-# newlines and extra columns are all refused.
+# Sets CYCLE_TOKEN / CYCLE_IDENTITY / CYCLE_VALUE.  A legacy two-column marker
+# is deliberately refused: without a committed value there is nothing to bind
+# the suspend payload to.  0644, symlinks, directories, extra newlines,
+# missing/extra columns and out-of-range values are all refused.
 _read_cycle_commit() {
     CYCLE_TOKEN=""
     CYCLE_IDENTITY=""
+    CYCLE_VALUE=""
     if [ ! -f "$CYCLE_FILE" ] || [ -L "$CYCLE_FILE" ]; then
         log_warn "resume handoff skipped (fail-closed): missing/unsafe cycle marker $CYCLE_FILE"
         return 1
@@ -865,63 +877,196 @@ _read_cycle_commit() {
         ;;
     esac
     CYCLE_TOKEN="${_c%% *}"
-    CYCLE_IDENTITY="${_c#* }"
-    if [ "$_c" != "$CYCLE_TOKEN $CYCLE_IDENTITY" ] \
+    _crest="${_c#* }"
+    case "$_crest" in *' '*) : ;; *)
+        log_warn "resume handoff skipped (fail-closed): invalid cycle marker '$_c'"
+        return 1
+        ;;
+    esac
+    CYCLE_IDENTITY="${_crest%% *}"
+    CYCLE_VALUE="${_crest#* }"
+    if [ "$_c" != "$CYCLE_TOKEN $CYCLE_IDENTITY $CYCLE_VALUE" ] \
         || ! printf '%s\n' "$CYCLE_TOKEN" | grep -Eq "$_CYCLE_TOKEN_RE" \
-        || ! printf '%s\n' "$CYCLE_IDENTITY" | grep -Eq '^[0-9]+:[0-9]+$'; then
+        || ! printf '%s\n' "$CYCLE_IDENTITY" | grep -Eq '^[0-9]+:[0-9]+$' \
+        || ! printf '%s\n' "$CYCLE_VALUE" | grep -Eq '^[0-9]{1,10}$'; then
         log_warn "resume handoff skipped (fail-closed): invalid cycle marker '$_c'"
         CYCLE_TOKEN=""
         CYCLE_IDENTITY=""
+        CYCLE_VALUE=""
+        return 1
+    fi
+    return 0
+}
+
+# Verify the suspend handoff against the root marker through ONE opened
+# descriptor.  The directory is pinned with O_DIRECTORY|O_NOFOLLOW and the
+# file is opened with O_NOFOLLOW via dir_fd; fstat supplies the incarnation
+# identity and EVERY byte is read from that SAME fd before the byte-exact
+# comparison with "<token> <value> published\n".  No pathname is re-resolved
+# after the open, so swapping the directory entry mid-verification cannot
+# change the verdict.  Stdout is either "VALUE <value>" (success) or
+# "FAIL <TOKEN|VALUE|INODE|STRUCT|IO> <detail>" (failure); it deliberately
+# never prints an `OK ` record, preserving the publisher stdout contract.
+_verify_suspend_fd() {
+    _vdir="$1"
+    _vname="$2"
+    _vtoken="$3"
+    _vident="$4"
+    _vvalue="$5"
+
+    [ -n "$_vdir" ] && [ -n "$_vname" ] || return 1
+    if ! command -v python3 > /dev/null 2>&1; then
+        log_warn "resume handoff skipped (fail-closed): python3 unavailable; cannot verify suspend handoff"
+        return 1
+    fi
+    # The verifier's test-only knobs are inert unless a test mode is explicitly
+    # enabled.  A production process that inherits either variable only gets a
+    # WARN: it can neither bypass the inode gate nor rewrite the verified bytes.
+    _vtest_mode="${C640_KBD_TEST_MODE:-}"
+    if [ "$_vtest_mode" != 1 ]; then
+        if [ -n "${C640_KBD_VERIFY_TEST_FAILPOINT:-}" ] \
+            || [ -n "${C640_KBD_VERIFY_TEST_SWAP_VALUE:-}" ]; then
+            log_warn "verify test hooks ignored (C640_KBD_TEST_MODE is not 1)"
+        fi
+    fi
+    if ! _vout="$(python3 -c '
+import os, stat, sys
+
+dirpath, name, token, expected_ident, expected_value, test_mode = sys.argv[1:7]
+# The test-only failpoints are gated by an explicit C640_KBD_TEST_MODE=1;
+# otherwise an inherited env var must have no effect on the verdict.
+failpoint = os.environ.get("C640_KBD_VERIFY_TEST_FAILPOINT", "") if test_mode == "1" else ""
+swap_value = os.environ.get("C640_KBD_VERIFY_TEST_SWAP_VALUE", "9") if test_mode == "1" else "9"
+dfd = sfd = None
+
+
+def inode(st):
+    return (st.st_dev, st.st_ino)
+
+
+def emit(verdict, detail=""):
+    sys.stdout.write("FAIL %s %s\n" % (verdict, detail))
+    sys.exit(1)
+
+
+try:
+    dfd = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if not stat.S_ISDIR(os.fstat(dfd).st_mode):
+        emit("IO", "not-a-directory")
+    sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    sst = os.fstat(sfd)
+    if not stat.S_ISREG(sst.st_mode):
+        emit("IO", "not-regular")
+    actual_ident = "%d:%d" % inode(sst)
+    # Test-mode only: force the identity gate to pass even for a swapped inode.
+    # Only the byte-exact value gate can then stop a tampered payload.
+    if failpoint == "force-identity":
+        actual_ident = expected_ident
+    if actual_ident != expected_ident:
+        emit("INODE", actual_ident)
+    # Test-mode only TOCTOU: swap the directory entry AFTER this fd was opened
+    # and stat-ed.  Reading from sfd still yields the original bytes; a
+    # pathname re-read would yield the swapped payload instead.
+    if failpoint == "swap-after-fstat":
+        tname = ".c640-kbd-verify.%d.%s" % (os.getpid(), os.urandom(6).hex())
+        tfd = os.open(
+            tname,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dfd,
+        )
+        data = ("%s %s published\n" % (token, swap_value)).encode("utf-8")
+        written = 0
+        while written < len(data):
+            written += os.write(tfd, data[written:])
+        os.close(tfd)
+        os.rename(tname, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    chunks = []
+    while True:
+        chunk = os.read(sfd, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    expected = ("%s %s published\n" % (token, expected_value)).encode("utf-8")
+    if data == expected:
+        sys.stdout.write("VALUE %s\n" % expected_value)
+        sys.exit(0)
+    if data.count(b"\n") != 1 or not data.endswith(b"\n"):
+        emit("STRUCT", "bad-framing")
+    fields = data[:-1].split(b" ")
+    if len(fields) != 3 or fields[2] != b"published":
+        emit("STRUCT", "bad-fields")
+    try:
+        actual_token = fields[0].decode("ascii")
+        actual_value = fields[1].decode("ascii")
+    except UnicodeDecodeError:
+        emit("STRUCT", "non-ascii")
+    if actual_token != token:
+        emit("TOKEN", actual_token)
+    if actual_value != expected_value:
+        emit("VALUE", actual_value)
+    emit("STRUCT", "mismatch")
+except Exception as exc:
+    sys.stdout.write("FAIL IO %s\n" % str(exc).replace(" ", "-"))
+    sys.exit(1)
+finally:
+    if sfd is not None:
+        os.close(sfd)
+    if dfd is not None:
+        os.close(dfd)
+' "$_vdir" "$_vname" "$_vtoken" "$_vident" "$_vvalue" "$_vtest_mode")"; then
+        # Map the internal verdict back onto the established journal strings
+        # (H5 token mismatch / H6 inode mismatch) so existing assertion
+        # patterns remain valid.  VALUE and STRUCT get their own WARN text.
+        case "$_vout" in
+            "FAIL INODE "*)
+                _detail="${_vout#FAIL INODE }"
+                log_warn "resume handoff skipped (fail-closed): suspend inode $_detail != cycle marker $CYCLE_IDENTITY"
+                ;;
+            "FAIL TOKEN "*)
+                log_warn "resume handoff skipped (fail-closed): suspend/cycle token mismatch"
+                ;;
+            "FAIL VALUE "*)
+                _detail="${_vout#FAIL VALUE }"
+                log_warn "resume handoff skipped (fail-closed): suspend/cycle value mismatch ('$_detail' vs '$CYCLE_VALUE')"
+                ;;
+            "FAIL STRUCT "*)
+                _detail="${_vout#FAIL STRUCT }"
+                log_warn "resume handoff skipped (fail-closed): invalid suspend handoff ($_detail)"
+                ;;
+            *)
+                log_warn "resume handoff skipped (fail-closed): suspend handoff verification failed ('$_vout')"
+                ;;
+        esac
         return 1
     fi
     return 0
 }
 
 # post may publish its flag only when the root marker, the suspend handoff
-# and the ACTUAL suspend inode all agree on the same token / identity.
-# Sets the global _token used in the resume record.
+# bytes and the ACTUAL suspend inode all agree on the same token, identity
+# and committed value.  Sets the globals _token and _svalue used in the
+# resume record.
 _verify_cycle_commit() {
     _token=""
+    _svalue=""
     _read_cycle_commit || return 1
     if [ -z "$HANDOFF_DIR" ] || [ ! -f "$HANDOFF_DIR/$SUSPEND_HANDOFF" ] \
         || [ -L "$HANDOFF_DIR/$SUSPEND_HANDOFF" ]; then
         log_warn "resume handoff skipped (fail-closed): suspend handoff missing/unsafe"
         return 1
     fi
-    _sf="$HANDOFF_DIR/$SUSPEND_HANDOFF"
-    _s="$(cat "$_sf" 2> /dev/null || echo '')"
-    _s="${_s%$_NL}"
-    case "$_s" in
-        *"$_NL"*)
-            log_warn "resume handoff skipped (fail-closed): suspend handoff has extra lines"
-            return 1
-            ;;
-        *' published') : ;;
-        *)
-            log_warn "resume handoff skipped (fail-closed): invalid suspend handoff '$_s'"
-            return 1
-            ;;
-    esac
-    _body="${_s% published}"
-    case "$_body" in *' '*) : ;; *)
-        log_warn "resume handoff skipped (fail-closed): invalid suspend handoff '$_s'"
-        return 1
-        ;;
-    esac
-    _stoken="${_body%% *}"
-    _svalue="${_body#* }"
-    if [ "$_body" != "$_stoken $_svalue" ] \
-        || ! printf '%s\n' "$_stoken" | grep -Eq "$_CYCLE_TOKEN_RE" \
-        || ! printf '%s\n' "$_svalue" | grep -Eq '^[0-9]+$' \
-        || [ "$_stoken" != "$CYCLE_TOKEN" ]; then
-        log_warn "resume handoff skipped (fail-closed): suspend/cycle token mismatch"
+    if ! _verify_suspend_fd "$HANDOFF_DIR" "$SUSPEND_HANDOFF" \
+        "$CYCLE_TOKEN" "$CYCLE_IDENTITY" "$CYCLE_VALUE"; then
         return 1
     fi
-    _ino="$(stat -c '%d:%i' "$_sf" 2> /dev/null || echo '')"
-    if [ "$_ino" != "$CYCLE_IDENTITY" ]; then
-        log_warn "resume handoff skipped (fail-closed): suspend inode $_ino != cycle marker $CYCLE_IDENTITY"
+    if [ "${_vout#VALUE }" = "$_vout" ] \
+        || ! printf '%s\n' "${_vout#VALUE }" | grep -Eq '^[0-9]{1,10}$'; then
+        log_warn "resume handoff skipped (fail-closed): invalid suspend verification record '$_vout'"
         return 1
     fi
+    _svalue="${_vout#VALUE }"
     _token="$CYCLE_TOKEN"
     return 0
 }
@@ -970,7 +1115,10 @@ publish_suspend_handoff() {
         return 1
         ;;
     esac
-    if ! _commit_out="$(_publish_handoff "$CYCLE_FILE" "$_token $_ident" \
+    # The committed value is part of the marker: post binds the suspend
+    # payload byte-for-byte to it, and the daemon carries it in the resume
+    # flag as the authoritative restore value.
+    if ! _commit_out="$(_publish_handoff "$CYCLE_FILE" "$_token $_ident $_curr" \
         "$_hook_uid" "$_hook_gid")"; then
         rm -f "$CYCLE_FILE" "$HANDOFF_DIR/$SUSPEND_HANDOFF" 2> /dev/null || true
         log_warn "cycle commit marker publish failed; suspend handoff rolled back"
@@ -990,7 +1138,7 @@ write_resume_handoff() {
     _epoch="$(date +%s 2> /dev/null || echo 0)"
     case "$_epoch" in '' | *[!0-9]*) _epoch=0 ;; esac
     if ! PUBLISHED_IDENTITY="$(_publish_handoff "$HANDOFF_DIR/$RESUME_HANDOFF" \
-        "$_token $_epoch $_action" "$HANDOFF_OWNER" "$HANDOFF_GID")"; then
+        "$_token $_epoch $_action $_svalue" "$HANDOFF_OWNER" "$HANDOFF_GID")"; then
         return 1
     fi
     printf '%s\n' "$PUBLISHED_IDENTITY"

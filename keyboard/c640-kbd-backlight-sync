@@ -1776,7 +1776,7 @@ _adopt_suspend_handoff_locked() {
         log "suspend handoff adoption deferred: restore in progress (staged value pending)"
         return 2
     fi
-    local raw val existing tmp lu src age token tok_epoch begin_raw adopted resume_raw
+    local raw val val_raw committed existing tmp lu src age token tok_epoch begin_raw adopted resume_raw
     # Strict per-cycle wire format: "<token> <value> published".  The legacy
     # bare-integer handoff is REJECTED: without a token there is nothing to
     # cross-check against a resume flag or an already-adopted cycle.
@@ -1797,7 +1797,16 @@ _adopt_suspend_handoff_locked() {
     fi
     tok_epoch="${BASH_REMATCH[1]}"
     token="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-    val=$((10#${BASH_REMATCH[4]}))
+    val_raw="${BASH_REMATCH[4]}"
+    # Bound the suspend value BEFORE arithmetic for the same reason as the
+    # epoch and committed value: 10#<digits> wraps at 2^64.  This is the value
+    # a legacy 3-column resume flag adopts, so an oversized copy must fail
+    # closed instead of aliasing a plausible brightness (e.g. 2^64+7 -> 7).
+    if [[ ! "$val_raw" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "suspend handoff value '$val_raw' out of range; daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+    val=$((10#${val_raw}))
 
     # Bound the epoch BEFORE arithmetic: $((10#<digits>)) wraps at 2^64, so a
     # >=20-digit epoch (e.g. 2^64+<fresh epoch>) would alias a stale token to
@@ -1815,10 +1824,28 @@ _adopt_suspend_handoff_locked() {
     if [ -f "$HANDOFF_RESUME_FILE" ]; then
         resume_raw="$(cat "$HANDOFF_RESUME_FILE" 2> /dev/null || echo "")"
         resume_raw="${resume_raw%$'\n'}"
+        # The 4th field (committed value) is optional for backward
+        # compatibility with 3-column flags from an older hook, but a present
+        # field is authoritative for the restore value: the suspend copy may
+        # have been rewritten after post verified it against the root marker.
         if [[ "$resume_raw" == *$'\n'* ]] \
-            || ! [[ "$resume_raw" =~ ^${token}[[:blank:]]([0-9]+)[[:blank:]][A-Za-z]+$ ]]; then
+            || ! [[ "$resume_raw" =~ ^${token}[[:blank:]]([0-9]+)[[:blank:]][A-Za-z]+([[:blank:]]([0-9]+))?$ ]]; then
             log_warn "suspend/resume handoff token mismatch ('$resume_raw' vs '$token'); daemon state left unchanged"
             return "$RC_FAIL"
+        fi
+        committed="${BASH_REMATCH[3]:-}"
+        if [ -n "$committed" ]; then
+            # Same 1-10 digit bound as the hook's marker: 10#$committed wraps
+            # at 2^64, so an oversized committed value must fail closed here.
+            if [[ ! "$committed" =~ ^[0-9]{1,10}$ ]]; then
+                log_warn "suspend handoff committed value '$committed' out of range; daemon state left unchanged"
+                return "$RC_FAIL"
+            fi
+            if [ "$((10#$committed))" -ne "$val" ]; then
+                log_warn "suspend/resume committed value mismatch ('$committed' vs '$val_raw'); using committed value $committed"
+            fi
+            val_raw="$committed"
+            val=$((10#$committed))
         fi
     fi
 

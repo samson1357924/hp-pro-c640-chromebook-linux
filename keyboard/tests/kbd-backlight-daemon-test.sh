@@ -773,9 +773,11 @@ write_state() {
 # Phase 4b helpers: the hook writes these with a trailing newline and never
 # deletes them; only a successful daemon adoption/restore consumes them.
 # Phase C: the suspend handoff is "<token> <value> published", the resume flag
-# is "<token> <epoch> <action>", and a fresh cycle-begin makes the fixed
-# token's epoch current.  A fixed token keeps the pre-existing value-focused
-# cases unchanged while still exercising the strict parser / gates.
+# is "<token> <epoch> <action> [<committed_value>]", and a fresh cycle-begin
+# makes the fixed token's epoch current.  The 4th column is optional (legacy
+# 3-column flags stay valid); when present it is the authoritative restore
+# value.  A fixed token keeps the pre-existing value-focused cases unchanged
+# while still exercising the strict parser / gates.
 write_handoff_suspend() {
     mkdir -p "$HANDOFF_DIR"
     printf '%s %s published\n' "$C640_TEST_TOKEN" "$1" > "$HANDOFF_SUSPEND_FILE"
@@ -804,6 +806,13 @@ write_handoff_suspend_legacy() {
 write_handoff_resume() {
     mkdir -p "$HANDOFF_DIR"
     printf '%s %s %s\n' "$C640_TEST_TOKEN" "$(date +%s)" "${1:-suspend}" > "$HANDOFF_RESUME_FILE"
+}
+
+# The post hook's 4-column flag.  Args: committed value, token, action.
+write_handoff_resume_committed() {
+    mkdir -p "$HANDOFF_DIR"
+    printf '%s %s %s %s\n' "${2:-$C640_TEST_TOKEN}" "$(date +%s)" \
+        "${3:-suspend}" "${1:-7}" > "$HANDOFF_RESUME_FILE"
 }
 
 write_resume_token() {
@@ -5026,6 +5035,81 @@ assert_present "D10: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
 assert_present "D10: resume flag retained" "$HANDOFF_RESUME_FILE"
 assert_eq "D10: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 assert_log_matches "D10: publish failure logged" "$DAEMON_ERR" 'cannot publish adopted-cycle'
+
+# D10a. A 4-column resume flag carries the value post verified against the
+#       root marker.  It is authoritative even when the suspend copy now says
+#       something else, and the divergence is journaled.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_handoff_resume_committed 9
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D10a: committed value adopted" "0" "$rc"
+assert_file "D10a: committed 9 overrides suspend 7" "$STATE_FILE" "9"
+assert_absent "D10a: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+assert_file "D10a: adopted-cycle records the token" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+assert_log_matches "D10a: committed divergence warned" "$DAEMON_ERR" 'using committed value 9'
+
+# D10b. Legacy 3-column flags remain valid and adopt the suspend value.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_handoff_resume
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D10b: legacy 3-column flag accepted" "0" "$rc"
+assert_file "D10b: suspend value adopted" "$STATE_FILE" "7"
+assert_absent "D10b: handoff consumed" "$HANDOFF_SUSPEND_FILE"
+if grep -q 'committed value mismatch' "$DAEMON_ERR"; then
+    bad "D10b: legacy flag must not log a committed mismatch"
+else
+    ok "D10b: legacy flag logs no committed mismatch"
+fi
+
+# D10c. 10#$committed wraps at 2^64: an oversized 4th column must fail closed
+#       and leave the suspend value/state/handoff untouched.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_handoff_resume_committed 18446744073709551616
+rc="$(run_fn_rc adopt_suspend_handoff)"
+assert_eq "D10c: overflowing committed value rejected" "1" "$rc"
+assert_file "D10c: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D10c: handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D10c: no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D10c: out of range logged" "$DAEMON_ERR" 'committed value .* out of range'
+
+# D10d. The committed value does NOT bypass the token cross-check: a
+#       foreign-token flag with a valid 4th column still fails closed.
+reset_case
+write_state 9
+write_handoff_suspend 7
+write_handoff_resume_committed 9 "$C640_FOREIGN_TOKEN"
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "D10d: foreign token with committed value rejected" "1" "$rc"
+assert_file "D10d: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D10d: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D10d: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_eq "D10d: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "D10d: token mismatch logged" "$DAEMON_ERR" 'token mismatch'
+
+# D10e. A legacy 3-column flag adopts the suspend value; a 20-digit suspend
+#       value wraps in 10#$val_raw (2^64+7 -> 7) unless it is bounded just like
+#       the committed value.  Fail closed: no adoption, no flag consumption,
+#       zero Properties.Set.
+reset_case
+write_state 9
+write_handoff_suspend_token "$C640_TEST_TOKEN" 18446744073709551623
+write_handoff_resume
+: > "$SET_LOG"
+rc="$(run_fn_rc handle_resume)"
+assert_eq "D10e: overflowing suspend value rejected" "1" "$rc"
+assert_file "D10e: STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_present "D10e: suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D10e: resume flag retained" "$HANDOFF_RESUME_FILE"
+assert_absent "D10e: no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
+assert_eq "D10e: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_log_matches "D10e: out of range logged" "$DAEMON_ERR" 'suspend handoff value .* out of range'
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

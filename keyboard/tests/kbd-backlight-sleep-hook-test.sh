@@ -115,22 +115,35 @@ assert_no_bus_or_led_writes() {
     assert_empty_log "sudo never called ($tag)" "$SUDO_LOG"
     assert_empty_log "ectool never called ($tag)" "$ECTOOL_LOG"
 }
-# Resume wire format is now "<token> <epoch> <action>".  This helper only
-# validates the flag; use resume_token() to read the token for cross-checking.
+# Resume wire format is "<token> <epoch> <action> <committed_value>".  The
+# committed value is the post-verified payload from the root marker; pass it
+# as the 4th argument when a case needs to pin it, otherwise only its presence
+# and 1..10 digit shape are checked.  Use resume_token()/resume_committed() to
+# read individual fields for cross-checking.
 assert_resume_flag() {
-    local label="$1" action="$2" file="${3:-$RESUME_FILE}" content
+    local label="$1" action="$2" file="${3:-$RESUME_FILE}" value="${4:-}" content
     content="$(cat "$file" 2> /dev/null || echo '<missing>')"
-    if [[ "$content" =~ ^[0-9]+-[0-9]+-[0-9a-f]{6,12}[[:space:]][0-9]+[[:space:]]"$action"$ ]]; then
-        ok "$label"
-    else
-        bad "$label (expected '<token> <epoch> $action', got '$content')"
+    if [[ "$content" =~ ^[0-9]+-[0-9]+-[0-9a-f]{6,12}[[:space:]][0-9]+[[:space:]]"$action"[[:space:]]([0-9]{1,10})$ ]]; then
+        if [ -z "$value" ] || [ "${BASH_REMATCH[1]}" = "$value" ]; then
+            ok "$label"
+            return 0
+        fi
     fi
+    bad "$label (expected '<token> <epoch> $action ${value:-<committed>}', got '$content')"
 }
 
 resume_token() {
     local file="${1:-$RESUME_FILE}" content
     content="$(cat "$file" 2> /dev/null || echo '')"
-    if [[ "$content" =~ ^([0-9]+-[0-9]+-[0-9a-f]{6,12})[[:space:]][0-9]+[[:space:]][A-Za-z]+$ ]]; then
+    if [[ "$content" =~ ^([0-9]+-[0-9]+-[0-9a-f]{6,12})[[:space:]][0-9]+[[:space:]][A-Za-z]+[[:space:]][0-9]{1,10}$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+resume_committed() {
+    local file="${1:-$RESUME_FILE}" content
+    content="$(cat "$file" 2> /dev/null || echo '')"
+    if [[ "$content" =~ ^[0-9]+-[0-9]+-[0-9a-f]{6,12}[[:space:]][0-9]+[[:space:]][A-Za-z]+[[:space:]]([0-9]{1,10})$ ]]; then
         printf '%s' "${BASH_REMATCH[1]}"
     fi
 }
@@ -160,14 +173,16 @@ suspend_token() {
     fi
 }
 
-# Root commit marker: "<token> <dev:ino>".
+# Root commit marker: "<token> <dev:ino> <value>" (legacy 2 columns are
+# intentionally refused by the hook).  The 3rd argument is the committed
+# value; it defaults to 7 to keep the older call sites unchanged.
 assert_cycle_marker() {
-    local label="$1" token="$2" file="${3:-$CYCLE_FILE}" content
+    local label="$1" token="$2" value="${3:-7}" file="${4:-$CYCLE_FILE}" content
     content="$(cat "$file" 2> /dev/null || echo '<missing>')"
-    if [ "$content" = "$token $(stat -c '%d:%i' "$SUSPEND_FILE" 2> /dev/null || echo '<missing>')" ]; then
+    if [ "$content" = "$token $(stat -c '%d:%i' "$SUSPEND_FILE" 2> /dev/null || echo '<missing>') $value" ]; then
         ok "$label"
     else
-        bad "$label (expected '$token <suspend dev:ino>', got '$content')"
+        bad "$label (expected '$token <suspend dev:ino> $value', got '$content')"
     fi
 }
 
@@ -179,7 +194,7 @@ prime_cycle() {
     mkdir -p "$HANDOFF_DIR"
     printf '%s %s published\n' "$token" "$value" > "$file"
     ident="$(stat -c '%d:%i' "$file")"
-    printf '%s %s\n' "$token" "$ident" > "$CYCLE_FILE"
+    printf '%s %s %s\n' "$token" "$ident" "$value" > "$CYCLE_FILE"
     chmod 600 "$CYCLE_FILE"
 }
 # A failed publish must not leave its temp file behind.
@@ -581,6 +596,9 @@ STUB_RACE_TARGET=""
 STUB_PYTHON_FAIL=0
 STUB_ID_G_FAIL=0
 HOOK_FAILPOINT=""
+HOOK_VERIFY_FAILPOINT=""
+HOOK_VERIFY_SWAP_VALUE=""
+HOOK_TEST_MODE=""
 HOOK_OUTSIDE="$TMP_DIR/boundary-victim"
 STUB_GNOME_ACTIVE=false
 STUB_FDO_ACTIVE=false
@@ -643,6 +661,9 @@ reset_case() {
     STUB_PYTHON_FAIL=0
     STUB_ID_G_FAIL=0
     HOOK_FAILPOINT=""
+    HOOK_VERIFY_FAILPOINT=""
+    HOOK_VERIFY_SWAP_VALUE=""
+    HOOK_TEST_MODE=""
     HOOK_OUTSIDE="$TMP_DIR/boundary-victim"
 }
 
@@ -686,9 +707,23 @@ run_hook() {
     if [ -n "$HOOK_TMPDIR" ]; then
         env_args+=("TMPDIR=$HOOK_TMPDIR")
     fi
+    # Verifier test knobs are injected only for cases that exercise them.  A
+    # case must set HOOK_TEST_MODE=1 as well; without it the failpoints are
+    # ignored by production code (and a WARN is logged).
+    if [ -n "$HOOK_VERIFY_FAILPOINT" ]; then
+        env_args+=("C640_KBD_VERIFY_TEST_FAILPOINT=$HOOK_VERIFY_FAILPOINT")
+    fi
+    if [ -n "$HOOK_VERIFY_SWAP_VALUE" ]; then
+        env_args+=("C640_KBD_VERIFY_TEST_SWAP_VALUE=$HOOK_VERIFY_SWAP_VALUE")
+    fi
+    if [ -n "$HOOK_TEST_MODE" ]; then
+        env_args+=("C640_KBD_TEST_MODE=$HOOK_TEST_MODE")
+    fi
     # The old D-Bus knobs are removed so resolution is deterministic.
     env -u SUDO_USER -u C640_KBD_SLEEP_USER -u C640_KBD_SLEEP_UID \
         -u C640_KBD_SLEEP_BUS -u C640_KBD_SLEEP_DELAY \
+        -u C640_KBD_TEST_MODE -u C640_KBD_VERIFY_TEST_FAILPOINT \
+        -u C640_KBD_VERIFY_TEST_SWAP_VALUE \
         "${env_args[@]}" "$HOOK" "$@" >> "$PUBLISH_OUT" 2>> "$HOOK_ERR"
 }
 
@@ -1681,13 +1716,23 @@ assert_eq "H5: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT
 assert_suspend_handoff "H5: tampered value still well formed" "7"
 assert_eq "H5: marker still binds the original token" "$H5_TOKEN" "$(cut -d' ' -f1 "$CYCLE_FILE")"
 
-# H6. Replacing the suspend file with a DIFFERENT inode carrying the same
-#     token must be caught by the dev:ino binding in the root marker.
+# H6. Replacing the suspend file with a DIFFERENT inode carrying identical
+#     bytes must be caught by the dev:ino binding in the root marker.  The
+#     temp is created while the ORIGINAL entry is still alive, so its inode
+#     cannot be the reused inode of a deleted pathname (the old flaky fixture).
 reset_case
 run_hook pre suspend
 H6_TOKEN="$(suspend_token)"
-rm -f "$SUSPEND_FILE"
-printf '%s 7 published\n' "$H6_TOKEN" > "$SUSPEND_FILE"
+H6_ORIG_IDENT="$(stat -c '%d:%i' "$SUSPEND_FILE")"
+H6_TMP="$HANDOFF_DIR/.h6-swap.$$"
+printf '%s 7 published\n' "$H6_TOKEN" > "$H6_TMP"
+mv -T -f -- "$H6_TMP" "$SUSPEND_FILE"
+H6_NEW_IDENT="$(stat -c '%d:%i' "$SUSPEND_FILE")"
+if [ "$H6_ORIG_IDENT" != "$H6_NEW_IDENT" ]; then
+    ok "H6: atomic replacement produced a different dev:ino"
+else
+    bad "H6: fixture reused the same dev:ino ($H6_NEW_IDENT)"
+fi
 : > "$HOOK_ERR"
 run_hook post suspend
 assert_absent "H6: inode swap publishes no flag" "$RESUME_FILE"
@@ -1695,7 +1740,68 @@ assert_log_matches "H6: inode mismatch warned" "$HOOK_ERR" 'suspend inode .* != 
 assert_eq "H6: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
 assert_suspend_handoff "H6: swapped handoff is well formed" "7"
 
-# H7. Root marker must be a regular 0600 file with strict content.
+# H6b. Same inode, same token, DIFFERENT value: the committed value in the
+#      root marker must be bound to the suspend payload byte-for-byte.
+reset_case
+run_hook pre suspend
+printf '%s 9 published\n' "$(suspend_token)" > "$SUSPEND_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H6b: same-inode value rewrite publishes no flag" "$RESUME_FILE"
+assert_log_matches "H6b: value mismatch warned" "$HOOK_ERR" 'value mismatch'
+assert_eq "H6b: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+assert_suspend_handoff "H6b: tampered value still well formed" "9"
+
+# H6c. Force the identity gate to pass for a swapped, value-tampered entry:
+#      only the committed-value binding can still refuse this case.
+reset_case
+run_hook pre suspend
+H6C_TOKEN="$(suspend_token)"
+H6C_TMP="$HANDOFF_DIR/.h6c-swap.$$"
+printf '%s 9 published\n' "$H6C_TOKEN" > "$H6C_TMP"
+mv -T -f -- "$H6C_TMP" "$SUSPEND_FILE"
+HOOK_VERIFY_FAILPOINT=force-identity
+HOOK_TEST_MODE=1
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_suspend_handoff "H6c: fixture swapped value is 9" "9"
+assert_absent "H6c: forced-identity tamper publishes no flag" "$RESUME_FILE"
+assert_log_matches "H6c: value mismatch warned" "$HOOK_ERR" 'value mismatch'
+assert_eq "H6c: no additional publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+# H6d. TOCTOU: the directory entry is swapped AFTER the verifier opened and
+#      stat-ed the file.  Reading all bytes from that ONE fd still sees the
+#      original committed value; a pathname re-read would see 9 and fail.
+reset_case
+run_hook pre suspend
+HOOK_VERIFY_FAILPOINT=swap-after-fstat
+HOOK_VERIFY_SWAP_VALUE=9
+HOOK_TEST_MODE=1
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_suspend_handoff "H6d: directory entry really swapped to 9" "9"
+assert_resume_flag "H6d: post publishes from the pinned fd" "suspend" "$RESUME_FILE" "7"
+assert_eq "H6d: committed value comes from the opened fd" "7" "$(resume_committed)"
+assert_eq "H6d: three OK records (pre x2, post x1)" "3" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+# H6e. The verifier failpoint is inert without an explicit test mode: the
+#      force-identity injection must NOT bypass the inode gate in production.
+#      The inherited knob is only warned about, and the swapped entry is
+#      rejected by the inode identity check.
+reset_case
+run_hook pre suspend
+H6E_TMP="$HANDOFF_DIR/.h6e-swap.$$"
+printf '%s 9 published\n' "$(suspend_token)" > "$H6E_TMP"
+mv -T -f -- "$H6E_TMP" "$SUSPEND_FILE"
+HOOK_VERIFY_FAILPOINT=force-identity
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H6e (no test mode): no flag" "$RESUME_FILE"
+assert_log_matches "H6e (no test mode): failpoint warned" "$HOOK_ERR" 'verify test hooks ignored'
+assert_log_matches "H6e (no test mode): inode gate still rejects" "$HOOK_ERR" 'suspend inode'
+assert_eq "H6e (no test mode): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+# H7. Root marker must be a regular 0600 file with strict (3-column) content.
 reset_case
 run_hook pre suspend
 chmod 644 "$CYCLE_FILE"
@@ -1724,6 +1830,37 @@ run_hook post suspend
 assert_absent "H7 (bad format): no flag" "$RESUME_FILE"
 assert_log_matches "H7 (bad format): strict parser rejected" "$HOOK_ERR" 'invalid cycle marker'
 assert_eq "H7 (bad format): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+reset_case
+run_hook pre suspend
+# A legacy "<token> <dev:ino>" marker has NO committed value: fail closed.
+printf '%s %s\n' "$(suspend_token)" "$(stat -c '%d:%i' "$SUSPEND_FILE")" > "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (legacy 2 columns): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (legacy 2 columns): strict parser rejected" "$HOOK_ERR" 'invalid cycle marker'
+assert_eq "H7 (legacy 2 columns): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+reset_case
+run_hook pre suspend
+# A committed value outside the 1..10 digit bound must also fail closed.
+printf '%s %s 18446744073709551616\n' "$(suspend_token)" "$(stat -c '%d:%i' "$SUSPEND_FILE")" > "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (value overflow): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (value overflow): strict parser rejected" "$HOOK_ERR" 'invalid cycle marker'
+assert_eq "H7 (value overflow): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
+
+reset_case
+run_hook pre suspend
+# A 4-column marker leaves an extra field unbound by the strict parser: fail
+# closed instead of silently trusting the first three columns.
+printf '%s %s 7 8\n' "$(suspend_token)" "$(stat -c '%d:%i' "$SUSPEND_FILE")" > "$CYCLE_FILE"
+: > "$HOOK_ERR"
+run_hook post suspend
+assert_absent "H7 (extra column): no flag" "$RESUME_FILE"
+assert_log_matches "H7 (extra column): strict parser rejected" "$HOOK_ERR" 'invalid cycle marker'
+assert_eq "H7 (extra column): no publish record" "2" "$(grep -c '^OK ' "$PUBLISH_OUT" || true)"
 
 # H8. Two cycles in the same second still get distinct tokens; each resume
 #     flag matches its own suspend handoff, and the old flag is invalidated.
