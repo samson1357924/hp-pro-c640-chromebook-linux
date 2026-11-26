@@ -26,7 +26,6 @@ file is a service; records files contain V/I/R/U/D rows.  Exit codes:
 3 = usage error.
 """
 
-import hashlib
 import sys
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -59,8 +58,19 @@ def _norm_group(raw_type: str) -> str:
     return "session" if bare == "session-noninteractive" else bare
 
 
-def _args_sha(args: Sequence[str]) -> str:
-    return hashlib.sha256("\x1f".join(args).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+def _argsfp_canonical(args: Sequence[str]) -> str:
+    """Injective hex encoding of an already-tokenised argument vector.
+
+    The authoritative argsfp is produced by lib/pam.sh's awk parser from the
+    RAW argument bytes (only libpam-insignificant normalisations applied) and
+    travels in the V record.  This helper exists for the synthetic canonical
+    rule supplied on the command line, whose tokens come from split() and
+    therefore need no further normalisation.  Hex-encoding every byte (with a
+    `.` token separator, which is not a hex digit) is one-to-one.
+    """
+    return ".".join(
+        token.encode("utf-8", "surrogateescape").hex() for token in args
+    )
 
 
 @dataclass
@@ -77,6 +87,10 @@ class Rule:
     canon: bool
     include_path: Tuple[str, ...] = ()
     dup_index: int = 0
+    # Phase C/#3: injective hex fingerprint of the full argument vector, read
+    # verbatim from the awk V record.  Distinct from `args` (kept for duplicate
+    # instance numbering and diagnostics).
+    argsfp: str = ""
 
     @property
     def dash(self) -> int:
@@ -90,7 +104,7 @@ class Rule:
             "/".join(self.include_path),
             self.path,
             self.control,
-            _args_sha(self.args),
+            self.argsfp,
             self.dup_index,
         )
 
@@ -101,7 +115,7 @@ class Rule:
             str(self.dash),
             self.control,
             self.path,
-            _args_sha(self.args),
+            self.argsfp,
         )
 
 
@@ -140,7 +154,7 @@ class Descriptor:
                 str(self.rule.dash),
                 self.rule.control,
                 self.rule.path,
-                _args_sha(self.rule.args),
+                self.rule.argsfp,
                 "1" if self.rule.fp else "0",
                 "|".join(self.targets),
                 "|".join(self.actions),
@@ -180,10 +194,14 @@ def _read_file(path: str) -> FileRules:
             fields = line.rstrip("\n").split("\t")
             kind = fields[0]
             if kind == "V":
-                # V <type> <control> <path> <start> <filetag> <args> <fp> <canon>
-                if len(fields) < 9:
-                    raise Unsupported("short V record in {}".format(path))
-                raw_type, control, module_path, start, tag, args_s, fp_s, canon_s = fields[1:9]
+                # V <type> <control> <path> <start> <filetag> <args> <fp>
+                #   <canon> <argsfp>
+                # Phase C/#3: a V record without argsfp is untrusted input;
+                # fail closed instead of silently falling back to a lossy
+                # whitespace-collapsed key.
+                if len(fields) < 10:
+                    raise Unsupported("short V record (missing argsfp) in {}".format(path))
+                raw_type, control, module_path, start, tag, args_s, fp_s, canon_s, argsfp_s = fields[1:10]
                 if _norm_group(raw_type) not in TYPES:
                     raise Unsupported("unknown PAM type {}".format(raw_type))
                 info.filetag = tag
@@ -199,6 +217,7 @@ def _read_file(path: str) -> FileRules:
                         start=int(start),
                         fp=fp_s == "1",
                         canon=canon_s == "1",
+                        argsfp=argsfp_s,
                     )
                 )
             elif kind == "I":
@@ -408,6 +427,7 @@ def _canonical_match(rule: Rule, canonical: Sequence[str]) -> bool:
         and rule.control == canonical[1]
         and rule.path == canonical[2]
         and tuple(rule.args) == tuple(canonical[3:])
+        and rule.argsfp == _argsfp_canonical(canonical[3:])
     )
 
 

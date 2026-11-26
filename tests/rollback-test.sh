@@ -311,8 +311,17 @@ run_sandboxed() {
         CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR="$sandbox/snapshots" \
         CROS_ENABLEMENT_ALLOWED_PREFIXES="/tmp/rollback-test-* /etc/ /usr/ /lib/ /lib64/ /opt/ /var/lib/fprint/" \
         CROS_ENABLEMENT_INSTALLED_TESTS_PREFIXES="$sandbox/root/usr/libexec/installed-tests/ $sandbox/root/usr/share/installed-tests/" \
+        CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST="${CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST:-}" \
         LOG_FILE="$sandbox/log.txt" \
         timeout "${RB_TEST_TIMEOUT:-0}" bash -c "$1" _ "$REPO_ROOT" "$sandbox" "${@:2}"
+}
+
+# Phase C/#3 P2: the allowlist seam is process-wide in lib/pam.sh, so a case
+# that supplies an explicit key MUST clear it afterwards. `setup_pam_sandbox`
+# runs inside $(...) and cannot clear the PARENT variable, so every allowlist
+# case calls this at both ends (and the Phase C group calls it before running).
+reset_pam_addition_allowlist() {
+    unset CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST
 }
 
 # ---------------------------------------------------------------------------
@@ -14128,8 +14137,11 @@ test_pam_75_postcondition_module_path() {
     cat > "$s/stub/pam-auth-update" << EOF
 #!/usr/bin/env bash
 "$s/stub/pam-auth-update.orig" "\$@"
-printf '%s\\n' 'auth required pam_unix.so nullok # pam_fprintd.so fallback' \\
-    >> "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+# Phase C/#3: amend an EXISTING rule with an inline comment instead of
+# appending a second rule (the zero-addition gate would correctly reject a
+# duplicate pam_unix rule; the point of this case is comment parsing only).
+/usr/bin/sed -i -e 's|pam_unix.so nullok|pam_unix.so nullok # pam_fprintd.so fallback|' \\
+    "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
 EOF
     chmod +x "$s/stub/pam-auth-update"
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
@@ -14305,6 +14317,7 @@ test_pam_81_t3_keyed_multiset() {
     local s log
     s="$(setup_pam_sandbox t3-keyed)"
     pam_write_full_stack "$s"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
     cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
     cat > "$s/stub/pam-auth-update" << EOF
 #!/usr/bin/env bash
@@ -14330,6 +14343,15 @@ EOF
     log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
     assert_contains "changed during convergence" "$log" \
         "PAM-81: T3 failure is explicit"
+    # Phase C/#3: a T3 failure is a FAILED transaction. The snapshot (not the
+    # tool's edit) is now the authority: force recovery must put the original
+    # common-auth bytes back, re-compare + re-scan, and keep the snapshot.
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-81: failed transaction force-restored the original common-auth bytes"
+    assert_contains "force-restoring common" "$log" \
+        "PAM-81: forced recovery was attempted"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-81: forced recovery re-verified bytes and re-scanned"
     [ -f "$s/manifest/pam-selection" ] && ok \
         || fail "PAM-81: snapshots retained for manual recovery"
 }
@@ -14579,9 +14601,10 @@ test_pam_86_include_counts_in_jumps
 # strip must fail the postcondition even though it only ADDED a non-fp rule
 # (all baseline keys remain present). This pins the jump endpoint field of T3.
 test_pam_88_convergence_jump_drift_fails_closed() {
-    local s log before_landing after_landing
+    local s log before_landing tool_landing
     s="$(setup_pam_sandbox convergence-jump-drift)"
     pam_write_full_stack "$s"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
     before_landing="$(python3 "$_PAM_ORACLE" landings "$s/pam/common-auth")"
     assert_contains "auth:pam_permit.so" "$before_landing" \
         "PAM-88: baseline landing is pam_permit"
@@ -14592,18 +14615,25 @@ test_pam_88_convergence_jump_drift_fails_closed() {
 # The tool adds an innocent-looking rule BEFORE the jump source: success=1
 # now skips pam_deny instead of reaching pam_permit.
 /usr/bin/sed -i '2i auth required pam_admin_shift.so' "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
 EOF
     chmod +x "$s/stub/pam-auth-update"
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
         run_pam_install "$s" debian
     assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
         "PAM-88: convergence jump drift fails closed"
-    after_landing="$(python3 "$_PAM_ORACLE" landings "$s/pam/common-auth")"
-    assert_contains "auth:pam_deny.so" "$after_landing" \
-        "PAM-88: the tool really shifted the landing"
+    # Phase C/#3: force recovery puts the snapshot bytes back, so prove the
+    # tool's edit through its OWN copy, not through the recovered live file.
+    tool_landing="$(python3 "$_PAM_ORACLE" landings "$s/tool.modified")"
+    assert_contains "auth:pam_deny.so" "$tool_landing" \
+        "PAM-88: the tool really shifted the landing (tool copy)"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-88: failed transaction force-restored the original common-auth bytes"
     log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
     assert_contains "jump endpoint changed" "$log" \
         "PAM-88: stale jump endpoint is named as the reason"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-88: forced recovery succeeded"
     [ -f "$s/manifest/pam-selection" ] && ok \
         || fail "PAM-88: snapshots retained for manual recovery"
 }
@@ -14624,6 +14654,9 @@ test_pam_89_t3_order_matters() {
 auth optional pam_echo.so
 auth optional pam_wheel.so
 EOF
+    # The snapshot authority includes the two appended rules, so the original
+    # copy used for the post-recovery byte comparison must be taken here.
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
     cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
     cat > "$s/stub/pam-auth-update" << EOF
 #!/usr/bin/env bash
@@ -14640,22 +14673,28 @@ lines[i], lines[j] = lines[j], lines[i]
 with open(p, 'w') as fh:
     fh.writelines(lines)
 PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
 EOF
     chmod +x "$s/stub/pam-auth-update"
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
         run_pam_install "$s" debian
     assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
         "PAM-89: a pure non-fp rule reorder fails closed"
-    # Raw-byte proof that the tool really swapped, without dropping a rule.
+    # Phase C/#3: force recovery restores the snapshot, so the tool's swap is
+    # proven from its OWN copy, while the live file must match the original.
     assert_eq "auth optional pam_wheel.so" \
-        "$(grep -F 'pam_wheel.so' "$s/pam/common-auth" | head -n 1)" \
+        "$(grep -F 'pam_wheel.so' "$s/tool.modified" | head -n 1)" \
         "PAM-89: the tool really moved pam_wheel ahead of pam_echo"
     assert_eq "auth optional pam_echo.so" \
-        "$(grep -F 'pam_echo.so' "$s/pam/common-auth" | head -n 1)" \
+        "$(grep -F 'pam_echo.so' "$s/tool.modified" | head -n 1)" \
         "PAM-89: pam_echo survived, so only the order changed"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-89: failed transaction force-restored the original common-auth bytes"
     log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
     assert_contains "non-fp rule order changed" "$log" \
         "PAM-89: the order failure is named explicitly"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-89: forced recovery succeeded"
     [ -f "$s/manifest/pam-selection" ] && ok \
         || fail "PAM-89: snapshots retained for manual recovery"
 }
@@ -15291,6 +15330,345 @@ test_pam_103_parity_include_and_control_norm() {
     ' _ "$REPO_ROOT" "$s/after/common-auth")"
     assert_eq "$control_before" "$control_after" \
         "PAM-103/control-space: product awk normalises bracket control whitespace"
+
+    # Phase C/#3 P1: `=` whitespace and numeric leading zeroes are libpam
+    # syntax ONLY in a bracketed CONTROL action. Inside a MODULE argument
+    # bracket they are string bytes the module parses itself, so `[foo = 007
+    # bar]` and `[foo=7 bar]` are DIFFERENT argv. The old shared normalisation
+    # collapsed them into one argsfp (fail-open); both implementations must now
+    # keep them distinct while still agreeing on each fingerprint byte-for-byte.
+    s="$(setup_pam_sandbox parity-argsfp-space)"
+    mkdir -p "$s/before" "$s/after"
+    printf 'auth required pam_echo.so [foo = 007 bar]\nauth required pam_permit.so\n' \
+        > "$s/before/common-auth"
+    printf 'auth required pam_echo.so [foo=7 bar]\nauth required pam_permit.so\n' \
+        > "$s/after/common-auth"
+    local before_fp after_fp oracle_fp product_fp
+    before_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/before/common-auth" 2> /dev/null)"
+    after_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/after/common-auth" 2> /dev/null)"
+    assert_neq "$before_fp" "$after_fp" \
+        "PAM-103/argsfp-space: module bracket bytes are NOT normalised (no fail-open collision)"
+    for variant in before after; do
+        oracle_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/$variant/common-auth" 2> /dev/null)"
+        product_fp="$(bash -c '
+            source "$1/lib/pam.sh"
+            rec="$(mktemp)"
+            _pam_parse_file "$2" "$rec" common common-auth || exit $?
+            awk -F "\t" "\$1 == \"V\" { printf \"%s\t%s\t%s\t%s\n\", \$5, \$3, \$4, \$10 }" "$rec"
+            rm -f -- "$rec"
+        ' _ "$REPO_ROOT" "$s/$variant/common-auth")"
+        assert_eq "$oracle_fp" "$product_fp" \
+            "PAM-103/argsfp-space/$variant: product and oracle argsfp are identical"
+    done
+
+    # P1: a backslash OUTSIDE a bracket is a literal byte to libpam, not an
+    # escape. `foo\]bar` and `foo]bar` must not share a fingerprint: the
+    # product must emit U (rc 3) and the independent oracle must agree.
+    printf 'auth required pam_echo.so foo\\]bar\nauth required pam_permit.so\n' \
+        > "$s/escape"
+    rc=0
+    bash -c '
+        source "$1/lib/pam.sh"
+        _pam_parse_file "$2" "$3" common common-auth || exit $?
+    ' _ "$REPO_ROOT" "$s/escape" "$s/escape.rec" > /dev/null 2>&1 || rc=$?
+    assert_eq "3" "$rc" \
+        "PAM-103/escape: a non-bracket backslash fails closed (U, no de-escape)"
+    if python3 "$_PAM_ORACLE" uncertain "$s/escape" > /dev/null 2>&1; then
+        ok
+    else
+        fail "PAM-103/escape: the independent oracle also refuses the non-bracket escape"
+    fi
+    assert_contains "unsupported escape outside bracket" \
+        "$(cat "$s/escape.rec" 2> /dev/null || echo '')" \
+        "PAM-103/escape: the U reason names the non-bracket escape"
+}
+
+# --- re-review #19 Phase C: arguments fingerprint, zero additions, recovery ---
+# PAM-99 (P2/#3): module arguments are part of a preserved rule's identity. A
+# tool rewriting `nullok` to `nodelay` keeps type/control/path and the numeric
+# landing unchanged; only argsfp can prove the rule changed. Mutation: drop
+# argsfp from the product V records and this case stops detecting the rewrite.
+test_pam_99_args_rewrite_fails_closed() {
+    local s log
+    s="$(setup_pam_sandbox args-rewrite)"
+    pam_write_full_stack "$s"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    text = fh.read()
+text = text.replace('pam_unix.so nullok', 'pam_unix.so nodelay')
+with open(p, 'w') as fh:
+    fh.write(text)
+PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-99: a preserved rule's argument rewrite fails closed"
+    # The tool copy proves the rewrite; the live file was force-recovered.
+    assert_contains "pam_unix.so nodelay" "$(cat "$s/tool.modified" 2> /dev/null || echo '')" \
+        "PAM-99: the tool really rewrote the rule arguments"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-99: failed transaction force-restored the original bytes"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed during convergence" "$log" \
+        "PAM-99: the argsfp change is named as a T3 failure"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-99: forced recovery succeeded"
+}
+
+# PAM-100 (re-review #19 Phase C P1 fix): a bracketed MODULE argument's inner
+# bytes are handed to the module as one string. `=` whitespace and leading
+# zeroes are NOT libpam syntax there, so `[foo = 007 bar]` -> `[foo=7 bar]`
+# changes argv and MUST fail closed. The control bracket reformat in the same
+# tool call IS legal (PAM-103/control-space proves that separately). Mutation:
+# restoring the shared bracket normalisation makes this case pass wrongly.
+test_pam_100_module_arg_normalization_fails_closed() {
+    local s log before_fp after_fp product_fp
+    s="$(setup_pam_sandbox argsfp-module-norm)"
+    pam_write_full_stack "$s"
+    # Put a bracketed token INSIDE the argument vector so the old shared
+    # normalisation would erase the change the tool makes.
+    /usr/bin/sed -i -e 's|pam_unix.so nullok|pam_unix.so nullok [foo = 007 bar]|' \
+        "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    text = fh.read()
+text = text.replace(
+    'auth [success=1 default=ignore] pam_unix.so nullok [foo = 007 bar]',
+    'auth [ success = 01 default = ignore ] pam_unix.so  nullok [foo=7 bar]')
+with open(p, 'w') as fh:
+    fh.write(text)
+PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-100: a module-argument reformat MUST fail closed (no fail-open collision)"
+    assert_neq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/tool.modified")" \
+        "PAM-100: the tool really rewrote the module argument bytes"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed during convergence" "$log" \
+        "PAM-100: the module-argument change is named as a T3 failure"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-100: forced recovery succeeded"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-100: failed transaction force-restored the original bytes"
+    # Independent proof: the two argv are NOT argsfp-equivalent.
+    before_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/original.common-auth" 2> /dev/null \
+        | awk -F '\t' '$2 ~ /success/ { print $4 }')"
+    after_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/tool.modified" 2> /dev/null \
+        | awk -F '\t' '$2 ~ /success/ { print $4 }')"
+    assert_neq "$before_fp" "$after_fp" \
+        "PAM-100: oracle fingerprints the two module argv differently"
+    product_fp="$(bash -c '
+        source "$1/lib/pam.sh"
+        rec="$(mktemp)"
+        _pam_parse_file "$2" "$rec" common common-auth || exit $?
+        awk -F "\t" "\$1 == \"V\" { printf \"%s\t%s\t%s\t%s\n\", \$5, \$3, \$4, \$10 }" "$rec"
+        rm -f -- "$rec"
+    ' _ "$REPO_ROOT" "$s/tool.modified" | awk -F '\t' '$3 ~ /pam_unix/ { print $4 }')"
+    assert_eq "$after_fp" "$product_fp" \
+        "PAM-100: product V argsfp matches the oracle after the rewrite"
+}
+
+# PAM-101/addition (P2/#3): zero-addition gate. The tool appends a harmless
+# rule AFTER the numeric jump source, so no landing or baseline key changes;
+# only the new descriptor can be detected. It must fail closed with the
+# explicit 'unexpected convergence addition' reason. Mutation: restoring the
+# Phase A arbitrary-supersequence check makes this case fail.
+test_pam_101_zero_addition_after_jump() {
+    local s log
+    s="$(setup_pam_sandbox zero-addition)"
+    pam_write_full_stack "$s"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+printf 'auth optional pam_admin_add.so extra\n' >> "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-101/addition: an added non-fp rule fails closed"
+    assert_contains "pam_admin_add.so" "$(cat "$s/tool.modified" 2> /dev/null || echo '')" \
+        "PAM-101/addition: the tool really appended a new rule"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-101/addition: failed transaction force-restored the original bytes"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "unexpected convergence addition" "$log" \
+        "PAM-101/addition: the zero-addition reason is explicit"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-101/addition: forced recovery succeeded"
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-101/addition: snapshot retained for uninstall"
+}
+
+# PAM-102/sudo-args (P2/#3): the canonical sudo rule's ARGUMENTS are part of
+# its identity. Both oracles must see a different argsfp when max-tries=1
+# becomes max-tries=2, and the product model must refuse to call the changed
+# file a valid canonical sudo stack.
+test_pam_102_sudo_canonical_args_change() {
+    local s before_fp after_fp rc=0
+    s="$(setup_pam_sandbox sudo-canonical-args)"
+    mkdir -p "$s/before" "$s/after"
+    printf 'auth sufficient pam_fprintd.so max-tries=1 timeout=10\n@include common-auth\n' \
+        > "$s/before/sudo"
+    printf 'auth sufficient pam_fprintd.so max-tries=2 timeout=10\n@include common-auth\n' \
+        > "$s/after/sudo"
+    before_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/before/sudo" 2> /dev/null)"
+    after_fp="$(python3 "$_PAM_ORACLE" argsfp "$s/after/sudo" 2> /dev/null)"
+    assert_neq "$before_fp" "$after_fp" \
+        "PAM-102/sudo-args: the independent oracle fingerprints changed args"
+    local product_before product_after
+    product_before="$(bash -c '
+        source "$1/lib/pam.sh"
+        rec="$(mktemp)"
+        _pam_parse_file "$2" "$rec" sudo sudo || exit $?
+        awk -F "\t" "\$1 == \"V\" { printf \"%s\t%s\t%s\t%s\n\", \$5, \$3, \$4, \$10 }" "$rec"
+        rm -f -- "$rec"
+    ' _ "$REPO_ROOT" "$s/before/sudo")"
+    product_after="$(bash -c '
+        source "$1/lib/pam.sh"
+        rec="$(mktemp)"
+        _pam_parse_file "$2" "$rec" sudo sudo || exit $?
+        awk -F "\t" "\$1 == \"V\" { printf \"%s\t%s\t%s\t%s\n\", \$5, \$3, \$4, \$10 }" "$rec"
+        rm -f -- "$rec"
+    ' _ "$REPO_ROOT" "$s/after/sudo")"
+    assert_eq "$before_fp" "$product_before" \
+        "PAM-102/sudo-args: product and oracle agree on the canonical argsfp"
+    assert_eq "$after_fp" "$product_after" \
+        "PAM-102/sudo-args: product and oracle agree on the changed argsfp"
+    python3 "$_PAM_ORACLE" parity "$s/before/sudo" "$s/after/sudo" > "$s/parity.out" 2>&1 \
+        || rc=$?
+    assert_neq "0" "$rc" \
+        "PAM-102/sudo-args: oracle parity rejects the canonical args rewrite"
+    # Product side: the post-insert assertion must also refuse the rewritten
+    # canonical rule (it is no longer "our" line, i.e. a stale fp module).
+    local verify_rc=0
+    bash -c '
+        export LOG_FILE="$2/sudo-verify.log"
+        source "$1/lib/pam.sh"
+        _PAM_SUDO_PATH="$2/after/sudo"
+        _PAM_DIR="$2/after"
+        _pam_verify_sudo_no_fp "$2/after/sudo" || exit $?
+    ' _ "$REPO_ROOT" "$s" > /dev/null 2>&1 || verify_rc=$?
+    assert_neq "0" "$verify_rc" \
+        "PAM-102/sudo-args: product _pam_verify_sudo_no_fp rejects the changed canonical args"
+    assert_contains "Post-install verification failed" \
+        "$(cat "$s/sudo-verify.log" 2> /dev/null || echo '')" \
+        "PAM-102/sudo-args: the product refusal is explicit"
+}
+
+# PAM-104 (P2): the addition allowlist is a SET OF LITERAL full P descriptors.
+# An unquoted `$key` used as a glob pattern lets a crafted `*` key match a
+# different allowlisted rule and fail open. Three cases:
+#   1. exact hit of a real model descriptor + surviving model proof => rc 0;
+#   2. a wildcard key must NOT match that descriptor;
+#   3. a near-miss key must fail closed.
+# The seam is exported by run_sandboxed and cleared by reset in BOTH directions
+# so no case can leak an allowlist into a later one.
+test_pam_addition_allowlist_literal_match() {
+    local s log allow_key rc
+    local -a names=() keys=() wants=()
+    local i
+    reset_pam_addition_allowlist
+    s="$(setup_pam_sandbox allowlist-literal)"
+    pam_write_full_stack "$s"
+
+    # (1) Derive the EXACT descriptor the tool will add, using the product
+    # parser + model (not a hand-written guess), then allowlist it.
+    mkdir -p "$s/model"
+    cp -a "$s/pam/common-auth" "$s/model/before"
+    {
+        cat "$s/model/before"
+        printf 'auth optional pam_admin_add.so extra\n'
+    } \
+        | /usr/bin/sed '/pam_fprintd\.so/d' > "$s/model/after"
+    bash -c '
+        source "$1/lib/pam.sh"
+        _PAM_DIR="$2"
+        for v in before after; do
+            _pam_parse_file "$2/$v" "$3/rec.$v" common common-auth || exit $?
+            printf "common-auth\t%s\n" "$3/rec.$v" > "$3/m.$v"
+            python3 "$1/lib/pam_stack_model.py" descriptors --nonfp "$3/m.$v" > "$3/d.$v" || exit $?
+        done
+    ' _ "$REPO_ROOT" "$s/model" "$s/model" > /dev/null 2>&1
+    allow_key="$(LC_ALL=C comm -13 \
+        <(LC_ALL=C sort "$s/model/d.before") <(LC_ALL=C sort "$s/model/d.after"))"
+    assert_neq "" "$allow_key" \
+        "PAM-104/allowlist: derived the exact added model descriptor"
+    printf '%s\n' "$allow_key" > "$s/allowlist"
+
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+printf 'auth optional pam_admin_add.so extra\n' >> "\$CROS_ENABLEMENT_PAM_DIR/common-auth"
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST="$allow_key" \
+        CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-104/allowlist/exact: exact hit + model proof passes (rc 0)"
+    assert_neq "$(file_hex "$s/model/before")" "$(file_hex "$s/tool.modified")" \
+        "PAM-104/allowlist/exact: the tool really appended the allowlisted rule"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "Verified no active pam_fprintd.so module remains" "$log" \
+        "PAM-104/allowlist/exact: the installed-state postcondition passed"
+    reset_pam_addition_allowlist
+
+    # (2)+(3) Direct literal-match tests through the SAME seam. Under the
+    # glob mutation, the wildcard key matches the allowlisted P line and the
+    # second assertion below fails.
+    names=(exact wildcard miss)
+    keys=("$allow_key" 'P*' "${allow_key}x")
+    wants=(0 1 1)
+    for i in 0 1 2; do
+        rc=0
+        CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST="$allow_key" \
+            run_sandboxed "$s" '
+                source "$1/lib/pam.sh"
+                _pam_nonfp_addition_allowed "$3" || exit $?
+            ' "${keys[i]}" > /dev/null 2>&1 || rc=$?
+        case "${names[i]}" in
+            exact)
+                assert_eq "${wants[i]}" "$rc" \
+                    "PAM-104/allowlist/exact: a literal full-descriptor key matches"
+                ;;
+            wildcard)
+                assert_eq "${wants[i]}" "$rc" \
+                    "PAM-104/allowlist/wildcard: a '*' key must NOT match another entry"
+                ;;
+            miss)
+                assert_eq "${wants[i]}" "$rc" \
+                    "PAM-104/allowlist/miss: a near-miss key fails closed"
+                ;;
+        esac
+    done
+    reset_pam_addition_allowlist
 }
 
 test_pam_92_mixed_management_groups_fails_closed
@@ -15303,6 +15681,12 @@ test_pam_98_normal_debian_profile_accepted
 test_pam_101_product_oracle_parity
 test_pam_102_typed_include_group_scope
 test_pam_103_parity_include_and_control_norm
+reset_pam_addition_allowlist
+test_pam_99_args_rewrite_fails_closed
+test_pam_100_module_arg_normalization_fails_closed
+test_pam_101_zero_addition_after_jump
+test_pam_102_sudo_canonical_args_change
+test_pam_addition_allowlist_literal_match
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

@@ -25,7 +25,9 @@ Modes (argv):
 * ``active-fp FILE``      - exit 0 if an active fp module exists, 1 if none,
                             2 if the file is unreadable or syntax is uncertain.
 * ``nonfp FILE``          - ordered ``type<TAB>basename`` list of non-fp rules.
-* ``rule-keys FILE``      - ``filetag|group|instance_id|control|path|argsfp``.
+* ``rule-keys FILE``      - ``filetag|group|control|path|argsfp``.
+* ``argsfp FILE``         - ``line<TAB>control<TAB>path<TAB>argsfp`` per module
+                            rule; the injective hex token-vector fingerprint.
 * ``fp-lines FILE``       - physical line numbers of fp rules (1-based).
 * ``strip FILE``          - file bytes with only fp rule lines removed.
 * ``records FILE``        - V/R/D/U/I records (product awk parser shape).
@@ -43,7 +45,6 @@ Print modes exit 2 on unreadable input; ``records`` still prints its U/R/D/I
 records before exiting 3, matching the product parser's contract.
 """
 
-import hashlib
 import os
 import re
 import sys
@@ -88,8 +89,93 @@ def _group(raw_type):
     return "session" if bare == "session-noninteractive" else bare
 
 
-def _argsfp(args):
-    return hashlib.sha256("\x1f".join(args).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+def _encode_tokens(tokens):
+    """Injective hex encoding: '.' is not a hex digit, so no two token
+    vectors can produce the same string.  Every byte except the explicitly
+    normalised ones is preserved."""
+    return ".".join(token.encode("utf-8", "surrogateescape").hex() for token in tokens)
+
+
+def _norm_numeric(value):
+    stripped = value.lstrip("0")
+    return stripped if stripped else "0"
+
+
+def _norm_bracket(token):
+    """Normalise a bracketed CONTROL action, which libpam does tokenise.
+
+    `=` whitespace and numeric leading zeroes are insignificant ONLY here.
+    Module arguments are NOT passed through this function: libpam hands their
+    inner bytes to the module verbatim (P1 fail-open fix).
+    """
+    token = re.sub(r"[ \t]*=[ \t]*", "=", token)
+    # [0-9], not \d: awk runs under LC_ALL=C and treats only ASCII digits as
+    # digits; Python's \d would also accept Unicode digits.
+    return re.sub(r"=([0-9]+)", lambda m: "=" + _norm_numeric(m.group(1)), token)
+
+
+def _argsfp_raw(raw, start, records):
+    """Tokenise RAW module arguments the way libpam does and return argsfp.
+
+    Whitespace separates tokens, a `[...]` group is ONE token (`\\]` is its
+    only escape and de-escapes to `]`), and there is no quoting syntax.  The
+    OUTER brackets are removed before hex-encoding: libpam passes exactly the
+    inner bytes to the module as one string.  Every remaining byte is kept
+    verbatim -- `=` whitespace and leading zeroes are ordinary module-parsed
+    bytes, NOT normalised (P1).  A backslash OUTSIDE a bracket is a literal
+    byte to libpam and cannot be fingerprinted without guessing: emit U and
+    fail closed.  This is an independent implementation of lib/pam.sh's awk
+    argfp(); it never imports or sources the product code.
+    """
+    tokens = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch in " \t":
+            i += 1
+            continue
+        chars = []
+        bracket = ch == "["
+        if bracket:
+            i += 1  # the opening '[' is not part of the module's argument value
+            closed = False
+            while i < n:
+                ch = raw[i]
+                if ch == "\\":
+                    if i + 1 >= n or raw[i + 1] != "]":
+                        records.append(("U", start, "unsupported escape in PAM module arguments"))
+                        raise Uncertain(records)
+                    chars.append("]")
+                    i += 2
+                    continue
+                if ch == "]":
+                    i += 1  # consume the closing ']' without including it
+                    closed = True
+                    break
+                chars.append(ch)
+                i += 1
+            if not closed:
+                records.append(("U", start, "unbalanced bracket in PAM module arguments"))
+                raise Uncertain(records)
+            token = "".join(chars)
+            if not token:
+                # An empty inner value would collide with "zero arguments".
+                records.append(("U", start, "empty bracket argument in PAM module arguments"))
+                raise Uncertain(records)
+        else:
+            while i < n and raw[i] not in " \t":
+                ch = raw[i]
+                if ch == "\\":
+                    records.append(
+                        ("U", start, "unsupported escape outside bracket in PAM module arguments")
+                    )
+                    raise Uncertain(records)
+                chars.append(ch)
+                i += 1
+            token = "".join(chars)
+        tokens.append(token)
+    return _encode_tokens(tokens)
 
 
 def _parse(path):
@@ -162,10 +248,10 @@ def _parse(path):
             if close < 0:
                 records.append(("U", start, "unbalanced bracket control"))
                 raise Uncertain(records)
-            # Bracket whitespace is not significant to libpam; normalise it so
-            # a reformat cannot change a rule identity (P3).
-            control = "[" + " ".join(rest[1:close].split()) + "]"
-            bracket = rest[1:close]
+            # Phase C/#3: the ONLY control normalisations are whitespace
+            # around `=` and leading zeroes of a numeric action value.
+            bracket = _norm_bracket(rest[1:close])
+            control = "[" + " ".join(bracket.split()) + "]"
             rest = rest[close + 1:].strip()
             for action in bracket.split():
                 if not BRACKET_ACTION.match(action):
@@ -173,7 +259,7 @@ def _parse(path):
                     raise Uncertain(records)
                 match = NUMERIC_ACTION.match(action)
                 if match:
-                    jump_values.append(int(match.group(1)))
+                    jump_values.append(int(_norm_numeric(match.group(1))))
         else:
             control = rest.split()[0]
             if control not in CONTROLS:
@@ -188,6 +274,11 @@ def _parse(path):
             raise Uncertain(records)
         basename = module_path.rsplit("/", 1)[-1]
         args = tuple(fields[1:])
+        # Phase C/#3: fingerprint the RAW bytes, not the whitespace-collapsed
+        # fields[] array.  Only libpam-insignificant reformatting may change
+        # the vector; every other byte is preserved by the hex encoding.
+        args_raw = rest[len(module_path):]
+        argsfp_value = _argsfp_raw(args_raw, start, records)
         if control in ("include", "substack"):
             # Keep the prefix type: `auth include X` contributes only auth
             # lines; `@include X` (above) contributes every group's lines.
@@ -200,6 +291,8 @@ def _parse(path):
                     "control": control,
                     "path": module_path,
                     "args": (),
+                    "args_raw": "",
+                    "argsfp": _encode_tokens(()),
                     "start": start,
                     "count": count,
                     "base": module_path,
@@ -214,6 +307,8 @@ def _parse(path):
             "control": control,
             "path": module_path,
             "args": args,
+            "args_raw": args_raw,
+            "argsfp": argsfp_value,
             "start": start,
             "count": count,
             "base": basename,
@@ -235,6 +330,7 @@ def _parse(path):
                     " ".join(args),
                     1 if rule["fp"] else 0,
                     1 if logical == CANONICAL_LINE else 0,
+                    argsfp_value,
                 )
             )
     return physical, records, rules, filetag
@@ -258,7 +354,7 @@ def _instance_id(rule, tag, include_path, dup_index):
         "/".join(include_path),
         rule["path"],
         rule["control"],
-        _argsfp(rule["args"]),
+        rule.get("argsfp", _encode_tokens(rule.get("args", ()))),
         dup_index,
     )
 
@@ -382,7 +478,7 @@ def _descriptors(rules, tag, resolver):
                         "0",
                         rule["control"],
                         rule["path"],
-                        _argsfp(()),
+                        rule.get("argsfp", _encode_tokens(())),
                         "0",
                         "",
                         "",
@@ -413,7 +509,7 @@ def _descriptors(rules, tag, resolver):
                     "1" if rule["raw_type"].startswith("-") else "0",
                     rule["control"],
                     rule["path"],
-                    _argsfp(rule["args"]),
+                    rule.get("argsfp", _encode_tokens(rule.get("args", ()))),
                     "1" if rule["fp"] else "0",
                     "|".join(targets),
                     "|".join(actions),
@@ -514,7 +610,10 @@ def main(argv):
     records = []
     try:
         physical, records, rules, tag = _parse(path)
-        check_jumps(records, rules, tag)
+        # argsfp mode is a pure fingerprint dump: it must work on any
+        # parseable file, including fixtures with unsafe numeric jumps.
+        if mode != "argsfp":
+            check_jumps(records, rules, tag)
     except OSError as exc:
         print("oracle: {}: {}".format(path, exc), file=sys.stderr)
         return 2
@@ -539,12 +638,23 @@ def main(argv):
             if rule["kind"] == "module" and not rule["fp"]:
                 print("{}\t{}".format(rule["raw_type"], rule["base"]))
         return 0
+    if mode == "argsfp":
+        # Phase C/#3: independent argsfp mode for differential parity against
+        # the product awk V records: <line><TAB><control><TAB><path><TAB><fp>.
+        for rule in rules:
+            if rule["kind"] == "module":
+                print(
+                    "{}\t{}\t{}\t{}".format(
+                        rule["start"], rule["control"], rule["path"], rule["argsfp"]
+                    )
+                )
+        return 0
     if mode == "rule-keys":
         for rule in rules:
             if rule["kind"] == "module" and not rule["fp"]:
                 print(
                     "{}|{}|{}|{}|{}".format(
-                        tag, rule["group"], rule["control"], rule["path"], _argsfp(rule["args"])
+                        tag, rule["group"], rule["control"], rule["path"], rule["argsfp"]
                     )
                 )
         return 0
@@ -631,7 +741,7 @@ def _parity(old_path, new_path):
             raw == canonical_tokens[0]
             and control == canonical_tokens[1]
             and path == canonical_tokens[2]
-            and argsfp == _argsfp(canonical_tokens[3:])
+            and argsfp == _encode_tokens(canonical_tokens[3:])
         ):
             print("oracle: unexpected added rule {}".format(descriptor[2]), file=sys.stderr)
             return 1

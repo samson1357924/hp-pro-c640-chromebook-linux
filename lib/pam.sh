@@ -69,12 +69,29 @@ _PAM_COMMON_FP_FOUND=0
 # AFTER convergence by _pam_verify_installed_no_fprintd(). Phase A/#1 (re-review
 # #19): these lines are now emitted by lib/pam_stack_model.py, which models a
 # SEPARATE handler stack per PAM management group and expands @include. A
-# descriptor token includes group/instance-id/control/args/numeric-jump target,
-# never a file-global module index. The baseline must remain a keyed MULTISET
-# plus an ORDERED SUBSEQUENCE: an external tool may ADD a rule, but may not
-# drop, modify or reorder an existing non-fprintd rule.
+# descriptor token includes group/instance-id/control/argsfp/numeric-jump target,
+# never a file-global module index. Phase C/#3 (re-review #19): argsfp is an
+# INJECTIVE hex encoding of the complete, libpam-tokenised argument vector. Only
+# continuation whitespace is collapsed; `=` whitespace and numeric leading
+# zeroes are normalised in the bracketed CONTROL action ONLY, never in a module
+# argument (libpam hands those bytes verbatim to the module). Every other byte
+# is preserved. The baseline must remain a keyed
+# MULTISET plus an ORDERED SUBSEQUENCE. Unlike Phase A it is now a ZERO-ADDITION
+# gate: an external tool may not add ANY rule unless its exact model descriptor
+# is explicitly allowlisted below (default empty).
 _PAM_NONFP_BASELINE=""
 _PAM_NONFP_EXPECTED=""
+# rc/failure-kind scratch for _pam_nonfp_seq_contains(); see that function.
+_PAM_NONFP_FAILURE_KIND=""
+_PAM_NONFP_FAILURE_DETAIL=""
+# Explicit addition allowlist (Phase C/#3). Each entry is one FULL P descriptor
+# line emitted by the Phase A model (service/group/instance-id/raw-type/dash/
+# control/path/argsfp/fp/landing/actions). Matching an entry is itself a Phase A
+# model proof of that rule's identity, and the rest of the baseline must still
+# pass the keyed multiset + ordered-subsequence proof. The seam exists ONLY so
+# an operator/test can enumerate a known-benign generated rule; it is empty by
+# default, so a newly added rule always fails closed.
+_PAM_NONFP_ADDITION_ALLOWLIST="${CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST:-}"
 _PAM_MODEL_HELPER="$SCRIPT_DIR_PAM/pam_stack_model.py"
 _PAM_SAVED_DIR="${CROS_ENABLEMENT_PAM_SAVED_DIR:-/var/lib/pam}"
 _PAM_SEL_SIDECAR="${CROS_ENABLEMENT_PAM_SELECTION_FILE:-${MANIFEST_FILE%/*}/pam-selection}"
@@ -110,8 +127,12 @@ _PAM_COMMON_ENTRIES_LEGACY=0
 # control flow: it emits raw rule facts and the exact physical line ranges;
 # per-management-group jump arithmetic lives in pam_stack_model.py (re-review
 # #19 finding #1). A file-global module index is NEVER computed here.
-#   V <type> <control> <path> <start> <filetag> <args> <fp> <canon>
+#   V <type> <control> <path> <start> <filetag> <args> <fp> <canon> <argsfp>
 #                                                    raw parsed rule facts
+#     <args>   raw argument bytes (T2 byte-compare + human diagnostics)
+#     <argsfp> injective hex encoding of the libpam-tokenised argument vector
+#              (Phase C/#3; empty for ZERO arguments, or when an unsupported
+#              escape made the rule U)
 #   R <start-line> <physical-line-count> <type> <basename>  removable fp
 #   I <start> <kind> <target> <filetag> <scope>        include/substack entry
 #     <scope> is `@` for @include/@substack (all groups), otherwise the raw
@@ -135,18 +156,108 @@ function nocmt(s,   p) { p = index(s, "#"); if (p > 0) s = substr(s, 1, p - 1); 
 function emitR(l, c, t, m) { printf "R\t%d\t%d\t%s\t%s\n", l, c, t, m }
 function emitD(l) { printf "D\t%d\n", l }
 function emitU(l, why) { printf "U\t%d\t%s\n", l, why }
-function emitV(t, c, p, l, f, a, fp, cn) {
-    printf "V\t%s\t%s\t%s\t%d\t%s\t%s\t%d\t%d\n", t, c, p, l, f, a, fp, cn
+function emitV(t, c, p, l, f, a, fp, cn, afp) {
+    printf "V\t%s\t%s\t%s\t%d\t%s\t%s\t%d\t%d\t%s\n", t, c, p, l, f, a, fp, cn, afp
 }
 # <scope>: `@` = group-agnostic @ directive; raw type = type-prefixed directive.
 function emitI(l, k, target, f, s) { printf "I\t%d\t%s\t%s\t%s\t%s\n", l, k, target, f, s }
+# Phase C/#3: injective argument-vector fingerprint.
+#
+# libpam has NO quoting syntax: whitespace separates module arguments and a
+# bracketed `[...]` group is ONE token. libpam removes the OUTER `[]` and
+# de-escapes the single escape it recognises INSIDE a bracket (`\]` -> `]`),
+# then hands the remaining INNER BYTES to the module as ONE STRING. Whitespace
+# around `=` and numeric leading zeroes are NOT libpam syntax there: they are
+# string bytes the module parses itself. `[foo = 007 bar]` and `[foo=7 bar]`
+# therefore have different argv and MUST have different fingerprints. The
+# `=`-whitespace / leading-zero normalisation below (normact) applies ONLY to
+# bracketed CONTROL actions, which libpam does tokenise.
+#
+# We tokenise the RAW argument bytes ourselves instead of reusing the
+# whitespace-collapsing `fields[]` array. Outside a bracket EVERY backslash is
+# a literal byte to libpam, so a token containing one cannot be fingerprinted
+# without guessing: emit U and fail closed. Every retained byte is hex-encoded
+# verbatim, so the fingerprint is injective. Callers must run awk with LC_ALL=C
+# so each awk character is exactly one byte.
+function normact(a,   v) {
+    if (a ~ /=[0-9]+$/) {
+        v = a; sub(/^.*=/, "", v); sub(/^0+/, "", v)
+        if (v == "") v = "0"
+        sub(/[0-9]+$/, v, a)
+    }
+    return a
+}
+function argfp(s, ln,   n, i, c, ch, tok, bracket, closed, nt, toks, out, j, k) {
+    n = length(s); nt = 0; i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == " " || c == "\t") { i++; continue }
+        tok = ""
+        bracket = (c == "[")
+        if (bracket) {
+            i++    # consume the opening '[': libpam drops it from the value
+            closed = 0
+            while (i <= n) {
+                ch = substr(s, i, 1)
+                if (ch == "\\") {
+                    if (i >= n || substr(s, i + 1, 1) != "]") {
+                        emitU(ln, "unsupported escape in PAM module arguments")
+                        uncertain = 1
+                        return ""
+                    }
+                    tok = tok "]"; i += 2; continue
+                }
+                if (ch == "]") { i++; closed = 1; break }   # consume ']' without including it
+                tok = tok ch; i++
+            }
+            if (!closed) {
+                emitU(ln, "unbalanced bracket in PAM module arguments")
+                uncertain = 1
+                return ""
+            }
+            if (tok == "") {
+                # An empty inner value would collide with "zero arguments";
+                # refuse to guess instead of producing a lossy fingerprint.
+                emitU(ln, "empty bracket argument in PAM module arguments")
+                uncertain = 1
+                return ""
+            }
+        } else {
+            while (i <= n) {
+                ch = substr(s, i, 1)
+                if (ch == " " || ch == "\t") break
+                if (ch == "\\") {
+                    # libpam does NOT recognise escapes outside brackets: the
+                    # backslash is an ordinary byte. Two argv that differ only
+                    # by a backslash must not collapse -> fail closed.
+                    emitU(ln, "unsupported escape outside bracket in PAM module arguments")
+                    uncertain = 1
+                    return ""
+                }
+                tok = tok ch; i++
+            }
+        }
+        toks[++nt] = tok
+    }
+    out = ""
+    for (j = 1; j <= nt; j++) {
+        if (j > 1) out = out "."
+        for (k = 1; k <= length(toks[j]); k++) out = out sprintf("%02x", ORD[substr(toks[j], k, 1)])
+    }
+    return out
+}
 function isfp(b) {
     if (scope == "sudo")
         return (b == "pam_fprintd.so" || b == "rust_fp.so" || b ~ /^fp_pam[^[:space:]]*\.so$/)
     return (b == "pam_fprintd.so")
 }
 function removable(b, allowed) { return isfp(b) && !allowed }
-BEGIN { uncertain = 0 }
+BEGIN {
+    uncertain = 0
+    # One byte -> ordinal map (LC_ALL=C is forced by _pam_parse_file). Used by
+    # argfp() to hex-encode every argument byte without lossy locale handling.
+    for (ORD_i = 0; ORD_i < 256; ORD_i++) ORD[sprintf("%c", ORD_i)] = ORD_i
+}
 {
     start = FNR
     line = trim(nocmt($0))
@@ -204,13 +315,16 @@ BEGIN { uncertain = 0 }
         }
         br = substr(rest, 2, cl - 2)
         rest = trim(substr(rest, cl + 1))
+        # Phase C/#3: the ONLY control normalisations libpam permits are
+        # whitespace around `=` and leading zeroes of a numeric action value.
+        # `[ success = 01 default = ignore ]` is the same control as
+        # `[success=1 default=ignore]`; any other byte is preserved/validated.
+        gsub(/[ \t]*=[ \t]*/, "=", br)
         nb = split(br, acts, /[ \t]+/)
-        # P3: normalise bracket whitespace in the emitted control. `[success=1
-        # default=ignore]` and `[success=1  default=ignore]` are the same
-        # control for libpam; a reformat must not change a rule identity.
         ncontrol = "["
         for (i = 1; i <= nb; i++) {
             if (acts[i] == "") continue
+            acts[i] = normact(acts[i])
             if (acts[i] !~ /^[A-Za-z_][A-Za-z0-9_]*=(ignore|bad|die|ok|done|reset|end|[0-9]+)$/) {
                 emitU(start, "uncertain bracket control action"); uncertain = 1; bad = 1; break
             }
@@ -252,7 +366,8 @@ BEGIN { uncertain = 0 }
     args = rest
     sub(/^[ \t]*[^ \t]+/, "", args)
     args = trim(args)
-    emitV(type, control, path, start, filetag, args, removable(base, allowed) ? 1 : 0, allowed)
+    emitV(type, control, path, start, filetag, args, removable(base, allowed) ? 1 : 0, allowed, \
+        argfp(args, start))
     if (removable(base, allowed)) emitR(start, count, type, base)
 }
 END {
@@ -293,8 +408,13 @@ _pam_parse_file() {
     # (which cannot read a 0600 non-root buffer once escalated), so prefer the
     # local probe and only escalate for root-only PAM files (PAM-19).
     [ -r "$1" ] || sudo test -r "$1" 2> /dev/null || return 2
+    # LC_ALL=C is set by `env` as the COMMAND sudo runs, not as a sudo variable
+    # assignment: the test sudo stub execs "$@" verbatim, so a `sudo LC_ALL=C
+    # awk` would try to execute a file literally named "LC_ALL=C". Going
+    # through env also keeps the byte-ordinal map deterministic when the awk
+    # implementation (e.g. gawk) sanitises its inherited environment.
     # shellcheck disable=SC2024 # caller-owned buffer, not a root-owned redirect
-    sudo awk -v scope="$scope" -v filetag="$tag" -v project_line="$project" \
+    sudo env LC_ALL=C awk -v scope="$scope" -v filetag="$tag" -v project_line="$project" \
         "$_PAM_AWK_PARSER" "$1" > "$2" 2> /dev/null || rc=$?
     case "$rc" in
         0 | 3) return "$rc" ;;
@@ -312,32 +432,58 @@ _pam_records_uncertain_reasons() {
     awk -F '\t' '$1 == "U" { printf "line %s: %s; ", $2, $3 }' "$1"
 }
 
-# Raw non-fp rule facts from one parsed file. The AUTHORITATIVE descriptor is
-# pam_stack_model.py's per-group output (_pam_model_scan_common); this remains
-# only as a human-readable dump of the awk V records (it carries no global jump
-# arithmetic and is never used as a safety proof).
-_pam_records_nonfp_seq() {
-    awk -F '\t' '$1 == "V" && $8 != "1" { printf "%s|%s|%s|%s|%s|%s\n", $6, $2, $3, $4, $7, $8 }' "$1"
+# Phase C/#3: an exact model descriptor must be explicitly allowlisted before
+# an ADDITIONAL non-fp rule may appear. The allowlist is empty by default, so
+# "an external tool may add a rule" (Phase A) is no longer true: convergence
+# now has a ZERO-ADDITION postcondition. Matching a full P descriptor is the
+# Phase A model proof of that rule's identity (group/instance/control/argsfp/
+# landing are all part of it); the surviving baseline must still pass the
+# multiset + ordered-subsequence proof below.
+_pam_nonfp_addition_allowed() {
+    local key="$1"
+    [ -n "$key" ] || return 1
+    # LITERAL whole-line match. A `case ... in *$key*)` pattern (or any other
+    # glob/regex interpretation of $key) lets a crafted descriptor containing
+    # `*` match a DIFFERENT allowlisted rule and fail open. -Fxq with `--`
+    # also keeps a key beginning with `-` from being read as an option.
+    grep -Fxq -- "$key" <<< "$_PAM_NONFP_ADDITION_ALLOWLIST"
 }
 
 # $1=newline-separated expected descriptors, $2=live descriptors.
-# A tool may ADD rules; it may not remove, modify or reorder any baseline rule.
-# Counts are compared as a keyed MULTISET (comm handles duplicates correctly)
-# and the baseline must additionally remain an ordered SUBSEQUENCE.
-# rc 0 = all baseline keys present AND still in the same relative order.
-# rc 1 = a baseline key is gone (rule removed/modified, or a jump endpoint
-#        changed so its descriptor no longer exists).
-# rc 2 = every key survived but the baseline order did not (pure reorder).
+# Keys are the FULL Phase A per-group P descriptors, including group, unique
+# instance id, control, argsfp and numeric-jump landing.
+# Checks, in this order (so an added rule that also shifts a landing is still
+# reported as the pre-existing "jump endpoint changed" failure):
+#   1. every baseline key is still present (keyed multiset, via comm);
+#   2. NO new key appears unless it is explicitly allowlisted;
+#   3. the baseline remains an ordered SUBSEQUENCE (monotonic cursor).
+# rc 0 = proof passed. rc 1 = a baseline key is gone OR an unexpected addition
+# appeared (see _PAM_NONFP_FAILURE_KIND). rc 2 = pure reorder.
 _pam_nonfp_seq_contains() {
-    local expected="$1" actual="$2" e a missing token found
+    local expected="$1" actual="$2" e a missing extra token found
     local -a ea=() aa=()
+    _PAM_NONFP_FAILURE_KIND=""
+    _PAM_NONFP_FAILURE_DETAIL=""
     e="$(_pam_tmp_file)" || return 2
     a="$(_pam_tmp_file)" || return 2
     printf '%s\n' "$expected" | grep -v '^$' | LC_ALL=C sort > "$e"
     printf '%s\n' "$actual" | grep -v '^$' | LC_ALL=C sort > "$a"
     missing="$(comm -23 "$e" "$a")"
+    extra="$(comm -13 "$e" "$a")"
     rm -f -- "$e" "$a"
-    [ -z "$missing" ] || return 1
+    if [ -n "$missing" ]; then
+        _PAM_NONFP_FAILURE_KIND="missing"
+        _PAM_NONFP_FAILURE_DETAIL="$(printf '%s\n' "$missing" | head -n 1)"
+        return 1
+    fi
+    while IFS= read -r token; do
+        [ -n "$token" ] || continue
+        if ! _pam_nonfp_addition_allowed "$token"; then
+            _PAM_NONFP_FAILURE_KIND="addition"
+            _PAM_NONFP_FAILURE_DETAIL="$token"
+            return 1
+        fi
+    done <<< "$extra"
     token=""
     while IFS= read -r token; do
         [ -n "$token" ] || continue
@@ -361,7 +507,10 @@ _pam_nonfp_seq_contains() {
                 break
             fi
         done
-        [ "$found" -eq 1 ] || return 2
+        if [ "$found" -eq 1 ]; then continue; fi
+        _PAM_NONFP_FAILURE_KIND="order"
+        _PAM_NONFP_FAILURE_DETAIL="$token"
+        return 2
     done
     return 0
 }
@@ -1993,7 +2142,13 @@ _pam_consume_snapshot() {
 # This is deliberately idempotent: stage -> verify -> atomic mv -T (regular file
 # and symlink), rm -f (was absent). A directory at any target is a hard failure -
 # rm -rf would destroy live state. No sed is used here (PAM-7).
+# $1=force (0 normal uninstall, 1 failed-transaction recovery). Force ONLY
+# skips the "external semantic change" refusal: the snapshot is the sole
+# authority and an admin/tool-added line must be discarded. All HARD failures
+# (probe errors, directories at a target, stage/install/mv failures, post-read
+# mismatch, entry-set divergence) stay fatal in both modes.
 _pam_restore_common_state_from_snapshot() {
+    local force="${1:-0}"
     local fields base path present type mode owner link sha stage probe live
     local live_norm snap_norm rc=0 entries_rc=0
     fields="$(_pam_common_snapshot_fields)" || {
@@ -2047,9 +2202,13 @@ _pam_restore_common_state_from_snapshot() {
                 live_norm="$(_pam_common_normalized_hash "$path")"
                 snap_norm="$(_pam_common_normalized_hash "$_PAM_COMMON_SNAPSHOT_DIR/files/$base")"
                 if [ "$live_norm" != "$snap_norm" ]; then
-                    log_error "External content change detected in $path since the snapshot (added/removed/reordered MODULE line); refusing to overwrite it - manual recovery required."
-                    rc=1
-                    continue
+                    if [ "$force" -eq 1 ]; then
+                        log_warn "Forced recovery: discarding the external content change in $path; the common/sudo snapshot is the sole authority."
+                    else
+                        log_error "External content change detected in $path since the snapshot (added/removed/reordered MODULE line); refusing to overwrite it - manual recovery required."
+                        rc=1
+                        continue
+                    fi
                 fi
                 stage="${path}.cros-common-restore.$$"
                 sudo rm -f -- "$stage" 2> /dev/null
@@ -2269,6 +2428,40 @@ _pam_verify_common_targets_against_snapshot() {
     esac
     [ "$rc" -eq 0 ] || return 1
     log_info "Verified final common-*/sudo state (bytes, mode, owner, type, link target, absence), savedir metadata and entry set against $_PAM_COMMON_SNAPSHOT_DIR."
+    return 0
+}
+
+# Phase C/#3: recover a FAILED install transaction that may already have
+# mutated the live PAM configuration. The first-wins .common snapshot is the
+# ONLY authority: force-restore common-*/sudo, then independently re-compare
+# bytes/metadata and re-run the same fail-closed rule scan used by preflight
+# and postcondition. The snapshot is deliberately NOT consumed here -- it is
+# still the uninstall's only authority for the original debconf selection and
+# saved profiles. Any failure leaves the live files in whatever state the
+# restore reached and is logged as CRITICAL manual recovery.
+_pam_recover_failed_pam_transaction() {
+    local verify_rc=0 scan_rc=0
+    if ! _pam_fs_probe d "$_PAM_COMMON_SNAPSHOT_DIR" \
+        || ! _pam_common_snapshot_readable "$_PAM_COMMON_SNAPSHOT_DIR"; then
+        log_error "CRITICAL: the PAM common/sudo snapshot is missing or incomplete; the failed transaction could not be recovered; manual recovery required."
+        return 1
+    fi
+    log_warn "PAM transaction failed after mutation; force-restoring common-*/sudo from the first-wins snapshot (snapshot is retained, not consumed)."
+    if ! _pam_restore_common_state_from_snapshot 1; then
+        log_error "CRITICAL: forced common/sudo restore from $_PAM_COMMON_SNAPSHOT_DIR failed; manual recovery required."
+        return 1
+    fi
+    _pam_verify_common_targets_against_snapshot || verify_rc=$?
+    if [ "$verify_rc" -ne 0 ]; then
+        log_error "CRITICAL: post-recovery byte/metadata comparison against $_PAM_COMMON_SNAPSHOT_DIR failed (rc $verify_rc); manual recovery required."
+        return 1
+    fi
+    _pam_common_fp_scan || scan_rc=$?
+    if [ "$scan_rc" -ne 0 ]; then
+        log_error "CRITICAL: post-recovery PAM rule scan failed (rc $scan_rc); manual recovery required."
+        return 1
+    fi
+    log_info "Failed PAM transaction recovered: common-*/sudo re-restored from the snapshot, byte-compared and re-scanned; snapshot kept for uninstall."
     return 0
 }
 
@@ -2720,6 +2913,7 @@ _pam_strip_fprintd_from_common_files() {
 # (PAM-90/97): "already configured" is not an excuse to skip verification.
 _pam_verify_sudo_no_fp() { # $1=sudo PAM file
     local file="$1" records rc=0 work="" manifest="" desc="" count=0
+    local argsfp_note=""
     records="$(_pam_tmp_file)" || return 1
     _pam_parse_file "$file" "$records" sudo sudo "$_PAM_FP_SUDO_LINE" || rc=$?
     if [ "$rc" -ne 0 ] || _pam_records_have_fp "$records"; then
@@ -2730,7 +2924,12 @@ _pam_verify_sudo_no_fp() { # $1=sudo PAM file
     count="$(grep -cFx -- "$_PAM_FP_SUDO_LINE" "$file" 2> /dev/null || true)"
     [ -n "$count" ] || count=0
     if [ "$count" != "1" ]; then
-        log_error "Post-install verification failed: the canonical sudo fingerprint line appears $count times in $file (expected exactly 1)."
+        # Phase C/#3: name an argsfp mismatch when a pam_fprintd.so rule is
+        # still present but its arguments differ from the canonical vector.
+        argsfp_note="$(awk -F '\t' '$1 == "V" && $4 == "pam_fprintd.so" && $9 != "1" {
+            printf " (a pam_fprintd.so rule with argsfp %s is present)", $10
+        }' "$records" 2> /dev/null)"
+        log_error "Post-install verification failed: the canonical sudo fingerprint line appears $count times in $file (expected exactly 1)$argsfp_note; refusing to claim fingerprint authentication."
         rm -f -- "$records"
         return 1
     fi
@@ -2980,11 +3179,13 @@ _pam_sudo_plan_and_verify() {
 # instance-id/control/args/numeric-jump-target, with @include expanded per
 # group); the T3 check below is a keyed MULTISET + ordered SUBSEQUENCE of the
 # per-group P descriptors emitted by that model (service/group/instance-id/
-# control/args/numeric-jump-target), not of the raw awk V records. A removed/
+# control/argsfp/numeric-jump-target), not of the raw awk V records. A removed/
 # changed non-fp rule can no longer hide behind another rule with the same
-# type:basename, and stale control flow fails the claim. Bracket control
-# whitespace is normalised by the parser; mode and debconf selection changes
-# remain irrelevant.
+# type:basename, and stale control flow fails the claim. Phase C/#3 adds a
+# ZERO-ADDITION gate: any new descriptor must be explicitly allowlisted. Only
+# bracket CONTROL `=` whitespace, numeric leading zeroes and continuation
+# whitespace are normalised; every module-argument byte is covered by argsfp.
+# Mode and debconf selection changes remain irrelevant.
 _pam_verify_installed_no_fprintd() {
     local scan_rc=0 seq_rc=0
     _pam_common_fp_scan || scan_rc=$?
@@ -2994,11 +3195,17 @@ _pam_verify_installed_no_fprintd() {
     fi
     _pam_nonfp_seq_contains "$_PAM_NONFP_EXPECTED" "$_PAM_NONFP_BASELINE" || seq_rc=$?
     if [ "$seq_rc" -ne 0 ]; then
-        if [ "$seq_rc" -eq 2 ]; then
-            log_error "Post-install verification failed: non-fp rule order changed during convergence (a baseline PAM rule is no longer an ordered subsequence); refusing to claim sudo-only fingerprint."
-        else
-            log_error "Post-install verification failed: a non-fprintd PAM rule or a numeric jump endpoint changed during convergence (authentication control flow unverified / stale jump counts); refusing to claim sudo-only fingerprint."
-        fi
+        case "$_PAM_NONFP_FAILURE_KIND" in
+            addition)
+                log_error "Post-install verification failed: unexpected convergence addition of a non-fp PAM rule ($_PAM_NONFP_FAILURE_DETAIL); refusing to claim sudo-only fingerprint."
+                ;;
+            order)
+                log_error "Post-install verification failed: non-fp rule order changed during convergence (a baseline PAM rule is no longer an ordered subsequence); refusing to claim sudo-only fingerprint."
+                ;;
+            *)
+                log_error "Post-install verification failed: a non-fprintd PAM rule or a numeric jump endpoint changed during convergence (authentication control flow unverified / stale jump counts); refusing to claim sudo-only fingerprint."
+                ;;
+        esac
         return 1
     fi
     log_info "Verified no active pam_fprintd.so module remains in Debian common-* PAM files and every non-fp rule + jump endpoint is unchanged (sudo-only fingerprint)."
@@ -3071,12 +3278,24 @@ _configure_pam_fingerprint_body() {
             # Finding #1 / PAM-96: one strip+insert preflight for sudo, before
             # any live sed. Anchor loss and provably unsafe stack changes now
             # fail closed instead of warning while claiming success.
-            _pam_sudo_plan_and_verify '^@include common-auth$' '@include common-auth' || return $?
+            if ! _pam_sudo_plan_and_verify '^@include common-auth$' '@include common-auth'; then
+                # Phase C/#3: a failed sudo verify may have already mutated the
+                # live file. Force the snapshot back BEFORE returning failure;
+                # never consume it. The snapshot is the sole authority.
+                _pam_recover_failed_pam_transaction
+                return 1
+            fi
             # Final installed-state postcondition: prove the actual common-*
             # files have no active fprintd module, not merely that our sed
             # returned 0. On failure do NOT consume any snapshot half and make
             # the install return non-zero.
-            _pam_verify_installed_no_fprintd || return $?
+            if ! _pam_verify_installed_no_fprintd; then
+                # Phase C/#3: T3 failed AFTER convergence and after the direct
+                # strip, so the live common-*/sudo state may be partially
+                # mutated. Recover from the snapshot, then report the failure.
+                _pam_recover_failed_pam_transaction
+                return 1
+            fi
             ;;
         fedora)
             # NOTE: authselect's with-fingerprint profile injects
