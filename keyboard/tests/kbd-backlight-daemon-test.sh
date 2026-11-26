@@ -85,6 +85,14 @@ ORDER_FILE="$TMP_DIR/blank-order"
 # screensaver_tristate() is called from command substitutions, so an in-process
 # counter would be lost in each subshell.
 STUB_ACTIVE_SEQ_FILE="$TMP_DIR/active-seq"
+# Phase D (19th re-review #4): gated dbus-monitor stubs.  The harness starts
+# monitor_login1 with the signal blocked, publishes the hook's pre/post commit
+# files, then releases true (and optionally false) so the interleaving is
+# deterministic instead of depending on scheduler timing.
+STUB_DBUS_STARTED="$TMP_DIR/dbus-monitor-started"
+STUB_DBUS_RELEASE="$TMP_DIR/dbus-monitor-release"
+STUB_DBUS_RELEASE_FALSE="$TMP_DIR/dbus-monitor-release-false"
+export STUB_DBUS_STARTED STUB_DBUS_RELEASE STUB_DBUS_RELEASE_FALSE
 HANDOFF_DIR="$TMP_DIR/handoff"
 HANDOFF_SUSPEND_FILE="$HANDOFF_DIR/c640-kbd-backlight.suspend"
 HANDOFF_RESUME_FILE="$HANDOFF_DIR/c640-kbd-backlight.resume"
@@ -704,6 +712,8 @@ reset_case() {
         "$STUB_EPOCH_ACTIVE_COUNT_FILE" \
         "$STUB_RETRY_GATE" "$STUB_RETRY_RELEASE" "$STUB_RETRY_STARTED" \
         "$STUB_WLOCK_HELD" "$STUB_WLOCK_RELEASE" \
+        "$STUB_DBUS_STARTED" "$STUB_DBUS_RELEASE" "$STUB_DBUS_RELEASE_FALSE" \
+        "$STUB_DBUS_RELEASE_FALSE.armed" "$STUB_DIR/dbus-monitor" \
         "$STUB_TORN_META" "$STUB_TORN_OLD" "$STUB_TORN_NEW" "$STUB_TORN_COUNTER" \
         "$UNHEALTHY_MARKER" "$STUB_SLOW_ACTIVE" "$STUB_SLOW_ACTIVE".claimed.*
     export STUB_TORN_META_ON=0
@@ -721,6 +731,7 @@ reset_case() {
     export STUB_GEN_CAT_LIE=0 STUB_GEN_CAT_LIE_VALUE=''
     export STUB_GEN_RM_FAIL=0
     export STUB_GEN_DATE_STALE='' STUB_GEN_DATE_STALE_SECS=10
+    export STUB_DATE_FAIL=0
     export TMPDIR="$ORIG_TMPDIR"
     # Phase D: G3-27 leaves a DIRECTORY at the epoch path, so rm -rf (not just
     # rm -f) is required before seeding a valid numeric token.  Forgetting the
@@ -914,6 +925,12 @@ cat() {
 }
 
 date() {
+    # Whole-clock failure for the PrepareForSleep(true) fence fallback case.
+    # Only +%s is failed; the command `date` used by the fixtures is untouched.
+    if [ "${STUB_DATE_FAIL:-0}" = "1" ] && [ "${1:-}" = "+%s" ]; then
+        builtin printf 'date: cannot obtain time\n' >&2
+        return 1
+    fi
     # One-shot "time jumped" injection for the guard evidence TTL: the first
     # +%s query with the marker present returns a time far in the future.
     # Claim it by an atomic rename (command mv bypasses the G3 mv fault stub):
@@ -979,6 +996,95 @@ wait_for_line() {
         n=$((n + 1))
     done
     grep -Fqx "$line" "$target" 2> /dev/null
+}
+
+wait_for_absent() {
+    local target="$1" n=0
+    while [ -e "$target" ] && [ "$n" -lt 300 ]; do
+        /bin/sleep 0.02
+        n=$((n + 1))
+    done
+    [ ! -e "$target" ]
+}
+
+wait_for_file_content() {
+    local target="$1" expected="$2" n=0 actual
+    while [ "$n" -lt 300 ]; do
+        actual="$(/bin/cat "$target" 2> /dev/null || echo '')"
+        [ "$actual" = "$expected" ] && return 0
+        /bin/sleep 0.02
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# Start monitor_login1 with a dbus-monitor stub that HOLDS the signal.  The
+# harness can then publish the hook's pre/post commit files before releasing
+# true; with `armed` set it also emits false after a second gate.  Sets
+# $LOGIN1_PID for the caller to `wait` after releasing both gates.
+start_gated_login1() {
+    local with_false="${1:-0}"
+    rm -f "$STUB_DBUS_STARTED" "$STUB_DBUS_RELEASE" "$STUB_DBUS_RELEASE_FALSE"
+    if [ "$with_false" = "1" ]; then
+        : > "$STUB_DBUS_RELEASE_FALSE.armed"
+    else
+        rm -f "$STUB_DBUS_RELEASE_FALSE.armed"
+    fi
+    cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+: > "${STUB_DBUS_STARTED:-/nonexistent}"
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+while [ ! -e "${STUB_DBUS_RELEASE:-/nonexistent}" ]; do
+    /bin/sleep 0.02
+done
+printf '   boolean true\n'
+if [ -e "${STUB_DBUS_RELEASE_FALSE:-/nonexistent}.armed" ]; then
+    while [ ! -e "${STUB_DBUS_RELEASE_FALSE:-/nonexistent}" ]; do
+        /bin/sleep 0.02
+    done
+    printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+    printf '   boolean false\n'
+fi
+STUB
+    chmod +x "$STUB_DIR/dbus-monitor"
+    : > "$DAEMON_ERR"
+    : > "$SET_LOG"
+    run_fn monitor_login1 &
+    LOGIN1_PID=$!
+    if ! wait_for_file "$STUB_DBUS_STARTED"; then
+        bad "test harness: gated dbus-monitor did not start"
+    fi
+}
+
+# Same stub but emits only PrepareForSleep(false), gated.  Used by the local
+# state fallback cases where no true/commit ever happened.
+start_gated_login1_false() {
+    rm -f "$STUB_DBUS_STARTED" "$STUB_DBUS_RELEASE"
+    cat > "$STUB_DIR/dbus-monitor" << 'STUB'
+#!/bin/sh
+: > "${STUB_DBUS_STARTED:-/nonexistent}"
+printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
+while [ ! -e "${STUB_DBUS_RELEASE:-/nonexistent}" ]; do
+    /bin/sleep 0.02
+done
+printf '   boolean false\n'
+STUB
+    chmod +x "$STUB_DIR/dbus-monitor"
+    : > "$DAEMON_ERR"
+    : > "$SET_LOG"
+    run_fn monitor_login1 &
+    LOGIN1_PID=$!
+    if ! wait_for_file "$STUB_DBUS_STARTED"; then
+        bad "test harness: gated dbus-monitor (false) did not start"
+    fi
+}
+
+finish_gated_login1() {
+    : > "$STUB_DBUS_RELEASE"
+    if [ -e "$STUB_DBUS_RELEASE_FALSE.armed" ]; then
+        : > "$STUB_DBUS_RELEASE_FALSE"
+    fi
+    wait "$LOGIN1_PID" 2> /dev/null || true
 }
 
 # Hold the daemon's WRITE_LOCK (fd 209) from a separate process.  Used to park
@@ -4893,10 +4999,11 @@ assert_file "D5: STATE_FILE unchanged" "$STATE_FILE" "9"
 assert_present "D5: handoff retained" "$HANDOFF_SUSPEND_FILE"
 assert_log_matches "D5: missing begin logged" "$DAEMON_ERR" 'cycle-begin file .* missing'
 
-# D6a. THE finding #2 regression: an old non-zero handoff with a newer daemon
-#      state must cause zero overwrite and zero Properties.Set.  First through
-#      login1(false) with NO resume flag (pre did not commit); then directly
-#      through handle_resume with a stale pre epoch.
+# D6a. THE finding #2 regression: an old non-zero handoff must NEVER overwrite
+#      a newer daemon state.  Through login1(false) with NO resume flag (pre
+#      did not commit) the daemon now restores its OWN saved value via the
+#      local fallback and leaves the handoff untouched; directly through
+#      handle_resume with a stale pre epoch it fails closed with zero writes.
 reset_case
 write_state 9
 write_handoff_suspend 7
@@ -4909,10 +5016,12 @@ chmod +x "$STUB_DIR/dbus-monitor"
 : > "$DAEMON_ERR"
 : > "$SET_LOG"
 run_fn monitor_login1
-assert_file "D6a (login1): STATE_FILE unchanged" "$STATE_FILE" "9"
-assert_eq "D6a (login1): zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
-assert_present "D6a (login1): suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
-assert_log_matches "D6a (login1): no-flag gate logged" "$DAEMON_ERR" 'no resume flag'
+assert_file "D6a (login1): local fallback restores the saved value, not the handoff" "$RAW_FILE" "9"
+assert_absent "D6a (login1): saved state consumed by the verified local restore" "$STATE_FILE"
+assert_eq "D6a (login1): exactly one Properties.Set for the local value" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D6a (login1): suspend handoff retained (not adopted)" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D6a (login1): no cycle adopted" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D6a (login1): no-flag fallback logged" "$DAEMON_ERR" 'no resume flag'
 rm -f "$STUB_DIR/dbus-monitor"
 
 reset_case
@@ -4976,9 +5085,10 @@ assert_file "D8: adopted-cycle written on success" "$ADOPTED_CYCLE_FILE" "$C640_
 # D9. PrepareForSleep(true) clears stale handoffs and refreshes cycle-begin;
 #     (false) only adopts when post actually published a flag.
 reset_case
-write_handoff_suspend 7
+# Genuinely stale pair: the OLD token epoch precedes cycle-begin - skew, so
+# PrepareForSleep(true) may clear both and refresh the wall-clock fence.
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
 write_handoff_resume
-printf '1\n' > "$CYCLE_BEGIN_FILE"
 cat > "$STUB_DIR/dbus-monitor" << 'STUB'
 #!/bin/sh
 printf 'signal 6 sender=:1.0 -> destination=:1.1 path=/org/freedesktop/login1\n'
@@ -4990,7 +5100,7 @@ run_fn monitor_login1
 assert_absent "D9 (true): stale suspend handoff cleared" "$HANDOFF_SUSPEND_FILE"
 assert_absent "D9 (true): stale resume flag cleared" "$HANDOFF_RESUME_FILE"
 _begin="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo '')"
-if [[ "$_begin" =~ ^[0-9]+$ ]] && [ "$_begin" -gt 1 ]; then
+if [[ "$_begin" =~ ^[0-9]+$ ]] && [ "$_begin" -gt 1763800000 ]; then
     ok "D9 (true): cycle-begin refreshed to the new sleep epoch"
 else
     bad "D9 (true): cycle-begin not refreshed ('$_begin')"
@@ -5110,6 +5220,282 @@ assert_present "D10e: resume flag retained" "$HANDOFF_RESUME_FILE"
 assert_absent "D10e: no adopted-cycle recorded" "$ADOPTED_CYCLE_FILE"
 assert_eq "D10e: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 assert_log_matches "D10e: out of range logged" "$DAEMON_ERR" 'suspend handoff value .* out of range'
+
+# --- Phase D (19th re-review #4): delayed PrepareForSleep(true) -------------
+
+# D11. pre/post commit is already published when a queued true finally runs.
+#      The committed cycle handoff must survive, cycle-begin must be fenced at
+#      the token epoch (never pushed to wall clock), and the following false
+#      must adopt exactly once with exactly one D-Bus write.
+reset_case
+write_state 9
+printf '1\n' > "$CYCLE_BEGIN_FILE"
+start_gated_login1 1
+# Publish BOTH commit files while true is still held in the stub.
+printf '%s 7 published\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+write_handoff_resume_committed 7
+: > "$STUB_DBUS_RELEASE"
+if ! wait_for_file_content "$CYCLE_BEGIN_FILE" '1763800000'; then
+    bad "D11 (true): cycle-begin was not anchored to the token epoch"
+fi
+assert_present "D11 (true): committed suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D11 (true): committed resume flag retained" "$HANDOFF_RESUME_FILE"
+# The monitor logs from a pipeline subshell: wait for the line instead of
+# sampling the log immediately after cycle-begin changed (micro-race).
+if wait_for_line "$DAEMON_ERR" '[c640-kbd-backlight-sync] keeping committed cycle handoff'; then
+    ok "D11 (true): keeping committed cycle handoff logged"
+else
+    bad "D11 (true): keeping committed cycle handoff logged"
+fi
+# The fence is causal: 1763800000 is far behind `date +%s`, so a date fence
+# would push cycle-begin past the token and strand this committed cycle.
+_now_epoch="$(date +%s)"
+if [ "$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo 0)" -lt "$((_now_epoch - 1000))" ]; then
+    ok "D11 (true): cycle-begin not pushed to wall clock"
+else
+    bad "D11 (true): cycle-begin was pushed to wall clock"
+fi
+: > "$STUB_DBUS_RELEASE_FALSE"
+wait "$LOGIN1_PID" 2> /dev/null || true
+assert_file "D11 (false): committed value 7 restored" "$RAW_FILE" "7"
+assert_eq "D11 (false): exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "D11 (false): suspend handoff consumed once" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D11 (false): resume flag consumed once" "$HANDOFF_RESUME_FILE"
+assert_file "D11 (false): adopted-cycle records the token once" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+if grep -q 'login1: resume handler failed' "$DAEMON_ERR"; then
+    bad "D11 (false): login1 reported a false resume failure"
+else
+    ok "D11 (false): login1 reported no resume failure"
+fi
+
+# D12. A suspend/flag token mismatch is NOT a reason for PrepareForSleep(true)
+#      to delete files: keep both for the adopt cross-check.  The subsequent
+#      false must fail closed with unchanged state and zero D-Bus writes.
+reset_case
+write_state 9
+printf '9\n' > "$RAW_FILE"
+printf '1\n' > "$CYCLE_BEGIN_FILE"
+start_gated_login1 1
+printf '%s 7 published\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+# 4-column flag (Phase B committed value) with a FOREIGN token: parsing must
+# accept the shape while the cross-check still rejects the cycle.
+write_handoff_resume_committed 9 "$C640_FOREIGN_TOKEN"
+: > "$STUB_DBUS_RELEASE"
+if ! wait_for_file_content "$CYCLE_BEGIN_FILE" '1763800000'; then
+    bad "D12 (true): mismatched cycle was not fenced at the token epoch"
+fi
+assert_present "D12 (true): mismatched suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D12 (true): mismatched resume flag retained" "$HANDOFF_RESUME_FILE"
+if wait_for_line "$DAEMON_ERR" '[c640-kbd-backlight-sync] keeping committed cycle handoff'; then
+    ok "D12 (true): keeping committed cycle handoff logged"
+else
+    bad "D12 (true): keeping committed cycle handoff logged"
+fi
+: > "$STUB_DBUS_RELEASE_FALSE"
+wait "$LOGIN1_PID" 2> /dev/null || true
+assert_file "D12 (false): STATE_FILE unchanged" "$STATE_FILE" "9"
+assert_file "D12 (false): brightness unchanged" "$RAW_FILE" "9"
+assert_eq "D12 (false): zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D12 (false): suspend handoff still present" "$HANDOFF_SUSPEND_FILE"
+assert_present "D12 (false): resume flag still present" "$HANDOFF_RESUME_FILE"
+assert_absent "D12 (false): no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D12 (false): token cross-check logged" "$DAEMON_ERR" 'token mismatch'
+assert_log_matches "D12 (false): rc=FAIL reported" "$DAEMON_ERR" 'login1: resume handler failed \(rc=1\)'
+
+# D13. A genuinely stale token (epoch < cycle-begin - skew) is still cleared,
+#      and cycle-begin is refreshed to the new sleep epoch.
+reset_case
+write_state 5
+start_gated_login1 0
+# write_handoff_suspend_token sets cycle-begin=1763800000; OLD token epoch
+# 1763700000 is provably older than begin - skew (1763799995).
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+write_handoff_resume
+finish_gated_login1
+wait_for_absent "$HANDOFF_SUSPEND_FILE" || bad "D13: stale suspend handoff not cleared"
+wait_for_absent "$HANDOFF_RESUME_FILE" || bad "D13: stale resume flag not cleared"
+ok "D13: provably stale handoffs cleared"
+_begin="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo '')"
+if [[ "$_begin" =~ ^[0-9]+$ ]] && [ "$_begin" -gt 1763800000 ]; then
+    ok "D13: cycle-begin refreshed to the new sleep epoch"
+else
+    bad "D13: cycle-begin not refreshed ('$_begin')"
+fi
+assert_absent "D13: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+assert_eq "D13: no brightness write from cleanup" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -q 'keeping committed cycle handoff' "$DAEMON_ERR"; then
+    bad "D13: stale cycle wrongly reported as committed"
+else
+    ok "D13: stale cycle not reported as committed"
+fi
+
+# D14. No committed resume flag: restore from the daemon's OWN state instead
+#      of skipping the restore, while NEVER adopting/deleting a handoff.
+# D14a. Valid local state -> one verified restore, no adopt.
+reset_case
+write_state 9
+start_gated_login1_false
+finish_gated_login1
+assert_file "D14a: local state 9 restored" "$RAW_FILE" "9"
+assert_eq "D14a: exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "D14a: state consumed after verified local restore" "$STATE_FILE"
+assert_absent "D14a: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+assert_log_matches "D14a: local fallback logged" "$DAEMON_ERR" 'falling back to local daemon state'
+
+# D14b. Invalid local state -> fail closed, no write, no adopt.
+reset_case
+printf 'garbage\n' > "$STATE_FILE"
+start_gated_login1_false
+finish_gated_login1
+assert_file "D14b: brightness unchanged with invalid state" "$RAW_FILE" "42"
+assert_file "D14b: invalid state left in place" "$STATE_FILE" "garbage"
+assert_eq "D14b: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "D14b: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+
+# D14c. Active screen -> DEFER, keep state, no write, no adopt.
+reset_case
+write_state 9
+export STUB_GNOME_ACTIVE=true STUB_FDO_ACTIVE=true
+start_gated_login1_false
+finish_gated_login1
+assert_file "D14c: brightness unchanged while active" "$RAW_FILE" "42"
+assert_file "D14c: state retained while deferred" "$STATE_FILE" "9"
+assert_eq "D14c: zero Properties.Set" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_absent "D14c: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+export STUB_GNOME_ACTIVE=false STUB_FDO_ACTIVE=false
+
+# D14d. A STALE handoff must be ignored: restore local state, leave the
+#       handoff (and its value) untouched, and never write adopted-cycle.
+reset_case
+write_state 9
+start_gated_login1_false
+write_handoff_suspend_token "$C640_OLD_TOKEN" 7
+finish_gated_login1
+assert_file "D14d: local state restored, stale handoff value ignored" "$RAW_FILE" "9"
+assert_eq "D14d: exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D14d: stale suspend handoff untouched" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D14d: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+
+# D14e. A FRESH handoff without a resume flag is uncommitted: the local path
+#       must not adopt it.  This is the mutation detector for "local-only +
+#       adopt" (which would write 7 instead of the saved 9).
+reset_case
+write_state 9
+start_gated_login1_false
+write_handoff_suspend 7
+finish_gated_login1
+assert_file "D14e: uncommitted handoff value not adopted" "$RAW_FILE" "9"
+assert_eq "D14e: exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+assert_present "D14e: uncommitted suspend handoff untouched" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D14e: no adopted-cycle written" "$ADOPTED_CYCLE_FILE"
+
+# D15. P2 regression: a poisoned FUTURE cycle-begin (or a clock rollback)
+#      makes `token epoch < begin - skew`, which used to delete BOTH files
+#      including the commit proof.  The following false then fell back to the
+#      stale local 9 and wrote the WRONG brightness instead of the committed 7.
+#      A matching 4-column flag must win over the wall-clock fence: keep both
+#      files, re-anchor cycle-begin to the token epoch, then adopt exactly 7.
+#      Mutation detector: removing the commit-proof branch deletes both files
+#      here, so this case fails with RAW=9 / missing handoffs.
+reset_case
+write_state 9
+printf '1900000000\n' > "$CYCLE_BEGIN_FILE"
+start_gated_login1 1
+printf '%s 7 published\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+write_handoff_resume_committed 7
+: > "$STUB_DBUS_RELEASE"
+if ! wait_for_file_content "$CYCLE_BEGIN_FILE" '1763800000'; then
+    bad "D15 (true): cycle-begin not re-anchored to the token epoch"
+fi
+assert_present "D15 (true): committed suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D15 (true): committed resume flag retained" "$HANDOFF_RESUME_FILE"
+if wait_for_line "$DAEMON_ERR" '[c640-kbd-backlight-sync] keeping committed cycle handoff'; then
+    ok "D15 (true): keeping committed cycle handoff logged"
+else
+    bad "D15 (true): keeping committed cycle handoff logged"
+fi
+: > "$STUB_DBUS_RELEASE_FALSE"
+wait "$LOGIN1_PID" 2> /dev/null || true
+assert_file "D15 (false): committed value 7 restored" "$RAW_FILE" "7"
+assert_eq "D15 (false): exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Eq 'int32 9([^0-9]|$)' "$SET_LOG"; then
+    bad "D15 (false): stale local value 9 was written (SET_LOG: $(cat "$SET_LOG"))"
+else
+    ok "D15 (false): stale local value 9 never written"
+fi
+assert_absent "D15 (false): suspend handoff consumed once" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D15 (false): resume flag consumed once" "$HANDOFF_RESUME_FILE"
+assert_file "D15 (false): adopted-cycle records the token once" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+if grep -q 'login1: resume handler failed' "$DAEMON_ERR"; then
+    bad "D15 (false): login1 reported a false resume failure"
+else
+    ok "D15 (false): login1 reported no resume failure"
+fi
+
+# D16. Phase D P3-1: the upgrade window (old hook + new daemon) leaves a
+#      legacy 3-column resume flag.  Its token matching the live published
+#      suspend handoff is the same proof adopt_suspend_handoff() accepts, so a
+#      delayed true with a poisoned FUTURE begin must keep BOTH files and
+#      re-anchor cycle-begin; the following false must adopt the suspend value.
+#      Mutation detector: restricting the proof parser to 4 columns deletes
+#      both files here, so false restores the stale local 9 instead of 7.
+reset_case
+write_state 9
+printf '1900000000\n' > "$CYCLE_BEGIN_FILE"
+start_gated_login1 1
+printf '%s 7 published\n' "$C640_TEST_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+write_resume_token "$C640_TEST_TOKEN" suspend
+: > "$STUB_DBUS_RELEASE"
+if ! wait_for_file_content "$CYCLE_BEGIN_FILE" '1763800000'; then
+    bad "D16 (true): legacy 3-column cycle not fenced at the token epoch"
+fi
+assert_present "D16 (true): suspend handoff retained" "$HANDOFF_SUSPEND_FILE"
+assert_present "D16 (true): legacy 3-column resume flag retained" "$HANDOFF_RESUME_FILE"
+if wait_for_line "$DAEMON_ERR" '[c640-kbd-backlight-sync] keeping committed cycle handoff'; then
+    ok "D16 (true): legacy 3-column proof logged"
+else
+    bad "D16 (true): legacy 3-column proof logged"
+fi
+: > "$STUB_DBUS_RELEASE_FALSE"
+wait "$LOGIN1_PID" 2> /dev/null || true
+assert_file "D16 (false): legacy commit adopted suspend value 7" "$RAW_FILE" "7"
+assert_eq "D16 (false): exactly one Properties.Set" "1" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
+if grep -Eq 'int32 9([^0-9]|$)' "$SET_LOG"; then
+    bad "D16 (false): stale local value 9 was written (SET_LOG: $(cat "$SET_LOG"))"
+else
+    ok "D16 (false): stale local value 9 never written"
+fi
+assert_absent "D16 (false): suspend handoff consumed once" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D16 (false): resume flag consumed once" "$HANDOFF_RESUME_FILE"
+assert_file "D16 (false): adopted-cycle records the token once" "$ADOPTED_CYCLE_FILE" "$C640_TEST_TOKEN"
+if grep -q 'login1: resume handler failed' "$DAEMON_ERR"; then
+    bad "D16 (false): login1 reported a false resume failure"
+else
+    ok "D16 (false): login1 reported no resume failure"
+fi
+
+# D17. Phase D P3-2: a failed `date +%s` must never publish an empty
+#      cycle-begin.  A stale pair forces the fence-refresh path; with the
+#      clock broken, the existing begin is the only trustworthy epoch and is
+#      re-published verbatim (the mv log proves a publish really happened, not
+#      merely an untouched file).  Removing the || printf fallback FAILS here.
+reset_case
+write_state 9
+printf '1763800123\n' > "$CYCLE_BEGIN_FILE"
+printf '%s 7 published\n' "$C640_OLD_TOKEN" > "$HANDOFF_SUSPEND_FILE"
+write_resume_token "$C640_FOREIGN_TOKEN" suspend
+export STUB_DATE_FAIL=1
+run_fn _prepare_for_sleep_true_cleanup
+export STUB_DATE_FAIL=0
+assert_file "D17: existing cycle-begin kept on date failure" "$CYCLE_BEGIN_FILE" "1763800123"
+assert_absent "D17: stale suspend handoff cleared" "$HANDOFF_SUSPEND_FILE"
+assert_absent "D17: stale resume flag cleared" "$HANDOFF_RESUME_FILE"
+if grep -Fq -- "$CYCLE_BEGIN_FILE" "$GEN_FAULT_LOG"; then
+    ok "D17: cycle-begin published from the fallback epoch"
+else
+    bad "D17: no cycle-begin publish from the fallback (GEN_FAULT_LOG: $(cat "$GEN_FAULT_LOG"))"
+fi
+assert_eq "D17: no brightness write from cleanup" "0" "$(grep -c 'Properties.Set' "$SET_LOG" || true)"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 if [ "$failed" -ne 0 ]; then

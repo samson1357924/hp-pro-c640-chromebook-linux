@@ -2005,12 +2005,17 @@ adopt_suspend_handoff() {
 
 # Map restore_state()'s result to the resume contract.  Only RC_DONE consumes
 # the resume flag; RC_DEFER and RC_FAIL keep it (and the saved state) for retry.
+# The local-state fallback passes consume=0: it must never touch a handoff.
 _finish_resume_restore() {
-    local rc="$1"
+    local rc="$1" consume="${2:-1}"
     case "$rc" in
         "$RC_DONE")
-            rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
-            log "resume: restore complete; resume flag consumed"
+            if [ "$consume" -eq 1 ]; then
+                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                log "resume: restore complete; resume flag consumed"
+            else
+                log "resume: local restore complete; handoff left untouched"
+            fi
             return "$RC_DONE"
             ;;
         "$RC_DEFER")
@@ -2064,6 +2069,15 @@ _handle_resume_locked() {
         log_debug "resume: no resume flag present; continuing from saved state"
     fi
 
+    _restore_local_state_locked 1
+}
+
+# Shared local restore body.  CALLER MUST HOLD RESUME_LOCK.  consume=1 settles
+# a committed cycle (a completed restore may clear the resume flag); consume=0
+# is the no-flag fallback, which NEVER adopts, NEVER touches a handoff file and
+# NEVER writes adopted-cycle.  Tristate / generation / DEFER rules are shared.
+_restore_local_state_locked() {
+    local consume_flag="${1:-0}"
     local saved
     saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
     if ! _is_brightness_value "$saved"; then
@@ -2076,8 +2090,12 @@ _handle_resume_locked() {
             log_warn "resume: generation bump failed with no saved state; keeping resume flag"
             return "$RC_DEFER"
         fi
-        rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
-        log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
+        if [ "$consume_flag" -eq 1 ]; then
+            rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+            log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
+        else
+            log "resume: no saved state; nothing to restore locally"
+        fi
         return "$RC_DONE"
     fi
     saved=$((10#$saved))
@@ -2153,7 +2171,7 @@ _handle_resume_locked() {
             rc=0
             if restore_state; then rc=0; else rc=$?; fi
             local frc=0
-            _finish_resume_restore "$rc" || frc=$?
+            _finish_resume_restore "$rc" "$consume_flag" || frc=$?
             return "$frc"
             ;;
         unknown)
@@ -2201,7 +2219,9 @@ _handle_resume_locked() {
                     return "$RC_DEFER"
                 fi
                 rm -f "$STATE_FILE" 2> /dev/null || true
-                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                if [ "$consume_flag" -eq 1 ]; then
+                    rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                fi
                 log "resume: ScreenSaver unknown but brightness already $saved; state consumed without writing"
                 flock -u 207 2> /dev/null || true
                 exec 207>&-
@@ -2216,7 +2236,7 @@ _handle_resume_locked() {
                 # fail-closed tristate guard inside restore_state.
                 if restore_state 1; then rc=0; else rc=$?; fi
                 local frc=0
-                _finish_resume_restore "$rc" || frc=$?
+                _finish_resume_restore "$rc" "$consume_flag" || frc=$?
                 return "$frc"
             fi
             log_warn "resume: ScreenSaver unknown (current=$cur saved=$saved); deferring restore, handoff kept"
@@ -2242,6 +2262,34 @@ handle_resume() {
         _handle_resume_locked || rc=$?
         flock -u 206 2> /dev/null || true
         exec 206>&-
+        exit "$rc"
+    )
+}
+
+# PrepareForSleep(false) with NO resume flag: pre never committed a cycle, so
+# there is nothing to adopt.  The old code skipped restore entirely and left a
+# perfectly valid daemon state un-restored.  This path serialises with the same
+# RESUME_LOCK as handle_resume(), but only restores the daemon's own state: it
+# never adopts a handoff, never deletes one and never writes adopted-cycle.
+restore_from_local_state() {
+    (
+        if ! exec 210> "$RESUME_LOCK"; then
+            log_warn "local restore: cannot open resume lock $RESUME_LOCK"
+            exit 0
+        fi
+        if ! flock -n 210; then
+            log_debug "local restore: another handler already active; skipping"
+            exec 210>&-
+            exit 0
+        fi
+        # Thaw invalidates D-Bus caches just as it does on the adopt path.
+        HAVE_GSD_KBD=""
+        HAVE_UPOWER_KBD=""
+        ensure_backends
+        local rc=0
+        _restore_local_state_locked 0 || rc=$?
+        flock -u 210 2> /dev/null || true
+        exec 210>&-
         exit "$rc"
     )
 }
@@ -2714,6 +2762,134 @@ monitor_screensaver_gdbus() {
     done
 }
 
+# Extract a parseable, 1-10 digit epoch from the CURRENT suspend handoff.
+# A missing, malformed or overflowing handoff prints nothing and fails: it
+# cannot prove a committed cycle, so PrepareForSleep(true) may drop it.
+_suspend_handoff_token_epoch() {
+    local raw epoch
+    [ -f "$HANDOFF_SUSPEND_FILE" ] || return 1
+    raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    raw="${raw%$'\n'}"
+    [[ "$raw" != *$'\n'* ]] || return 1
+    [[ "$raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]] || return 1
+    epoch="${BASH_REMATCH[1]}"
+    [[ "$epoch" =~ ^[0-9]{1,10}$ ]] || return 1
+    printf '%s\n' "$epoch"
+}
+
+# Commit proof for the CURRENT cycle: a resume flag whose token equals the
+# live (published) suspend handoff.  A Phase B 4-column flag additionally has
+# to carry the same committed value as the suspend copy; a legacy 3-column
+# flag from an older hook proves the commit by token identity alone, exactly
+# as adopt_suspend_handoff() accepts it.  Unlike a wall-clock epoch this proof
+# is causal: a clock rollback or a poisoned future cycle-begin cannot disprove
+# it.  Prints the token epoch on success; prints nothing when the flag is
+# missing, malformed, foreign or in disagreement (then the epoch fence may
+# still drop the pair).
+_current_cycle_commit_proof() {
+    local suspend_raw resume_raw token epoch value committed
+    [ -f "$HANDOFF_SUSPEND_FILE" ] && [ -f "$HANDOFF_RESUME_FILE" ] || return 1
+    suspend_raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    suspend_raw="${suspend_raw%$'\n'}"
+    [[ "$suspend_raw" != *$'\n'* ]] || return 1
+    [[ "$suspend_raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]] || return 1
+    token="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+    epoch="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[4]}"
+    # Bound before 10# arithmetic: 2^64 wrap would alias an oversized token
+    # epoch / value into a plausible match for the current cycle.
+    [[ "$epoch" =~ ^[0-9]{1,10}$ ]] || return 1
+    [[ "$value" =~ ^[0-9]{1,10}$ ]] || return 1
+
+    resume_raw="$(cat "$HANDOFF_RESUME_FILE" 2> /dev/null || echo "")"
+    resume_raw="${resume_raw%$'\n'}"
+    [[ "$resume_raw" != *$'\n'* ]] || return 1
+    # Both wire formats are accepted: the 4th column is optional, just as it
+    # is in adopt_suspend_handoff().  Bound every numeric field before 10#
+    # arithmetic so an oversized copy cannot alias into a plausible match.
+    [[ "$resume_raw" =~ ^([^[:blank:]]+)[[:blank:]]([0-9]{1,10})[[:blank:]]([A-Za-z]+)([[:blank:]]([0-9]{1,10}))?$ ]] || return 1
+    [ "${BASH_REMATCH[1]}" = "$token" ] || return 1
+    committed="${BASH_REMATCH[5]:-}"
+    # A 3-column flag has no committed value: token identity with the live
+    # published suspend handoff IS the proof the legacy hook committed.  A
+    # present 4th column stays authoritative and must agree with suspend.
+    if [ -n "$committed" ] && [ "$((10#$committed))" -ne "$((10#$value))" ]; then
+        return 1
+    fi
+    printf '%s\n' "$epoch"
+}
+
+# PrepareForSleep(true) cleanup (Phase D, 19th re-review P2).  A delayed signal
+# may arrive AFTER the hook's pre/post commit: never delete a handoff that is
+# not PROVABLY old.  Commit proof wins over wall-clock time: a flag matching
+# the live suspend token (and, when present, its committed value) IS this
+# cycle's commit, even when a rolled-back clock or a poisoned future
+# cycle-begin makes `epoch < begin - skew`.  Only without proof is the epoch
+# fence consulted; a
+# token that cannot be parsed or is provably older than begin-skew is dropped.
+# When cycle-begin is missing/invalid we cannot prove oldness either, so the
+# pair is kept and begin is anchored to the token.  Trade-off: a genuinely old
+# cycle could then be adopted, but adoption still needs the flag/token/
+# committed cross-check and the replay barrier, whereas discarding a valid
+# commit would feed a stale local value to the LED (wrong brightness).
+_prepare_for_sleep_true_cleanup() {
+    local tok_epoch="" begin_raw="" kept=0 now_epoch=""
+    if [ -f "$CYCLE_BEGIN_FILE" ]; then
+        begin_raw="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo "")"
+        begin_raw="${begin_raw%$'\n'}"
+        [[ "$begin_raw" =~ ^[0-9]{1,10}$ ]] || begin_raw=""
+    fi
+
+    # 1. Commit proof FIRST: causal evidence must not be overturned by a wall
+    #    clock fence, even when the token epoch precedes begin-skew.
+    if tok_epoch="$(_current_cycle_commit_proof)" && [ -n "$tok_epoch" ]; then
+        kept=1
+    elif tok_epoch="$(_suspend_handoff_token_epoch)" && [ -n "$tok_epoch" ]; then
+        if [ -n "$begin_raw" ] \
+            && ((10#$tok_epoch < 10#$begin_raw - C640_KBD_CYCLE_BEGIN_SKEW)); then
+            : # no proof, provably old: drop both handoffs and open a fresh fence
+        else
+            # Missing/invalid begin, or a current token: not provably old.
+            kept=1
+        fi
+    fi
+    if [ "$kept" -eq 1 ]; then
+        # Keep BOTH files: the resume flag is the commit proof, so a delayed
+        # signal must never split a committed cycle.  Anchoring to the token
+        # epoch (possibly LOWER than a poisoned begin) is the recovery path for
+        # that poisoned fence; it is a causal fence, never wall-clock time.
+        if ! _atomic_publish_text "$tok_epoch" "$CYCLE_BEGIN_FILE"; then
+            log_warn "prepare-for-sleep: cannot anchor cycle-begin to token $tok_epoch; resume will fail closed"
+        fi
+        if [ -f "$HANDOFF_SUSPEND_FILE" ] && [ -f "$HANDOFF_RESUME_FILE" ]; then
+            log "keeping committed cycle handoff"
+        fi
+        return 0
+    fi
+    rm -f "$HANDOFF_RESUME_FILE" "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+    if [ -e "$HANDOFF_RESUME_FILE" ] || [ -e "$HANDOFF_SUSPEND_FILE" ] \
+        || [ -L "$HANDOFF_RESUME_FILE" ] || [ -L "$HANDOFF_SUSPEND_FILE" ]; then
+        log_warn "prepare-for-sleep: stale handoff could not be cleared; this cycle will fail closed"
+    fi
+    # 2. Monotonic wall-clock fence: a rolled-back `date +%s` must never lower
+    #    an existing begin and thereby admit an old cycle.  A poisoned FUTURE
+    #    begin is recovered by the commit-proof anchor above instead.  If
+    #    `date` fails, the existing begin is the only trustworthy epoch; with
+    #    no usable begin at all there is nothing safe to publish, so keep the
+    #    old fence instead of opening a zero/empty window.
+    now_epoch="$(date +%s 2> /dev/null || printf '%s' "${begin_raw:-0}")"
+    if [[ ! "$now_epoch" =~ ^[0-9]{1,10}$ ]] || [ "$((10#$now_epoch))" -eq 0 ]; then
+        log_warn "prepare-for-sleep: clock unavailable and no valid cycle-begin; existing fence kept"
+        return 0
+    fi
+    if [ -n "$begin_raw" ] && ((10#$now_epoch < 10#$begin_raw)); then
+        now_epoch="$begin_raw"
+    fi
+    if ! _atomic_publish_text "$now_epoch" "$CYCLE_BEGIN_FILE"; then
+        log_warn "prepare-for-sleep: cannot publish cycle-begin; resume will fail closed"
+    fi
+}
+
 monitor_login1() {
     dbus-monitor --system "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" 2> /dev/null | while IFS= read -r line; do
         log_debug "login1: $line"
@@ -2721,38 +2897,29 @@ monitor_login1() {
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
                 save_state || log_warn "prepare-for-sleep: save_state failed (rc=$?)"
-                # Drop BOTH stale handoff files of any previous cycle.  A
-                # stale suspend copy without a fresh root commit marker must
-                # never be adopted after this sleep.
-                rm -f "$HANDOFF_RESUME_FILE" "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
-                if [ -e "$HANDOFF_RESUME_FILE" ] || [ -e "$HANDOFF_SUSPEND_FILE" ] \
-                    || [ -L "$HANDOFF_RESUME_FILE" ] || [ -L "$HANDOFF_SUSPEND_FILE" ]; then
-                    log_warn "prepare-for-sleep: stale handoff could not be cleared; this cycle will fail closed"
-                fi
-                # Remember when THIS sleep began.  The hook's pre token must
-                # be at least this new (minus skew) to be adoptable.
-                if ! _atomic_publish_text "$(date +%s)" "$CYCLE_BEGIN_FILE"; then
-                    log_warn "prepare-for-sleep: cannot publish cycle-begin; resume will fail closed"
-                fi
+                _prepare_for_sleep_true_cleanup
                 ;;
             *boolean\ false*)
                 log "PrepareForSleep false -> daemon adopts handoff and restores"
                 # Finding #2 main gate: the hook publishes the resume flag
                 # ONLY after its root commit marker verified the fresh suspend
-                # handoff.  No flag means pre failed (or was invalidated by
-                # PrepareForSleep(true)): do NOT adopt and do NOT write
-                # brightness.  The sampler/unblank/startup paths are already
-                # flag-gated; this is the previously unguarded path.
+                # handoff.  No flag means pre did not commit: do NOT adopt a
+                # handoff, but still restore the daemon's own saved brightness
+                # (Phase D fallback).  The sampler/unblank/startup paths stay
+                # flag-gated for adoption.
                 local rrc=0
                 if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
-                    log "login1: no resume flag; skipping adoption (pre did not commit a cycle)"
+                    # Finding #4: no committed cycle does NOT mean "no work".
+                    # Restore the daemon's own state; never adopt a handoff.
+                    log "login1: no resume flag; falling back to local daemon state"
+                    restore_from_local_state || rrc=$?
                 else
                     # The thawed daemon owns the single restore path now.
                     handle_resume || rrc=$?
-                    # rc=2 means deferred (retry via sampler/unblank), not failure.
-                    if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
-                        log_warn "login1: resume handler failed (rc=$rrc)"
-                    fi
+                fi
+                # rc=2 means deferred (retry via sampler/unblank), not failure.
+                if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
+                    log_warn "login1: resume handler failed (rc=$rrc)"
                 fi
                 ;;
         esac
