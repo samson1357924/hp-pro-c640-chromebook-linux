@@ -13963,7 +13963,7 @@ EOF
     [ ! -e "$s/manifest/pam-selection" ] && ok \
         || fail "PAM-71: no sidecar published for a custom stack"
     log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
-    assert_contains "Uncertain PAM rule syntax" "$log" \
+    assert_contains "per-management-group stack" "$log" \
         "PAM-71: jump-target refusal is explicit"
 
     control="$(setup_pam_sandbox custom-jump-managed-control)"
@@ -14252,7 +14252,7 @@ EOF
     [ ! -e "$s/manifest/pam-selection.common" ] && ok \
         || fail "PAM-78: no common-state snapshot published"
     log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
-    assert_contains "numeric jump target identity changes" "$log" \
+    assert_contains "per-management-group stack" "$log" \
         "PAM-78: fail-closed reason is explicit"
 }
 
@@ -14446,6 +14446,13 @@ auth sufficient pam_fprintd.so
 auth [success=1 default=ignore] pam_unix.so nullok
 auth requisite pam_deny.so
 auth required pam_permit.so
+EOF
+    # Finding #1: the include target must really exist so the per-group model
+    # can expand it (an unresolved include with a numeric jump fails closed).
+    cat > "$s/pam/common-auth-extra" << 'EOF'
+auth required pam_env.so
+auth required pam_faillock.so
+auth required pam_echo.so
 EOF
     cp -a "$s/pam/common-auth" "$s/before"
     CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
@@ -14729,6 +14736,573 @@ EOF
         "PAM-91: no active fp module remains"
 }
 test_pam_91_end_to_end_landing_accepted
+
+# --- re-review #19 finding #1: per-management-group stack model --------------
+# Independent libpam black-box oracle (never parses rules, never sources
+# lib/pam.sh). Its self-test must reproduce the reviewer's 7 -> 0 decision.
+_PAM_LIBPAM_ORACLE="$REPO_ROOT/tests/pam_libpam_oracle.py"
+_PAM_LIBPAM_FIXTURES="$REPO_ROOT/tests/fixtures"
+
+# PAM-92: mixed auth/account rules. A file-global module index thinks the
+# `success=1` landing is `account:pam_permit.so` both before and after; the
+# real auth stack lands on the fp rule before and on `final` afterwards.
+test_pam_92_mixed_management_groups_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox mixed-groups)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_permit.so src
+auth requisite pam_deny.so skipme
+account required pam_permit.so acct
+auth sufficient pam_fprintd.so fp
+auth required pam_permit.so final
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" && ok \
+        || fail "PAM-92: group-based oracle must flag the changed auth landing"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-92: mixed-group jump change fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-92: common-auth bytes unchanged (zero mutations)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-92: no sed mutation"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-92: no sidecar published before the failed transformation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "per-management-group stack" "$log" \
+        "PAM-92: per-group refusal is explicit"
+
+    # Independent REAL libpam decision/trace proof (not the product parser).
+    python3 "$_PAM_LIBPAM_ORACLE" self-test > "$s/libpam.out" 2>&1 \
+        && ok || fail "PAM-92: libpam oracle must reproduce UNSAFE 7 -> 0 ($(cat "$s/libpam.out" 2> /dev/null))"
+    assert_contains "7 -> 0" "$(cat "$s/libpam.out" 2> /dev/null || echo '')" \
+        "PAM-92: libpam oracle observed the reviewer's decision change"
+}
+
+# PAM-93: two instances of pam_permit.so with different arguments. The old
+# `type:path` landing identity is unchanged, but the per-group landing moves
+# from `pam_permit.so shadow` to `pam_permit.so` -- a different instance.
+test_pam_93_same_module_multi_instance_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox multi-instance)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+auth required pam_permit.so
+auth required pam_permit.so shadow
+EOF
+    _pam_oracle_uncertain "$s/pam/common-auth" && ok \
+        || fail "PAM-93: oracle must flag the instance-level landing change"
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-93: instance-level landing change fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-93: zero mutations"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-93: no sed mutation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "per-management-group stack" "$log" \
+        "PAM-93: refusal names the per-group transformation"
+}
+
+# PAM-94: @include is expanded into the SAME per-group handler stack. The
+# normal shape (fp before the jump source) must install and the product/oracle
+# per-group descriptors must be byte-identical.
+test_pam_94_include_expansion_parity() {
+    local s before
+    s="$(setup_pam_sandbox include-expansion)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=2 default=ignore] pam_unix.so nullok
+@include common-auth-extra
+auth required pam_permit.so
+EOF
+    cat > "$s/pam/common-auth-extra" << 'EOF'
+auth required pam_deny.so
+auth required pam_wheel.so
+auth required pam_echo.so
+EOF
+    before="$(file_hex "$s/pam/common-auth")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-94: expanded include with a stable landing installs rc 0"
+    assert_eq "0" "$(grep -cF 'pam_fprintd.so' "$s/pam/common-auth")" \
+        "PAM-94: the fp line was removed"
+    assert_eq "1" "$(grep -cF '@include common-auth-extra' "$s/pam/common-auth")" \
+        "PAM-94: the include directive survived"
+    assert_eq "1" "$(grep -cF 'pam_wheel.so' "$s/pam/common-auth-extra")" \
+        "PAM-94: included stack was not modified"
+    # The independent oracle resolves the same include closure (keep the copy
+    # in the PAM directory so relative include targets are visible).
+    cp -a "$s/pam/common-auth" "$s/pam/common-auth.before"
+    python3 "$_PAM_ORACLE" stack "$s/pam/common-auth.before" > "$s/oracle.stack" 2> /dev/null \
+        || fail "PAM-94: oracle could not model the include expansion"
+    assert_contains "common-auth-extra" "$(cat "$s/oracle.stack" 2> /dev/null || echo '')" \
+        "PAM-94: oracle stack contains expanded include instances"
+    assert_contains "pam_wheel.so" "$(cat "$s/oracle.stack" 2> /dev/null || echo '')" \
+        "PAM-94: all three included handlers are present"
+}
+
+# PAM-95: substack has different jump semantics (inner done/die/reset stay in
+# the frame). With a numeric jump in the parent stack the model cannot prove
+# the landing, so it must fail closed BEFORE any write. Without any jump the
+# conservative opaque-boundary model is still installable.
+test_pam_95_substack_fails_closed() {
+    local s control before sed_before log
+    s="$(setup_pam_sandbox substack-jump)"
+    pam_write_full_stack "$s"
+    # fp is BEFORE the jump source so the landing is END both before and
+    # after removal: the ONLY reason to refuse is the unmodelled substack.
+    cat > "$s/pam/common-auth" << 'EOF'
+auth substack sub-auth
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+auth required pam_permit.so
+EOF
+    cat > "$s/pam/sub-auth" << 'EOF'
+auth required pam_deny.so
+EOF
+    before="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-95: numeric jump + substack fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-95: zero mutations"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-95: no sed mutation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "substack" "$log" \
+        "PAM-95: unsupported substack topology is named"
+
+    control="$(setup_pam_sandbox substack-no-jump)"
+    pam_write_full_stack "$control"
+    cat > "$control/pam/common-auth" << 'EOF'
+auth substack sub-auth
+auth sufficient pam_fprintd.so
+auth required pam_permit.so
+EOF
+    cp "$s/pam/sub-auth" "$control/pam/sub-auth"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$control/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$control/pam" \
+        run_pam_install "$control" debian
+    assert_eq "0" "$(cat "$control/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-95/control: substack with no numeric jump installs rc 0"
+}
+
+# PAM-96: sudo stale fp AFTER a numeric jump source plus the canonical insert
+# is proven as ONE transformation. The preflight must run before the FIRST sed
+# (mutation: moving it after strip makes sed.log grow and this case fail).
+test_pam_96_sudo_single_preflight() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox sudo-single-preflight)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/sudo" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+auth required pam_permit.so
+@include common-auth
+@include common-account
+EOF
+    before="$(file_hex "$s/pam/sudo")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-96: unsafe sudo strip+insert fails closed"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-96: sudo bytes unchanged"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-96: sed.log unchanged (preflight before strip)"
+    assert_eq "0" "$(pam_record_count "$s")" \
+        "PAM-96: sudo backup was not published before the failed proof"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "not provably safe" "$log" \
+        "PAM-96: the single sudo preflight is named"
+}
+
+# PAM-97: the "already configured" branch still models the stack; a canonical
+# line plus a stale fp rule and a numeric jump must fail closed.
+test_pam_97_canonical_stale_fp_jump_fails_closed() {
+    local s before sed_before log
+    s="$(setup_pam_sandbox canonical-stale-jump)"
+    pam_write_initial_files "$s" none none
+    cat > "$s/pam/sudo" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so max-tries=1 timeout=10
+auth sufficient pam_fprintd.so
+auth required pam_permit.so
+@include common-auth
+EOF
+    before="$(file_hex "$s/pam/sudo")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-97: canonical line cannot mask stale fp + jump"
+    assert_eq "$before" "$(file_hex "$s/pam/sudo")" \
+        "PAM-97: zero mutations"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-97: no sed mutation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "already configured" "$log" \
+        "PAM-97: the already-configured branch really ran"
+    assert_contains "active fingerprint module remains" "$log" \
+        "PAM-97: stale fp refusal is explicit"
+}
+
+# PAM-98: the normal Debian profile must NOT be falsely fail-closed: fp is
+# before the jump source, the landing stays pam_permit, sudo gets exactly one
+# canonical line, and the independent libpam oracle reports SAFE.
+test_pam_98_normal_debian_profile_accepted() {
+    local s log landing
+    s="$(setup_pam_sandbox normal-debian-accepted)"
+    pam_write_full_stack "$s"
+    pam_write_selection "$s" 'unix, systemd, fprintd'
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-98: normal Debian stack installs rc 0"
+    landing="$(python3 "$_PAM_ORACLE" landings "$s/pam/common-auth" 2> /dev/null || echo '')"
+    assert_contains "pam_permit.so" "$landing" \
+        "PAM-98: landing is still pam_permit"
+    assert_not_contains "END" "$landing" \
+        "PAM-98: normal profile did not drift to END"
+    assert_eq "1" "$(grep -cFx -- 'auth sufficient pam_fprintd.so max-tries=1 timeout=10' "$s/pam/sudo")" \
+        "PAM-98: sudo has exactly one canonical line"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "jump endpoint is unchanged" "$log" \
+        "PAM-98: normal profile still gets the explicit verification claim"
+
+    python3 "$_PAM_LIBPAM_ORACLE" compare --ignore-trace allow \
+        "$_PAM_LIBPAM_FIXTURES/pam_safe_before.conf" \
+        "$_PAM_LIBPAM_FIXTURES/pam_safe_after.conf" > "$s/libpam-safe.out" 2>&1 \
+        && ok || fail "PAM-98: libpam oracle must classify the normal profile SAFE ($(cat "$s/libpam-safe.out" 2> /dev/null))"
+    assert_contains "SAFE" "$(cat "$s/libpam-safe.out" 2> /dev/null || echo '')" \
+        "PAM-98: real libpam decision and trace are unchanged"
+}
+
+# PAM-101: differential parity. The product helper and the independent oracle
+# must emit byte-identical per-group descriptors for every fixture, including
+# `@include` (all groups) and type-prefixed `auth include` / `session substack`
+# (own group only). Neither may use a file-global index.
+test_pam_101_product_oracle_parity() {
+    local s n before product oracle manifest
+    for n in full-stack custom-jump negative-type end-landing continuation \
+        include-agnostic include-typed substack-typed; do
+        s="$(setup_pam_sandbox "parity-$n")"
+        pam_write_full_stack "$s"
+        case "$n" in
+            custom-jump)
+                cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+auth required pam_deny.so
+auth required pam_permit.so
+EOF
+                ;;
+            negative-type)
+                cat > "$s/pam/common-auth" << 'EOF'
+-auth required pam_unix.so nullok
+auth sufficient pam_fprintd.so
+-session optional pam_permit.so
+EOF
+                ;;
+            end-landing)
+                cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+auth sufficient pam_fprintd.so
+EOF
+                ;;
+            continuation)
+                cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so \
+   max-tries=1
+auth required pam_unix.so
+EOF
+                ;;
+            include-agnostic)
+                # `@include` is group-agnostic: all three auth lines enter the
+                # auth stack at the directive position.
+                cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=2 default=ignore] pam_unix.so nullok
+@include extra
+auth required pam_permit.so
+EOF
+                cat > "$s/pam/extra" << 'EOF'
+auth required pam_deny.so
+auth required pam_wheel.so
+auth required pam_echo.so
+EOF
+                ;;
+            include-typed)
+                # `auth include X` contributes ONLY auth lines.
+                cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+auth include extra
+auth required pam_permit.so
+EOF
+                cat > "$s/pam/extra" << 'EOF'
+auth required pam_deny.so
+auth required pam_permit.so
+EOF
+                ;;
+            substack-typed)
+                # `session substack X` must not create an auth boundary, even
+                # with a numeric jump in the auth group (P0 false rejection).
+                cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+session substack extra
+auth required pam_permit.so
+EOF
+                cat > "$s/pam/extra" << 'EOF'
+session required pam_deny.so
+EOF
+                ;;
+        esac
+        # Use the original fixture path so both sides derive the same filetag.
+        before="$s/pam/common-auth"
+        manifest="$s/model.manifest"
+        # Build the include closure exactly like production: the product must
+        # resolve the same target files as the oracle's independent resolver.
+        bash -c '
+            source "$1/lib/pam.sh"
+            _PAM_DIR="$4"
+            work="$(mktemp -d)"
+            _pam_parse_file "$2" "$work/rec" common common-auth || exit $?
+            _pam_model_manifest "$work" "$3" "$work/rec|common-auth" || exit $?
+            python3 "$1/lib/pam_stack_model.py" descriptors --nonfp "$3"
+            rc=$?
+            rm -rf "$work"
+            exit "$rc"
+        ' _ "$REPO_ROOT" "$before" "$manifest" "$s/pam" > "$s/product.all" \
+            || fail "PAM-101/$n: product helper failed"
+        awk -F '\t' '$2 == "common-auth"' "$s/product.all" > "$s/product.stack"
+        python3 "$_PAM_ORACLE" stack "$before" > "$s/oracle.all" 2> /dev/null \
+            || fail "PAM-101/$n: independent oracle failed"
+        awk -F '\t' '$2 == "common-auth"' "$s/oracle.all" > "$s/oracle.stack"
+        product="$(cat "$s/product.stack")"
+        oracle="$(cat "$s/oracle.stack")"
+        assert_eq "$oracle" "$product" "PAM-101/$n: product and oracle descriptors are identical"
+    done
+}
+
+# PAM-102 (re-review #19 P0): a TYPE-PREFIXED include/substack is scoped to its
+# own management group. `session include extra` must not inject `extra`'s auth
+# rule into the auth stack; otherwise a numeric jump whose landing moves from
+# the fp rule to a different module is silently called SAFE. A `session
+# substack` must likewise NOT be rejected merely because the auth group has a
+# numeric jump; only an auth substack is opaque to an auth jump.
+test_pam_102_typed_include_group_scope() {
+    local s sub authsub before_hex sed_before log product_rc oracle_rc libpam_rc
+
+    s="$(setup_pam_sandbox typed-include-p0)"
+    pam_write_full_stack "$s"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth [success=1 default=ignore] pam_unix.so nullok
+session include extra
+auth required pam_deny.so skipme
+auth sufficient pam_fprintd.so fp
+auth required pam_permit.so final
+EOF
+    cat > "$s/pam/extra" << 'EOF'
+auth required pam_env.so env
+EOF
+    # Both independent oracles key rule identity by basename: keep the SAME
+    # basename on each side of the comparison.
+    mkdir -p "$s/case/before" "$s/case/after"
+    cp "$s/pam/common-auth" "$s/case/before/common-auth"
+    cp "$s/pam/extra" "$s/case/before/extra"
+    cp "$s/pam/extra" "$s/case/after/extra"
+    /usr/bin/sed '/pam_fprintd\.so/d' "$s/case/before/common-auth" > "$s/case/after/common-auth"
+
+    # (1) Product model: prove MUST reject the changed auth landing (rc 1).
+    product_rc=0
+    bash -c '
+        source "$1/lib/pam.sh"
+        _PAM_DIR="$4"
+        work="$(mktemp -d)"
+        _pam_parse_file "$2" "$work/pre.rec" common common-auth || exit $?
+        _pam_parse_file "$3" "$work/post.rec" common common-auth || exit $?
+        _pam_parse_file "$4/extra" "$work/extra.rec" common extra || exit $?
+        printf "common-auth\t%s\nextra\t%s\n" "$work/pre.rec" "$work/extra.rec" > "$work/pre.manifest"
+        printf "common-auth\t%s\nextra\t%s\n" "$work/post.rec" "$work/extra.rec" > "$work/post.manifest"
+        python3 "$1/lib/pam_stack_model.py" prove "$work/pre.manifest" "$work/post.manifest"
+        rc=$?
+        rm -rf "$work"
+        exit "$rc"
+    ' _ "$REPO_ROOT" "$s/case/before/common-auth" "$s/case/after/common-auth" "$s/case/before" \
+        > "$s/prove.out" 2>&1 || product_rc=$?
+    assert_neq "0" "$product_rc" \
+        "PAM-102: product prove rejects the typed-include auth jump change"
+    assert_contains "rule descriptor changed" "$(cat "$s/prove.out" 2> /dev/null || echo '')" \
+        "PAM-102: prove names the changed auth jump landing"
+
+    # (2) Independent rule oracle parity MUST agree (UNSAFE), with the include
+    # expanded on both sides rather than treated as an opaque boundary.
+    oracle_rc=0
+    python3 "$_PAM_ORACLE" parity "$s/case/before/common-auth" "$s/case/after/common-auth" \
+        > "$s/parity.out" 2>&1 || oracle_rc=$?
+    assert_neq "0" "$oracle_rc" \
+        "PAM-102: independent oracle parity also reports UNSAFE"
+
+    # (3) REAL libpam decision/trace proof: 7 -> 0 with the fake fp module
+    # disappearing from the auth stack. This is not the product parser.
+    libpam_rc=0
+    python3 "$_PAM_LIBPAM_ORACLE" compare --ignore-trace fp \
+        --include extra="$_PAM_LIBPAM_FIXTURES/pam_include_extra.conf" \
+        "$_PAM_LIBPAM_FIXTURES/pam_include_before.conf" \
+        "$_PAM_LIBPAM_FIXTURES/pam_include_after.conf" \
+        > "$s/libpam.out" 2>&1 || libpam_rc=$?
+    assert_neq "0" "$libpam_rc" \
+        "PAM-102: real libpam reports the typed-include transformation UNSAFE ($(cat "$s/libpam.out" 2> /dev/null))"
+    assert_contains "before rc=7" "$(cat "$s/libpam.out" 2> /dev/null || echo '')" \
+        "PAM-102: libpam's before decision is 7 (fake fp module ran)"
+    assert_contains "UNSAFE" "$(cat "$s/libpam.out" 2> /dev/null || echo '')" \
+        "PAM-102: libpam classifies the transformation UNSAFE"
+
+    # (4) End-to-end: the real preflight refuses before any mutation.
+    before_hex="$(file_hex "$s/pam/common-auth")"
+    sed_before="$(wc -l < "$s/sed.log")"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-102: typed-include jump change fails closed"
+    assert_eq "$before_hex" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-102: common-auth bytes unchanged (zero mutations)"
+    assert_eq "$sed_before" "$(wc -l < "$s/sed.log")" \
+        "PAM-102: no sed mutation"
+    [ ! -e "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-102: no sidecar published before the failed transformation"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "per-management-group stack" "$log" \
+        "PAM-102: per-group refusal is explicit"
+
+    # (5) Control: `session substack other` is NOT in the auth group, so an
+    # auth numeric jump must still install (P0 false rejection regression).
+    sub="$(setup_pam_sandbox typed-substack-session)"
+    pam_write_full_stack "$sub"
+    cat > "$sub/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+session substack other
+auth required pam_permit.so final
+EOF
+    cat > "$sub/pam/other" << 'EOF'
+session required pam_deny.so
+EOF
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$sub/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$sub/pam" \
+        run_pam_install "$sub" debian
+    assert_eq "0" "$(cat "$sub/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-102/session-substack: an auth jump is NOT falsely rejected"
+    log="$(cat "$sub/log.txt" 2> /dev/null || echo '')"
+    assert_not_contains "unmodelled substack" "$log" \
+        "PAM-102/session-substack: no substack refusal for the auth group"
+    assert_eq "0" "$(grep -cF 'pam_fprintd.so' "$sub/pam/common-auth")" \
+        "PAM-102/session-substack: the fp rule was still stripped"
+
+    # (6) Negative control: only an AUTH substack is opaque to an auth jump.
+    authsub="$(setup_pam_sandbox typed-substack-auth)"
+    pam_write_full_stack "$authsub"
+    cat > "$authsub/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+auth substack other
+auth required pam_permit.so final
+EOF
+    cat > "$authsub/pam/other" << 'EOF'
+auth required pam_deny.so
+EOF
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$authsub/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$authsub/pam" \
+        run_pam_install "$authsub" debian
+    assert_neq "0" "$(cat "$authsub/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-102/auth-substack: an auth substack still fails closed"
+    log="$(cat "$authsub/log.txt" 2> /dev/null || echo '')"
+    assert_contains "substack" "$log" \
+        "PAM-102/auth-substack: the unsupported substack topology is named"
+}
+
+# PAM-103 (P2/P3): parity must expand both `@`-form and type-prefixed includes
+# before comparing FULL descriptors; bracket whitespace is insignificant.
+test_pam_103_parity_include_and_control_norm() {
+    local s variant rc control_before control_after
+    for variant in at-include typed-include; do
+        s="$(setup_pam_sandbox "parity-closure-$variant")"
+        mkdir -p "$s/before" "$s/after"
+        case "$variant" in
+            at-include) printf '@include extra\n' > "$s/directive" ;;
+            typed-include) printf 'auth include extra\n' > "$s/directive" ;;
+        esac
+        {
+            printf 'auth required pam_unix.so\n'
+            cat "$s/directive"
+            printf 'auth required pam_permit.so\n'
+        } > "$s/before/common-auth"
+        cp "$s/before/common-auth" "$s/after/common-auth"
+        # The ONLY difference is inside the included file. The old parity()
+        # used `lambda _name: None` and called this SAFE.
+        printf 'auth required pam_deny.so\n' > "$s/before/extra"
+        printf 'auth required pam_permit.so\n' > "$s/after/extra"
+        rc=0
+        python3 "$_PAM_ORACLE" parity "$s/before/common-auth" "$s/after/common-auth" \
+            > "$s/parity.out" 2>&1 || rc=$?
+        assert_neq "0" "$rc" \
+            "PAM-103/$variant: parity expands the include and sees the changed rule"
+    done
+
+    # P3: a whitespace-only bracket-control reformat must not change identity.
+    s="$(setup_pam_sandbox parity-bracket-space)"
+    mkdir -p "$s/before" "$s/after"
+    printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth required pam_permit.so\n' \
+        > "$s/before/common-auth"
+    printf 'auth [success=1  default=ignore] pam_unix.so nullok\nauth required pam_permit.so\n' \
+        > "$s/after/common-auth"
+    rc=0
+    python3 "$_PAM_ORACLE" parity "$s/before/common-auth" "$s/after/common-auth" \
+        > "$s/parity.out" 2>&1 || rc=$?
+    assert_eq "0" "$rc" "PAM-103/control-space: bracket whitespace reformat stays SAFE"
+
+    control_before="$(bash -c '
+        source "$1/lib/pam.sh"
+        rec="$(mktemp)"
+        _pam_parse_file "$2" "$rec" common common-auth || exit $?
+        awk -F "\t" "\$1 == \"V\" { print \$3; exit }" "$rec"
+        rm -f -- "$rec"
+    ' _ "$REPO_ROOT" "$s/before/common-auth")"
+    control_after="$(bash -c '
+        source "$1/lib/pam.sh"
+        rec="$(mktemp)"
+        _pam_parse_file "$2" "$rec" common common-auth || exit $?
+        awk -F "\t" "\$1 == \"V\" { print \$3; exit }" "$rec"
+        rm -f -- "$rec"
+    ' _ "$REPO_ROOT" "$s/after/common-auth")"
+    assert_eq "$control_before" "$control_after" \
+        "PAM-103/control-space: product awk normalises bracket control whitespace"
+}
+
+test_pam_92_mixed_management_groups_fails_closed
+test_pam_93_same_module_multi_instance_fails_closed
+test_pam_94_include_expansion_parity
+test_pam_95_substack_fails_closed
+test_pam_96_sudo_single_preflight
+test_pam_97_canonical_stale_fp_jump_fails_closed
+test_pam_98_normal_debian_profile_accepted
+test_pam_101_product_oracle_parity
+test_pam_102_typed_include_group_scope
+test_pam_103_parity_include_and_control_norm
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

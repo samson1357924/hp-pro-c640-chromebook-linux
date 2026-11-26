@@ -787,3 +787,99 @@ jobs:
             exit 1
           fi
           echo "PAM lib helper E2E sentinel verified on host"
+
+      # Re-review #19 finding #1: an INDEPENDENT black-box libpam regression.
+      # The product parser and the Python rule oracle never decide this case:
+      # a real pam_start_confdir() service decides auth, and the fake module
+      # traces which numeric-jump landing actually executed. Missing symbol,
+      # gcc failure or a skipped heredoc must turn the host gate RED.
+      - name: "Real libpam per-management-group jump oracle (decision + trace)"
+        run: |
+          set -euo pipefail
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pam-libpam-oracle.XXXXXX")"
+          oracle_rc=0
+          docker run --rm -i \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$artifact_dir:/pam-oracle-artifacts" \
+            ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb \
+            bash -s <<'EOS' || oracle_rc=$?
+          set -euxo pipefail
+          echo "libpam oracle container started" > /pam-oracle-artifacts/started
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends gcc libc6-dev libpam0g python3
+          cd /workspace
+
+          # Sanity: the runtime MUST provide the confdir entry point. The
+          # oracle exits 2 on any environment failure; `set -e` makes that red.
+          python3 -c 'import ctypes; lib = ctypes.CDLL("libpam.so.0"); assert hasattr(lib, "pam_start_confdir")'
+
+          # The reviewer's mixed auth/account fixture MUST be classified
+          # UNSAFE: real libpam decision 7 -> 0 with the fp module disappearing
+          # from the trace. A global-index model calls this unchanged.
+          self_rc=0
+          python3 tests/pam_libpam_oracle.py self-test \
+              | tee /pam-oracle-artifacts/selftest.log || self_rc=$?
+          test "$self_rc" -eq 0
+          mixed_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace fp \
+              tests/fixtures/pam_mixed_before.conf \
+              tests/fixtures/pam_mixed_after.conf \
+              | tee /pam-oracle-artifacts/mixed.log || mixed_rc=$?
+          test "$mixed_rc" -eq 1
+
+          # Re-review #19 P0: a TYPE-PREFIXED `session include extra` must NOT
+          # inject the included file's auth rules.  The real auth stack lands
+          # on the fp module before the edit and on the final pam_permit after
+          # it, so libpam reports UNSAFE (7 -> 0).  A group-agnostic model
+          # falsely reports SAFE.
+          include_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace fp \
+              --include extra=tests/fixtures/pam_include_extra.conf \
+              tests/fixtures/pam_include_before.conf \
+              tests/fixtures/pam_include_after.conf \
+              | tee /pam-oracle-artifacts/include.log || include_rc=$?
+          test "$include_rc" -eq 1
+
+          # The normal Debian profile (fp BEFORE the jump source) MUST stay
+          # SAFE: same decision and no surviving module trace difference.
+          safe_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace allow \
+              tests/fixtures/pam_safe_before.conf \
+              tests/fixtures/pam_safe_after.conf \
+              | tee /pam-oracle-artifacts/safe.log || safe_rc=$?
+          test "$safe_rc" -eq 0
+
+          grep -q '7 -> 0' /pam-oracle-artifacts/selftest.log
+          grep -q 'UNSAFE' /pam-oracle-artifacts/mixed.log
+          grep -q 'UNSAFE' /pam-oracle-artifacts/include.log
+          grep -q 'before rc=7' /pam-oracle-artifacts/include.log
+          grep -q 'rc=0' /pam-oracle-artifacts/include.log
+          grep -q 'SAFE' /pam-oracle-artifacts/safe.log
+          printf 'PAM_LIBPAM_ORACLE_OK\n' > /pam-oracle-artifacts/oracle-ok
+          chmod -R a+rX /pam-oracle-artifacts
+          EOS
+
+          if [ "$oracle_rc" -ne 0 ]; then
+            echo "::error::libpam oracle container failed with rc $oracle_rc"
+            exit 1
+          fi
+          for f in started selftest.log mixed.log include.log safe.log oracle-ok; do
+            if [ ! -s "$artifact_dir/$f" ]; then
+              echo "::error::libpam oracle artifact $f missing (silent skip is not allowed)"
+              exit 1
+            fi
+          done
+          grep -qx 'PAM_LIBPAM_ORACLE_OK' "$artifact_dir/oracle-ok" \
+            || { echo "::error::libpam oracle sentinel invalid"; exit 1; }
+          grep -q '7 -> 0' "$artifact_dir/selftest.log" \
+            || { echo "::error::libpam oracle did not reproduce the 7 -> 0 decision change"; exit 1; }
+          grep -q 'UNSAFE' "$artifact_dir/mixed.log" \
+            || { echo "::error::mixed fixture was not classified UNSAFE"; exit 1; }
+          grep -q 'UNSAFE' "$artifact_dir/include.log" \
+            || { echo "::error::type-prefixed include fixture was not classified UNSAFE"; exit 1; }
+          grep -q 'before rc=7' "$artifact_dir/include.log" \
+            || { echo "::error::type-prefixed include fixture did not reproduce the 7 -> 0 decision change"; exit 1; }
+          grep -q 'SAFE' "$artifact_dir/safe.log" \
+            || { echo "::error::normal Debian fixture was not classified SAFE"; exit 1; }
+          echo "PAM libpam oracle sentinel verified on host"

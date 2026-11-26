@@ -66,14 +66,16 @@ _PAM_COMMON_FP_FOUND=0
 # (P3: the old _PAM_FP_CONVERGENCE_VERIFIED write-only flag is gone; the
 # postcondition below is the single authority that decides fail-closed.)
 # Keyed non-fp rule descriptors captured BEFORE any mutation and compared again
-# AFTER convergence by _pam_verify_installed_no_fprintd(). A token is
-#   filetag|type|control|full-module-path|numeric-jump-landing
-# (one per line). The baseline must remain a keyed MULTISET plus an ORDERED
-# SUBSEQUENCE: an external tool may ADD a rule, but may not drop, modify or
-# reorder an existing non-fprintd rule. The landing field makes numeric-jump
-# control flow part of the postcondition.
+# AFTER convergence by _pam_verify_installed_no_fprintd(). Phase A/#1 (re-review
+# #19): these lines are now emitted by lib/pam_stack_model.py, which models a
+# SEPARATE handler stack per PAM management group and expands @include. A
+# descriptor token includes group/instance-id/control/args/numeric-jump target,
+# never a file-global module index. The baseline must remain a keyed MULTISET
+# plus an ORDERED SUBSEQUENCE: an external tool may ADD a rule, but may not
+# drop, modify or reorder an existing non-fprintd rule.
 _PAM_NONFP_BASELINE=""
 _PAM_NONFP_EXPECTED=""
+_PAM_MODEL_HELPER="$SCRIPT_DIR_PAM/pam_stack_model.py"
 _PAM_SAVED_DIR="${CROS_ENABLEMENT_PAM_SAVED_DIR:-/var/lib/pam}"
 _PAM_SEL_SIDECAR="${CROS_ENABLEMENT_PAM_SELECTION_FILE:-${MANIFEST_FILE%/*}/pam-selection}"
 _PAM_SAVED_SNAPSHOT_DIR="${_PAM_SEL_SIDECAR}.saved"
@@ -104,35 +106,47 @@ _PAM_COMMON_ENTRIES_LEGACY=0
 # verify/sudo: no caller may reintroduce `grep pam_fprintd.so` or an unanchored
 # `sed /.../d`.
 #
-# stdout records (tab separated):
-#   V <type> <control> <path> <start-line> <filetag> <landing>  verified NON-fp
-#   R <start-line> <physical-line-count> <type> <basename>       removable fp
-#   D <line>                                                    blank/@/comment
-#   U <line> <reason>                                           uncertain syntax
-# `landing` is the identity (`type:full-path`, or END) of the rule a numeric
-# jump reaches in the ORIGINAL stack; `-` means the rule has no numeric jump.
-# `-v scope=sudo` widens the fp module set to the stale sudo variants
-# (rust_fp.so / fp_pam*.so); the default scope only strips pam_fprintd.so.
-# `-v filetag=<name>` labels the rule's file so the postcondition key cannot
-# confuse two files with identical rules.
+# stdout records (tab separated). The awk parser is deliberately DUMB about
+# control flow: it emits raw rule facts and the exact physical line ranges;
+# per-management-group jump arithmetic lives in pam_stack_model.py (re-review
+# #19 finding #1). A file-global module index is NEVER computed here.
+#   V <type> <control> <path> <start> <filetag> <args> <fp> <canon>
+#                                                    raw parsed rule facts
+#   R <start-line> <physical-line-count> <type> <basename>  removable fp
+#   I <start> <kind> <target> <filetag> <scope>        include/substack entry
+#     <scope> is `@` for @include/@substack (all groups), otherwise the raw
+#     PAM type of a type-prefixed `auth include X` / `session substack X`
+#     (only that management group's lines are introduced; man7 pam.conf(5)).
+#   D <line>                                          blank/comment line
+#   U <line> <reason>                                 uncertain syntax
+# `fp=1` marks a removable fingerprint rule (R records point at its physical
+# lines); `canon=1` marks the one sudo rule we are allowed to insert. The raw
+# `-auth` prefix is preserved in <type> and every module argument is preserved
+# in <args>, so two instances of the same path with different control/args are
+# distinguishable. `-v scope=sudo` widens the fp module set to stale variants.
+# `-v filetag=<name>` labels the rule's file so the model key cannot confuse
+# two files with identical rules.
 # rc 0 = parsed, 2 = unreadable/probe error, 3 = uncertain (U emitted).
-# PHASE A P1: ANY change of a numeric jump landing caused by removing an fp rule
-# is a control-flow change, including a landing that becomes END. No managed
-# marker exempts this check: the marker previously made the whole jump check a
-# no-op (Phase A P2). Such a stack is rejected BEFORE a mutation.
+# ANY unresolved include/substack topology or numeric-jump change caused by an
+# fp removal is rejected by the Python model BEFORE any mutation.
 _PAM_AWK_PARSER='
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
 function nocmt(s,   p) { p = index(s, "#"); if (p > 0) s = substr(s, 1, p - 1); return s }
 function emitR(l, c, t, m) { printf "R\t%d\t%d\t%s\t%s\n", l, c, t, m }
 function emitD(l) { printf "D\t%d\n", l }
 function emitU(l, why) { printf "U\t%d\t%s\n", l, why }
+function emitV(t, c, p, l, f, a, fp, cn) {
+    printf "V\t%s\t%s\t%s\t%d\t%s\t%s\t%d\t%d\n", t, c, p, l, f, a, fp, cn
+}
+# <scope>: `@` = group-agnostic @ directive; raw type = type-prefixed directive.
+function emitI(l, k, target, f, s) { printf "I\t%d\t%s\t%s\t%s\t%s\n", l, k, target, f, s }
 function isfp(b) {
     if (scope == "sudo")
         return (b == "pam_fprintd.so" || b == "rust_fp.so" || b ~ /^fp_pam[^[:space:]]*\.so$/)
     return (b == "pam_fprintd.so")
 }
 function removable(b, allowed) { return isfp(b) && !allowed }
-BEGIN { nmod = 0; njump = 0; uncertain = 0 }
+BEGIN { uncertain = 0 }
 {
     start = FNR
     line = trim(nocmt($0))
@@ -148,13 +162,27 @@ BEGIN { nmod = 0; njump = 0; uncertain = 0 }
         line = line " " trim(nocmt($0))
     }
     if (bad) next
-    # man7 pam.conf: @include/@substack is a stack entry. Count it in the jump
-    # arithmetic (Phase A P3) but never treat it as a fingerprint module.
+    # man7 pam.conf: @include/@substack is a stack entry, NOT a fingerprint
+    # module and NOT a generic handler for the Python model. Emit I records;
+    # the per-group model expands includes and refuses unsupported topologies.
     if (substr(line, 1, 1) == "@") {
-        nmod++
-        mtype[nmod] = "@"; mctrl[nmod] = "-"; mpath[nmod] = line
-        mline[nmod] = start; mfile[nmod] = filetag; mbase[nmod] = line; mallowed[nmod] = 0
-        emitD(start)
+        directive = trim(substr(line, 2))
+        split(directive, df, /[ \t]+/)
+        dctl = df[1]
+        if (dctl != "include" && dctl != "substack") {
+            emitU(start, "unknown @ directive")
+            uncertain = 1
+            next
+        }
+        dtarget = trim(substr(directive, length(dctl) + 1))
+        if (dtarget == "") {
+            emitU(start, "empty @ include target")
+            uncertain = 1
+            next
+        }
+        # @include/@substack are group-agnostic: every management group sees
+        # the included lines at this position.
+        emitI(start, dctl, dtarget, filetag, "@")
         next
     }
 
@@ -174,21 +202,26 @@ BEGIN { nmod = 0; njump = 0; uncertain = 0 }
         if (cl == 0) {
             emitU(start, "unbalanced bracket control"); uncertain = 1; next
         }
-        control = substr(rest, 1, cl)
         br = substr(rest, 2, cl - 2)
         rest = trim(substr(rest, cl + 1))
         nb = split(br, acts, /[ \t]+/)
+        # P3: normalise bracket whitespace in the emitted control. `[success=1
+        # default=ignore]` and `[success=1  default=ignore]` are the same
+        # control for libpam; a reformat must not change a rule identity.
+        ncontrol = "["
         for (i = 1; i <= nb; i++) {
             if (acts[i] == "") continue
             if (acts[i] !~ /^[A-Za-z_][A-Za-z0-9_]*=(ignore|bad|die|ok|done|reset|end|[0-9]+)$/) {
                 emitU(start, "uncertain bracket control action"); uncertain = 1; bad = 1; break
             }
+            ncontrol = ncontrol (ncontrol == "[" ? "" : " ") acts[i]
             if (acts[i] ~ /=[0-9]+$/) {
                 value = acts[i]; sub(/^.*=/, "", value)
                 jumps = jumps " " value
             }
         }
         if (bad) next
+        control = ncontrol "]"
     } else {
         split(rest, f2, /[ \t]+/)
         control = f2[1]
@@ -207,47 +240,22 @@ BEGIN { nmod = 0; njump = 0; uncertain = 0 }
     # The canonical line WE insert into sudo is the intended single fp rule;
     # it is not "stale" and must survive the post-insert verification.
     allowed = (scope == "sudo" && project_line != "" && line == project_line) ? 1 : 0
-    nmod++
-    mtype[nmod] = type; mctrl[nmod] = control; mpath[nmod] = path
-    mline[nmod] = start; mfile[nmod] = filetag; mbase[nmod] = base; mallowed[nmod] = allowed
-    if (jumps != "") { njump++; jrule[njump] = nmod; jline[njump] = start; jval[njump] = jumps }
+    if (control == "include" || control == "substack") {
+        # An include/substack is a stack edge, not a handler with a path. Keep
+        # the raw type: `auth include X` introduces ONLY auth lines, while
+        # `@include X` introduces the lines of every group (man7 pam.conf(5)).
+        emitI(start, control, path, filetag, type)
+        next
+    }
+    # Preserve ALL arguments, not just the module path. The awk parser never
+    # guesses a jump landing; pam_stack_model.py does that per group.
+    args = rest
+    sub(/^[ \t]*[^ \t]+/, "", args)
+    args = trim(args)
+    emitV(type, control, path, start, filetag, args, removable(base, allowed) ? 1 : 0, allowed)
     if (removable(base, allowed)) emitR(start, count, type, base)
 }
 END {
-    # Landing identity in the CURRENT stack, and in the stack after fp removal.
-    for (i = 1; i <= nmod; i++) mland[i] = "-"
-    nk = 0
-    for (i = 1; i <= nmod; i++) {
-        if (removable(mbase[i], mallowed[i])) continue
-        nk++
-        ktype[nk] = mtype[i]; kpath[nk] = mpath[i]; kept[i] = nk
-    }
-    for (j = 1; j <= njump; j++) {
-        src = jrule[j]
-        if (removable(mbase[src], mallowed[src]) || !(src in kept)) continue
-        nv = split(jval[j], vals, /[ \t]+/)
-        land = ""
-        for (v = 1; v <= nv; v++) {
-            if (vals[v] == "") continue
-            n = vals[v] + 0
-            t1 = src + n + 1
-            t2 = kept[src] + n + 1
-            id1 = (t1 > nmod) ? "END" : (mtype[t1] ":" mpath[t1])
-            id2 = (t2 > nk) ? "END" : (ktype[t2] ":" kpath[t2])
-            # Phase A P1: landing on END is NOT a safe exception. Every landing
-            # change (module -> module, module -> END, END -> module) is U.
-            if (id1 != id2) {
-                emitU(jline[j], "numeric jump target identity changes after removing fingerprint module")
-                uncertain = 1
-            }
-            land = land (land == "" ? "" : "|") id1
-        }
-        mland[src] = land
-    }
-    for (i = 1; i <= nmod; i++) {
-        if (removable(mbase[i], mallowed[i])) continue
-        printf "V\t%s\t%s\t%s\t%d\t%s\t%s\n", mtype[i], mctrl[i], mpath[i], mline[i], mfile[i], mland[i]
-    }
     if (uncertain) exit 3
     exit 0
 }
@@ -304,13 +312,12 @@ _pam_records_uncertain_reasons() {
     awk -F '\t' '$1 == "U" { printf "line %s: %s; ", $2, $3 }' "$1"
 }
 
-# Phase A P2 (T3): keyed descriptors, one per non-fp rule:
-#   filetag|type|control|full-module-path|numeric-jump-landing
-# The old `type:basename` key let a deleted/changed rule hide behind another
-# rule of the same type (and treated a sub-sequence as proof). The landing field
-# makes control flow part of the postcondition.
+# Raw non-fp rule facts from one parsed file. The AUTHORITATIVE descriptor is
+# pam_stack_model.py's per-group output (_pam_model_scan_common); this remains
+# only as a human-readable dump of the awk V records (it carries no global jump
+# arithmetic and is never used as a safety proof).
 _pam_records_nonfp_seq() {
-    awk -F '\t' '$1 == "V" { printf "%s|%s|%s|%s|%s\n", $6, $2, $3, $4, $7 }' "$1"
+    awk -F '\t' '$1 == "V" && $8 != "1" { printf "%s|%s|%s|%s|%s|%s\n", $6, $2, $3, $4, $7, $8 }' "$1"
 }
 
 # $1=newline-separated expected descriptors, $2=live descriptors.
@@ -359,6 +366,148 @@ _pam_nonfp_seq_contains() {
     return 0
 }
 
+# --- per-management-group model glue (re-review #19 finding #1) -------------
+# The awk parser emits raw V/I/R facts only. These helpers build a manifest of
+# parsed service files (plus their @include closure) and hand it to the Python
+# model. All buffers are caller-owned; no live PAM file is read by Python.
+_pam_model_workdir() {
+    # Use the SAME mktemp template shape as _pam_tmp_file(): PAM-29 pins that
+    # every temp request is made through the private TMPDIR seam, and the
+    # fault-injection stub inspects the first argument.
+    local path
+    path="$(_pam_tmp_file)" || return 1
+    rm -f -- "$path" || return 1
+    mkdir -- "$path" || return 1
+    printf '%s\n' "$path"
+}
+
+# $1=work dir, $2=manifest output, rest: "<records-file>|<filetag>" specs.
+# Parses @include targets from the same PAM dir up to a bounded depth; an
+# unavailable target becomes an opaque boundary which the model refuses to
+# jump into instead of guessing a landing. rc 1 = unsupported topology.
+_pam_model_manifest() {
+    local work="$1" manifest="$2" spec rec tag line kind start target
+    local target_file target_rec exists=0 depth=0
+    shift 2
+    : > "$manifest" || return 1
+    local -a queue=() next=()
+    for spec in "$@"; do
+        rec="${spec%%|*}"
+        tag="${spec#*|}"
+        printf '%s\t%s\n' "$tag" "$rec" >> "$manifest" || return 1
+        queue+=("$rec|$tag")
+    done
+    while [ "$depth" -lt 8 ] && [ "${#queue[@]}" -gt 0 ]; do
+        next=()
+        for spec in "${queue[@]}"; do
+            rec="${spec%%|*}"
+            tag="${spec#*|}"
+            # I <start> <kind> <target> <filetag> <scope>; the model reads the
+            # final field to decide which management groups this applies to.
+            while IFS=$'\t' read -r kind start _ target _; do
+                [ "$kind" = "I" ] || continue
+                case "$target" in
+                    '' | */* | *..*)
+                        log_error "Unsupported PAM include target '$target' in $tag; refusing to modify PAM configuration."
+                        return 1
+                        ;;
+                esac
+                # A cycle is detected by the Python model via its include path.
+                grep -qF -- "$target"$'\t' "$manifest" && continue
+                target_file="$_PAM_DIR/$target"
+                [ -f "$target_file" ] || continue
+                target_rec="$work/rec.$target.$depth"
+                _pam_parse_file "$target_file" "$target_rec" common "$target" || {
+                    log_error "Could not parse included PAM file $target_file; refusing to modify PAM configuration."
+                    rm -f -- "$target_rec"
+                    return 1
+                }
+                printf '%s\t%s\n' "$target" "$target_rec" >> "$manifest" || return 1
+                next+=("$target_rec|$target")
+            done < "$rec"
+        done
+        if [ "${#next[@]}" -gt 0 ]; then queue=("${next[@]}"); else queue=(); fi
+        depth=$((depth + 1))
+    done
+    return 0
+}
+
+# $1=manifest, $2=output, $3=optional --nonfp
+_pam_model_descriptors() {
+    local nonfp="${3:-}"
+    python3 "$_PAM_MODEL_HELPER" descriptors "$1" $nonfp > "$2"
+}
+
+# $1=pre manifest, $2=post manifest, $3=label, $4=optional canonical line.
+_pam_model_prove() {
+    local pre="$1" post="$2" label="$3" canonical="${4:-}" rc=0 reason=""
+    if [ -n "$canonical" ]; then
+        reason="$(python3 "$_PAM_MODEL_HELPER" prove --canonical "$canonical" "$pre" "$post" 2>&1)" || rc=$?
+    else
+        reason="$(python3 "$_PAM_MODEL_HELPER" prove "$pre" "$post" 2>&1)" || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        log_error "PAM stack transformation is not provably safe for $label (rc $rc): $reason"
+        return 1
+    fi
+    return 0
+}
+
+# Parse the live common-* set and emit per-group descriptors. Used both by the
+# pre-mutation preflight and by the post-convergence verifier, so they can
+# never disagree about what a stack handler is.
+_pam_model_scan_common() { # $1=work dir, $2=manifest, $3=descriptors output
+    local work="$1" manifest="$2" out="$3" base file rec exists=0
+    local -a specs=()
+    for base in "${_PAM_COMMON_BASES[@]}"; do
+        file="$_PAM_DIR/$base"
+        exists=0
+        _pam_common_path_exists "$file" || exists=$?
+        case "$exists" in
+            2)
+                log_error "Could not probe $file while modelling the PAM stack; failing closed."
+                return 1
+                ;;
+            1) continue ;;
+        esac
+        rec="$work/rec.$base"
+        _pam_parse_file "$file" "$rec" common "$base" || {
+            log_error "Could not parse $file for the PAM stack model; failing closed."
+            return 1
+        }
+        specs+=("$rec|$base")
+    done
+    _pam_model_manifest "$work" "$manifest" "${specs[@]}" || return 1
+    _pam_model_descriptors "$manifest" "$out" --nonfp || {
+        log_error "Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration."
+        return 1
+    }
+    return 0
+}
+
+# Prove that removing every fp rule from one parsed common-* file is a safe
+# per-group transformation. This runs INSIDE the zero-write preflight, before
+# any snapshot publication, backup or sed. The planned record set is simply the
+# original facts minus the removable fp rules; the Python model recomputes all
+# jump targets for the planned stack.
+_pam_common_planned_proof() { # $1=records, $2=filetag, $3=label
+    local records="$1" tag="$2" label="$3"
+    local work="" pre="" post="" planned=""
+    work="$(_pam_model_workdir)" || return 1
+    pre="$work/pre.manifest"
+    post="$work/post.manifest"
+    planned="$work/planned.records"
+    if ! awk -F '\t' '$1 != "R" && !($1 == "V" && $8 == "1")' "$records" > "$planned" \
+        || ! _pam_model_manifest "$work" "$pre" "$records|$tag" \
+        || ! _pam_model_manifest "$work" "$post" "$planned|$tag" \
+        || ! _pam_model_prove "$pre" "$post" "$label (planned common stack)"; then
+        rm -rf -- "$work"
+        return 1
+    fi
+    rm -rf -- "$work"
+    return 0
+}
+
 # Preflight for the GDM claim race. MUST run at the very top of the Debian
 # branch, before any snapshot publication, backup, sed, tool call or sudo
 # change: a symlinked common-* with an active fp module cannot be repaired by
@@ -372,6 +521,7 @@ _pam_nonfp_seq_contains() {
 # what counts as a module.
 _pam_common_fp_scan() {
     local base file is_link=0 exists=0 parse_rc=0 records=""
+    local model_work="" model_manifest="" model_desc=""
     _PAM_COMMON_FP_FOUND=0
     _PAM_NONFP_BASELINE=""
     for base in "${_PAM_COMMON_BASES[@]}"; do
@@ -418,9 +568,30 @@ _pam_common_fp_scan() {
             fi
             _PAM_COMMON_FP_FOUND=1
         fi
-        _PAM_NONFP_BASELINE+="$(_pam_records_nonfp_seq "$records")"$'\n'
+        # Finding #1: per-group transformation preflight BEFORE publication.
+        if ! _pam_common_planned_proof "$records" "$base" "$file"; then
+            log_error "Removing the fingerprint rule from $file would change a per-management-group stack or its numeric jump target; refusing to modify PAM configuration."
+            rm -f -- "$records"
+            return 1
+        fi
         rm -f -- "$records"
     done
+    # Finding #1: the per-management-group model is part of the MUTATION
+    # PREFLIGHT, not a post-hoc claim. It runs here, before any snapshot
+    # publication, backup, sed or external tool call. Unsupported include /
+    # substack topologies and uncertain stacks fail closed with zero writes.
+    model_work="$(_pam_model_workdir)" || {
+        log_error "Could not allocate the PAM stack model buffer; failing closed."
+        return 1
+    }
+    model_manifest="$model_work/manifest"
+    model_desc="$model_work/descriptors"
+    if ! _pam_model_scan_common "$model_work" "$model_manifest" "$model_desc"; then
+        rm -rf -- "$model_work"
+        return 1
+    fi
+    _PAM_NONFP_BASELINE="$(cat -- "$model_desc")"
+    rm -rf -- "$model_work"
     return 0
 }
 
@@ -2341,6 +2512,7 @@ _pam_strip_fp_lines() {
     local file="$1" scope="$2" tag="$3" label="$4" noop_sed="${5:-0}"
     local records="" original="" expected="" actual="" live_snap="" live_records=""
     local inode="" kind start count rc=0 is_link=0
+    local model_work="" model_pre="" model_post="" planned_records="" canonical=""
     local -a sed_args=() sed_expr=()
     _PAM_STRIP_HAD_FP=0
     records="$(_pam_tmp_file)" || {
@@ -2446,8 +2618,35 @@ _pam_strip_fp_lines() {
         rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
         return 1
     }
+    # Finding #1: prove the PLANNED bytes are a safe transformation BEFORE
+    # touching the live file. The awk parser only supplies raw facts; the
+    # Python model checks per-group handler stacks, include expansion and jump
+    # targets. A bad plan leaves zero sed mutations.
+    model_work="$(_pam_model_workdir)" || {
+        log_error "Could not allocate the PAM stack model buffer for $label."
+        rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
+        return 1
+    }
+    model_pre="$model_work/pre.manifest"
+    model_post="$model_work/post.manifest"
+    planned_records="$model_work/planned.records"
+    if [ "$scope" = sudo ]; then canonical="$_PAM_FP_SUDO_LINE"; fi
+    if ! _pam_model_manifest "$model_work" "$model_pre" "$records|$tag" \
+        || ! _pam_parse_file "$expected" "$planned_records" "$scope" "$tag" "$canonical" \
+        || ! _pam_model_manifest "$model_work" "$model_post" "$planned_records|$tag"; then
+        log_error "Could not model the planned PAM transformation for $label; refusing to strip."
+        rm -rf -- "$model_work"
+        rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
+        return 1
+    fi
+    if ! _pam_model_prove "$model_pre" "$model_post" "$label"; then
+        rm -rf -- "$model_work"
+        rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
+        return 1
+    fi
     if ! sudo sed "${sed_args[@]}" "$file"; then
         log_error "Could not strip fingerprint modules from $label; original backup stays tracked for rollback"
+        rm -rf -- "$model_work"
         rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
         return 1
     fi
@@ -2456,6 +2655,7 @@ _pam_strip_fp_lines() {
     inode="$(sudo stat -c '%d:%i' -- "$file" 2> /dev/null)" || inode=""
     [ -n "$inode" ] || {
         log_error "Could not re-stat $label after stripping; refusing to continue."
+        rm -rf -- "$model_work"
         rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
         return 1
     }
@@ -2466,6 +2666,16 @@ _pam_strip_fp_lines() {
         log_error "Post-strip parse of $label is uncertain or still has an active fingerprint module; original bytes restored."
         _pam_restore_bytes "$file" "$original" "$inode" \
             || log_error "Could not restore the original bytes of $label; rollback backup is still tracked."
+        rm -rf -- "$model_work"
+        rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
+        return 1
+    fi
+    if ! _pam_model_manifest "$model_work" "$model_post" "$records|$tag" \
+        || ! _pam_model_prove "$model_pre" "$model_post" "$label (live)"; then
+        log_error "Post-strip PAM stack model verification failed for $label; original bytes restored."
+        _pam_restore_bytes "$file" "$original" "$inode" \
+            || log_error "Could not restore the original bytes of $label; rollback backup is still tracked."
+        rm -rf -- "$model_work"
         rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
         return 1
     fi
@@ -2474,9 +2684,11 @@ _pam_strip_fp_lines() {
         log_error "Non-fingerprint PAM bytes changed while stripping $label; original bytes restored."
         _pam_restore_bytes "$file" "$original" "$inode" \
             || log_error "Could not restore the original bytes of $label; rollback backup is still tracked."
+        rm -rf -- "$model_work"
         rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
         return 1
     fi
+    rm -rf -- "$model_work"
     rm -f -- "$records" "$original" "$expected" "$actual" "$live_snap" "$live_records"
     log_info "Removed fingerprint module line(s) from $label; original bytes are tracked for rollback and non-fp bytes verified byte-identical."
     return 0
@@ -2502,9 +2714,12 @@ _pam_strip_fprintd_from_common_files() {
 }
 
 # Post-insert sudo assertion (all distros, not just Debian): re-parse through
-# the SAME parser to prove no stale fp module survived the one delete sed.
+# the SAME parser to prove no stale fp module survived the one delete sed, and
+# model the sudo/auth stack so an unresolved include/substack topology is never
+# silently claimed safe. The canonical project line must appear EXACTLY once
+# (PAM-90/97): "already configured" is not an excuse to skip verification.
 _pam_verify_sudo_no_fp() { # $1=sudo PAM file
-    local file="$1" records rc=0
+    local file="$1" records rc=0 work="" manifest="" desc="" count=0
     records="$(_pam_tmp_file)" || return 1
     _pam_parse_file "$file" "$records" sudo sudo "$_PAM_FP_SUDO_LINE" || rc=$?
     if [ "$rc" -ne 0 ] || _pam_records_have_fp "$records"; then
@@ -2512,22 +2727,264 @@ _pam_verify_sudo_no_fp() { # $1=sudo PAM file
         rm -f -- "$records"
         return 1
     fi
-    if ! grep -qFx -- "$_PAM_FP_SUDO_LINE" "$file"; then
-        log_error "Post-install verification failed: the canonical sudo fingerprint line is missing from $file."
+    count="$(grep -cFx -- "$_PAM_FP_SUDO_LINE" "$file" 2> /dev/null || true)"
+    [ -n "$count" ] || count=0
+    if [ "$count" != "1" ]; then
+        log_error "Post-install verification failed: the canonical sudo fingerprint line appears $count times in $file (expected exactly 1)."
         rm -f -- "$records"
         return 1
     fi
+    work="$(_pam_model_workdir)" || {
+        log_error "Could not allocate the sudo PAM stack model buffer; refusing to claim success."
+        rm -f -- "$records"
+        return 1
+    }
+    manifest="$work/manifest"
+    desc="$work/descriptors"
+    if ! _pam_model_manifest "$work" "$manifest" "$records|sudo" \
+        || ! _pam_model_descriptors "$manifest" "$desc"; then
+        log_error "Post-install verification failed: unsupported sudo PAM stack topology in $file."
+        rm -rf -- "$work"
+        rm -f -- "$records"
+        return 1
+    fi
+    rm -rf -- "$work"
     rm -f -- "$records"
-    log_info "Verified sudo PAM has no stale fingerprint module and exactly the canonical project line."
+    log_info "Verified sudo PAM has no stale fingerprint module, exactly the canonical project line, and a modelable stack."
+    return 0
+}
+
+# Finding #1 / PAM-96: ONE preflight for the WHOLE sudo transformation
+# (stale-fp strip + canonical insert), before any live sed or backup. The
+# caller only chooses the distro anchor; every safety decision is here.
+# $1=anchor regex (sed address form, no slashes); $2=human label.
+_pam_sudo_plan_and_verify() {
+    local anchor="$1" label="$2"
+    local file="$_PAM_SUDO_PATH" canonical="$_PAM_FP_SUDO_LINE"
+    local original="" stripped="" planned="" records="" live_records="" planned_records=""
+    local work="" pre_manifest="" post_manifest="" live_manifest=""
+    local rc=0 inode="" count=0 has_fp=0 needs_mutation=1 kind start count_sed
+    local -a sed_args=() sed_expr=()
+
+    if [ ! -f "$file" ]; then
+        log_warn "$file not found; sudo fingerprint not configured."
+        return 0
+    fi
+    original="$(_pam_tmp_file)" || return 1
+    stripped="$(_pam_tmp_file)" || {
+        rm -f -- "$original"
+        return 1
+    }
+    planned="$(_pam_tmp_file)" || {
+        rm -f -- "$original" "$stripped"
+        return 1
+    }
+    records="$(_pam_tmp_file)" || {
+        rm -f -- "$original" "$stripped" "$planned"
+        return 1
+    }
+    live_records="$(_pam_tmp_file)" || {
+        rm -f -- "$original" "$stripped" "$planned" "$records"
+        return 1
+    }
+    work="$(_pam_model_workdir)" || {
+        log_error "Could not allocate the sudo PAM model buffer; refusing to modify $file."
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    }
+    pre_manifest="$work/pre.manifest"
+    post_manifest="$work/post.manifest"
+    live_manifest="$work/live.manifest"
+    planned_records="$work/planned.records"
+
+    # shellcheck disable=SC2024 # caller-owned buffer, not a root-owned redirect
+    if ! sudo cat -- "$file" > "$original" 2> /dev/null; then
+        log_error "Could not snapshot $file before the sudo transformation; failing closed."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    inode="$(sudo stat -c '%d:%i' -- "$file" 2> /dev/null)" || inode=""
+    if [ -z "$inode" ]; then
+        log_error "Could not stat $file before the sudo transformation; failing closed."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    _pam_parse_file "$original" "$records" sudo sudo "$canonical" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_error "Uncertain PAM rule syntax in $file (unreadable or uncertain); refusing to modify it."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    count="$(grep -cFx -- "$canonical" "$original" 2> /dev/null || true)"
+    [ -n "$count" ] || count=0
+    if [ "$count" -gt 1 ]; then
+        log_error "Refusing to modify $file: the canonical sudo rule appears $count times (expected at most one)."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+
+    # Plan the FULL transformation in caller-owned buffers. No live write yet.
+    sed_args=(-i)
+    sed_expr=()
+    while IFS=$'\t' read -r kind start count_sed _ _; do
+        [ "$kind" = "R" ] || continue
+        has_fp=1
+        if [ "$count_sed" = "1" ]; then
+            sed_args+=(-e "${start}d")
+            sed_expr+=(-e "${start}d")
+        else
+            sed_args+=(-e "${start},$((start + count_sed - 1))d")
+            sed_expr+=(-e "${start},$((start + count_sed - 1))d")
+        fi
+    done < "$records"
+    if [ "$count" -eq 1 ]; then
+        log_info "pam_fprintd already configured in $file."
+    fi
+    if [ "$count" -eq 1 ] && [ "$has_fp" -eq 1 ]; then
+        # PAM-90/97: a canonical line must NOT mask a second, real fp module.
+        log_error "Post-install verification failed: an active fingerprint module remains in $file (canonical line cannot mask a stale rule); refusing to claim fingerprint authentication."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    if [ "$count" -eq 1 ] && [ "$has_fp" -eq 0 ]; then
+        # Already configured (PAM-90/97): still model the live stack and prove
+        # no additional stale fp rule survived; no insertion or sed is needed.
+        needs_mutation=0
+        cp -- "$original" "$planned" || {
+            log_error "Could not stage the unchanged sudo plan."
+            rm -rf -- "$work"
+            rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+            return 1
+        }
+    else
+        if ! grep -qE "$anchor" "$original"; then
+            log_error "Refusing to modify $file: the sudo '$label' anchor is missing (fail closed)."
+            rm -rf -- "$work"
+            rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+            return 1
+        fi
+        if [ "${#sed_expr[@]}" -gt 0 ]; then
+            sed "${sed_expr[@]}" "$original" > "$stripped" || {
+                log_error "Could not stage the sudo strip plan."
+                rm -rf -- "$work"
+                rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+                return 1
+            }
+        else
+            cp -- "$original" "$stripped" || {
+                log_error "Could not stage the sudo strip plan."
+                rm -rf -- "$work"
+                rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+                return 1
+            }
+        fi
+        sed "0,/$anchor/s//$canonical\n&/" "$stripped" > "$planned" || {
+            log_error "Could not stage the sudo insert plan."
+            rm -rf -- "$work"
+            rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+            return 1
+        }
+    fi
+
+    if ! _pam_model_manifest "$work" "$pre_manifest" "$records|sudo" \
+        || ! _pam_parse_file "$planned" "$planned_records" sudo sudo "$canonical" \
+        || ! _pam_model_manifest "$work" "$post_manifest" "$planned_records|sudo" \
+        || ! _pam_model_prove "$pre_manifest" "$post_manifest" "$file (planned sudo)" "$canonical"; then
+        log_error "sudo strip+insert transformation cannot be proven safe for $file; no sed mutation was performed."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+
+    if ! _pam_verify_sudo_no_fp "$planned" || [ "$(grep -cFx -- "$canonical" "$planned")" != "1" ]; then
+        log_error "The planned sudo PAM file does not verify."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+
+    # Only now may we mutate the live file. Preserve the two-sed budget:
+    # one (possibly no-op) strip + one insert; a canonical-only file gets zero.
+    if [ "$needs_mutation" -eq 1 ]; then
+        backup_file_manifest_aware "$file" "fingerprint" || {
+            log_error "Could not track $file for rollback; refusing to modify it."
+            rm -rf -- "$work"
+            rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+            return 1
+        }
+        if [ "${#sed_args[@]}" -gt 1 ]; then
+            if ! sudo sed "${sed_args[@]}" "$file"; then
+                log_error "Could not strip stale fingerprint rules from $file."
+                rm -rf -- "$work"
+                rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+                return 1
+            fi
+        else
+            sudo sed -i -e '/^$/!b' "$file" || {
+                log_error "Could not run the no-op sudo strip sed on $file."
+                rm -rf -- "$work"
+                rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+                return 1
+            }
+        fi
+        if [ "$count" -ne 1 ] || [ "$has_fp" -ne 0 ]; then
+            sudo sed -i "0,/$anchor/s//$canonical\n&/" "$file" || {
+                log_error "Could not insert the canonical sudo rule into $file."
+                _pam_restore_bytes "$file" "$original" "$inode" \
+                    || log_error "Could not restore $file after a failed sudo insert."
+                rm -rf -- "$work"
+                rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+                return 1
+            }
+        fi
+    fi
+    # Live bytes must be byte-identical to the proven plan (T2).
+    # shellcheck disable=SC2024 # caller-owned buffer, not a root-owned redirect
+    if ! sudo cat -- "$file" > "$live_records" 2> /dev/null || ! cmp -s "$planned" "$live_records"; then
+        log_error "Live sudo PAM bytes differ from the proven plan for $file; restoring original bytes."
+        inode="$(sudo stat -c '%d:%i' -- "$file" 2> /dev/null)" || inode=""
+        _pam_restore_bytes "$file" "$original" "$inode" \
+            || log_error "Could not restore $file after sudo verification failure."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    rc=0
+    _pam_parse_file "$file" "$records" sudo sudo "$canonical" || rc=$?
+    if [ "$rc" -ne 0 ] \
+        || ! _pam_model_manifest "$work" "$live_manifest" "$records|sudo" \
+        || ! _pam_model_prove "$pre_manifest" "$live_manifest" "$file (live sudo)" "$canonical" \
+        || ! _pam_verify_sudo_no_fp "$file"; then
+        log_error "Post-mutation sudo PAM verification failed for $file; restoring original bytes."
+        inode="$(sudo stat -c '%d:%i' -- "$file" 2> /dev/null)" || inode=""
+        _pam_restore_bytes "$file" "$original" "$inode" \
+            || log_error "Could not restore $file after sudo verification failure."
+        rm -rf -- "$work"
+        rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+        return 1
+    fi
+    rm -rf -- "$work"
+    rm -f -- "$original" "$stripped" "$planned" "$records" "$live_records"
+    log_success "sudo fingerprint PAM configured; strip+insert transformation proven safe and verified byte-exact."
     return 0
 }
 
 # Installed-state postcondition (after sudo setup and --package convergence):
-# reuse the SAME parser as preflight. T3 is now a keyed multiset + ordered
-# subsequence over (file, type, control, full module path, numeric-jump landing),
-# so a removed/changed non-fp rule can no longer hide behind another rule with
-# the same type:basename, and a stale jump landing fails the claim. Whitespace,
-# mode and debconf selection changes remain irrelevant.
+# reuse the SAME parser as preflight. The authoritative transformation proof is
+# lib/pam_stack_model.py's per-management-group descriptor model (service/group/
+# instance-id/control/args/numeric-jump-target, with @include expanded per
+# group); the T3 check below is a keyed MULTISET + ordered SUBSEQUENCE of the
+# per-group P descriptors emitted by that model (service/group/instance-id/
+# control/args/numeric-jump-target), not of the raw awk V records. A removed/
+# changed non-fp rule can no longer hide behind another rule with the same
+# type:basename, and stale control flow fails the claim. Bracket control
+# whitespace is normalised by the parser; mode and debconf selection changes
+# remain irrelevant.
 _pam_verify_installed_no_fprintd() {
     local scan_rc=0 seq_rc=0
     _pam_common_fp_scan || scan_rc=$?
@@ -2557,7 +3014,6 @@ _configure_pam_fingerprint_body() {
     fi
 
     local sudo_pam="$_PAM_SUDO_PATH"
-    local fp_line="$_PAM_FP_SUDO_LINE"
     local converge_rc=0
 
     case "$DISTRO_FAMILY" in
@@ -2612,31 +3068,10 @@ _configure_pam_fingerprint_body() {
                 log_warn "PAM profile convergence returned rc $converge_rc; NOT verified: authentication control flow unverified / stale jump counts are not assumed safe. Install only continues if the explicit postcondition re-proves every jump endpoint; snapshot halves stay for uninstall."
             fi
 
-            if [ -f "$sudo_pam" ]; then
-                if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                    log_info "pam_fprintd already configured in $sudo_pam."
-                else
-                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
-                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
-                    # Remove any stale fingerprint module (including continued
-                    # rules) through the SAME parser, with exact line numbers.
-                    _pam_strip_fp_lines "$sudo_pam" sudo sudo sudo-pam 1 || return $?
-                    sudo sed -i '0,/^@include common-auth$/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
-                    if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                        log_success "sudo fingerprint PAM configured."
-                    else
-                        log_warn "@include common-auth anchor not found in $sudo_pam; sudo fingerprint NOT configured."
-                    fi
-                fi
-                # P2 (fail-open): verify BOTH branches. The canonical project
-                # line is the parser's allowed fp rule (scope=sudo &&
-                # project_line), so an existing canonical line must NOT skip
-                # the stale-fp check: a second, real pam_fprintd.so rule would
-                # otherwise survive and install would claim success.
-                _pam_verify_sudo_no_fp "$sudo_pam" || return $?
-            else
-                log_warn "$sudo_pam not found; sudo fingerprint not configured."
-            fi
+            # Finding #1 / PAM-96: one strip+insert preflight for sudo, before
+            # any live sed. Anchor loss and provably unsafe stack changes now
+            # fail closed instead of warning while claiming success.
+            _pam_sudo_plan_and_verify '^@include common-auth$' '@include common-auth' || return $?
             # Final installed-state postcondition: prove the actual common-*
             # files have no active fprintd module, not merely that our sed
             # returned 0. On failure do NOT consume any snapshot half and make
@@ -2655,28 +3090,7 @@ _configure_pam_fingerprint_body() {
                 sudo authselect disable-feature with-fingerprint 2> /dev/null || true
                 sudo authselect apply-changes 2> /dev/null || true
             fi
-            if [ -f "$sudo_pam" ]; then
-                if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                    log_info "pam_fprintd already configured in $sudo_pam."
-                else
-                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
-                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
-                    # Remove any stale fingerprint module (including continued
-                    # rules) through the SAME parser, with exact line numbers.
-                    _pam_strip_fp_lines "$sudo_pam" sudo sudo sudo-pam 1 || return $?
-                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
-                    if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                        log_success "sudo fingerprint PAM configured."
-                    else
-                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
-                    fi
-                fi
-                # P2: verify BOTH branches (the canonical line is the parser's
-                # allowed fp rule), not just the insert branch.
-                _pam_verify_sudo_no_fp "$sudo_pam" || return $?
-            else
-                log_warn "$sudo_pam not found; sudo fingerprint not configured."
-            fi
+            _pam_sudo_plan_and_verify '^auth[[:space:]]\+include[[:space:]]\+system-auth' 'auth include system-auth' || return $?
             ;;
         suse)
             # Do NOT use `pam-config -a --fprintd` — it injects pam_fprintd into
@@ -2686,52 +3100,14 @@ _configure_pam_fingerprint_body() {
                 log_info "Removing fprintd from common-auth/system-auth to avoid GDM claim race..."
                 sudo pam-config -d --fprintd 2> /dev/null || true
             fi
-            if [ -f "$sudo_pam" ]; then
-                if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                    log_info "pam_fprintd already configured in $sudo_pam."
-                else
-                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
-                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
-                    _pam_strip_fp_lines "$sudo_pam" sudo sudo sudo-pam 1 || return $?
-                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
-                    if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                        log_success "sudo fingerprint PAM configured."
-                    else
-                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
-                    fi
-                fi
-                # P2: verify BOTH branches (the canonical line is the parser's
-                # allowed fp rule), not just the insert branch.
-                _pam_verify_sudo_no_fp "$sudo_pam" || return $?
-            else
-                log_warn "$sudo_pam not found; sudo fingerprint not configured."
-            fi
+            _pam_sudo_plan_and_verify '^auth[[:space:]]\+include[[:space:]]\+system-auth' 'auth include system-auth' || return $?
             ;;
         arch)
             # Do NOT add pam_fprintd to /etc/pam.d/system-auth: gdm-password
             # includes system-auth and would race the dedicated
             # gdm-fingerprint PAM worker for the single fprintd device Claim
             # on unlock (GNOME/gdm#1071). Enable fingerprint for sudo only.
-            if [ -f "$sudo_pam" ]; then
-                if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                    log_info "pam_fprintd already configured in $sudo_pam."
-                else
-                    log_info "Enabling fingerprint for sudo only in $sudo_pam..."
-                    backup_file_manifest_aware "$sudo_pam" "fingerprint"
-                    _pam_strip_fp_lines "$sudo_pam" sudo sudo sudo-pam 1 || return $?
-                    sudo sed -i '0,/^auth[[:space:]]\+include[[:space:]]\+system-auth/s//auth sufficient pam_fprintd.so max-tries=1 timeout=10\n&/' "$sudo_pam"
-                    if grep -qFx -- "$fp_line" "$sudo_pam"; then
-                        log_success "sudo fingerprint PAM configured."
-                    else
-                        log_warn "'auth include system-auth' anchor not found in $sudo_pam; sudo fingerprint NOT configured."
-                    fi
-                fi
-                # P2: verify BOTH branches (the canonical line is the parser's
-                # allowed fp rule), not just the insert branch.
-                _pam_verify_sudo_no_fp "$sudo_pam" || return $?
-            else
-                log_warn "$sudo_pam not found; sudo fingerprint not configured."
-            fi
+            _pam_sudo_plan_and_verify '^auth[[:space:]]\+include[[:space:]]\+system-auth' 'auth include system-auth' || return $?
             ;;
         nixos)
             log_info "For NixOS, set 'services.fprintd.enable = true;' with the crfpmoc-enabled libfprint override and 'security.pam.services.sudo.fprintAuth = true;' (see docs/distros/nixos.md)."
