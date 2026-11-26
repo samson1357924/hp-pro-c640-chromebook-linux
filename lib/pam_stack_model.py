@@ -43,6 +43,12 @@ TYPES = {
     "-session-noninteractive",
 }
 NUMERIC_ACTION = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*=([0-9]+)$")
+# MUST match _PAM_MODEL_MAX_INCLUDE_DEPTH in lib/pam.sh. The shell builder is
+# authoritative about which targets exist in the PAM dir: it resolves every
+# reachable include up to this depth and fails closed on an existing target it
+# cannot resolve within the cap. Here a manifest entry expanded past the cap is
+# likewise unsupported, so neither layer may silently leave a deep rule
+# unmodelled (T3's zero-addition/argsfp gate would then be fail-open).
 MAX_INCLUDE_DEPTH = 12
 
 

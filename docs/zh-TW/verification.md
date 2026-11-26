@@ -348,8 +348,9 @@ c640 的真實 S3 仍待執行**；2026-11-22 freeze/thaw 是舊 hook 的歷史�
   epoch 重新錨定（絕非 wall-clock 時間），並記錄 `keeping committed cycle handoff`。
   `PrepareForSleep(false)` 沒有 flag 時改呼叫 `restore_from_local_state()`——只還原 daemon
   自己的已存亮度，不 adopt handoff、不碰 handoff 檔、不寫 adopted-cycle marker。
-  D11–D14 deterministic interleaving 涵蓋 pre/post commit 後延遲的 true、false fallback、
-  token 不符不當作刪檔理由、真正過期清理與無新 handoff 復原。
+  D11–D17 deterministic interleaving 涵蓋 pre/post commit 後延遲的 true、false fallback、
+  token 不符不當作刪檔理由、真正過期清理與無新 handoff 復原；D15–D17 另涵蓋 future
+  begin/commit proof、legacy 三欄 sidecar 升級與 date fallback。
 
 **本機目前總數：** daemon **976 通過、0 失敗**、sleep hook **398 通過、0 失敗**、
 rollback **2508 通過、0 失敗**；keyd self-test **34 個案例**、

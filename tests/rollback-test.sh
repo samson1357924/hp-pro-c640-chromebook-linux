@@ -15671,6 +15671,104 @@ EOF
     reset_pam_addition_allowlist
 }
 
+# PAM-105 (re-review #19 final fixer, P2): the shell include-closure builder and
+# lib/pam_stack_model.py must use the SAME depth cap (12). Two regressions:
+#
+#  (a) A 9-level include chain is resolved all the way into the manifest, so a
+#      tool rewrite of a rule on level 9 is visible to T3's descriptor gate:
+#      rc != 0, zero net writes after force recovery, snapshot retained. Mutation: lower the
+#      shell cap back to 8 -> level 9 becomes an opaque boundary, the rewrite
+#      is invisible and the tool stub is never blamed -> this case fails.
+#  (b) An include that EXISTS but would need level 13 must fail closed at the
+#      manifest builder itself, not become an opaque boundary. Mutation: drop
+#      the fail-closed branch -> _pam_model_manifest returns 0 -> this case
+#      fails even though no install is attempted.
+test_pam_105_deep_include_closure_fail_closed() {
+    local s log rc i
+
+    # (a) nine-level chain; level 9 holds a non-fp rule the tool rewrites.
+    s="$(setup_pam_sandbox deep-include-level9)"
+    pam_write_full_stack "$s"
+    for i in 1 2 3 4 5 6 7 8; do
+        printf '@include deep-l%s\n' "$((i + 1))" > "$s/pam/deep-l$i"
+    done
+    printf 'auth required pam_wheel.so deep\n' > "$s/pam/deep-l9"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+@include deep-l1
+auth required pam_permit.so
+EOF
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/deep-l9" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    text = fh.read()
+text = text.replace('pam_wheel.so deep', 'pam_wheel.so rewritten')
+with open(p, 'w') as fh:
+    fh.write(text)
+PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/deep-l9" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-105/level9: a rewritten rule at include level 9 fails closed"
+    assert_contains "pam_wheel.so rewritten" "$(cat "$s/tool.modified" 2> /dev/null || echo '')" \
+        "PAM-105/level9: the tool really rewrote the level-9 rule"
+    # This is a POST-convergence T3 failure, so the project's own strip sed has
+    # already run; "zero writes" here means zero NET writes after force recovery.
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-105/level9: common-auth was force-restored (zero net writes)"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed during convergence" "$log" \
+        "PAM-105/level9: the deep descriptor change is named as a T3 failure"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-105/level9: forced recovery succeeded"
+    [ -f "$s/manifest/pam-selection" ] && ok \
+        || fail "PAM-105/level9: snapshot retained for uninstall"
+
+    # (b) a 13-level chain exceeds the shared cap: the builder itself must
+    # refuse instead of leaving level 13 as an opaque boundary.
+    s="$(setup_pam_sandbox deep-include-limit)"
+    pam_write_full_stack "$s"
+    for i in $(seq 1 12); do
+        printf '@include deep2-l%s\n' "$((i + 1))" > "$s/pam/deep2-l$i"
+    done
+    printf 'auth required pam_permit.so tail\n' > "$s/pam/deep2-l13"
+    cp -a "$s/pam/deep2-l13" "$s/original.deep2-l13"
+    cat > "$s/pam/common-auth" << 'EOF'
+auth sufficient pam_fprintd.so
+auth [success=1 default=ignore] pam_unix.so nullok
+@include deep2-l1
+auth required pam_permit.so
+EOF
+    rc=0
+    LOG_FILE="$s/direct.log" bash -c '
+        source "$1/lib/pam.sh"
+        _PAM_DIR="$3"
+        work="$(mktemp -d)"
+        _pam_parse_file "$3/common-auth" "$work/rec" common common-auth || exit 9
+        _pam_model_manifest "$work" "$work/manifest" "$work/rec|common-auth"
+        rc=$?
+        rm -rf "$work"
+        exit "$rc"
+    ' _ "$REPO_ROOT" "$s" "$s/pam" > /dev/null 2>&1 || rc=$?
+    assert_neq "0" "$rc" \
+        "PAM-105/limit: an existing level-13 include fails closed"
+    assert_contains "exceeds the modelled depth of 12" \
+        "$(cat "$s/direct.log" 2> /dev/null || echo '')" \
+        "PAM-105/limit: the refusal names the shared depth cap"
+    assert_eq "$(file_hex "$s/original.deep2-l13")" "$(file_hex "$s/pam/deep2-l13")" \
+        "PAM-105/limit: zero writes to the unresolved deep file"
+}
+
 test_pam_92_mixed_management_groups_fails_closed
 test_pam_93_same_module_multi_instance_fails_closed
 test_pam_94_include_expansion_parity
@@ -15687,6 +15785,7 @@ test_pam_100_module_arg_normalization_fails_closed
 test_pam_101_zero_addition_after_jump
 test_pam_102_sudo_canonical_args_change
 test_pam_addition_allowlist_literal_match
+test_pam_105_deep_include_closure_fail_closed
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

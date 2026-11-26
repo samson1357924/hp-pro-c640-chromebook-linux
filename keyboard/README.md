@@ -510,9 +510,10 @@ cycle is re-anchored to the **token epoch** (never wall-clock time) and logs
 `keeping committed cycle handoff`. When there is no resume flag,
 `PrepareForSleep(false)` calls `restore_from_local_state()` instead of doing nothing: it
 restores the daemon's own saved brightness (under `RESUME_LOCK`) without adopting a
-handoff, touching the handoff files or writing an adopted-cycle marker. D11–D14 cover the
+handoff, touching the handoff files or writing an adopted-cycle marker. D11–D17 cover the
 delayed-true interleaving, the no-flag fallback, token mismatch not being a delete reason,
-genuinely stale cleanup and the no-fresh-handoff case.
+genuinely stale cleanup and the no-fresh-handoff case. D15–D17 add the future begin/commit
+proof, the legacy three-column sidecar upgrade and the date fallback.
 
 **Physical write serialisation and generation gate (Tier 1):** every physical
 `SetBrightness`/gsd `Properties.Set` is wrapped in `WRITE_LOCK` (flock fd 209),

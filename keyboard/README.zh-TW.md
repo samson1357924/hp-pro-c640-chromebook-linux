@@ -428,8 +428,9 @@ value 一致）即證明屬於本 cycle，即使時鐘回撥或中毒的未來 `
 **token epoch** 重新錨定（絕非 wall-clock 時間），並記錄 `keeping committed cycle handoff`。
 沒有 resume flag 時，`PrepareForSleep(false)` 改呼叫 `restore_from_local_state()`：在
 `RESUME_LOCK` 下還原 daemon 自己的已存亮度，不 adopt handoff、不碰 handoff 檔、不寫
-adopted-cycle marker。D11–D14 涵蓋延遲 true 交錯、無 flag fallback、token 不符不當作
-刪檔理由、真正過期清理與無新 handoff 的案例。
+adopted-cycle marker。D11–D17 涵蓋延遲 true 交錯、無 flag fallback、token 不符不當作
+刪檔理由、真正過期清理與無新 handoff 的案例；D15–D17 另涵蓋 future begin/commit
+proof、legacy 三欄 sidecar 升級與 date fallback。
 
 **實體寫入序列化與 generation gate（Tier 1）**：每次實體
 `SetBrightness`／gsd `Properties.Set` 都在 `WRITE_LOCK`（flock fd 209）內，包含

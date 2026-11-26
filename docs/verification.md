@@ -402,9 +402,10 @@ P1/P1/P2/P2; none of the earlier closed items is reopened.
   the token epoch (never wall-clock time) and logs `keeping committed cycle handoff`.
   `PrepareForSleep(false)` with no flag now calls `restore_from_local_state()` — it
   restores the daemon's own saved brightness without adopting a handoff, touching the
-  handoff files or writing an adopted-cycle marker. Deterministic interleavings D11–D14
+  handoff files or writing an adopted-cycle marker. Deterministic interleavings D11–D17
   cover delayed true after pre/post commit, the false fallback, token mismatch not being
-  a delete reason, genuine stale cleanup and no-fresh-handoff recovery.
+  a delete reason, genuine stale cleanup and no-fresh-handoff recovery. D15–D17 add the
+  future begin/commit proof, the legacy three-column sidecar upgrade and the date fallback.
 
 **Current local totals:** daemon **976 passed, 0 failed**, sleep hook **398 passed,
 0 failed**, rollback **2508 passed, 0 failed**; keyd self-test **34 cases**,

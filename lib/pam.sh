@@ -530,10 +530,19 @@ _pam_model_workdir() {
     printf '%s\n' "$path"
 }
 
+# Depth cap for the resolved @include closure. MUST match MAX_INCLUDE_DEPTH in
+# lib/pam_stack_model.py: if the shell expands fewer levels than the model can
+# represent, a deep include is left as an opaque boundary and a later rewrite
+# of that deep rule is invisible to T3's zero-addition/argsfp gate (fail open).
+_PAM_MODEL_MAX_INCLUDE_DEPTH=12
+
 # $1=work dir, $2=manifest output, rest: "<records-file>|<filetag>" specs.
-# Parses @include targets from the same PAM dir up to a bounded depth; an
-# unavailable target becomes an opaque boundary which the model refuses to
-# jump into instead of guessing a landing. rc 1 = unsupported topology.
+# Parses @include targets from the same PAM dir up to _PAM_MODEL_MAX_INCLUDE_DEPTH.
+# An include target that is genuinely unavailable becomes an opaque boundary
+# which the model refuses to jump into instead of guessing a landing. An
+# include target that EXISTS but cannot be resolved within the depth cap is a
+# DIFFERENT case: it is unsupported and fails closed (rc 1), never an opaque
+# boundary -- otherwise depth-limited rules would be silently unmodelled.
 _pam_model_manifest() {
     local work="$1" manifest="$2" spec rec tag line kind start target
     local target_file target_rec exists=0 depth=0
@@ -546,7 +555,10 @@ _pam_model_manifest() {
         printf '%s\t%s\n' "$tag" "$rec" >> "$manifest" || return 1
         queue+=("$rec|$tag")
     done
-    while [ "$depth" -lt 8 ] && [ "${#queue[@]}" -gt 0 ]; do
+    # Round N resolves level-N files (the roots are level 0). Processing the
+    # level-MAX round is required so that an include coming OUT of the deepest
+    # representable file is detected rather than silently left unresolved.
+    while [ "$depth" -le "$_PAM_MODEL_MAX_INCLUDE_DEPTH" ] && [ "${#queue[@]}" -gt 0 ]; do
         next=()
         for spec in "${queue[@]}"; do
             rec="${spec%%|*}"
@@ -565,6 +577,10 @@ _pam_model_manifest() {
                 grep -qF -- "$target"$'\t' "$manifest" && continue
                 target_file="$_PAM_DIR/$target"
                 [ -f "$target_file" ] || continue
+                if [ "$depth" -eq "$_PAM_MODEL_MAX_INCLUDE_DEPTH" ]; then
+                    log_error "PAM include '$target' in $tag exceeds the modelled depth of $_PAM_MODEL_MAX_INCLUDE_DEPTH; refusing to modify PAM configuration."
+                    return 1
+                fi
                 target_rec="$work/rec.$target.$depth"
                 _pam_parse_file "$target_file" "$target_rec" common "$target" || {
                     log_error "Could not parse included PAM file $target_file; refusing to modify PAM configuration."
@@ -578,6 +594,12 @@ _pam_model_manifest() {
         if [ "${#next[@]}" -gt 0 ]; then queue=("${next[@]}"); else queue=(); fi
         depth=$((depth + 1))
     done
+    # Belt and braces: never hand the model a manifest whose closure is still
+    # open because of the depth cap.
+    if [ "${#queue[@]}" -gt 0 ]; then
+        log_error "PAM include closure is still unresolved after $_PAM_MODEL_MAX_INCLUDE_DEPTH levels; refusing to modify PAM configuration."
+        return 1
+    fi
     return 0
 }
 
