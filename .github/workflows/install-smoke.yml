@@ -614,6 +614,16 @@ jobs:
           cp -a "$custom_stack" /etc/pam.d/common-auth
           # P3: pin the REASON, not just the non-zero rc, so a future mutation
           # that fails closed for an unrelated reason cannot satisfy this guard.
+          # Phase A per-group model: the planned-stack proof now refuses the
+          # edit with "would change a per-management-group stack or its numeric
+          # jump target". This is the same jump-landing safety property the old
+          # numeric-jump-identity pin described: dropping the fp rule would
+          # move the success=1 landing from pam_deny.so to
+          # pam_permit.so. Pin the proof evidence too (the rule descriptor
+          # change carrying that exact landing transition), so a future wording
+          # change elsewhere cannot satisfy the guard on the reason string
+          # alone. Uncertain syntax / unsupported topology / depth failures
+          # emit different messages and cannot satisfy both pins together.
           pam77_log=/tmp/pam-e2e-pam77-reason.log
           : > "$pam77_log"
           custom_rc=0
@@ -623,9 +633,11 @@ jobs:
             echo "::error::PAM-77 custom jump stack was silently accepted"
             exit 1
           fi
-          grep -qF "numeric jump target identity changes" "$pam77_log" \
-            || { echo "::error::PAM-77 fail-closed reason was not the numeric jump target change"; exit 1; }
-          echo "PAM-77 fail-closed reason pinned: numeric jump target identity changes"
+          grep -qF "would change a per-management-group stack or its numeric jump target" "$pam77_log" \
+            || { echo "::error::PAM-77 fail-closed reason was not the per-group numeric jump target change"; exit 1; }
+          grep -qE "rule descriptor changed: .*pam_deny\.so.*->.*pam_permit\.so" "$pam77_log" \
+            || { echo "::error::PAM-77 fail-closed proof did not show the pam_deny.so -> pam_permit.so jump landing change"; exit 1; }
+          echo "PAM-77 fail-closed reason pinned: per-management-group numeric jump target change (pam_deny.so -> pam_permit.so landing)"
           cmp -s /etc/pam.d/common-auth "$custom_stack" \
             || { echo "::error::PAM-77 custom stack bytes were modified"; exit 1; }
           test ! -e /var/lib/cros-enablement/pam-selection \
