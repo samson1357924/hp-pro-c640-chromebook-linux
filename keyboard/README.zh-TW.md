@@ -2,25 +2,50 @@
 
 # 鍵盤頂排映射（HP Pro c640 Chromebook）
 
-ChromeOS 裝置頂排為專用功能鍵而非傳統 F1-F12。在標準 Linux 下，這些按鍵可透過核心/硬體層的 `systemd-hwdb` 或輸入層的 `keyd` 重新映射。
+多數 ChromeOS 裝置頂排為專用功能鍵而非傳統 F1-F12（這台 Dratini 則是直接送
+AT `F1`-`F10`）。在標準 Linux 下，這些按鍵可透過核心/硬體層的 `systemd-hwdb`
+或輸入層的 `keyd` 重新映射。
 
 ---
 
 ## 🎹 頂排按鍵對照表
 
-| 實際位置 | ChromeOS 圖示 | AT 掃描碼 | Linux hwdb 鍵碼 | 建議功能 |
+| 實際位置 | ChromeOS 圖示 | 原始掃描碼 / hwdb 屬性 | Linux hwdb 鍵碼 | 建議功能 |
 | :--- | :--- | :--- | :--- | :--- |
-| **頂排 1 (F1)** | ◀ (返回) | `KEYBOARD_KEY_ea` | `KEY_BACK` | 瀏覽器 / 應用程式返回 |
-| **頂排 2 (F2)** | ▶ (前進) | `KEYBOARD_KEY_e9` | `KEY_FORWARD` | 瀏覽器 / 應用程式前進 |
-| **頂排 3 (F3)** | ⟳ (重新整理) | `KEYBOARD_KEY_e7` | `KEY_REFRESH` | 重新載入頁面 |
-| **頂排 4 (F4)** | ⛶ (全螢幕) | `KEYBOARD_KEY_91` | `KEY_F11` | 切換全螢幕 |
-| **頂排 5 (F5)** | ⧉ (總覽) | `KEYBOARD_KEY_92` | `KEY_SCALE` | GNOME / 桌面工作切換 |
-| **頂排 6 (F6)** | 🔅 (降低亮度) | `KEYBOARD_KEY_ee` | `KEY_BRIGHTNESSDOWN` | 降低螢幕背光 |
-| **頂排 7 (F7)** | 🔆 (提高亮度) | `KEYBOARD_KEY_ef` | `KEY_BRIGHTNESSUP` | 提高螢幕背光 |
-| **頂排 8 (F8)** | 🔇 (靜音) | `KEYBOARD_KEY_a0` | `KEY_MUTE` | 音訊靜音 |
-| **頂排 9 (F9)** | 🔉 (降低音量) | `KEYBOARD_KEY_ae` | `KEY_VOLUMEDOWN` | 降低音量 |
-| **頂排 10 (F10)** | 🔊 (提高音量) | `KEYBOARD_KEY_b0` | `KEY_VOLUMEUP` | 提高音量 |
-| **Search / Launcher** | 🔍 (搜尋) | `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) 或 CapsLock |
+| **頂排 1 (F1)** | ◀ (返回) | `0x3b` / `KEYBOARD_KEY_3b` | `KEY_BACK` | 瀏覽器 / 應用程式返回 |
+| **頂排 2 (F2)** | ▶ (前進) | `0x3c` / `KEYBOARD_KEY_3c` | `KEY_FORWARD` | 瀏覽器 / 應用程式前進 |
+| **頂排 3 (F3)** | ⟳ (重新整理) | `0x3d` / `KEYBOARD_KEY_3d` | `KEY_REFRESH` | 重新載入頁面 |
+| **頂排 4 (F4)** | ⛶ (全螢幕) | `0x3e` / `KEYBOARD_KEY_3e` | `KEY_F11` | 切換全螢幕 |
+| **頂排 5 (F5)** | ⧉ (總覽) | `0x3f` / `KEYBOARD_KEY_3f` | `KEY_SCALE` | GNOME / 桌面工作切換 |
+| **頂排 6 (F6)** | 🔅 (降低亮度) | `0x40` / `KEYBOARD_KEY_40` | `KEY_BRIGHTNESSDOWN` | 降低螢幕背光 |
+| **頂排 7 (F7)** | 🔆 (提高亮度) | `0x41` / `KEYBOARD_KEY_41` | `KEY_BRIGHTNESSUP` | 提高螢幕背光 |
+| **頂排 8 (F8)** | 🔇 (靜音) | `0x42` / `KEYBOARD_KEY_42` | `KEY_MUTE` | 音訊靜音 |
+| **頂排 9 (F9)** | 🔉 (降低音量) | `0x43` / `KEYBOARD_KEY_43` | `KEY_VOLUMEDOWN` | 降低音量 |
+| **頂排 10 (F10)** | 🔊 (提高音量) | `0x44` / `KEYBOARD_KEY_44` | `KEY_VOLUMEUP` | 提高音量 |
+| **Search / Launcher** | 🔍 (搜尋) | `0xdb` / `KEYBOARD_KEY_db` | `KEY_LEFTMETA` | Super (Meta) 或 CapsLock |
+
+> **掃描碼是 2026-10-31 在實機 Dratini 上推論而來。** `0x3b`-`0x44`
+> （`KEY_F1`-`KEY_F10`）是由 hwdb 轉換後的 `EVIOCGKEY` 按鍵狀態對照標準 AT
+> 掃描碼表推論，`EVIOCGKEYCODE` 只確認核心映射表；**不是**部分 Chromebook
+> 使用的 ChromeOS action 掃描碼（`0xea`、`0xe9`、`0xe7`…）。目前證據中沒有
+> 原始 `MSC_SCAN` 捕獲，要確認仍需停掉 keyd 後用
+> `check-top-row-hwdb.py --scan` 或不加 `--grab` 的 `evtest` 擷取。因此 hwdb
+> 必須映射 `0x3b`-`0x44`；映射 action 掃描碼在這台機器上完全無效。推論表存於
+> `keyboard/tests/hwdb-top-row-scancodes.tsv`，CI 會逐條斷言。
+>
+> **其他 Chromebook／其他 Hatch 機板：** 這份映射**只**套用於
+> `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
+> DMI 條目；它**不匹配**其他 Hatch 機板（在實機 Dratini 上，「Hatch」是產品
+> 家族而非產品名稱，因此不使用 `pn*Hatch*` 萬用字元）。其他機型會送各自的
+> 掃描碼，需要建立自己的 hwdb 條目。沿用這張表前，請先停掉 keyd
+> （`sudo systemctl stop keyd`），用 `check-top-row-hwdb.py --scan 60` 或
+> 不加 `--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論
+> 掃描碼並建立自己的 hwdb 條目。未知機型或 `EVIOCGKEYCODE` 不支援時，改用
+> `check-top-row-hwdb.py --scan-only 60`：它完全跳過表格檢查，因此 Dratini
+> fixture 不符也不會擋住原始擷取。**擷取完成後請執行
+> `sudo systemctl start keyd` 恢復服務**，否則 Search 輕點/長按與亮度重映射
+> 會持續失效。`--listen` 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件，不是原始
+> 掃描碼。
 
 ---
 
@@ -39,8 +64,135 @@ chmod +x keyboard/install-keyboard.sh
 
 * `./keyboard/install-keyboard.sh --check`：檢查 hwdb 是否已部署。
 * `./keyboard/install-keyboard.sh --dry-run`：預覽操作。
-* `./keyboard/install-keyboard.sh --uninstall`：還原 hwdb 變更。
-* `./keyboard/install-keyboard.sh --with-keyd`：連 keyd 一起安裝（進階雙重角色）。
+* `./keyboard/install-keyboard.sh --uninstall`：移除頂排 hwdb、背光同步與（若已安裝的）keyd 設定。
+* `./keyboard/install-keyboard.sh --with-keyd`：連 keyd 一起安裝（進階雙重角色）。若 keyd
+  服務無法啟動會回傳非 0：只寫入設定檔但沒有 keyd binary 時回傳 3；設定被拒絕、服務 manifest
+  寫入失敗（不部署設定、不 enable/restart，snapshot 保留為 `.failed`）或重啟/回復失敗時回傳 1。
+* `./keyboard/install-keyboard.sh --keyd-config-only`：隱含 `--with-keyd`，但明確接受「只有設定檔、沒有 keyd 服務」的結果（rc 0）；安裝器仍會標明雙重角色**未**生效。
+
+**keyd 快照目錄（進階）：** `CROS_ENABLEMENT_KEYD_SNAPSHOT_DIR` 可覆寫預設的
+`/var/lib/cros-enablement-keyd-snapshots`。自訂路徑必須是絕對路徑：base 需為 root 擁有且權限
+`0700`，所有上層目錄也需 root 擁有，直接父目錄不得為群組/其他人可寫（即使有 sticky 位也一樣）。
+家目錄下的路徑會被拒絕；任一檢查失敗時安裝器會拒絕部署 keyd 設定。
+
+**備份 manifest 採 fail-closed：** 部署的檔案、服務與群組會記錄在
+`/var/lib/cros-enablement/install-manifest.json`。manifest 不存在時仍會建立空骨架；
+但若**已存在的 manifest 損毀/無效**，會記錄 `MANIFEST_INVALID ... original bytes left
+untouched`、原檔保持位元組不變，並讓備份/寫入路徑拒絕繼續（解析失敗時不備份任何目標，
+也不宣稱任何目標已受追蹤）。重裝前請修復或明確移除損毀的 manifest，以免 rollback
+覆蓋範圍被悄悄放棄。
+
+紀錄**按欄位型別驗證，絕不修補**（所有 reader/writer 共用同一驗證器）。record 的
+`target` 必須是無 NUL 的絕對路徑字串；`component`、`installed_at`、`version`、`scope`
+若存在必須是字串。安全決策欄位 `was_existing`、`was_enabled`、`was_active`、
+`was_member` 為**必填布林**——所有真實 writer（v1.0 與 v2.0）一直都會寫出這些欄位，
+因此真正向後相容的只有頂層陣列缺席、keyd record 缺 `component`（回填）或缺 `scope`。
+字串 `"false"` 與數字 `1` 會被拒絕，不會被轉換；service 的 `name`/`component`、group 的
+`group`/`user`/`component` 為必填，其他選用欄位可缺席，未知 key 忽略。型別錯誤是新的
+`MANIFEST_INVALID` 原因（不只是 JSON 損毀），原檔位元組保持不變。非絕對的 pseudo-target
+（例如指紋的 `package:libfprint-crfpmoc`）在寫入紀錄前會被略過並記錄
+`skipping manifest entry with non-absolute target`（Meson install plan 的目的路徑也必須
+是絕對路徑），讓安裝器不會寫出自己驗證器日後會拒絕的紀錄。
+
+**整個元件操作與 manifest 寫入跨程序序列化：** `install_keyboard()`、
+`uninstall_keyboard()` 與 `install_keyd_step()` 各自透過 `run_manifest_operation()`
+（`lib/backup.sh`）在備份/紀錄 → 部署 → 完成/回滾期間只取得一把操作級鎖；巢狀 helper 以
+`MANIFEST_LOCK_DEPTH` 重入，`DRY_RUN` 則完全不取鎖。這可避免平行 uninstall 在目標檔缺席時
+消耗剛寫入的 `was_existing=false` 紀錄，留下沒有追蹤紀錄的已部署檔案。每一次
+read-modify-write（備份 helper 加上此處的 keyd-link 正規化）都在該鎖內執行，
+`flock -x -w` 等待 `$MANIFEST_DIR/.install-manifest.lock`（fd 9）最多
+`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒）；缺少 `flock` 或等待逾時都會 fail
+closed 且保持 manifest 位元組不變。鎖檔是 root 擁有的 `0600` 普通檔，由短暫的
+`coproc sudo bash -c` root helper 持有 fd 9，並以 `/proc/$$/fd/9` 檢查 fd/路徑
+`(dev,ino)`、owner `0`、mode `600` 與檔案型別；父行程關閉 pipe 即釋放 flock（無 stale
+lock、無 EXIT trap）。`CROS_ENABLEMENT_MANIFEST_DIR` 必須是絕對路徑（否則記錄
+`must be an absolute path`），且**任何字面 symlink component 一律拒絕**
+（`contains a symlink` / `untrusted symlink`），即使是 root 擁有也一樣——這是 fail-closed
+取捨，因為 symlink 可隱藏使用者可寫、能重新命名鎖的目標。gate 以 `realpath -e` 解析最深的
+存在前綴並補回缺少的層（仍支援首次建立），再檢查 **canonical** 祖先
+（`untrusted realpath ancestor`）。**直接父目錄必須由 root 擁有**——目前 EUID/UID 擁有
+不再合格，因為其擁有者可將有效的鎖重新命名——且每一層祖先都必須由 root 控管：非 root
+擁有或群組/其他可寫但無 sticky 的層會 fail closed（`not root-controlled`），root 擁有且具
+sticky 的世界可寫層（例如 `/tmp` `1777`）可通過。`/var/lib/cros-enablement` 請維持
+`0755`；舊的 `0644` 鎖會升級為 `0600`。在 holder 行程內，`realpath -e "$dir"` 必須仍等於
+canonical 父目錄（否則 `FAILED:canonical`），且每一層真實祖先必須 uid `0`，並為非群組/
+其他可寫或 root sticky（否則 `FAILED:ancestor`）。holder 並以 **fd 8** 釘住直接父目錄
+（重新檢查 uid/mode/type/dev+ino，失敗印 `FAILED:parentdir`），防止重新命名讓第二個
+程序對新 inode 取鎖；symlink、非普通檔與 inode 替換同樣 fail closed。gate → 重新讀取 → 決策 → 寫入
+全在 critical section 內，因此平行程序不會遺失另一程序
+first-wins 的備份/服務/群組紀錄。每個 writer 使用唯一的 `.install-manifest.*.tmp`
+（mkstemp + fsync + `chmod 0644` + `os.replace`）而非共用 `.tmp`，避免平行 writer 覆寫彼此
+的暫存檔。鎖檔以 `umask 077` + `set -C` 建立（絕不用 `install`），因此 inode 不會被替換。
+
+**rollback 在任何副作用前先做 gate：** `rollback_component()`、`uninstall_keyboard()` 與
+`remove_group_membership()` 會先驗證 manifest——在 `systemctl disable keyd` / `gpasswd -d`
+以及任何服務/檔案變更之前——驗證失敗即 fail closed（rc 1、不 log_success）。rollback
+將驗證過的文件經 stdin 餵給還原腳本（不再二次解析、沒有 TOCTOU 窗口）。由於服務先於檔案
+還原，腳本執行到一半失敗可能留下部分狀態：此時會記錄
+`rollback of <component> failed; service/file state may be partial (retained records
+remain for retry)` 並回傳 rc 1，而不是謊稱成功。
+
+**rollback 安全語意：**
+
+* **原始狀態未知即 fail closed。** `was_existing` / `was_enabled` / `was_active` /
+  `was_member` 欄位缺失或型別錯誤代表「原始狀態未知」，絕非 `false`。此類紀錄不刪檔、
+  不停服務、不移除成員資格；保留紀錄、警告（`RECORD_STATE_UNKNOWN` /
+  `SERVICE_STATE_UNKNOWN`）並回 rc 1。`_keyd_managed_by_us()` 同樣在沒有有效布林快照時
+  拒絕停用/停止 keyd。
+* **目標缺席時仍會還原。** 對 `was_existing` 紀錄，rollback 不論目標是否還存在，一律找出
+  最早且符合的備份，先暫存到目標旁，再以單次原子 `os.replace()` 取代（還原 owner、
+  mode 與 symlink 目標）。普通檔案/symlink 不會先 unlink，因此取代失敗時已安裝的目標
+  仍保持原樣；任何涉及目錄的交換（含 dir→dir）都會把舊項目移到一旁並在失敗時移回。只有確認
+  成功才消耗紀錄；找不到備份時保留紀錄、警告（`[WARN NO BACKUP]`）、記錄
+  `RECORD_BACKUP_MISSING` / `ROLLBACK_INCOMPLETE` 並回 rc 1，不會憑空建立檔案
+  （其他項目仍會正常 rollback）。
+* **還原失敗就保留紀錄。** 每一次 `systemctl` enable/disable/start/stop 都會檢查回傳碼
+  （含 timeout、stderr 與 spawn error）。失敗的服務會記錄 `SERVICE_RESTORE_FAILED` /
+  `ROLLBACK_INCOMPLETE`、保留紀錄供日後重試，並讓 rollback 回傳非 0；成功的則記錄
+  `[RESTORED SERVICE]`。
+* **先記錄群組 membership 再變更。** 對 `plugdev`，安裝器先把原始成員資格寫入 manifest，
+  再明確檢查 `sudo usermod -aG` 的 rc（移除 `|| true`）；若 `usermod` 失敗且先前沒有紀錄，
+  就移除剛寫入的紀錄。keyboard、fingerprint 與 EC 程式共用 `manifest_has_group` /
+  `manifest_remove_group` / `ensure_group_membership` helper。
+* **plugdev 歸屬由所有元件共同判定，過期紀錄會更新。** uninstall 時
+  `remove_group_membership()` 彙總所有元件的 `(group,user)` 紀錄：任一 `was_member=false`
+  即證明是我們加入的（rc 0），沒有紀錄代表無需 rollback（rc 1），**全部為 `true`** 代表
+  原本就存在（rc 3），欄位型別錯誤則 fail closed。first-wins 不變——rc 0 才執行
+  `gpasswd -d`（除非仍有 udev rule 需要該 group），成功後會消耗該組的**所有紀錄**
+  （`manifest_remove_group_all`），因此完整安裝/解除安裝不論元件順序皆可。**rc 3 時完全
+  不呼叫 gpasswd**：有 udev rule 仍引用時保留快照；一旦沒有 rule 引用（所有使用該 group
+  的元件皆已卸載），就以零次 gpasswd 消耗全部過期紀錄，讓下次安裝重新擷取真實的成員
+  資格。消耗失敗會 fail closed（rc 1）。`gpasswd -d` 失敗是真正的錯誤（rc 1），會折進
+  uninstaller 的結束碼，不再謊報成功。
+* **PAM 還原由 rollback 全權負責。** 指紋 uninstaller 絕不對 `/etc/pam.d/sudo` 執行 sed；
+  原始位元組由 `rollback_component("fingerprint")` 還原，因此原本就存在的精確
+  `pam_fprintd` 行會被保留。Debian/Ubuntu 安裝時**直接**以
+  `sed -i '/pam_fprintd\.so/d'` 移除 `common-*` 中的 fp 行，絕不呼叫
+  `pam-auth-update --remove fprintd`（那會直接刪除 debconf profile selection）。安裝時
+  會把 selection 與 `/var/lib/pam/*` 快照到 first-wins sidecar，並自行執行
+  `pam-auth-update --package` 收斂；uninstall 在 rollback 完成後以
+  `debconf-set-selections` + `--package` 還原並驗證 selection 後才消耗快照。
+  Debian 的 Tier 2 備份、管理員覆寫取捨、唯讀的 stale-record 檢查與 authselect/pam-config
+  限制見 [UNINSTALL.md](../docs/UNINSTALL.md)。
+* **PAM stack 依 management group 個別建模（第十九次 re-review）。** awk 解析器現在只輸出
+  原始 rule facts；`lib/pam_stack_model.py` 為 auth/account/password/session 建立**各自的**
+  handler stack、展開 `@include`、把 substack 視為不透明 frame，並在任何編輯**之前**於
+  未建模 substack 可能影響 numeric jump 或 transformation、或拓撲無法解析／不支援時 fail closed
+  （`Uncertain PAM rule syntax ... refusing to modify PAM configuration`、
+  `Removing the fingerprint rule ... would change a per-management-group stack or its numeric
+  jump target ...`）。instance identity 含 group/instance/control/path/args 與 jump 落點，
+  絕不是整份檔案共用的 module index；sudo strip+insert 共用單一 preflight，canonical 行
+  必須恰好一條。獨立 libpam oracle（`ctypes` `pam_start_confdir` 指向隔離 service dir，
+  搭配記錄 argv 的 fake module）黑盒比較 pre/post 的決策 rc 與 trace；缺少 symbol/compiler
+  時 CI gate 失敗，不靜默跳過。每個保留規則還帶 `argsfp`——完整 argument vector 的單射
+  hex 指紋（只在 libpam 會正規化處正規化；不支援 escape 即 fail closed）。non-fp
+  postcondition 是**零新增** gate：addition allowlist 預設為空，外部工具新增的規則會
+  fail closed。若後續驗證失敗，安裝器會先從保留的 snapshot **強制還原** `common-*`／sudo
+  再回 rc 1（`PAM transaction failed after mutation; force-restoring common-*/sudo from the
+  first-wins snapshot ...`）。
+
+所有安裝 caller 會先存 rollback rc、完成其餘收尾，最後才回傳該 rc，避免 `set -e` 在
+rollback 失敗時提前中止收尾。
 
 ---
 
@@ -48,12 +200,14 @@ chmod +x keyboard/install-keyboard.sh
 
 若希望 **Search 鍵** 呈現 **輕點為 CapsLock、長按為 Super/Meta**，或希望 `Search + 頂排` 輸出傳統 `F1-F10`：
 
-> **前置條件：** 需先安裝選項 1 `systemd-hwdb`。`keyd` 依賴 hwdb 已將
-> `0xEA/0xE9/0xE7/0x91/0x92/0xEE/0xEF/0xA0/0xAE/0xB0/0xDB` 轉為
-> `KEY_BACK`/`KEY_LEFTMETA` 等，`cros.conf` 使用這些名稱（`back`、`leftmeta`）。
-> 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。
+> **前置條件：** 需先安裝選項 1 `systemd-hwdb`。`keyd` 依賴 hwdb 已將推論的
+> 頂排掃描碼 `0x3b`-`0x44` 轉為 `KEY_BACK`/`KEY_BRIGHTNESSDOWN`…，以及
+> `0xDB`→`KEY_LEFTMETA`；`cros.conf` 使用這些名稱（`back`、`leftmeta`）。
+> 可用 `sudo python3 keyboard/tests/check-top-row-hwdb.py` 確認核心映射。
+> 建議：`sudo ./keyboard/install-keyboard.sh --with-keyd`（原子化安裝 hwdb+背光+keyd）。若系統尚未安裝 keyd，此指令現在會回傳
+> rc 3，而不會宣稱雙重角色已生效；若刻意只想部署設定檔（例如 CI 容器），請改用 `--keyd-config-only`。
 
-1. 安裝 `keyd`（CI 固定 `v2.6.0` `7c0aecb8...`）：
+1. 安裝 `keyd`（CI 固定 `v2.6.0` 只做語法檢查；實機行為驗證於 `2.5.0-5`）：
 
    ```bash
    # Ubuntu 25.04+ / Debian 13+（原生）
@@ -75,8 +229,15 @@ chmod +x keyboard/install-keyboard.sh
    sudo pacman -S keyd
 
    # NixOS
-   # services.keyd.enable = true;
+   # services.keyd.enable = true;  # 另需 environment.etc."keyd/cros.conf".source = ./keyboard/keyd/cros.conf
    ```
+
+   > **各發行版執行檔名稱不同（Ubuntu 26.04 實測）：** Debian/Ubuntu 套件安裝的是
+   > **`/usr/bin/keyd.rvaiya`**（2.5.0-5），而非 `/usr/bin/keyd`（`$PATH` 中沒有 `keyd`）；systemd 服務名稱
+   > 仍是 `keyd`。請用實際存在的名稱，例如 `keyd.rvaiya --version`；安裝器會透過
+   > `lib/syscheck.sh` 的 `keyd_bin()` 自動偵測。另外 **`keyd check` 僅存在於 keyd ≥ 2.6**，
+   > 2.5.x 會直接印出用法並回傳 0。CI 固定 v2.6.0 只驗證**語法**；下方所有
+   > tap/hold/防護行為都是在實機以 2.5.0-5 測得（見「實機驗證記錄」）。
 
 2. 安裝設定檔（建議走安裝器）：
 
@@ -84,21 +245,23 @@ chmod +x keyboard/install-keyboard.sh
    sudo ./keyboard/install-keyboard.sh --with-keyd
    # 等價手動：
    # sudo install -D -m 0644 keyboard/keyd/cros.conf /etc/keyd/cros.conf
-   # sudo ln -sf cros.conf /etc/keyd/default.conf
-   # keyd check /etc/keyd/cros.conf
-   # sudo systemctl enable --now keyd
+   # keyd check /etc/keyd/cros.conf     # 僅 keyd ≥ 2.6；2.5.x 於啟動時驗證
+   # sudo systemctl enable keyd
+   # sudo systemctl restart keyd         # keyd 2.5.x 只在啟動時讀取設定
    ```
 
 3. 驗證與調校：
 
    ```bash
-   keyd --version
-   sudo keyd monitor  # 短按 Search -> capslock，長按 -> leftmeta；Search+頂排 -> F1
+   keyd --version || keyd.rvaiya --version   # Ubuntu 26.04 為 keyd.rvaiya
+   # 被動擷取 keyd 的輸出（安全，不會 grab 裝置）：
+   sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
+   # 短按 Search -> capslock；長按 -> 乾淨的 leftmeta；Search+頂排 -> F1
    sudo systemctl status keyd
    journalctl -eu keyd -f
-   # 若輕點/長按太靈敏，於 /etc/keyd/cros.conf [global] 加入：
-   # overload_tap_timeout = 200  # ms，見 man keyd
-   # sudo keyd reload
+   # 輕點/長按門檻是 /etc/keyd/cros.conf 裡 overloadt2() 的第三個參數
+   # （目前 200 ms）。[global] 的 overload_tap_timeout 只影響 plain
+   # overload()，對 overloadt2() 無效。改完數字後 restart keyd 生效。
    ```
 
    **GNOME Wayland 觸控板 quirk**（選用，修 `disable-while-typing` 卡頓）：
@@ -109,6 +272,21 @@ chmod +x keyboard/install-keyboard.sh
    ```
 
     **備註：**
+    * `[ids] 0001:0001` 將 `cros.conf` 限定在內建 AT 鍵盤。若用萬用字元 `*`，會一併
+      grab ChromeOS 的 `Video Bus`（`0000:0006`）與外接 USB 鍵盤，造成亮度鍵重複處理、
+      外接鍵盤按鍵被吞掉。若要一併映射外接鍵盤，請從 `sudo keyd monitor` 取得 ID 後加入。
+    * 使用 `overloadt2(meta, capslock, 200)` 後，**輕點是乾淨的 `CAPSLOCK`**（不再送
+      `leftmeta`），長按是 `Super`。單純的 `overload(meta, capslock)` 不行：它在按下時
+      就啟動 Meta 層，放開時 keyd 的修飾鍵防護（`src/keyboard.c` 的 `clear_mod()`）
+      會插入 `LEFTCTRL`，Mutter 會把這串當成 `Meta+Ctrl` 組合，因此長按永遠打不開
+      GNOME 活動總覽。`overloadt2` 會延後判定，且圖層放開路徑會抑制防護，單純長按
+      放開只送出乾淨的 `LEFTMETA` down/up。
+    * 200 ms 是輕點/長按的分界：在這之內放開是 CapsLock，超過就是 Super；
+      Search 按住期間按其他鍵會判定為長按。
+    * 頂排鍵刻意不在 `[main]` 重新映射；keyd 對未映射的鍵會原樣放行，因此 hwdb
+      轉出的媒體鍵在單按時仍有效，`[meta:M]` 則提供 F1-F10 層。
+    * keyd 2.5.x 沒有裝置熱插拔偵測：修改 `/etc/keyd/*.conf` 後必須
+      `sudo systemctl restart keyd`（`reload` 只會重新解析已被 grab 裝置的設定）。
     * `X11` 使用者：`setxkbmap` 會在 `keyd restart` 後重置，需重套。
     * `TTY` 由 `uinput` 支援；若設定鎖死，急救：`backspace+escape+enter`。
 
@@ -119,6 +297,13 @@ chmod +x keyboard/install-keyboard.sh
 螢幕熄滅/鎖定時自動關閉鍵盤背光，螢幕點亮時自動恢復。支援 GNOME Wayland
 閒置（`org.gnome.ScreenSaver` + `org.freedesktop.login1 PrepareForSleep` 對應 S3 盒蓋）與 ChromeOS EC
 `cros_kbd_led_backlight`（`/sys/class/leds/chromeos::kbd_backlight`）。
+
+**寫入鏈（single-writer）**：daemon 先寫 gsd-power 屬性
+`org.gnome.SettingsDaemon.Power.Keyboard.Brightness`（百分比）——它是唯一權威寫入者，
+可同步 gsd-power 自己的快取並驅動 UPower/LED。只有 gsd-power 不可用時才降級到
+UPower `KbdBacklight.SetBrightness`（raw），再降級到 `sysfs`/`ectool`。讀取走 UPower
+`GetBrightness`。`C640_KBD_FORCE_LEGACY=1` 會停用兩個 D-Bus 後端，強制走
+`sysfs`/`ectool`（便於 A/B 比較）。
 
 透過 `./keyboard/install-keyboard.sh` 自動安裝：
 
@@ -132,17 +317,210 @@ chmod +x keyboard/install-keyboard.sh
 
 **安裝內容：**
 
-* `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`）
+* `61-chromeos-kbd-backlight.rules` → `/etc/udev/rules.d/`（`TAG+="uaccess"`，並以
+  `RUN+=chgrp plugdev` / `RUN+=chmod 0660` 調整 brightness 屬性權限）
 * `c640-kbd-backlight-sync` → `/usr/local/bin/`（bash daemon，`gdbus`/`dbus-monitor` 事件驅動，預設無輪詢）
-* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`）
-* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（S3 喚醒後恢復，
-  0.6 秒 debounce 避免 `LED_CORE_SUSPENDRESUME` 競態）
+* `c640-kbd-backlight-sync.service` → `/etc/systemd/user/`（全域啟用，`WantedBy=graphical-session.target`；
+  `StandardError=journal` 讓所有 daemon 日誌出現在 `journalctl`）
+* `c640-kbd-backlight-sleep.sh` → `/usr/lib/systemd/system-sleep/`（在 frozen
+  `user.slice` 下只當純 handoff 寫入者：不寫 LED、不查 D-Bus、不刪 state、不延遲）
+
+**儲存/還原語意**：亮度 `0` 也是有效的已存值，且與其他數值走完全相同的寫入/驗證路徑。
+選值時優先用當下非零讀數，所以熄滅前剛調整的亮度不會被 5 秒取樣的快取覆蓋。快取只用於
+blank-side 的 0（韌體已關閉）、無法讀取的硬體，以及*新鮮*的手動關閉（`source=manual0`
+附 `ts`，僅在 gsd-power 仍回報**明確的** 0 時，於 `C640_KBD_LAST_USER_TTL=15` 秒內有效；
+gsd 查詢失敗/空值代表「無法確認」，不是 0，此時以當下非零讀數為準）。sampler 也遵守
+同一規則：空值 gsd 的兩個 on-screen 0 不會被記成 `manual0`。sidecar
+`LAST_USER_META_FILE`（`c640-kbd-backlight.last-user.meta`）記錄
+`source=nonzero|manual0` + `ts` + `restore=<generation>`；generation 戳記讓 unblank guard
+能分辨「還原後的使用者變更」與「熄屏前的過期快取」。daemon 重啟時會以當下讀數重新
+seed（`cur=0` → `manual0`）。沒有 state 檔時完全不寫入，因此使用者手動調整會被保留。
+
+`save_state()` 是原子且**first-wins 只保護有效副本**：持鎖（`STATE_LOCK`）時會檢查已存值是
+單行、無 NUL 的純非負十進位整數。有效的既有副本絕不被覆寫，即使之後又熄滅一次；空白、
+非數字、多列或二進位的 state 檔不算副本——會在鎖內驗證後，以本次熄滅擷取到的值原子取代，
+並記錄 `replacing invalid saved brightness with N`。選值在取鎖前完成；只有真正的
+mktemp/寫入/驗證失敗才回 rc `2` 並保持 LED 亮著。
+
+`save_state()` 有明確的 rc：`0` = 已有有效副本（原本就存在或剛自我修復）、
+`1` = state lock 的 `flock -w` 逾時或出錯、`2` = 選值或寫入 state 失敗。
+`C640_KBD_SAVE_LOCK_WAIT` 限制該等待時間（預設 `2s`；`0` = 不等待）。熄滅時 daemon
+**在關閉 LED 前只取樣一次**，而**第一次 `save_state "$captured"` 就直接使用該擷取值——
+不會再取樣第二次**。取樣兩次可能讓 blank-side 的硬體 `0` 回退到過期的 last-user cache
+（把真實的 `30` 存成 `8`），而這個錯誤值之後的重試永遠不會修正。只有當擷取結果本身為空時，
+`save_state` 才會自行取樣；重試則一律重用同一個擷取值。**保存成功才關閉 LED**；若全部失敗，
+會記錄 `blank: brightness NOT saved (...)`、`blank: deferred save attempt N failed`、
+保持 LED 亮著，並把擷取值留在 last-user cache，讓下次熄滅仍有機會保存。
+`--test-blank` 在保存失敗時回傳 1。
+
+`set_brightness()` 在至少一個後端接受寫入且讀回（`verify_brightness()`）確認後回傳 0
+（成功）；沒有任何讀回途徑時，寫入成功會附 WARN 視為成功；rc 1 代表寫入失敗或讀回
+不一致。慢速寫入前，state 會先暫存到
+`C640_KBD_RESTORE_PENDING_FILE`（`c640-kbd-backlight.restore-pending`），讓寫入期間
+發生的熄滅仍能存下新值；暫存值**只有在寫入驗證成功後才消耗**，否則回滾（rc 1）並在
++0.5s/+1.5s/+3s 重試。暫存與 finalize 之間當機的值會在下次 daemon 啟動時復原。
+
+**ScreenSaver 是三態（fail-closed）**：`screensaver_tristate()` 回傳 `active`、
+`inactive` 或 `unknown`；只有明確的 `inactive` 允許還原寫入，`active`/`unknown` 都會
+**延後**並保留 state 給下次點亮。布林 wrapper `screensaver_is_active()` 供 sampler、
+重啟 seed 與 `guard_blank` 使用：前兩者遇到 unknown 只是不取樣，而 `guard_blank`
+在明確 `true` 時**會寫入 0**（最佳的額外強制熄火）。只有還原路徑使用 fail-closed 的三態。
+
+**sleep hook 只做 handoff**：真實 S3 週期中，systemd 會在 `post` 階段前凍結
+`user.slice`，因此 hook 絕不查詢使用者/session D-Bus、絕不寫 LED、絕不刪 state。
+`pre` 寫入 `/run/c640-kbd-backlight/state` 作為**本次開機第一次 suspend 的單次診斷快照**
+（first-wins，保留到重開機），並發佈 `c640-kbd-backlight.suspend`
+（`<token> <value> published`，`0` 有效）；`post` 只發佈
+`c640-kbd-backlight.resume`（`<token> <epoch> <action> <committed_value>`；第十九次
+新增第四欄，daemon 仍相容三欄 legacy flag，並以第四欄為權威，與 suspend copy 不符時
+警告）。root 快照**不被 hook 或 daemon 消耗，也從不用於還原**；daemon 只消費兩個
+handoff 檔與自己的 `$XDG_RUNTIME_DIR/c640-kbd-backlight.state`。`<token>` 是
+`<epoch>-<pid>-<random_hex>`，由 `pre` 每次鑄造；root-only `0600` cycle marker
+（`<token> <dev:ino> <value>`——第十九次起為**三欄**，legacy 兩欄 marker 直接 fail
+closed）是成功 `pre` 的最後一步。`post` 透過**單一**釘住的 directory fd + `O_NOFOLLOW`
+descriptor 驗證 suspend bytes（fstat 加上從同一 fd 對
+`<token> <value> published\n` 做 byte-exact 比對），因此同 inode 改值或相同文字的
+inode 替換都無法混入不同值。stdout contract 不變：`pre` 兩筆、`post` 一筆
+`OK dev:ino`，verifier 不印任何 `OK`。兩個 handoff 與 inode、committed value 都會由
+`post`／daemon 交叉比對。兩個 handoff 檔都是 `0600`、chown 給解析出的 session user
+（uid **與** gid），並由 inline `python3` writer 釘住 directory fd 發布：對目錄用
+`O_DIRECTORY|O_NOFOLLOW`，暫存檔用 `O_EXCL|O_NOFOLLOW` 的 `0600` 檔搭配
+`fchmod`／`fchown`，重查目錄 identity，再用 `src_dir_fd`／`dst_dir_fd` 執行
+`os.rename`（fd 釘住版的 `mv -T -f --`），最後驗證發布檔的 inode／owner／mode。
+destination entry、identity、mode 或 rename 失敗即 **fail closed**，**沒有 `cp`
+或一般 `mv` 降級**（`unsafe destination entry`／`cannot publish ...`）；`python3`
+是 `pre`／`post` 的新執行期依賴。root 診斷快照與 uid 釘住檔仍使用有 guard 的
+同目錄 `mv -T -f --`。uid 來自
+`Session.User`（`loginctl show-session` 的 `User=<uid>`），不是 User object 的 `UID=`；
+session ID 可為英數（如 `c1`）。`C640_KBD_HANDOFF_DIR` 可覆寫 hook 的目錄且依設計
+信任 caller（只檢查 `-d`），但最終 component 仍受保護。當 daemon 持有
+不同的非零已存值時，blank-side 的 handoff `0` 會被忽略，讓使用者亮度在「已熄屏時
+休眠」後仍保留——**除非**三者同時成立：新鮮的 last-user `source=manual0`（TTL 內）、
+cache 值為 `0`、且 gsd 明確回報 pct `0`。gsd 空值仍是「無法確認」，該 `0` 照樣視為
+blank-side 而忽略。hook 只對**單一 active local graphical session** 寫 handoff
+（0 或多個候選會在 root journal 以 `session selection fail-closed: ...` fail closed），
+並記錄 `selected session ... for uid ...`，在 `pre` 把 uid 釘在 root-only `0600` 檔、
+`post` 沿用不重選。hook 絕不建立／chmod／chown `/run/user/<uid>`：不存在或權限不安全
+即 fail closed、不寫 handoff。daemon 不再掃描其他 uid 的 runtime dir；只有 explicit
+`C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
+跨 uid 問題請查 root journal，不要掃描 `/run/user`。hook 絕不消耗 handoff 檔——
+由 daemon 在成功 adopt/還原後消耗。
+
+**喚醒 handoff（thaw 後的 daemon 是唯一寫入者）**：`handle_resume()` 由 **system**
+bus（未被凍結）上的 `PrepareForSleep(false)`、sampler 擷到的 resume flag，或啟動
+復原觸發。`RESUME_LOCK` 讓 login1 monitor、sampler 與啟動路徑互斥；daemon 會重新
+探測兩個 D-Bus 後端、把 suspend handoff adopt 進 `STATE_FILE`，再以
+0.2/0.4/0.8/1.6/3.2s 延遲輪詢三態，並受 `C640_KBD_RESUME_PROBE_MAX=10` 秒的
+**wall-clock 期限**約束。期限在每次探測後（以及下次探測前）檢查，因此也把 D-Bus
+查詢時間算進去；它不是硬中斷：最壞持有 `RESUME_LOCK` 約為 `probe_max` + 一次三態
+查詢（兩個後端各 `timeout 3`，約 6 秒）。逾時即以 `unknown` 收斂。`inactive` →
+經 gsd-power→UPower→legacy 還原；`active` → 延後並
+重試；`unknown` → 只有目前亮度已等於已存值時才不寫入地收斂，否則延後。
+`C640_KBD_RESUME_ALLOW_UNKNOWN=1` 可選擇在答案仍為 unknown 時還原——這等於接受
+點亮仍鎖定螢幕的風險，預設關閉。只要有 resume flag，`handle_unblank()` 就會路由到
+`handle_resume()`，避免雙重寫入。
+
+**cycle-aware login1 清理（第十九次 re-review）**：延後的 `PrepareForSleep(true)` 可能在
+hook 的 `pre`／`post` commit 之後才送達，因此 true handler 不再無條件刪除兩個 handoff。
+因果 commit proof 優先：resume flag 的 token 與 live suspend handoff 相符（且 committed
+value 一致）即證明屬於本 cycle，即使時鐘回撥或中毒的未來 `cycle-begin` 讓 token 看似過期。
+只有無法解析或可證明比 `cycle-begin - skew` 更舊的 handoff 才丟棄。保留的 cycle 以
+**token epoch** 重新錨定（絕非 wall-clock 時間），並記錄 `keeping committed cycle handoff`。
+沒有 resume flag 時，`PrepareForSleep(false)` 改呼叫 `restore_from_local_state()`：在
+`RESUME_LOCK` 下還原 daemon 自己的已存亮度，不 adopt handoff、不碰 handoff 檔、不寫
+adopted-cycle marker。D11–D17 涵蓋延遲 true 交錯、無 flag fallback、token 不符不當作
+刪檔理由、真正過期清理與無新 handoff 的案例；D15–D17 另涵蓋 future begin/commit
+proof、legacy 三欄 sidecar 升級與 date fallback。
+
+**實體寫入序列化與 generation gate（Tier 1）**：每次實體
+`SetBrightness`／gsd `Properties.Set` 都在 `WRITE_LOCK`（flock fd 209）內，包含
+熄屏、還原、重試與兩個 guard；路徑可用 `C640_KBD_WRITE_LOCK` 覆寫。鎖順序是
+`RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK`；持有 `WRITE_LOCK` 時不得再取外層鎖
+（finalize、verify 與 generation 維護都在釋放後做）。慢速 D-Bus 讀取（guard 的
+LED 讀回）在取得 `WRITE_LOCK` **之前**完成，因此 3 秒 gdbus timeout 不會拖住
+等待鎖的還原。`bump_restore_gen()` 在 `WRITE_LOCK` 內讀取、遞增並以 **fail-closed** 方式發佈
+generation，同時清除 guard marker，成功回 0；鎖取得失敗時**完全不發佈**
+（不在鎖外降級寫入）、回 1，所有呼叫端都轉為 DEFER 並保留 flag/handoff/state。
+發佈程序是同目錄 `mktemp` → 寫入 → `chmod` → `mv -T` → 以 bash `read` builtin 讀回：
+目的地不是普通檔即拒絕並保持原狀，讀回不符才使該目的地失效；只有在驗證過的發布**與** marker
+清理都成功後，記憶體內的 generation 才前進。`C640_KBD_RESTORE_GEN_FILE` 可覆寫
+`c640-kbd-backlight.restore-gen`；`C640_KBD_GUARD_WRITTEN_GEN` 可覆寫
+`c640-kbd-backlight.guard-written-gen`，該 marker 讓同一 generation 的兩個 guard
+只有一個能重設亮度。retry/guard **epoch**（`C640_KBD_RESTORE_RETRY_EPOCH`，預設
+`c640-kbd-backlight.retry-epoch`）在 `WRITE_LOCK` 內於成功與失敗路徑都輪替：
+即使 generation 發布失敗，舊 epoch 的 retry/guard 仍會被吊銷。已排定的工作在
+sleep 後、慢速三態探測後，以及寫入前於 `WRITE_LOCK` 內都會再查一次 epoch。
+guard 證據（LED/gsd 讀值）超過 `C640_KBD_GUARD_EVIDENCE_TTL`（預設 6 秒）時會
+重新探測，而不是信任舊值。
+
++0.3/+0.9s 的 unblank guard 與 +0.25/+1.0s 的 blank guard 會在 sleep 後以及
+`WRITE_LOCK` 內、寫入前再查一次 generation；過期 guard **完全不寫入**。
++0.5/+1.5/+3s 重試在取得 `WRITE_LOCK` 後也必須重查 generation：它先前的檢查是在
+`STATE_LOCK` 內做，等鎖時已釋放；若期間有新週期把 generation 往前推，重試會釋放鎖、
+用 `finalize_restore ... RC_DEFER` 把 `RESTORE_PENDING` 回滾到 `STATE_FILE`
+（不留 PENDING orphan），然後不寫入地結束。
+
+unblank guard 的決策表（依序）：
+
+| 狀態 | 行為 |
+| :--- | :--- |
+| sleep 後或 `WRITE_LOCK` 內（含寫入前最後一次）generation 已變 | 記錄取消；零寫入 |
+| LED 已等於已存值，或本 generation 已有 guard marker | 略過（不重複寫入） |
+| 單憑帶戳記 cache：`lu != saved` **且** `lu_gen == restore_gen` | 視為使用者意願，不寫入（不論 gsd 為何） |
+| 無此 cache，且 gsd pct 仍等於 `want_pct` | 真正的 restore 遺失；重設為已存值 |
+| 其他情況，例如 `gpct != want_pct`、gsd 查詢為空/失敗、cache 無戳記 | **模糊／fail-closed：不寫入** |
+
+`read_last_user_record()` 只 `cat` meta 檔**一次**，並從同一份快照解析 `value=` 與
+`restore=`；guard 使用這組成對資料，因此 sampler 在兩次讀取之間改寫 cache 不可能
+偽造出「舊值 + 新 generation」的證據。戳記只證明快取值是在本次還原後寫入，
+並不保證取樣值本身正確。**此規則的代價：**若 restore 遺失時 gsd 百分比已經跟著
+使用者新值改變（`gpct != want_pct`），現在會被視為模糊而**不再修復**——guard
+選擇 fail-closed，不覆蓋可能是使用者選擇的亮度。原本的「gsd/LED 與同一份 cache
+都同意」第三條款已移除。
+
+`WRITE_LOCK` 取得失敗在所有路徑都 fail-closed：`restore_state()` 與重試不寫入地
+DEFER（暫存值會回滾）；`handle_blank()` 在保存成功後保持 LED 亮著；
+`--test-blank` 回 1 並印出 `simulated blank: failed to set 0`；guard 記錄
+`WRITE_LOCK unavailable` 並略過。
+`C640_KBD_SELF_WRITE_SENTINEL` 是選用 **Tier 2 brightness-signal**（在
+`WRITE_LOCK` 內、`set_brightness` 前寫入 `value:gen`，避免自我寫入被當成使用者意圖）
+的保留欄位；**Tier 2 尚未實作**，該 sentinel 只由測試建立/清除，Tier 1 不會讀它。
+
+adopt、還原與 `verify_restore_applied()` 共用一組結果碼：
+`0 = RC_DONE`（寫入已驗證，`STATE`/`restore-pending` 已消耗）、`1 = RC_FAIL`（輸入無效
+或 I/O 失敗）、`2 = RC_DEFER`（鎖競爭、暫存還原仍在進行，或螢幕 active/unknown）。
+鎖取得失敗、`STATE`/`PENDING` 仍存在、或亮度讀回與已存值不符，都歸為 DEFER/FAIL 而非
+成功。**只有 `RC_DONE` 會消耗 resume flag（以及 handoff/state）**。`RC_DEFER` 保留
+flag/handoff/state 並排定重試供 sampler 或下次 unblank 使用；`RC_FAIL` 保留 resume
+flag，但 saved state 可能已被消耗（僅 last-user cache 留有擷取值）；寫入/finalize 失敗且 state 仍在時仍會重排
++0.5/+1.5/+3s 重試，而 verify 或 adoption 失敗則不排。
+`handle_unblank()` 在 DEFER 時記錄 `unblank: restore deferred`，而不是
+誤發 WARN。
+
+**後端重新探測**：只有成功的探測才會快取；缺失或失敗的 gsd-power / UPower 每次使用
+都會重新探測，因此晚出現的 D-Bus name 也能被採用。執行期失敗會丟棄快取並記錄
+`... lost (1 -> 0) ... re-probe on next use`；恢復時記錄
+`... RECOVERED (0 -> 1); switching back to single writer`。`C640_KBD_FORCE_LEGACY=1`
+仍會停用兩個 D-Bus 後端並強制走 `sysfs`/`ectool`（便於 A/B 比較）。
+
+> **為何需要 `RUN+=chmod`？** `MODE=`、`GROUP=`、`uaccess` 只作用於 `/dev` 裝置節點。
+> `/sys/class/leds/chromeos::kbd_backlight/brightness` 是沒有裝置節點的純 sysfs 屬性，
+> udev 無法用那些欄位改權限，預設會維持 `root:root 0644`；因此規則額外執行
+> `chgrp plugdev` + `chmod 0660`（Ubuntu 26.04 實測有效）。否則使用者服務會退回到
+> `echo | sudo -n tee`，而 session service 通常無法回應 sudo。驗證：
+>
+> ```bash
+> ls -l /sys/class/leds/chromeos::kbd_backlight/brightness   # 應為 root plugdev 0660
+> sudo udevadm control --reload-rules
+> sudo udevadm trigger --subsystem-match=leds                # 不重開機即可重套
+> id -nG | tr ' ' '\n' | grep -qx plugdev && echo "使用者屬於 plugdev"
+> ```
 
 **免熄屏手動測試：**
 
 ```bash
 c640-kbd-backlight-sync --check          # 顯示目前亮度與狀態
-c640-kbd-backlight-sync --test-blank     # 模擬螢幕熄滅 -> 儲存並設為 0
+c640-kbd-backlight-sync --test-blank     # 模擬熄滅：先儲存再設 0（儲存失敗則回傳 1）
 cat /sys/class/leds/chromeos::kbd_backlight/brightness  # 應為 0
 c640-kbd-backlight-sync --test-unblank   # 模擬螢幕點亮 -> 恢復
 ```
@@ -161,22 +539,279 @@ systemctl --user restart c640-kbd-backlight-sync.service 2> /dev/null || true
 ```
 
 **Wayland/X11 相容性：** 主要路徑為 `org.gnome.ScreenSaver`（GNOME Wayland
-原生，事件驅動，無輪詢）。`IdleMonitor` 為選用。非 GNOME 工作階段由 `system-sleep` hook 覆蓋 S3 盒蓋情境。
+原生，事件驅動，無輪詢）。`IdleMonitor` 為選用。S3 盒蓋喚醒時 `system-sleep` hook
+只發佈 handoff 檔，還原由 thaw 後的使用者 daemon 執行，因此使用者服務必須在運行。
 
-**日誌：**
+**日誌：** daemon 訊息全部寫到 stderr；unit 設了 `StandardError=journal`，因此
+（含 `backends probed: gsd=... upower=...`、`RECOVERED (0 -> 1)`、
+`saved brightness`、`replacing invalid saved brightness with N`、
+`restoring brightness`、`restore verify (gen=...): ... not completed`、
+`suspend handoff adoption deferred`、`restore deferred: ScreenSaver ...`、
+`resume deferred:`、`unblank: restore deferred`、`ignoring blank-side suspend handoff 0`、
+`blank: brightness NOT saved`、`blank: deferred save attempt N failed`、
+`restore failed (... rc=...): keeping brightness ... for retry`、
+`another restore is in progress`、`resume: restore complete; resume flag consumed`
+與 `[WARN]` 降級訊息）都可在使用者 journal 看到：
 
 ```bash
 journalctl --user -u c640-kbd-backlight-sync.service -f
 journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" | cat
 ```
 
+**執行期環境變數**（不碰系統檔案）：`C640_KBD_FORCE_LEGACY=1` 停用兩個 D-Bus
+後端（見上）；`C640_KBD_LAST_USER_TTL` 設定手動關閉快取的 TTL（預設 15 秒）；
+`C640_KBD_SAVE_LOCK_WAIT` 限制 `save_state` 的 state lock 等待（預設 2 秒）；
+`C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後 ScreenSaver 輪詢的 **wall-clock 預算
+（每次探測後檢查；最壞 ≈ 預算 + 一次查詢）**（預設 10 秒）；
+`C640_KBD_RESUME_ALLOW_UNKNOWN=1` 選擇在答案未知時仍還原；
+`C640_KBD_GUARD_EVIDENCE_TTL` 限制 guard 證據的最大年齡（秒，預設 6），超過即重新探測。
+所有實體寫入都由 `C640_KBD_WRITE_LOCK`（預設 `$STATE_DIR/c640-kbd-backlight.write.lock`）序列化。
+
+**僅供測試的環境變數**（不碰系統檔案）：daemon 接受 `C640_KBD_SYSFS_BRIGHTNESS` /
+`C640_KBD_SYSFS_MAX` 指向假 LED 節點，以及 `C640_KBD_HANDOFF_SUSPEND` /
+`C640_KBD_HANDOFF_RESUME` / `C640_KBD_RESTORE_PENDING_FILE` /
+`C640_KBD_RESUME_LOCK` / `C640_KBD_LAST_USER_META_FILE` 覆寫暫存/handoff 路徑，
+另有 `C640_KBD_WRITE_LOCK`、`C640_KBD_RESTORE_GEN_FILE`、
+`C640_KBD_RESTORE_RETRY_EPOCH`、`C640_KBD_GUARD_WRITTEN_GEN` 與
+`C640_KBD_SELF_WRITE_SENTINEL` 覆寫 write lock／generation／retry epoch／
+guard marker／保留的 Tier 2 sentinel 路徑；sleep hook 接受 `C640_KBD_SLEEP_SYSFS`、`C640_KBD_SLEEP_STATE_DIR`、
+`C640_KBD_HANDOFF_DIR` 與 `C640_KBD_RUN_USER_ROOT`；explicit
+`C640_KBD_HANDOFF_DIR` 會跳過 loginctl 選擇與 uid 釘住，daemon 只用同一值做
+覆寫不一致 WARN（不再有跨 uid 掃描）。舊的 `C640_KBD_SLEEP_USER` /
+`_UID` / `_BUS` / `_DELAY` bus 探測變數已忽略（hook 不再查 D-Bus、不再延遲）。
+
+**單元測試（不需 root、不碰真實 sysfs/D-Bus）**：stub 工具放在 `PATH` 最前，
+所有狀態都在暫存目錄。daemon 測試有 976 個案例（寫入鏈、重新探測、暫存/驗證、
+三態、喚醒結果碼/重試、熄滅前保存、單次取樣熄滅、無效 state 自我修復、
+經 mutation 驗證的空值 gsd pct、未確認的 sampler 零值、wall-clock 探測期限、
+explicit handoff 目錄覆寫不一致、gsd 確認的新鮮 manual0 adopt、帶 generation 戳記的
+guard 使用者變更保護、過期重試的鎖內 generation gate 與 PENDING 回滾、
+嚴格單調的 generation bump、**fail-closed generation 發布與讀回、epoch barrier 吊銷
+過期 retry/guard、TTL 證據重新探測**、fail-closed 鎖失敗與單次讀取的 last-user cache）；
+sleep hook 測試本機有 398 個案例（review 時點 CI 為 369/3，全為 H6——僅以 push 出去的
+HEAD 的 CI 為準）（純 handoff、`0600`/`chown` 搭配
+fd 釘住的 inline `python3` 發布器（directory-fd `os.rename` 與 inode／owner／mode
+驗證、無 `cp`／一般 `mv` 降級）、cycle token 與 inode 綁定、三欄 root marker 搭配
+committed value 與單一 fd byte-exact 驗證、四欄 resume flag 與三欄 legacy 相容、
+deterministic H6 inode reuse／同 inode 改值 fixture、
+`C640_KBD_HANDOFF_DIR`、由 loginctl `Session.User`（`User=<uid>`、英數 session ID）
+選出單一 active local graphical session 並在 root journal fail closed、uid 釘住與沿用、
+0700 runtime dir 檢查、不寫 LED）。另有唯讀的
+`keyboard/tests/loginctl-contract-check.sh`（systemd host 為 `CONTRACT OK`、其他為 `SKIP`
+——不是真實 S3 測試）。rollback 測試（`tests/rollback-test.sh`，需 root）有 2508 個案例，包含損毀
+與欄位型別錯誤的 manifest fail-closed、副作用前的 rollback gate、pseudo-target 略過、
+unknown 狀態 fail closed、目標缺席時從第一份備份還原、取代失敗時保留目標的原子還原、
+找不到備份回 rc 1、root-only `0600` holder 鎖的絕對路徑/canonical/字面 symlink/inode/
+祖先/父目錄拒絕與 fd 8 釘住、跨元件 plugdev 歸屬（含選用的逐次安裝 `added_by_project`
+證據 R15–R20、all-true 過期紀錄零 gpasswd 消耗）與 gpasswd 失敗回 rc 1、PAM 原始行保護
+與 first-wins debconf selection／`/var/lib/pam` 快照、`pam-auth-update --package` 收斂及
+uninstall 驗證還原（含非 root/passwordless `sudo` 案例）、symlinked `common-*` 中的
+生效 fprintd 讓安裝 fail closed、`.common` 的 lstat symlink owner 以 `chown -h` +
+`mv -T` 還原、savedir 三態 entry set 驗證且非 regular entry fail closed、整個操作鎖
+（部署 vs rollback 的 OP1/OP2 FIFO barrier 回歸、真實安裝器 barrier 與 fail-closed body）、
+唯一 writer 暫存檔與 systemctl 還原檢查 rc。CI 另以真實工具在 Ubuntu 24.04 container
+執行 PAM 來回 E2E。
+
+```bash
+bash keyboard/tests/kbd-backlight-daemon-test.sh       # 976 個案例
+bash keyboard/tests/kbd-backlight-sleep-hook-test.sh   # 398 個案例（以 CI 為準）
+bash keyboard/tests/loginctl-contract-check.sh         # CONTRACT OK／SKIP（唯讀）
+sudo bash tests/rollback-test.sh                       # 2508 個案例（需 root）
+```
+
+#### Handoff 發布與協調合約（第十七次 re-review）
+
+* **發布合約。** inline `python3` writer 以 `O_DIRECTORY|O_NOFOLLOW` 開啟 handoff 目錄、釘住
+  directory fd、驗證**解析後的 owner** 與 `0700` mode，以
+  `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` 建立 `0600` 暫存檔，寫入／`fchmod`／`fchown` 後重查
+  目錄 `(dev,ino)`，再以 `src_dir_fd`/`dst_dir_fd` 重新命名並驗證發布檔的**新 inode**。
+  owner、mode、暫存 identity 或 rename 失敗都是 **fail closed**（不發布 handoff、不動預期外
+  項目）；`python3` 是目標機上 `pre`/`post` 的**新執行期依賴**，缺失時記錄
+  `handoff skipped (fail-closed): python3 unavailable`。
+* **Cycle identity。** `pre` 鑄造 `<epoch>-<pid>-<random_hex>`，先作廢上一輪產物，發布
+  root-only `0600` cycle marker 並把 token 寫進 suspend handoff；`post` 與 daemon 交叉比對
+  suspend/resume token、cycle-begin epoch 與 handoff inode。過期 handoff、token/epoch 不符、
+  epoch 超出範圍或 `pre` 失敗都不覆蓋已存值
+  （`suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、
+  `suspend handoff token epoch ... stale`）。同一 cycle 的 DEFER 重試保留 token。
+* **Payload binding（第十九次 re-review；升級窗）。** root commitment marker 現在是
+  `<token> <dev:ino> <value>`（三欄），resume flag 是
+  `<token> <epoch> <action> <committed_value>`（四欄）；**legacy 兩欄 marker 直接拒絕**
+  （`resume handoff skipped (fail-closed): invalid cycle marker ...`），而 legacy 三欄
+  resume flag 仍被 daemon 接受，第四欄存在時以其為權威。`post` 從**單一**釘住 fd 讀取
+  suspend bytes，並與 `<token> <value> published\n` 逐位元組比對；TOKEN/VALUE/INODE/
+  STRUCT/IO 任一不符即 fail closed（`resume handoff skipped (fail-closed): suspend inode
+  ... != cycle marker ...`、`suspend/cycle value mismatch ...`）。`python3` 在發布與驗證
+  兩階段都是執行期依賴，缺失即 fail closed。**hook 與 daemon 必須同包升級**：舊 hook 配
+  新 daemon 會失去 committed value 證明（走 legacy 路徑），新 hook 配舊 daemon 則可能
+  發布舊 parser 無法解的第四欄 flag。
+* **共同故障邊界。** generation 與 epoch 發布同時失敗時，epoch 會**原地**撤銷，讓舊週期
+  armed 的 retry/guard 無法存活；若連撤銷也失敗，持久的 `COORDINATION_UNHEALTHY` marker 讓
+  **每個後續 gate** fail closed。**重啟**時 marker 會強制先鑄造新 nonce 再清除，讓在舊數字
+  epoch 下 fork 的 worker 無法在重啟後通過 gate（G3-37）。guard 證據 TTL 以**最早 witness** 搭配 monotonic
+  `/proc/uptime` 時鐘計時，寫入前重查；時鐘缺失或回撥即視為過期。daemon 刻意**降級為在每個
+  gate 拒絕寫入**，而非信任過期 witness。範圍僅限後續 gate；已進入 `WRITE_LOCK` 的 writer
+  無法回溯，可能仍完成一次寫入；state 目錄完全不可寫時持久 marker 無法建立，撤銷前已 fork
+  的 worker 只看到 in-process flag。此為非阻塞殘留，協調通道不可寫時不宣稱回溯撤銷。
+
 ---
 
 ## 🧪 驗證與測試
 
-驗證按鍵事件是否正確識別：
+### 先驗證 hwdb 掃描碼映射
+
+hwdb 只有在映射到硬體真正送出的掃描碼時才有效。這支唯讀腳本會比對核心的
+`EVIOCGKEYCODE` 映射與 `keyboard/tests/hwdb-top-row-scancodes.tsv`（不下 grab，
+keyd 執行中也能跑）。它證明的是核心套用了哪份映射，不是硬體實際送什麼：
+`0x3b`-`0x44` 是由 hwdb 轉換後的 `EVIOCGKEY` 按鍵狀態對照標準 AT 表推論，
+`EVIOCGKEYCODE` 只確認核心映射表；目前證據中沒有原始 `MSC_SCAN` 捕獲。
+要取得原始值，請先停掉 keyd，再用 `check-top-row-hwdb.py --scan` 或不加
+`--grab` 的 `evtest` 讀 `EV_MSC/MSC_SCAN`，並對照標準 AT 表推論。
+`--listen` 模式只透過 `EVIOCGKEY` 觀察 hwdb 轉換後的 `KEY_*` 按鍵事件；
+修正前每次實體按鍵都仍以 `KEY_F1`-`KEY_F10` 抵達，而 action 掃描碼的
+hwdb 完全沒作用。
 
 ```bash
-sudo evtest
-# 選擇「AT Translated Set 2 keyboard」並按下頂排按鍵。
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/check-top-row-hwdb.py
+# 0x3b  back             KEY_BACK             KEY_BACK             OK
+# 0x40  brightnessdown   KEY_BRIGHTNESSDOWN   KEY_BRIGHTNESSDOWN   OK
+# 0xdb  leftmeta         KEY_LEFTMETA         KEY_LEFTMETA         OK
+# RESULT=PASS
 ```
+
+`RESULT=` 只報告 EVIOCGKEYCODE 映射的判定。若加上 `--scan SECONDS`，
+也必須觀測到原始 `MSC_SCAN`：沒看到時（keyd 仍抓住裝置，或期間沒按鍵），
+工具會印出 `RESULT=PASS (mapping check only; raw capture FAILED)`，
+但**結束碼非 0**。判斷整體成功請看結束碼與 `RAW_CAPTURE=` 行，
+不要只 grep `RESULT=PASS`。
+
+若出現 `MISMATCH ... KEY_F1`，代表 hwdb 沒套用（或映射錯掃描碼），請重跑
+`sudo ./keyboard/install-keyboard.sh --with-keyd`。
+
+### 自動化 keyd 雙重角色測試（虛擬鍵盤，不需人手按鍵）
+
+`keyboard/tests/keyd-dualrole-uinput.py` 會建立 AT ID `0001:0001` 的虛擬鍵盤、
+重啟 keyd 讓它被 grab，注入按鍵後讀取 keyd 虛擬鍵盤的輸出並斷言：
+
+```bash
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/keyd-dualrole-uinput.py
+# PASS: tap Search -> CAPSLOCK only (no META, no guard)
+# PASS: hold Search + <每個頂排鍵> -> F1 ... F10（共 10 個；
+#        [meta:M] 圖層的 LEFTCTRL 組合鍵防護屬預期）
+# PASS: <每個頂排鍵> 單按 -> 對應媒體鍵（共 10 個）
+# PASS: hold Search alone -> bare META release (no guard)
+# RESULT=PASS
+```
+
+> 這支測試注入的是 **hwdb 轉換後**的鍵碼，無法抓出掃描碼錯誤。2026-10-31 之前
+> 就是因為這樣，整段死碼 hwdb 仍讓測試全綠。請務必搭配上面的掃描碼檢查。
+>
+> 測試過程會重啟 keyd 兩次，實體鍵盤會中斷約 1 秒；請從 TTY/SSH 執行，或接受
+> 短暫中斷。
+
+### 被動擷取實體按鍵（安全，不會搶走鍵盤）
+
+`keyboard/tests/capture-keyd-output.py` 以唯讀方式讀取 keyd 虛擬鍵盤，執行時桌面仍可正常輸入：
+
+```bash
+sudo apt install -y python3-evdev
+sudo python3 keyboard/tests/capture-keyd-output.py --seconds 120
+# 18:14:47 KEY_LEFTMETA 1     <- 長按 Search（Super），2026-10-31
+# 18:14:47 KEY_LEFTMETA 2     <- 按住時的 autorepeat
+# 18:14:50 KEY_LEFTMETA 0     <- 乾淨放開：沒有 LEFTCTRL 防護
+# 18:14:52 KEY_CAPSLOCK 1     <- 輕點 Search（只送 CAPSLOCK）
+# 18:14:52 KEY_CAPSLOCK 0
+# 18:15:18 KEY_F1 1           <- 長按 Search + Back（F2-F10 同理）
+```
+
+**絕對不要對 keyd 虛擬鍵盤下 grab**（`evtest --grab`、`evemu-record
+--grab`、raw `EVIOCGRAB`）：一旦獨占，compositor 就收不到鍵盤，整個桌面
+會失去輸入，直到程式結束為止。不加 `--grab` 的一般 `evtest` 是唯讀且安全的。
+實體鍵盤一旦被 keyd grab，其它 reader 完全讀不到它的事件——這正是本擷取工具
+改讀 keyd 虛擬鍵盤的原因。`keyd monitor` 也不能取代：keyd 2.5.x 無法開啟
+已被自己 grab 的裝置，所以內建鍵盤不會出現在那裡。
+
+### 怎麼看 `udevadm test` 的輸出
+
+`udevadm test /sys/class/input/event2` 對泛用查詢（`evdev:`、`evdev:name:`、
+`evdev:name:...:phys:...`）都會印 `No entry found from hwdb`，這是正常的。
+只有 `evdev:atkbd:$attr{[dmi/id]modalias}` 那一行才是重點；只要它套用了
+`KEYBOARD_KEY_*`，映射就是生效的。實機 Dratini 的 modalias 在 `bd*` 與 `svn*`
+之間多了 `br0.0:efr0.0` 欄位，`bd*:svnGoogle*` 仍可命中（2026-10-31 驗證）。
+
+### 實機驗證記錄（HP Pro c640 / Dratini，2026-10-31）
+
+環境：Ubuntu 26.04 LTS、kernel `7.0.0-38-generic`、`keyd 2.5.0-5`
+（執行檔 `/usr/bin/keyd.rvaiya`）、`python3-evdev 1.9.3`、GNOME Wayland。
+
+> **證據版本範圍：**語法（`keyd check`）在 CI 以 keyd **2.6.0** 驗證；下列
+> tap/hold/組合鍵防護行為只在實機以 **2.5.0-5** 驗證。其它版本**未驗證** —
+> 上游 2.6.x 對 `overloadt2` 有已知行為差異，不要把 2.6.0 的語法檢查當成
+> 2.6.0 的行為驗證。
+
+> 標示 **uinput** 的列使用虛擬鍵盤、注入的是 hwdb **之後**的鍵碼，只能證明 keyd
+> 設定正確，不能證明實體鍵盤送出那些掃描碼。標示 **被動擷取** 的列是實際按下
+> 實體鍵時，唯讀側錄 keyd 虛擬鍵盤的輸出。
+
+| 檢查項目 | 結果 | 證據 |
+| :--- | :---: | :--- |
+| hwdb 即時轉譯 | 🟢 | `check-top-row-hwdb.py`（2026-10-31 19:45:29，對實體鍵盤做 `EVIOCGKEYCODE`）：11 條全部 OK — `0x3b`→`KEY_BACK`、`0x40`→`KEY_BRIGHTNESSDOWN`、`0x42`→`KEY_MUTE`、`0xdb`→`KEY_LEFTMETA` |
+| keyd 只 grab 內建鍵盤 | 🟢 | journal：`match 0001:0001 ... (AT Translated Set 2 keyboard)`；`ignoring 0000:0006 (Video Bus)` |
+| 輕點 Search（uinput） | 🟢 | uinput 測試（2026-10-31 19:45:37）：只有 `CAPSLOCK` down/up，沒有 `META`、沒有防護組 |
+| 純長按 Search（uinput） | 🟢 | uinput 測試（19:45:37）：`LEFTMETA` down、autorepeat、乾淨的 `LEFTMETA` up，沒有 `LEFTCTRL` 防護，Mutter 可開總覽 |
+| 長按 Search + 頂排（uinput） | 🟢 | uinput 測試（19:45:37）：10 組全部通過 — `Back`→`F1`、`Forward`→`F2`、`Refresh`→`F3`、`F11`→`F4`、`Scale`→`F5`、`BrightnessDown`→`F6`、`BrightnessUp`→`F7`、`Mute`→`F8`、`VolumeDown`→`F9`、`VolumeUp`→`F10` |
+| 單按頂排（uinput） | 🟢 | uinput 測試（19:45:37）：10 個鍵全部原樣送出媒體鍵碼（`KEY_BACK` … `KEY_VOLUMEUP`） |
+| 實體長按 Search 後放開（被動擷取） | 🟢 | `18:14:47-18:14:50`：`LEFTMETA` down + autorepeat、乾淨的 `LEFTMETA` up（**沒有 `LEFTCTRL`**）；GNOME 活動總覽確實開啟（畫面確認） |
+| 實體輕點 Search（被動擷取） | 🟢 | `18:14:52`：只有 `CAPSLOCK` down/up |
+| 實體單按亮度/靜音/音量（被動擷取） | 🟢 | `18:14:59-18:15:07`：`KEY_BRIGHTNESSDOWN`/`KEY_BRIGHTNESSUP`/`KEY_MUTE`/`KEY_VOLUMEDOWN`/`KEY_VOLUMEUP`；螢幕亮度與音量確實改變（畫面確認） |
+| 實體長按 Search + Back（被動擷取） | 🟢 | `18:15:18`：`KEY_F1` down/up（meta 層）；keyd 圖層在組合鍵時會夾帶 `LEFTCTRL` 防護，屬預期行為，不影響單獨長按 |
+| LED 節點權限 | 🟢 | `udevadm trigger --subsystem-match=leds` 後 `chromeos::kbd_backlight/brightness` 為 `-rw-rw---- root plugdev`；一般使用者可直接寫入，無需 sudo |
+| daemon 熄滅/恢復 | 🟢 | `--test-blank` 2 → 0、`--test-unblank` 0 → 2，state 檔 `0600` 且會清除 |
+| daemon 事件路徑 | 🟢 | `gdbus emit ... ScreenSaver.ActiveChanged true/false` → 亮度 2 → 0 → 2，使用者 journal **完全沒有 sudo 呼叫** |
+| sleep hook | 🟢 | **2026-10-31 舊 hook 行為（僅供沿革參考，現已不適用）**：`pre suspend` 存下 6，模擬 0，`post suspend` 還原 6，state 檔清除（該 session 以直接呼叫驗證）。現行 hook 已改為**純 handoff 寫入者**，絕不寫亮度或刪 state；2026-11-22 曾以**舊 hook** 觀察到完整真實 S3 freeze/thaw（僅為歷史證據）；現行 HEAD 的 selector／root 邊界與第十九次 payload／login1 修正**待目標機執行**——見 [verification.md](../docs/verification.md)。本機安裝的 daemon 仍對應 `a03e4a0`（早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察））；螢幕黑掉時背光仍亮是已知 Tier 2 限制，非本輪 regression |
+| `--check` | 🟢 | 全綠，含「backlight node writable by group plugdev (mode 660)」 |
+
+**沿革（2026-10-31 已修）：** 先前 `12:49`、`13:25`、`13:26` 的被動擷取出現
+`KEY_F1`／`KEY_F6`，一度被當成 keyd meta 層有效的證據。事實並非如此：當時
+hwdb 轉換後的 `EVIOCGKEY` 狀態顯示單純 `F1`-`F10`，hwdb 映射的是從其他
+Chromebook 抄來的 ChromeOS action 掃描碼（`0xea`-`0xb0`），這台硬體從不送出，
+單按媒體鍵完全沒作用。根據轉換後狀態與 AT 表推論修正
+映射後已移除那些列，並以上方修正後的擷取取代。被動擷取只證明按鍵以 `EV_KEY`
+送達桌面；證據中沒有原始 `MSC_SCAN` 捕獲，確認仍需停掉 keyd 後用 `--scan`。
+
+**實機發現的坑（repo 已修）：**
+
+1. Ubuntu 26.04 的 `keyd` 套件執行檔是 `/usr/bin/keyd.rvaiya`，`$PATH` 沒有 `keyd`；
+   請用 `keyd_bin()` / `command -v keyd keyd.rvaiya`。
+2. keyd 2.5.x 沒有 `check` 子命令，也沒有裝置熱插拔偵測：安裝器部署
+   `/etc/keyd/cros.conf` 後必須 `systemctl restart keyd`，否則仍是舊映射（或完全沒映射）。
+3. `[ids] *` 會一併 grab ChromeOS `Video Bus`；應限定 `0001:0001`。
+4. udev 的 `MODE=`/`GROUP=`/`uaccess` **不會**改 sysfs LED 屬性；背光 daemon 需要
+   `61-chromeos-kbd-backlight.rules` 裡的 `RUN+=chgrp plugdev` + `RUN+=chmod 0660`，
+   否則會退回 `sudo -n tee`，而使用者服務無法回應 sudo。
+5. 單純的 `overload(meta, ...)` 不適合 GNOME 總覽：keyd 的修飾鍵防護會在單獨
+   Meta 放開時插入 `LEFTCTRL`，Mutter 會視為 `Meta+Ctrl` 而不開 Activities。
+   改用 `overloadt2(meta, capslock, 200)` 後，圖層放開不插防護，輕點也不再送
+   `META`，測試可以直接斷言「只有 `CAPSLOCK`」。
+6. 使用者端 `uinput` 裝置必須提供完整 `keyboard_mask`（`KEY_1..0`、`Q..Y`）或
+   `KEY_BRIGHTNESSUP`，keyd 才會視為鍵盤；只給 `KEY_LEFTMETA` 會被忽略。
+7. 對 keyd 虛擬鍵盤下 grab（`EVIOCGRAB`、`evtest --grab`、`evemu-record
+   --grab`）會把它從 compositor 手上搶走，整個桌面鍵盤會失效到程式結束為止；
+   不加 `--grab` 的一般 `evtest` 是唯讀且安全的。實體鍵盤一旦被 keyd grab，
+   其它 reader 完全讀不到它的事件，因此改用被動的 `capture-keyd-output.py`
+   讀 keyd 虛擬鍵盤。
+8. `udevadm test` 對泛用 `evdev:` 查詢印 `No entry found from hwdb` 是正常現象；
+   只有 `evdev:atkbd:` 那條會套用 `KEYBOARD_KEY_*`。
+9. 這台頂排**推論**使用標準 AT 掃描碼 `0x3b`-`0x44`（`KEY_F1`-`KEY_F10`）
+   （由 hwdb 轉換後 `EVIOCGKEY` 對照 AT 表而來，`EVIOCGKEYCODE` 只確認核心映射；
+   原始 `MSC_SCAN` 未捕獲），不是
+   ChromeOS action 掃描碼（`0xea`、`0xe9`…）。從別台 Chromebook 抄來的 hwdb
+   可能看起來正確、`udevadm info` 也顯示 `KEYBOARD_KEY_ea=back`，但每顆實體鍵
+   仍是單純的 `F` 鍵。請用 `check-top-row-hwdb.py` 驗證，不要只看映射表。
+10. `EVIOCGKEYCODE` 只顯示「映射表」；不代表硬體會送那些掃描碼。`EVIOCGKEY`
+    （腳本的 `--listen`，或 `active_keys()` 探針）顯示的是實際按下後 hwdb
+    轉換出的 `KEY_*` 鍵碼，不是原始掃描碼。請先停掉 keyd，再用不加 `--grab`
+    的 `evtest` 或 `--scan` 讀 `EV_MSC/MSC_SCAN` 取得原始掃描碼，
+    再對照標準 AT 表推論。

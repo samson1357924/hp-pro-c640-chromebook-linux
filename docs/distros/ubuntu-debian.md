@@ -65,6 +65,18 @@ sudo systemctl --global enable c640-kbd-backlight-sync.service
 # sudo ./keyboard/install-keyboard.sh --with-keyd
 ```
 
+> **Ubuntu 26.04 note (real-hardware verified 2026-10-31):** the `keyd` package
+> (2.5.0-5) installs **`/usr/bin/keyd.rvaiya`**, so plain `keyd ...` is "command
+> not found"; the service is still `keyd`. There is no `keyd check` subcommand
+> before 2.6 - the syntax is validated when the daemon starts. keyd 2.5.x also
+> has no hot-plug detection, so re-run `sudo systemctl restart keyd` after
+> changing `/etc/keyd/*.conf`. `install-keyboard.sh --with-keyd` handles all
+> three cases (binary lookup, optional `check`, restart).
+>
+> The udev rule sets `root:plugdev 0660` on the keyboard-backlight brightness
+> attribute via `RUN+=chgrp/chmod`; `MODE=`/`GROUP=` alone do not touch sysfs.
+> Confirm with `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness`.
+
 ### (4) Compile and Install the Fingerprint Driver
 
 ```bash
@@ -78,14 +90,102 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 > [!IMPORTANT]
-> Do **not** run `pam-auth-update --enable fprintd`. That profile injects
-> `pam_fprintd` into `common-auth`, which `gdm-password` includes — on
-> unlock GDM forks the `gdm-password` and `gdm-fingerprint` workers
-> concurrently and both try to Claim the single fprintd device, so the lock
-> screen shows no fingerprint prompt (GNOME/gdm#1071). The installer keeps
-> fingerprint **only in `/etc/pam.d/sudo`**; if you already enabled it in
-> `common-auth`, remove it:
+> Do **not** run `pam-auth-update --enable fprintd` yourself. That profile injects
+> `pam_fprintd` into `common-auth`, which `gdm-password` includes — on unlock GDM
+> forks the `gdm-password` and `gdm-fingerprint` workers concurrently and both try
+> to Claim the single fprintd device, so the lock screen shows no fingerprint
+> prompt (GNOME/gdm#1071). The installer keeps fingerprint **only in
+> `/etc/pam.d/sudo`** and removes fp lines from `common-*` with a direct
+> `sed -i '/pam_fprintd\.so/d'` during installation.
+>
+> **Do not run `pam-auth-update --remove fprintd` yourself.** That action deletes
+> debconf's `libpam-runtime/profiles` selection outright. On Debian/Ubuntu the
+> installer first snapshots that selection and every saved module file under
+> `/var/lib/pam` into a first-wins sidecar (`pam-selection` mode `0644`;
+> `pam-selection.saved` a root-owned `0700` directory of file copies), plus a third
+> root-owned `0700` `pam-selection.common` half recording every `common-*` / sudo
+> target's bytes, mode, owner, type, symlink target and absence and the savedir
+> directory metadata (plus a checksummed entry-set manifest whose class is
+> `absent` / `empty` / `nonempty`; any non-regular savedir entry fails closed),
+> with all reads/copies through `sudo` so a non-root caller with passwordless
+> `sudo` is supported. For symlink targets the lstat owner of the link itself is
+> recorded and restored with `chown -h` + `mv -T -f --` (never dereferencing the
+> target). It backs up **all** existing
+> `common-*` bytes (not only fp-containing ones), strips only fp module lines,
+> then runs `pam-auth-update --package` itself so debconf and `/var/lib/pam`
+> converge to a stable "no fprintd" state and a later package-triggered run is a
+> no-op. On uninstall, every tool call finishes first; only then are the original
+> `common-*` / sudo files re-applied from `.common`, followed by final verification
+> of bytes/mode/owner/type/link/absence, savedir and selection/seen. All three
+> halves are consumed together only after that verification — a consumed manifest
+> record plus an equal selection alone is not success. A failed restore keeps all
+> halves and returns rc 1. A legacy sidecar with no `.common` warns explicitly and
+> claims no byte guarantee; a missing `.saved` with a populated live savedir fails
+> closed (`manual recovery`); a semantic edit to `common-*` returns rc 1 and retains
+> all halves (`External content change detected`).
+>
+> **Symlinked `common-*` with an active fprintd module fails the install closed.**
+> Before any snapshot/backup/`sed`/tool call, every `common-*` is probed through
+> `sudo`: a symlink whose target has an active (non-commented) `pam_fprintd.so`
+> line cannot be repaired by `sed -i` without replacing the link, so the
+> installer exits non-zero and leaves **PAM files and the debconf selection
+> untouched** (no first-wins snapshot is published). Unreadable targets or grep
+> errors fail closed too; absent/dangling targets carry no active module. The
+> installed-state postcondition checks the **actual** `common-*` bytes for no
+> active fprintd — a disabled record kept in the debconf selection is not
+> sufficient. Replace the symlink with a regular file (or remove the fp line
+> under its real target deliberately) and re-run the installer.
+> Trade-off: a selection you change during installation is overwritten on
+> uninstall, and a manual `--enable fprintd` reintroduces the GDM race until
+> uninstall. If `common-auth` still has an fp line on an older install, remove
+> only that line, or re-run `./fingerprint/install-fingerprint.sh`, which handles it:
+
+> [!WARNING]
+> This manual `sed` is a **legacy** instruction from before the 17th-re-review PAM-aware
+> parser: a substring match also deletes unrelated auth rules whose trailing `#` comment
+> merely mentions `pam_fprintd.so`. Prefer re-running
+> `./fingerprint/install-fingerprint.sh` — it parses the **module-path field**, preserves
+> non-fp bytes byte-for-byte, and fails closed on uncertain syntax or a custom/numeric jump
+> landing (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+> `numeric jump target identity changes ...`). If you edit by hand, check the module-path
+> field and verify the non-fp bytes afterwards. "No active fp module" and "convergence
+> verified" are separate facts (`convergence NOT verified yet`).
+>
+> **19th re-review (per-group model / argsfp / forced recovery):** the installer now models
+> a **separate handler stack per management group**, expands `@include`, treats substack as
+> an opaque frame, and fails closed **before editing anything** when an unmodelled substack
+> can affect a numeric jump or the transformation, or when topology is
+> unresolvable/unsupported. (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+> `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`,
+> `Removing the fingerprint rule ... would change a per-management-group stack or its
+> numeric jump target ...`). Every retained rule carries `argsfp`, an injective fingerprint
+> of the complete module argument vector; the non-fp postcondition is a **zero-addition**
+> gate (empty allowlist by default), so an external tool adding/rewriting a rule fails closed
+> (`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`). If a
+> later verification fails, the installer force-restores `common-*` / sudo from the retained
+> snapshot before rc 1 (`PAM transaction failed after mutation; force-restoring
+> common-*/sudo ...`). Do not hand-edit a custom stack you cannot prove safe — let the
+> installer refuse it.
 
 ```bash
-sudo pam-auth-update --remove fprintd
+sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
 ```
+
+> [!NOTE]
+> **Keyboard backlight upgrade window:** the root commitment marker is
+> `<token> <dev:ino> <value>` (3 columns; legacy 2-column markers fail closed) and the
+> resume flag is `<token> <epoch> <action> <committed_value>` (4 columns; legacy 3-column
+> flags stay readable by the daemon, with the committed value authoritative). Deploy the
+> hook and daemon **from the same package**. `python3` is a runtime dependency of both
+> publication and the single-fd byte-exact verification in `pre`/`post`; without it no
+> handoff is published (fail closed).
+>
+> **Real-machine observation (read-only, 2026-11-26):** on the local host (DMI
+> `Google` / `Dratini` / `HP` board, coreboot `MrChromebox-2606.1`, hostname `ubuntu-c640`,
+> kernel `7.0.0-44`; `/sys/class/leds/chromeos::kbd_backlight` with `max=100` / current `30`,
+> daemon running) the installed `/usr/local/bin/c640-kbd-backlight-sync` still matches
+> `a03e4a0` — **predates all four nineteenth-re-review fixes (observed at the time of the
+> read-only audit)** — CI's byte-identical assertion is not a local fact. The backlight staying
+> on when the screen blacks out is a known **Tier 2** limitation (idle-dim/idle-brightness
+> with ScreenSaver inactive; IdleMonitor not
+> implemented), not a regression; real S3 / lock-unlock on HEAD is still pending.

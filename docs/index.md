@@ -35,7 +35,7 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 
 ## 📊 Hardware Status At-a-Glance
 
-> **Honest by design** — 🟢 = verified on real HP Pro c640 (Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-23), ⚠️ = driver bound but functional test not captured, ❌ = not measured. See [Verification Matrix](verification.md) for evidence bundle and reproducibility steps.
+> **Honest by design** — 🟢 = verified on real HP Pro c640 (Ubuntu 26.04 / kernel 7.0.0-29 / 2026-08-23; keyboard top-row, dual-role and backlight re-verified 2026-10-31 on 7.0.0-38), ⚠️ = driver bound but functional test not captured, ❌ = not measured. See [Verification Matrix](verification.md) for evidence bundle and reproducibility steps.
 
 | Hardware Component | Status | Driver / Solution | Notes & Support Level |
 | :--- | :---: | :--- | :--- |
@@ -44,13 +44,13 @@ Complete Linux support for **HP Pro c640 Chromebook** (Board: `dratini` / Basebo
 | **Wi-Fi 6 & Bluetooth 5.0** | ⚠️ **Driver bound** | Intel AX201 (`iwlwifi` / `btusb`) | Drivers bind out of the box; **WPA3/throughput not measured** (see [verification.md](verification.md)). |
 | **Touchscreen & Touchpad** | ⚠️ **Driver bound** | `i2c_hid` / `elan_i2c` | Modules present; **gesture/palm-rejection not captured** (see [verification.md](verification.md)). |
 | **Intel UHD Display & Hardware Decoding** | ⚠️ **Driver bound** | `i915` (Wayland / X11) | Display works; **VA-API 4K60 not measured** (see [verification.md](verification.md)). |
-| **Keyboard Backlight & Top-Row Keys** | ⚠️ **Top-row verified, Backlight sync ready (config-only)** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon (user service + system-sleep) | Top-row F1–F10 hwdb verified. Backlight sync daemon installed via `./setup.sh --keyboard` (event-driven `org.gnome.ScreenSaver`/`login1 PrepareForSleep`, `TAG+="uaccess"`); verify with `c640-kbd-backlight-sync --check/--test-blank`. See [verification.md](verification.md). |
+| **Keyboard Backlight & Top-Row Keys** | 🟢 **Top-row + dual-role + backlight verified** | `cros_ec` + `udev hwdb` / `keyd` + `c640-kbd-backlight-sync` daemon (user service + system-sleep) | Top-row media keys via hwdb (AT scancodes `0x3b`-`0x44` inferred from post-hwdb `EVIOCGKEY` against the standard AT table; kernel map confirmed via `EVIOCGKEYCODE`, raw `MSC_SCAN` not captured — confirming it requires `--scan` after stopping keyd) and Super+TopRow F1-F10 via keyd. 2026-10-31: virtual uinput test PASS (lone hold=bare Super with no `LEFTCTRL` guard; chord `LEFTCTRL` guard expected) plus passive capture of real key presses (GNOME overview; brightness/volume/mute); backlight 0↔restore on `ScreenSaver.ActiveChanged`/`--test-blank`, sysfs `0660 root:plugdev` (no sudo), sleep hook publishes S3 handoff files only for a single active local graphical session (uid from `Session.User` / `User=<uid>` from `loginctl show-session`, not a session `UID=`; alphanumeric IDs), published with the fd-pinned inline-`python3` handoff publisher (dir-fd `os.rename`, no `cp` fallback) and per-cycle token/inode binding; the thawed user daemon performs the restore. The 2026-11-22 full S3 freeze/thaw is **historical evidence from the old hook** — the current HEAD is **pending on the target machine** — the nineteenth-re-review fixes (per-group PAM model, payload binding, argsfp/recovery, cycle-aware login1 cleanup) are likewise **not hardware-verified**. On this host the installed daemon matches `a03e4a0`, which predates all four nineteenth-re-review fixes (observed at the time of the read-only audit); the backlight staying on when the screen blacks out is a known **Tier 2** limitation, not a regression. Manual lid-close remains a supplementary to-test. See [verification.md](verification.md). |
 | **EC Battery Protection & Fan Control** | 🟢 **Working** | ChromeOS EC LPC (`c640-ec-control` + `c640-battery-limit`) | 90% limit daemon with 0 mA AC bypass, S3 sleep resume hook, fan silent mode. |
 | **Sleep/Resume** | 🟢 **S3 lid cycle verified** | ACPI S3 `deep` (default) + `s2idle` | Real lid-close S3 cycle verified 2026-08-18. **Key/fingerprint wake untested**; panel stays dark until keypress (see [verification.md](verification.md)). |
 | **Dual Type-C Output & Fast Charging** | ⚠️ **Charging works** | USB-PD + DP 1.2 Alt Mode | PD charging present; **external display via Type-C not verified** (see [verification.md](verification.md)). |
 
 !!! note "Last verified"
-    **2026-08-23** on Ubuntu 26.04 LTS (kernel `7.0.0-29-generic`, PipeWire `1.6.2`, fprintd `1.94.5`, MrChromebox `2606.1`). Evidence bundle `c640-diagnostic-20260815_152233.tar.gz` (EC 90% daemon + `c640-ec-sleep.sh` + `ectool` verified; packaging `1.94.10-2` metadata, driver unchanged) — see [verification.md](verification.md) for how to reproduce.
+    **2026-08-23** on Ubuntu 26.04 LTS (kernel `7.0.0-29-generic`, PipeWire `1.6.2`, fprintd `1.94.5`, MrChromebox `2606.1`); keyboard top-row/dual-role/backlight re-verified 2026-10-31 on `7.0.0-38-generic`. Evidence bundle `c640-diagnostic-20260815_152233.tar.gz` (EC 90% daemon + `c640-ec-sleep.sh` + `ectool` verified; packaging `1.94.10-2` metadata, driver unchanged) — see [verification.md](verification.md) for how to reproduce.
 
 ---
 
@@ -152,7 +152,8 @@ Comet Lake SOF DSP via ALSA UCM2:
 
 - **Option A (default)**: `systemd-hwdb` zero-overhead, TTY/X11/Wayland
 - **Option B**: `keyd` dual-mode `Search` → CapsLock / Super, Super+TopRow → F1–F10 — see [keyboard/keyd/cros.conf](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/keyd/cros.conf)
-- **Option C (new)**: Backlight sync with screen blank — event-driven `c640-kbd-backlight-sync` (GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` for S3 lid) + `cros_kbd_led_backlight` sysfs (`/sys/class/leds/chromeos::kbd_backlight`). See [keyboard/README.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.md#option-3-keyboard-backlight-sync-with-screen-blank-new)
+- **Option C (new)**: Backlight sync with screen blank — event-driven `c640-kbd-backlight-sync` (GNOME Wayland `org.gnome.ScreenSaver` + `login1 PrepareForSleep` for S3 lid) + `cros_kbd_led_backlight` sysfs (`/sys/class/leds/chromeos::kbd_backlight`). See [keyboard/README.md](https://github.com/samson1357924/hp-pro-c640-chromebook-linux/blob/main/keyboard/README.md#option-3-keyboard-backlight-sync-with-screen-blank)
+- **Upgrade window:** deploy the sleep hook and daemon from the same package. The root marker is `<token> <dev:ino> <value>` (3 columns; legacy 2-column markers fail closed) and the resume flag is `<token> <epoch> <action> <committed_value>` (4 columns; legacy 3-column flags stay readable). `python3` is a runtime dependency; see [COMPATIBILITY.md](COMPATIBILITY.md) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the new fail-closed messages.
 
 ---
 
@@ -164,7 +165,7 @@ Special thanks to **Abhinav Baid** (original `crfpmoc`), **Felix Niederer**, **M
 
 ## 📜 License & Compliance
 
-This project follows [REUSE 3.0](https://reuse.software/) with SPDX:
+This project follows [REUSE 3.3](https://reuse.software/) with SPDX:
 
 | Module | Path | License |
 | :--- | :--- | :--- |

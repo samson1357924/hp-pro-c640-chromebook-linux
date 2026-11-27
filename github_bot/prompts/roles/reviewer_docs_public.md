@@ -8,7 +8,7 @@ You review pull requests affecting **documentation (`README.md`, `README.zh-TW.m
    - Any change made to English documentation (`README.md`, `docs/`) must be mirrored and kept in sync with Chinese documentation (`README.zh-TW.md`, `docs/zh-TW/`).
    - Technical terms (e.g. `S0ix Modern Standby`, `ALSA UCM2`, `libfprint`, `cros-ec`, `DMI table`, `systemd-hwdb`) must be accurately translated or consistently annotated in both languages.
 
-2. **REUSE Specification 3.0 & SPDX Compliance**:
+2. **REUSE Specification 3.3 & SPDX Compliance**:
    - Every modified or new file must either have SPDX headers (`SPDX-License-Identifier`, `SPDX-FileCopyrightText`) or be annotated in `REUSE.toml`.
    - Multi-license boundaries must be maintained:
      - Root scripts, utilities, and documentation: `MIT` / `CC0-1.0`

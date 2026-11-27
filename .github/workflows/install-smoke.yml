@@ -202,6 +202,13 @@ jobs:
           test "$(stat -c %a /usr/local/bin/c640-kbd-backlight-sync)" = "755"
           test "$(stat -c %a /etc/systemd/user/c640-kbd-backlight-sync.service)" = "644"
           test "$(stat -c %a /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh)" = "755"
+          # Deployed backlight components must be byte-identical to the repo:
+          # a stale daemon/unit/hook would silently drop the gsd-power
+          # single-writer or ScreenSaver-defer fix (TROUBLESHOOTING.md §11).
+          diff -u keyboard/c640-kbd-backlight-sync /usr/local/bin/c640-kbd-backlight-sync
+          diff -u keyboard/systemd/c640-kbd-backlight-sync.service /etc/systemd/user/c640-kbd-backlight-sync.service
+          grep -q '^StandardError=journal$' /etc/systemd/user/c640-kbd-backlight-sync.service
+          diff -u keyboard/systemd/c640-kbd-backlight-sleep.sh /usr/lib/systemd/system-sleep/c640-kbd-backlight-sleep.sh
           /usr/local/bin/c640-kbd-backlight-sync --check > /dev/null 2>&1 || true
           /usr/local/bin/c640-kbd-backlight-sync --help > /dev/null
 
@@ -226,13 +233,50 @@ jobs:
       - name: Install keyd Dual-Role (optional)
         run: |
           set -euo pipefail
-          # install with keyd flag (keyd binary not present in container, but config should be deployed)
-          USER=smoketest ./keyboard/install-keyboard.sh --with-keyd
+          # keyd binary is deliberately absent in the container: the config is
+          # still deployed, but no keyd service can be activated. Config-only
+          # is explicitly accepted here so rc stays 0; a strict --with-keyd
+          # would correctly return 3.
+          USER=smoketest ./keyboard/install-keyboard.sh --with-keyd --keyd-config-only
           test -f /etc/keyd/cros.conf
-          test -L /etc/keyd/default.conf
-          test "$(readlink /etc/keyd/default.conf)" = "cros.conf"
-          # keyd check already validated in lint job, but verify file exists
-          grep -q "leftmeta = overload" /etc/keyd/cros.conf
+          test ! -e /etc/keyd/default.conf
+          test ! -L /etc/keyd/default.conf
+          # keyd check already validated in lint job, but verify the deployed
+          # config still carries the core dual-role fix. The old broad grep
+          # ("leftmeta = overload") also matched the broken plain overload()
+          # form, so it never guarded the regression.
+          check_dualrole() {
+            local conf="$1"
+            # Positive: exact overloadt2(meta, capslock, <ms>) form.
+            grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overloadt2\([[:space:]]*meta[[:space:]]*,[[:space:]]*capslock[[:space:]]*,[[:space:]]*[0-9]+[[:space:]]*\)[[:space:]]*$' "$conf" || return 1
+            # Negative: the known-broken plain overload() must not be present.
+            if grep -qE '^[[:space:]]*leftmeta[[:space:]]*=[[:space:]]*overload[[:space:]]*\(' "$conf"; then
+              return 1
+            fi
+            return 0
+          }
+          if ! check_dualrole /etc/keyd/cros.conf; then
+            echo "::error::deployed keyd config lacks the precise overloadt2(meta, capslock, <ms>) dual-role fix (or still uses plain overload())"
+            exit 1
+          fi
+          # Deployed file must be byte-identical to the repo source.
+          diff -u keyboard/keyd/cros.conf /etc/keyd/cros.conf
+          # Self-negative test: the new check must reject the old broken form
+          # and accept the fixed form (temp files only, no repo changes).
+          SELF_TEST=$(mktemp)
+          printf 'leftmeta = overload(meta, capslock)\n' > "$SELF_TEST"
+          if check_dualrole "$SELF_TEST"; then
+            echo "::error::self-negative test failed: plain overload() was accepted"
+            rm -f "$SELF_TEST"
+            exit 1
+          fi
+          printf 'leftmeta = overloadt2(meta, capslock, 200)\n' > "$SELF_TEST"
+          if ! check_dualrole "$SELF_TEST"; then
+            echo "::error::self-positive test failed: overloadt2(...) was rejected"
+            rm -f "$SELF_TEST"
+            exit 1
+          fi
+          rm -f "$SELF_TEST"
 
       - name: Uninstall Round-Trip (manifest rollback)
         run: |
@@ -270,7 +314,9 @@ jobs:
       - name: Prepare Minimal Container Environment
         run: |
           apt-get update -y
-          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3
+          # gcc builds the tiny setuid-root exec helper used by PAM-19 to model
+          # a non-root caller with passwordless sudo.
+          apt-get install -y --no-install-recommends git ca-certificates bash coreutils sudo python3 gcc libc6-dev
 
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -282,4 +328,570 @@ jobs:
           # (container has no systemd; python subprocess.run needs systemctl)
           printf '%s\n' '#!/bin/bash' 'case "$*" in' '  *is-enabled*|*is-active*|*is-system-running*|*is-failed*) exit 1;;' '  *) exit 0;;' 'esac' > /usr/local/bin/systemctl
           chmod +x /usr/local/bin/systemctl
+          # Defense in depth: the PAM sandbox snippets strip /usr/sbin from
+          # PATH, so an absent stub resolves to "not found" rather than to the
+          # real tool. Make any accidental real-tool call fail LOUDLY instead
+          # of rewriting the container's debconf DB / /var/lib/pam/seen.
+          printf '%s\n' '#!/bin/bash' 'echo "REAL pam-auth-update called from sandbox tests" >&2' 'exit 99' > /usr/local/bin/pam-auth-update
+          chmod +x /usr/local/bin/pam-auth-update
           bash tests/rollback-test.sh
+
+  pam-profile-reversibility-e2e:
+    name: lib/pam.sh helper round-trip with real pam-auth-update
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Re-review #13 finding #1: stub-only tests can self-prove. This job runs
+      # the real Debian/Ubuntu pam-auth-update and debconf tools inside a
+      # throwaway container (pinned to the same digest as the other jobs, never
+      # on the runner host). In the non-root sub-test the real tool is wrapped
+      # ONLY by an exec-through logging shim: the shim runs the real binary and
+      # records its exit status, so every byte-for-byte baseline assertion still
+      # exercises the real code. It `source`s lib/pam.sh and calls the helpers
+      # directly (configure_pam_fingerprint / rollback_component /
+      # disable_pam_fingerprint); it does NOT execute the
+      # fingerprint/install-fingerprint.sh entrypoint.
+      #
+      # Re-review #39 hardening:
+      #   * `docker run ... bash -s <<'EOS'` WITHOUT `-i` let the container hit
+      #     EOF immediately and exit 0; apt / real pam-auth-update / baseline /
+      #     sensitivity control / non-root all silently vanished while the job
+      #     stayed green. `-i` now delivers the heredoc to bash -s.
+      #   * A sentinel is written by the container into a mounted, host-writable
+      #     dir; the host step verifies it after docker run returns (and captures
+      #     the real rc even under `set -e`). The dir is created with mktemp -d
+      #     so parallel jobs on a self-hosted runner cannot delete each other's
+      #     artifacts.
+      #   * The non-root child PATH includes /usr/sbin:/sbin. A recording
+      #     wrapper logs uid / args / rc / a host-generated one-time nonce AFTER
+      #     the real .real binary returns, then exits with that real rc. The
+      #     host gate requires rc=0 AND the same nonce, so a pre-written log
+      #     line or a failed .real cannot look green. The child ALSO asserts
+      #     and exports its own uid (1000); the host gate checks that value.
+      - name: "lib/pam.sh helpers (configure / rollback / disable) + real pam-auth-update round-trip + sensitivity control"
+        run: |
+          set -euo pipefail
+
+          # Unique dir per run: a stale marker must never make a skipped E2E
+          # look green, and parallel jobs must not delete each other's files.
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pam-lib-helper-e2e.XXXXXX")"
+
+          # One-time nonce created HERE (host side) and injected into the
+          # container. No process can pre-forge a matching log line.
+          pam_e2e_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          test -n "$pam_e2e_nonce"
+
+          # Capture the real rc: `|| docker_rc=$?` keeps `set -e` from aborting
+          # before the sentinel checks below, which are the real green/red gate.
+          docker_rc=0
+          docker run --rm -i \
+            -e "PAM_E2E_NONCE=$pam_e2e_nonce" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$artifact_dir:/pam-e2e-artifacts" \
+            ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb \
+            bash -s <<'EOS' || docker_rc=$?
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Written immediately: proves the heredoc really reached bash -s.
+          echo "container script started" > /pam-e2e-artifacts/started
+
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            bash coreutils sed grep findutils python3 sudo debconf util-linux \
+            gcc libc6-dev libpam-runtime libpam-fprintd
+          test -f /usr/share/pam-configs/fprintd
+          test -x /usr/sbin/pam-auth-update
+
+          # Root container: transparent sudo passthrough so the production code
+          # path is identical to a sudo host, without touching runner PAM.
+          printf '#!/bin/bash\nexec "$@"\n' > /usr/local/bin/sudo
+          chmod +x /usr/local/bin/sudo
+          # rollback_component asks systemctl about restored services.
+          printf '#!/bin/bash\ncase "$*" in *is-enabled*|*is-active*|*is-system-running*|*is-failed*) exit 1;; *) exit 0;; esac\n' > /usr/local/bin/systemctl
+          chmod +x /usr/local/bin/systemctl
+
+          # INDEPENDENT oracle: talk to debconf directly through its protocol,
+          # NEVER through lib/pam.sh's _pam_read_selection() (that would be a
+          # self-proving test). Parse the protocol STATUS as well as the value:
+          # a non-zero status means "absent", which must not look like an empty
+          # value. This also handles debconf-show's '* ' vs '  ' seen prefixes.
+          debconf_oracle() { # $1 = one debconf-communicate command
+            local reply status value
+            reply="$(printf '%s\n' "$1" | debconf-communicate libpam-runtime 2>/dev/null)" || return 1
+            reply="${reply%%$'\n'*}"
+            status="${reply%% *}"
+            [ "$status" = "0" ] || return 1
+            value=""
+            [ "$reply" = "$status" ] || value="${reply#* }"
+            printf '%s' "$value"
+          }
+          read_selection() { debconf_oracle 'GET libpam-runtime/profiles'; }
+          read_seen() { debconf_oracle 'FGET libpam-runtime/profiles seen'; }
+          set_seen() { # $1 = true|false, forced via the REAL debconf tool
+            local reply
+            reply="$(printf 'FSET libpam-runtime/profiles seen %s\n' "$1" \
+              | debconf-communicate libpam-runtime 2>/dev/null)"
+            [ "${reply%% *}" = "0" ] \
+              || { echo "FSET seen $1 failed: $reply"; return 1; }
+          }
+          common_files=(/etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive /etc/pam.d/common-password)
+          saved_files=(/var/lib/pam/auth /var/lib/pam/account /var/lib/pam/password /var/lib/pam/session /var/lib/pam/session-noninteractive /var/lib/pam/seen)
+
+          # Establish a genuine fprintd selection with the REAL tool. A bare
+          # debconf-set-selections is NOT enough: the following --package lets
+          # diff_profiles() derive the list from common-* + /var/lib/pam and
+          # overwrites it without fprintd (verified with real tools). --enable
+          # both injects pam_fprintd.so into common-auth and persists the
+          # selection, so the sensitivity control below cannot be vacuous.
+          sudo pam-auth-update --enable fprintd
+          grep -qF pam_fprintd.so /etc/pam.d/common-auth \
+            || { echo "baseline --enable did not write pam_fprintd.so to common-auth"; exit 1; }
+          baseline_sel="$(read_selection)"
+          grep -qF fprintd <<< "$baseline_sel" || { echo "baseline selection lost fprintd"; exit 1; }
+
+          mkdir -p /root/baseline/etc/pam.d /root/baseline/var/lib/pam
+          cp -a "${common_files[@]}" /root/baseline/etc/pam.d/
+          cp -a /etc/pam.d/sudo /root/baseline/etc/pam.d/
+          for f in "${saved_files[@]}"; do
+            [ -e "$f" ] && cp -a "$f" /root/baseline/var/lib/pam/
+          done
+          printf '%s\n' "$baseline_sel" > /root/baseline/selection
+          # Snapshot the whole /etc/pam.d NAME SET, not just the files we copy
+          # byte-for-byte below: a newly created profile must be detectable.
+          ( cd /etc/pam.d && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort ) \
+            > /root/baseline/etc/pam.d.names
+
+          compare_with_baseline() {
+            local f base new_files
+            for f in "${common_files[@]}" /etc/pam.d/sudo; do
+              cmp -s "$f" "/root/baseline/etc/pam.d/${f##*/}" \
+                || { echo "MISMATCH: $f"; return 1; }
+              # Re-review #15 finding #2: --package rewrites common-* with
+              # umask 0022 + .pam-new, so bytes alone cannot prove rollback.
+              # Mode/lstat owner must match the ORIGINAL files too.
+              [ "$(stat -c '%a:%u:%g' "$f")" \
+                = "$(stat -c '%a:%u:%g' "/root/baseline/etc/pam.d/${f##*/}")" ] \
+                || { echo "MISMATCH: metadata $f"; return 1; }
+            done
+            for f in "${saved_files[@]}"; do
+              # Drive the check from the BASELINE: skipping a file that vanished
+              # would make this comparison ignore exactly the data loss we test.
+              base="/root/baseline/var/lib/pam/${f##*/}"
+              [ -e "$base" ] || continue
+              [ -e "$f" ] || { echo "MISMATCH: saved file missing: $f"; return 1; }
+              cmp -s "$f" "$base" || { echo "MISMATCH: $f"; return 1; }
+            done
+            # Also compare the NAME SET produced by find, not just the baseline
+            # list: a NEW /var/lib/pam file is invisible to the loop above.
+            ( cd /root/baseline/var/lib/pam && find . -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-baseline-pam-files
+            ( cd /var/lib/pam && find . -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-current-pam-files
+            new_files="$(LC_ALL=C comm -13 /tmp/pam-e2e-baseline-pam-files /tmp/pam-e2e-current-pam-files)"
+            [ -z "$new_files" ] \
+              || { echo "MISMATCH: new files in /var/lib/pam: $new_files"; return 1; }
+            # Same NAME-SET guard for /etc/pam.d: a new file there is invisible
+            # to the per-file loop above, just like a new /var/lib/pam file.
+            ( cd /etc/pam.d && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort ) \
+              > /tmp/pam-e2e-current-pamd-files
+            new_pamd_files="$(LC_ALL=C comm -13 /root/baseline/etc/pam.d.names /tmp/pam-e2e-current-pamd-files)"
+            [ -z "$new_pamd_files" ] \
+              || { echo "MISMATCH: new files in /etc/pam.d: $new_pamd_files"; return 1; }
+            [ "$(read_selection)" = "$baseline_sel" ] \
+              || { echo "MISMATCH: debconf selection"; return 1; }
+            [ "$(read_seen)" = "$(cat /root/baseline/selection-seen)" ] \
+              || { echo "MISMATCH: debconf seen flag (expected $(cat /root/baseline/selection-seen), got $(read_seen))"; return 1; }
+          }
+
+          # SENSITIVITY CONTROL: with NO snapshot/convergence, direct sed alone
+          # really does make the real tool drop fprintd. This proves the later
+          # equality assertions are not vacuous.
+          echo "== sensitivity control: sed-only must lose fprintd =="
+          sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
+          pam-auth-update --package
+          if grep -q fprintd <<< "$(read_selection)"; then
+            echo "::error::real --package kept fprintd after sed (control not sensitive)"
+            exit 1
+          fi
+          echo "control confirmed: real --package dropped fprintd"
+
+          # Restore the pristine baseline before exercising the library helpers.
+          cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+          cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+          printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
+          pam-auth-update --package
+          # Force a known seen baseline with the REAL tool. set-selections marks
+          # the question seen, so FSET is required for both baselines.
+          set_seen true
+          printf '%s\n' 'true' > /root/baseline/selection-seen
+          compare_with_baseline
+
+          echo "== lib/pam.sh helpers -> external package --package -> rollback =="
+          export CROS_ENABLEMENT_PAM_DIR=/etc/pam.d
+          export CROS_ENABLEMENT_PAM_SAVED_DIR=/var/lib/pam
+          export CROS_ENABLEMENT_PAM_SUDO_PATH=/etc/pam.d/sudo
+          export CROS_ENABLEMENT_MANIFEST_DIR=/var/lib/cros-enablement
+          export CROS_ENABLEMENT_PAM_SELECTION_FILE=/var/lib/cros-enablement/pam-selection
+          export CROS_ENABLEMENT_BACKUP_DIR=/var/backups/cros-enablement
+          cd /workspace
+          source lib/pam.sh
+          DISTRO_FAMILY=debian DISTRO_ID=ubuntu
+          export DISTRO_FAMILY DISTRO_ID
+          configure_pam_fingerprint
+          test -f /var/lib/cros-enablement/pam-selection
+          # Third half: root:0700 common-*/sudo state snapshot (finding #2).
+          test -d /var/lib/cros-enablement/pam-selection.common
+          [ "$(stat -c '%a:%u' /var/lib/cros-enablement/pam-selection.common)" = "700:0" ] \
+            || { echo "common-state snapshot is not root:0700"; exit 1; }
+          test -f /var/lib/cros-enablement/pam-selection.common/state
+          if grep -q fprintd <<< "$(read_selection)"; then
+            echo "::error::install did not converge the real debconf selection"
+            exit 1
+          fi
+          # Simulate a package upgrade touching PAM after our install.
+          pam-auth-update --package
+          # Mirror _uninstall_fp_body(): rollback first, then PAM disable.
+          rollback_component "fingerprint"
+          disable_pam_fingerprint
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection
+          test ! -e /var/lib/cros-enablement/pam-selection.common
+          echo "PAM lib helper E2E OK: selection, common-*, /var/lib/pam and sudo are byte-identical"
+
+          # Re-review P1 #2: BOTH seen baselines must survive a full real-tool
+          # round-trip. Every expected value below is read by the INDEPENDENT
+          # oracle above (debconf_oracle), not by lib/pam.sh's parser, and the
+          # baseline is checked byte-identical before AND after each cycle.
+          seen_roundtrip() { # $1 = true|false
+            local baseline="$1"
+            echo "== real-tool round-trip with seen=$baseline =="
+            cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+            cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+            printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" \
+              | debconf-set-selections
+            pam-auth-update --package
+            # Force the baseline AFTER --package (which may itself touch seen).
+            set_seen "$baseline"
+            printf '%s\n' "$baseline" > /root/baseline/selection-seen
+            compare_with_baseline
+            [ "$(read_seen)" = "$baseline" ] \
+              || { echo "baseline seen=$baseline was not established"; return 1; }
+
+            configure_pam_fingerprint
+            test -f /var/lib/cros-enablement/pam-selection
+            grep -qF "# cros-enablement: selection-seen=$baseline" \
+              /var/lib/cros-enablement/pam-selection \
+              || { echo "sidecar lacks seen=$baseline metadata"; return 1; }
+            pam-auth-update --package
+            rollback_component "fingerprint"
+            disable_pam_fingerprint
+            compare_with_baseline
+            test ! -e /var/lib/cros-enablement/pam-selection
+            test ! -e /var/lib/cros-enablement/pam-selection.common
+            echo "real-tool seen=$baseline round-trip OK: value + seen byte-identical"
+          }
+          seen_roundtrip true
+          seen_roundtrip false
+
+          # Re-review #17 finding #1 / PAM-77: a custom stack with a numeric
+          # jump whose landing MODULE would change after removing fprintd must
+          # be refused by the REAL code path BEFORE any publication or write.
+          # The marker-free fixture is not a pam-auth-update-managed stack, so
+          # convergence cannot repair its jumps.
+          echo "== PAM-77 real-tool custom jump stack guard =="
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "sidecar survived the previous round-trip"; exit 1; }
+          custom_stack=/tmp/pam-e2e-custom-common-auth
+          cat > "$custom_stack" <<'PAEOF'
+          auth [success=1 default=ignore] pam_unix.so nullok
+          auth sufficient pam_fprintd.so
+          auth required pam_deny.so
+          auth required pam_permit.so
+          PAEOF
+          cp -a "$custom_stack" /etc/pam.d/common-auth
+          # P3: pin the REASON, not just the non-zero rc, so a future mutation
+          # that fails closed for an unrelated reason cannot satisfy this guard.
+          # Phase A per-group model: the planned-stack proof now refuses the
+          # edit with "would change a per-management-group stack or its numeric
+          # jump target". This is the same jump-landing safety property the old
+          # numeric-jump-identity pin described: dropping the fp rule would
+          # move the success=1 landing from pam_deny.so to
+          # pam_permit.so. Pin the proof evidence too (the rule descriptor
+          # change carrying that exact landing transition), so a future wording
+          # change elsewhere cannot satisfy the guard on the reason string
+          # alone. Uncertain syntax / unsupported topology / depth failures
+          # emit different messages and cannot satisfy both pins together.
+          pam77_log=/tmp/pam-e2e-pam77-reason.log
+          : > "$pam77_log"
+          custom_rc=0
+          configure_pam_fingerprint 2>>"$pam77_log" || custom_rc=$?
+          cat "$pam77_log" >&2
+          if [ "$custom_rc" -eq 0 ]; then
+            echo "::error::PAM-77 custom jump stack was silently accepted"
+            exit 1
+          fi
+          grep -qF "would change a per-management-group stack or its numeric jump target" "$pam77_log" \
+            || { echo "::error::PAM-77 fail-closed reason was not the per-group numeric jump target change"; exit 1; }
+          grep -qE "rule descriptor changed: .*pam_deny\.so.*->.*pam_permit\.so" "$pam77_log" \
+            || { echo "::error::PAM-77 fail-closed proof did not show the pam_deny.so -> pam_permit.so jump landing change"; exit 1; }
+          echo "PAM-77 fail-closed reason pinned: per-management-group numeric jump target change (pam_deny.so -> pam_permit.so landing)"
+          cmp -s /etc/pam.d/common-auth "$custom_stack" \
+            || { echo "::error::PAM-77 custom stack bytes were modified"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "::error::PAM-77 selection sidecar was published"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection.saved \
+            || { echo "::error::PAM-77 saved-profile snapshot was published"; exit 1; }
+          test ! -e /var/lib/cros-enablement/pam-selection.common \
+            || { echo "::error::PAM-77 common-state snapshot was published"; exit 1; }
+          echo "PAM-77 custom stack refused: rc=$custom_rc, bytes identical, no sidecar"
+
+          # Restore the pristine baseline and prove the normal real-tool
+          # round-trip still succeeds after the refusal (no poisoned state).
+          cp -a /root/baseline/etc/pam.d/common-auth /etc/pam.d/common-auth
+          compare_with_baseline
+          configure_pam_fingerprint
+          test -f /var/lib/cros-enablement/pam-selection
+          pam-auth-update --package
+          rollback_component "fingerprint"
+          disable_pam_fingerprint
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection \
+            || { echo "::error::PAM-77 sidecar survived the restored round-trip"; exit 1; }
+          echo "PAM-77 restored baseline round-trip OK"
+
+          echo "== non-root (passwordless sudo) uninstall with REAL tools =="
+          # Restore the pristine baseline before the second round-trip.
+          cp -a /root/baseline/etc/pam.d/common-* /etc/pam.d/
+          cp -a /root/baseline/var/lib/pam/. /var/lib/pam/
+          printf 'libpam-runtime libpam-runtime/profiles multiselect %s\n' "$baseline_sel" | debconf-set-selections
+          pam-auth-update --package
+          # Match the seen flag left by the last seen_roundtrip before comparing.
+          set_seen "$(cat /root/baseline/selection-seen)"
+          compare_with_baseline
+
+          configure_pam_fingerprint
+          pam-auth-update --package
+
+          # Record every call to the REAL tool. /usr/sbin/pam-auth-update is the
+          # canonical location the product's `command -v pam-auth-update` finds
+          # once /usr/sbin is on PATH. The shim runs the real binary (renamed to
+          # .real) FIRST, then logs uid / args / rc / the host nonce, and exits
+          # with the REAL rc. A missing or failing .real can never be recorded
+          # as a successful call.
+          invoke_log=/tmp/pam-e2e-invocations.log
+          : > "$invoke_log"
+          chown 0:0 "$invoke_log"
+          chmod 0644 "$invoke_log"
+          test -x /usr/sbin/pam-auth-update
+          mv /usr/sbin/pam-auth-update /usr/sbin/pam-auth-update.real
+          test -x /usr/sbin/pam-auth-update.real \
+            || { echo "pam-auth-update.real missing or not executable"; exit 1; }
+          cat > /usr/sbin/pam-auth-update <<'PAEOF'
+          #!/bin/bash
+          /usr/sbin/pam-auth-update.real "$@"
+          rc=$?
+          printf 'uid=%s args=%s rc=%s nonce=%s\n' \
+            "$(/usr/bin/id -u)" "$*" "$rc" "$PAM_E2E_NONCE" >> /tmp/pam-e2e-invocations.log
+          exit "$rc"
+          PAEOF
+          chmod 0755 /usr/sbin/pam-auth-update
+
+          # uid 1000 reaches privileged files only via passwordless sudo. The
+          # root path above used a passthrough stub; here a real setuid-root
+          # exec helper models passwordless sudo. (setpriv CANNOT re-escalate:
+          # capabilities are dropped when it changes uid.) Install under
+          # /usr/local so uid 1000 can traverse it; /root is 0700.
+          mkdir -p /usr/local/nonroot-bin
+          cat > /usr/local/nonroot-bin/suid-exec.c <<'CEOS'
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc < 2) return 127;
+              if (setgid(0) != 0) return 126;
+              if (setuid(0) != 0) return 125;
+              execvp(argv[1], &argv[1]);
+              return 127;
+          }
+          CEOS
+          gcc -O2 -o /usr/local/nonroot-bin/suid-exec /usr/local/nonroot-bin/suid-exec.c
+          chown 0:0 /usr/local/nonroot-bin/suid-exec
+          chmod 4755 /usr/local/nonroot-bin/suid-exec
+          printf '#!/bin/bash\nexec /usr/local/nonroot-bin/suid-exec "$@"\n' > /usr/local/nonroot-bin/sudo
+          chmod +x /usr/local/nonroot-bin/sudo
+          stat -c '%u:%a %n' /var/lib/cros-enablement/pam-selection /var/lib/cros-enablement/pam-selection.saved
+
+          # Clear the log so ONLY the product's calls are counted below (all
+          # setup calls above used the real binary directly, before wrapping).
+          # Root-owned 0644: writable by the suid-exec'ed wrapper (uid 0), but
+          # NOT pre-forgeable by the uid 1000 child.
+          : > "$invoke_log"
+          chown 0:0 "$invoke_log"
+          chmod 0644 "$invoke_log"
+          setpriv --reuid=1000 --regid=1000 --clear-groups \
+            env PATH="/usr/local/nonroot-bin:/usr/bin:/bin:/usr/sbin:/sbin" LOG_FILE=/tmp/pam-e2e-nonroot.log \
+            bash -c '
+              set -euo pipefail
+              # Do NOT trust the setpriv flags alone: prove the child really is
+              # uid 1000 and export the value for the host gate.
+              test "$(id -u)" = 1000 || exit 1
+              printf "%s\n" "$(id -u)" > /tmp/pam-e2e-nonroot-uid
+              # Fail loudly if the non-root PATH ever hides the real tool again;
+              # otherwise the product would silently skip --package.
+              test "$(command -v pam-auth-update)" = /usr/sbin/pam-auth-update \
+                || { echo "non-root PATH hides pam-auth-update"; exit 1; }
+              source /workspace/lib/pam.sh
+              DISTRO_FAMILY=debian DISTRO_ID=ubuntu
+              export DISTRO_FAMILY DISTRO_ID
+              rollback_component "fingerprint" || exit $?
+              disable_pam_fingerprint || exit $?
+            '
+
+          # Root exports the child's own uid claim; the host verifies 1000.
+          cp /tmp/pam-e2e-nonroot-uid /pam-e2e-artifacts/nonroot-uid
+
+          # The real tool must have RUN, returned 0, and logged the host nonce.
+          # `--package` is matched as a whole token (not `.*--package`).
+          test -s "$invoke_log" || { echo "product never called pam-auth-update"; exit 1; }
+          grep -Eq "^uid=0 args=(.* )?--package( .*)? rc=0 nonce=${PAM_E2E_NONCE}\$" "$invoke_log" \
+            || { echo "no successful nonce-matching --package call as uid 0: $(cat "$invoke_log")"; exit 1; }
+          cp "$invoke_log" /pam-e2e-artifacts/pam-auth-update-invocations.log
+
+          compare_with_baseline
+          test ! -e /var/lib/cros-enablement/pam-selection
+          test ! -e /var/lib/cros-enablement/pam-selection.saved
+          test ! -e /var/lib/cros-enablement/pam-selection.common
+          echo "non-root PAM lib helper E2E OK: root-only sidecar + /var/lib/pam + .common snapshots consumed by uid 1000"
+
+          # Sentinel: everything above must have passed before this file
+          # appears on the host-mounted artifact dir.
+          printf 'PAM_LIB_HELPER_E2E_OK\n' > /pam-e2e-artifacts/e2e-ok
+          # Final container command: neutralize any restrictive umask so the
+          # host (possibly a different uid on a self-hosted runner) can read
+          # every artifact instead of reporting a false red.
+          chmod -R a+rX /pam-e2e-artifacts
+          EOS
+
+          # Host-side verification (under `set -e`, with the real rc captured).
+          if [ "$docker_rc" -ne 0 ]; then
+            echo "::error::PAM lib helper E2E container exited with status $docker_rc"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/started" ]; then
+            echo "::error::PAM lib helper E2E container never ran the script (empty-run regression)"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/e2e-ok" ] \
+             || ! grep -qx 'PAM_LIB_HELPER_E2E_OK' "$artifact_dir/e2e-ok"; then
+            echo "::error::PAM lib helper E2E sentinel missing/invalid - assertions did not all pass; refusing green"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/nonroot-uid" ] \
+             || ! grep -qx '1000' "$artifact_dir/nonroot-uid"; then
+            echo "::error::PAM lib helper E2E child was not uid 1000: $(cat "$artifact_dir/nonroot-uid" 2>/dev/null || echo MISSING)"
+            exit 1
+          fi
+          if [ ! -f "$artifact_dir/pam-auth-update-invocations.log" ] \
+             || ! grep -Eq "^uid=0 args=(.* )?--package( .*)? rc=0 nonce=${pam_e2e_nonce}\$" \
+                     "$artifact_dir/pam-auth-update-invocations.log"; then
+            echo "::error::product did not run the real pam-auth-update --package successfully (rc=0 + host nonce required)"
+            exit 1
+          fi
+          echo "PAM lib helper E2E sentinel verified on host"
+
+      # Re-review #19 finding #1: an INDEPENDENT black-box libpam regression.
+      # The product parser and the Python rule oracle never decide this case:
+      # a real pam_start_confdir() service decides auth, and the fake module
+      # traces which numeric-jump landing actually executed. Missing symbol,
+      # gcc failure or a skipped heredoc must turn the host gate RED.
+      - name: "Real libpam per-management-group jump oracle (decision + trace)"
+        run: |
+          set -euo pipefail
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/pam-libpam-oracle.XXXXXX")"
+          oracle_rc=0
+          docker run --rm -i \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$artifact_dir:/pam-oracle-artifacts" \
+            ubuntu@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb \
+            bash -s <<'EOS' || oracle_rc=$?
+          set -euxo pipefail
+          echo "libpam oracle container started" > /pam-oracle-artifacts/started
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends gcc libc6-dev libpam0g python3
+          cd /workspace
+
+          # Sanity: the runtime MUST provide the confdir entry point. The
+          # oracle exits 2 on any environment failure; `set -e` makes that red.
+          python3 -c 'import ctypes; lib = ctypes.CDLL("libpam.so.0"); assert hasattr(lib, "pam_start_confdir")'
+
+          # The reviewer's mixed auth/account fixture MUST be classified
+          # UNSAFE: real libpam decision 7 -> 0 with the fp module disappearing
+          # from the trace. A global-index model calls this unchanged.
+          self_rc=0
+          python3 tests/pam_libpam_oracle.py self-test \
+              | tee /pam-oracle-artifacts/selftest.log || self_rc=$?
+          test "$self_rc" -eq 0
+          mixed_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace fp \
+              tests/fixtures/pam_mixed_before.conf \
+              tests/fixtures/pam_mixed_after.conf \
+              | tee /pam-oracle-artifacts/mixed.log || mixed_rc=$?
+          test "$mixed_rc" -eq 1
+
+          # Re-review #19 P0: a TYPE-PREFIXED `session include extra` must NOT
+          # inject the included file's auth rules.  The real auth stack lands
+          # on the fp module before the edit and on the final pam_permit after
+          # it, so libpam reports UNSAFE (7 -> 0).  A group-agnostic model
+          # falsely reports SAFE.
+          include_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace fp \
+              --include extra=tests/fixtures/pam_include_extra.conf \
+              tests/fixtures/pam_include_before.conf \
+              tests/fixtures/pam_include_after.conf \
+              | tee /pam-oracle-artifacts/include.log || include_rc=$?
+          test "$include_rc" -eq 1
+
+          # The normal Debian profile (fp BEFORE the jump source) MUST stay
+          # SAFE: same decision and no surviving module trace difference.
+          safe_rc=0
+          python3 tests/pam_libpam_oracle.py compare --ignore-trace allow \
+              tests/fixtures/pam_safe_before.conf \
+              tests/fixtures/pam_safe_after.conf \
+              | tee /pam-oracle-artifacts/safe.log || safe_rc=$?
+          test "$safe_rc" -eq 0
+
+          grep -q '7 -> 0' /pam-oracle-artifacts/selftest.log
+          grep -q 'UNSAFE' /pam-oracle-artifacts/mixed.log
+          grep -q 'UNSAFE' /pam-oracle-artifacts/include.log
+          grep -q 'before rc=7' /pam-oracle-artifacts/include.log
+          grep -q 'rc=0' /pam-oracle-artifacts/include.log
+          grep -q 'SAFE' /pam-oracle-artifacts/safe.log
+          printf 'PAM_LIBPAM_ORACLE_OK\n' > /pam-oracle-artifacts/oracle-ok
+          chmod -R a+rX /pam-oracle-artifacts
+          EOS
+
+          if [ "$oracle_rc" -ne 0 ]; then
+            echo "::error::libpam oracle container failed with rc $oracle_rc"
+            exit 1
+          fi
+          for f in started selftest.log mixed.log include.log safe.log oracle-ok; do
+            if [ ! -s "$artifact_dir/$f" ]; then
+              echo "::error::libpam oracle artifact $f missing (silent skip is not allowed)"
+              exit 1
+            fi
+          done
+          grep -qx 'PAM_LIBPAM_ORACLE_OK' "$artifact_dir/oracle-ok" \
+            || { echo "::error::libpam oracle sentinel invalid"; exit 1; }
+          grep -q '7 -> 0' "$artifact_dir/selftest.log" \
+            || { echo "::error::libpam oracle did not reproduce the 7 -> 0 decision change"; exit 1; }
+          grep -q 'UNSAFE' "$artifact_dir/mixed.log" \
+            || { echo "::error::mixed fixture was not classified UNSAFE"; exit 1; }
+          grep -q 'UNSAFE' "$artifact_dir/include.log" \
+            || { echo "::error::type-prefixed include fixture was not classified UNSAFE"; exit 1; }
+          grep -q 'before rc=7' "$artifact_dir/include.log" \
+            || { echo "::error::type-prefixed include fixture did not reproduce the 7 -> 0 decision change"; exit 1; }
+          grep -q 'SAFE' "$artifact_dir/safe.log" \
+            || { echo "::error::normal Debian fixture was not classified SAFE"; exit 1; }
+          echo "PAM libpam oracle sentinel verified on host"

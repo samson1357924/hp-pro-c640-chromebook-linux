@@ -6,14 +6,30 @@
 # (Wayland/X11) and org.freedesktop.login1 PrepareForSleep (S3) to turn off
 # keyboard backlight when screen goes dark and restore it when screen lights up.
 #
-# State is stored atomically in $XDG_RUNTIME_DIR/c640-kbd-backlight.state
-# with first-wins semantics; 0 is never saved/restored to preserve user intent.
-# Handles LED_CORE_SUSPENDRESUME race with 0.5s debounce and re-checks
-# ScreenSaver Active before restoring (covers TROUBLESHOOTING.md §11).
+# Write chain (single-writer aware):
+#   gsd-power Keyboard.Brightness (pct) -> UPower SetBrightness (raw) -> LED.
+#   UPower's "external" signals are ignored by gsd-power, so writing UPower
+#   alone leaves gsd-power's cache stale.  We therefore write the property
+#   first and only fall back to direct UPower / sysfs / ectool writes.
+#
+# State is stored atomically in $XDG_RUNTIME_DIR/c640-kbd-backlight.state.
+# A 5s sampler keeps the last user-visible brightness (0 = user explicitly
+# switched it off) so a blank can be saved even when the LED was already
+# turned off by firmware.
 set -euo pipefail
 
-SYSFS_BRIGHTNESS="/sys/class/leds/chromeos::kbd_backlight/brightness"
-SYSFS_MAX="/sys/class/leds/chromeos::kbd_backlight/max_brightness"
+# Restore / handoff result-code contract.  Only RC_DONE means "work actually
+# completed and was verified", and is therefore the only code allowed to
+# consume HANDOFF_RESUME_FILE / STATE_FILE.  RC_DEFER is retryable contention
+# or an active/unknown screen (keep flag, handoff and state); RC_FAIL is an
+# invalid input or an I/O failure (keep everything and warn).
+RC_DONE=0
+RC_FAIL=1
+RC_DEFER=2
+
+# Optional sysfs overrides (mainly for testing / non-standard kernels).
+SYSFS_BRIGHTNESS="${C640_KBD_SYSFS_BRIGHTNESS:-/sys/class/leds/chromeos::kbd_backlight/brightness}"
+SYSFS_MAX="${C640_KBD_SYSFS_MAX:-/sys/class/leds/chromeos::kbd_backlight/max_brightness}"
 
 # Secure per-user state directory
 # Prefer XDG_RUNTIME_DIR, fallback to /run/user/<uid>, then secure tmp
@@ -27,62 +43,531 @@ else
     chmod 700 "$STATE_DIR" 2> /dev/null || true
 fi
 STATE_FILE="$STATE_DIR/c640-kbd-backlight.state"
+# Phase 4b handoff files.  The root sleep hook publishes the pre-suspend
+# brightness and the post-thaw flag into the user's runtime dir; the daemon
+# adopts them after thaw and is the ONLY writer of the restored brightness.
+# Both env overrides are for the unit test; production uses the same dir as
+# STATE_FILE (i.e. $XDG_RUNTIME_DIR).
+HANDOFF_SUSPEND_FILE="${C640_KBD_HANDOFF_SUSPEND:-$STATE_DIR/c640-kbd-backlight.suspend}"
+HANDOFF_RESUME_FILE="${C640_KBD_HANDOFF_RESUME:-$STATE_DIR/c640-kbd-backlight.resume}"
+# Per-cycle identity gates (Phase C).  These live in the USER state dir, not
+# in the root sleep hook's private $STATE_DIR/cycle commit marker.  A cycle is
+# adopted only when its token is at least as new as cycle-begin (with a small
+# skew for pre vs. PrepareForSleep(true) ordering) and has not already been
+# recorded in adopted-cycle.  The env overrides are for the unit test.
+ADOPTED_CYCLE_FILE="${C640_KBD_ADOPTED_CYCLE:-$STATE_DIR/c640-kbd-backlight.adopted-cycle}"
+CYCLE_BEGIN_FILE="${C640_KBD_CYCLE_BEGIN:-$STATE_DIR/c640-kbd-backlight.cycle-begin}"
+C640_KBD_CYCLE_BEGIN_SKEW="${C640_KBD_CYCLE_BEGIN_SKEW:-5}"
+# A non-numeric skew must never weaken the freshness gate.
+case "$C640_KBD_CYCLE_BEGIN_SKEW" in
+    '' | *[!0-9]*) C640_KBD_CYCLE_BEGIN_SKEW=5 ;;
+esac
+# The root sleep hook publishes into the session user's XDG_RUNTIME_DIR, which
+# production normally resolves to the SAME directory this daemon reads.  The
+# only user-visible diagnostic kept here is an EXPLICIT C640_KBD_HANDOFF_DIR
+# override (tests / deliberate configuration) that disagrees with the file the
+# daemon actually reads.  We deliberately do NOT scan /run/user/<other uid>:
+# a real 0700 runtime dir cannot be traversed by another user, so a "read-only
+# cross-uid scan" would silently see nothing and promise a diagnosis it cannot
+# deliver.  The hook now logs the selected uid/session/path and its
+# fail-closed reasons to the root journal instead; never cross-adopt a file
+# from another user's runtime dir.
+HOOK_HANDOFF_DIR="${C640_KBD_HANDOFF_DIR:-}"
+
+_warn_hook_side_handoff() {
+    local filename="$1" expected="$2" candidate
+    if [ -f "$expected" ]; then
+        return 0
+    fi
+    [ -n "$HOOK_HANDOFF_DIR" ] || return 0
+    candidate="${HOOK_HANDOFF_DIR%/}/$filename"
+    [ "$candidate" != "$expected" ] || return 0
+    if [ -f "$candidate" ]; then
+        log_warn "handoff directory mismatch: hook wrote $candidate but daemon reads $expected (check XDG_RUNTIME_DIR / C640_KBD_HANDOFF_DIR)"
+    fi
+}
+# Staging file used while a restore write is in flight.  STATE_FILE is renamed
+# here just before the (potentially slow) write, so a blank arriving mid-write
+# can still store its new value in STATE_FILE; the staged value is consumed
+# only after the write has been verified.
+RESTORE_PENDING_FILE="${C640_KBD_RESTORE_PENDING_FILE:-$STATE_DIR/c640-kbd-backlight.restore-pending}"
 STATE_LOCK="$STATE_DIR/c640-kbd-backlight.state.lock"
 LOCK_FILE="$STATE_DIR/c640-kbd-backlight.lock"
+# Separate lock so the login1 monitor, the 5s sampler and the startup handler
+# cannot all enter handle_resume() at once (which would issue two gsd writes).
+RESUME_LOCK="${C640_KBD_RESUME_LOCK:-$STATE_DIR/c640-kbd-backlight.resume.lock}"
+# Every PHYSICAL brightness write is serialised on WRITE_LOCK (fd 209).  The
+# global lock order is RESUME_LOCK -> STATE_LOCK -> WRITE_LOCK; no path may
+# take WRITE_LOCK and then acquire STATE_LOCK or RESUME_LOCK (finalize/verify
+# and the generation bookkeeping must run AFTER the write lock is released).
+# set_brightness() stays lock-free; each call site wraps it explicitly.
+WRITE_LOCK="${C640_KBD_WRITE_LOCK:-$STATE_DIR/c640-kbd-backlight.write.lock}"
+# Generation for which an unblank guard has already re-applied the restore.
+# Cleared by bump_restore_gen() under WRITE_LOCK, so only the guards of the
+# CURRENT generation can write (and only one of the two delays does).
+GUARD_WRITTEN_GEN_FILE="${C640_KBD_GUARD_WRITTEN_GEN:-$STATE_DIR/c640-kbd-backlight.guard-written-gen}"
+# Reserved for the optional brightness-signal Tier 2 (value:gen written under
+# WRITE_LOCK before set_brightness so a self-write is not read as user intent).
+# Tier 1 does not use it; reset_case() clears it so the file cannot leak.
+SELF_WRITE_SENTINEL="${C640_KBD_SELF_WRITE_SENTINEL:-$STATE_DIR/c640-kbd-backlight.self-write}"
+LAST_USER_FILE="$STATE_DIR/c640-kbd-backlight.last-user"
+# Sidecar metadata for LAST_USER_FILE: how the value was recorded and when.
+# A "manual0" record means the sampler saw two consecutive on-screen zeros,
+# i.e. the user explicitly switched the light off.  It is only honoured for
+# C640_KBD_LAST_USER_TTL seconds while gsd-power still reports an EXPLICIT 0,
+# so a live non-zero reading after the user brightens again is not mistaken for
+# a firmware residue.  A failed/empty gsd query cannot confirm the off intent.
+LAST_USER_META_FILE="${C640_KBD_LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+C640_KBD_LAST_USER_TTL="${C640_KBD_LAST_USER_TTL:-15}"
+# Bounded wait (seconds) for the state lock in save_state().  A restore can
+# hold STATE_LOCK for a few seconds while probing ScreenSaver; waiting for it
+# (instead of silently skipping the save) prevents a blank from turning the
+# LED off with no persisted copy of the new brightness.  0 = no wait.
+C640_KBD_SAVE_LOCK_WAIT="${C640_KBD_SAVE_LOCK_WAIT:-2}"
+# An unblank guard's gsd/ScreenSaver evidence can age during a slow probe and
+# a WRITE_LOCK wait.  Past this many seconds the guard releases the lock,
+# re-probes and re-acquires (bounded) instead of acting on stale evidence.
+# The TTL is measured against a monotonic clock: wall time can jump backwards
+# (NTP / manual adjustment), which must never make stale evidence look fresh.
+C640_KBD_GUARD_EVIDENCE_TTL="${C640_KBD_GUARD_EVIDENCE_TTL:-6}"
+# A non-numeric TTL must never weaken the freshness gate.
+case "$C640_KBD_GUARD_EVIDENCE_TTL" in
+    '' | *[!0-9]*) C640_KBD_GUARD_EVIDENCE_TTL=6 ;;
+esac
+# Monotonic clock source for the evidence TTL.  /proc/uptime is the default;
+# "date" is an explicit degraded/test mode that does NOT resist wall-clock
+# jumps.  Both overrides are intended for tests / unusual environments.
+C640_KBD_MONOTONIC_SOURCE="${C640_KBD_MONOTONIC_SOURCE:-uptime}"
+C640_KBD_MONOTONIC_FILE="${C640_KBD_MONOTONIC_FILE:-/proc/uptime}"
+# Generation gate.  The env override mirrors WRITE_LOCK / the guard markers so
+# tests (and alternate runtime layouts) can redirect it before the daemon is
+# sourced.
+RESTORE_GEN_FILE="${C640_KBD_RESTORE_GEN_FILE:-$STATE_DIR/c640-kbd-backlight.restore-gen}"
+# Retry / guard epoch.  A SUCCESSFUL bump rotates it (numeric e+1) under
+# WRITE_LOCK.  If the publish channel fails, the epoch is revoked IN PLACE
+# (truncate/unlink, see _invalidate_retry_epoch) so retries and guards armed in
+# the old cycle cannot survive.  If even that fails, COORDINATION_UNHEALTHY
+# plus a persistent marker file make every brightness writer fail closed.
+RESTORE_RETRY_EPOCH_FILE="${C640_KBD_RESTORE_RETRY_EPOCH:-$STATE_DIR/c640-kbd-backlight.retry-epoch}"
+# Persistent mirror of COORDINATION_UNHEALTHY.  The in-memory flag is NOT
+# visible to workers forked before the failure (e.g. an append-only inode that
+# defeats `: >` and `rm -f` but still accepts `: >>`).  Every gate therefore
+# reads this marker file at check time; a successful rotation/initialization
+# removes it.  Same directory as the epoch so overrides stay together.
+RETRY_EPOCH_UNHEALTHY_FILE="${C640_KBD_RETRY_EPOCH_UNHEALTHY:-${RESTORE_RETRY_EPOCH_FILE}.unhealthy}"
 
 # Optional: enable IdleMonitor polling via env (0=off default, 1=on)
 C640_KBD_ENABLE_IDLEMONITOR="${C640_KBD_ENABLE_IDLEMONITOR:-0}"
+# Force the legacy sysfs/ectool write path (A/B comparison, no D-Bus at all).
+C640_KBD_FORCE_LEGACY="${C640_KBD_FORCE_LEGACY:-0}"
+# Verbose monitor/debug logging (0=off default).
+C640_KBD_DEBUG="${C640_KBD_DEBUG:-0}"
+# Resume convergence: poll ScreenSaver for up to ~6s (0.2+0.4+0.8+1.6+3.2)
+# after thaw, capped by C640_KBD_RESUME_PROBE_MAX seconds.  Set to 0 in tests
+# to make "unknown" converge immediately.  An explicit opt-in is required to
+# restore while the ScreenSaver answer is still unknown.
+C640_KBD_RESUME_PROBE_MAX="${C640_KBD_RESUME_PROBE_MAX:-10}"
+C640_KBD_RESUME_ALLOW_UNKNOWN="${C640_KBD_RESUME_ALLOW_UNKNOWN:-0}"
 
+# D-Bus well-known paths / interfaces.
+UP_PATH="/org/freedesktop/UPower/KbdBacklight"
+UP_IFACE="org.freedesktop.UPower.KbdBacklight"
+GSD_PATH="/org/gnome/SettingsDaemon/Power"
+GSD_IFACE="org.gnome.SettingsDaemon.Power.Keyboard"
+DBUS_PROPS="org.freedesktop.DBus.Properties"
+
+# Backend availability.  Only the value "1" is cached: 0/empty are re-probed
+# on every use so a long-running daemon can adopt gsd-power / UPower after
+# their D-Bus names appear (and drop them when they disappear).
+HAVE_GSD_KBD=""
+HAVE_UPOWER_KBD=""
+# Emit "backends probed: ..." once per process; later changes are transition
+# logs so the journal stays readable while re-probing on every use.
+_BACKENDS_LOGGED=0
+restore_gen=0
+# Coordination token.  The publish channel (_atomic_publish_text) can fail as a
+# whole (full FS, mktemp/mv failure), so a failed bump cannot be revoked through
+# that same channel.  INVALID is a VALUE, not a number: INVALID == INVALID is
+# never "current".  COORDINATION_UNHEALTHY is set when even the in-place
+# revocation (`: >` / `rm -f`) fails; from then on all writers fail closed.
+# It is mirrored to $RETRY_EPOCH_UNHEALTHY_FILE so workers forked BEFORE the
+# failure also fail closed (the env override below is test-only).
+EPOCH_INVALID='INVALID'
+retry_epoch_seq=0
+RETRY_EPOCH_NONCE=""
+COORDINATION_UNHEALTHY=0
+# Only the test harness forces this; production never sets it.  It models a
+# coordination channel that cannot prove a revocation (e.g. read-only dir).
+C640_KBD_FORCE_COORD_UNHEALTHY="${C640_KBD_FORCE_COORD_UNHEALTHY:-0}"
+case "$C640_KBD_FORCE_COORD_UNHEALTHY" in
+    '' | *[!0-9]*) C640_KBD_FORCE_COORD_UNHEALTHY=0 ;;
+esac
+# In-process mirror of the last user-visible brightness.  The value is also
+# persisted to LAST_USER_FILE so save_state (which runs in a subshell) can read
+# it.  A value of 0 means "the user explicitly turned the backlight off".
+last_user_brightness=""
+# Consecutive on-screen zero readings; two are required before a 0 is treated
+# as user intent rather than gsd-power's transient blank-side write.
+_C640_ZERO_STREAK=0
 log() {
     echo "[c640-kbd-backlight-sync] $*" >&2
 }
 
-get_brightness() {
-    if [ -f "$SYSFS_BRIGHTNESS" ]; then
-        cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo ""
-    elif command -v ectool > /dev/null 2>&1; then
-        local pct
-        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
-        if [[ "$pct" =~ ^[0-9]+$ ]]; then
-            local max
-            max="$(get_max)"
-            if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
-                max=100
-            fi
-            echo $((pct * max / 100))
-        else
-            echo ""
-        fi
-    elif [ -x /usr/local/bin/ectool ]; then
-        local pct2
-        pct2="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
-        if [[ "$pct2" =~ ^[0-9]+$ ]]; then
-            local max2
-            max2="$(get_max)"
-            if ! [[ "$max2" =~ ^[0-9]+$ ]] || [ "$max2" -eq 0 ]; then
-                max2=100
-            fi
-            echo $((pct2 * max2 / 100))
-        else
-            echo ""
-        fi
-    else
-        echo ""
+# Warnings are always visible (stderr -> journald via the user unit).
+log_warn() {
+    echo "[WARN] [c640-kbd-backlight-sync] $*" >&2
+}
+
+# Rate-limited warning: each key is emitted at most once per runtime dir.
+# A marker FILE is used instead of an in-process array: most callers run in a
+# subshell (command substitutions, the retry/guard subshells, handle_resume
+# and the 5s sampler that calls it), so an array update there never reaches
+# the parent and "once" silently degraded to "every poll".  A marker in the
+# state dir is visible to every subshell; TOCTOU (two subshells logging the
+# same key at once) is harmless.
+log_warn_once() {
+    local key="$1"
+    shift
+    local marker="$STATE_DIR/.warned.$key"
+    if [ -e "$marker" ]; then
+        return 0
+    fi
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    : > "$marker" 2> /dev/null || true
+    log_warn "$@"
+}
+
+log_debug() {
+    if [ "$C640_KBD_DEBUG" = "1" ]; then
+        echo "[DEBUG] [c640-kbd-backlight-sync] $*" >&2
     fi
 }
 
+# Milliseconds from an arbitrary monotonic origin.  /proc/uptime is "SEC.FRAC
+# IDLE.FRAC"; only the first field matters.  Any unparsable value, missing file
+# or backward/unavailable wall clock is reported as failure so callers treat
+# the evidence as expired instead of trusting a negative/zero age.  `date` is
+# an explicit degraded/test source and is NOT monotonic.
+_monotonic_ms() {
+    local f="$C640_KBD_MONOTONIC_FILE" line secs frac ms s
+    if [ "$C640_KBD_MONOTONIC_SOURCE" = "uptime" ] && [ -r "$f" ]; then
+        IFS= read -r line 2> /dev/null < "$f" || return 1
+        line="${line%% *}"
+        case "$line" in '' | *[!0-9.]* | *.*.*) return 1 ;; esac
+        secs="${line%%.*}"
+        [ -n "$secs" ] || return 1
+        frac="${line#*.}"
+        [ "$frac" != "$line" ] || frac=0
+        frac="${frac}000"
+        ms=$((10#$secs * 1000 + 10#${frac:0:3}))
+        printf '%s' "$ms"
+        return 0
+    fi
+    # Wall-clock fallback: only when explicitly requested or /proc/uptime is
+    # unreadable.  It cannot resist jumps; see the degraded-mode documentation.
+    s="$(date +%s 2> /dev/null || echo 0)"
+    case "$s" in '' | *[!0-9]*) s=0 ;; esac
+    printf '%s' "$((10#$s * 1000))"
+}
+
+# Extract the first decimal number from a gdbus reply such as "(50,)" or
+# "(<0>,)".  The int32 type token is stripped first so "<int32 50>" parses
+# as 50 rather than 32.
+parse_first_int() {
+    local n
+    n="$(printf '%s\n' "${1//int32 /}" | grep -o '[0-9][0-9]*' | head -n1 || true)"
+    printf '%s' "$n"
+}
+
+# --- Backend probes -------------------------------------------------------
+
+gsd_kbd_present() {
+    local intro
+    intro="$(timeout 3 gdbus introspect --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" 2> /dev/null || true)"
+    grep -q "Brightness" <<< "$intro"
+}
+
+upower_kbd_present() {
+    local intro
+    intro="$(timeout 3 gdbus introspect --system --dest org.freedesktop.UPower --object-path "$UP_PATH" 2> /dev/null || true)"
+    grep -q "SetBrightness" <<< "$intro"
+}
+
+# Log a backend availability change (only when it actually changed).
+log_backend_transition() {
+    local name="$1" old="$2" new="$3"
+    if [ "$old" = "$new" ]; then
+        return 0
+    fi
+    if [ "$new" = "1" ]; then
+        log "$name RECOVERED ($old -> 1); switching back to single writer"
+    else
+        log_warn "$name lost ($old -> 0); falling back"
+    fi
+}
+
+ensure_backends() {
+    # FORCE_LEGACY must be checked first: no gdbus call and no re-probe at all.
+    if [ "$C640_KBD_FORCE_LEGACY" = "1" ]; then
+        HAVE_GSD_KBD=0
+        HAVE_UPOWER_KBD=0
+        log "C640_KBD_FORCE_LEGACY=1: D-Bus backends disabled"
+        return 0
+    fi
+
+    local old_gsd="$HAVE_GSD_KBD" old_upower="$HAVE_UPOWER_KBD"
+
+    # TTL=0: only "1" is cached.  Re-probe on every use while a backend is
+    # unavailable so a name that shows up later is picked up by this daemon.
+    if [ "$HAVE_GSD_KBD" != "1" ]; then
+        if command -v gdbus > /dev/null 2>&1 && gsd_kbd_present; then
+            HAVE_GSD_KBD=1
+        else
+            HAVE_GSD_KBD=0
+        fi
+    fi
+    if [ "$HAVE_UPOWER_KBD" != "1" ]; then
+        if command -v gdbus > /dev/null 2>&1 && upower_kbd_present; then
+            HAVE_UPOWER_KBD=1
+        else
+            HAVE_UPOWER_KBD=0
+        fi
+    fi
+
+    if [ "$_BACKENDS_LOGGED" != "1" ]; then
+        _BACKENDS_LOGGED=1
+        log "backends probed: gsd=$HAVE_GSD_KBD upower=$HAVE_UPOWER_KBD"
+        return 0
+    fi
+    log_backend_transition "gsd-power" "$old_gsd" "$HAVE_GSD_KBD"
+    log_backend_transition "UPower" "$old_upower" "$HAVE_UPOWER_KBD"
+}
+
+# A failed runtime D-Bus call invalidates a cached "1": drop it so the next
+# ensure_backends() re-probes instead of writing into a dead backend forever.
+backend_runtime_failed() {
+    local backend="$1" detail="$2" var name old
+    if [ "$backend" = "gsd" ]; then
+        var=HAVE_GSD_KBD
+        name="gsd-power"
+    else
+        var=HAVE_UPOWER_KBD
+        name="UPower"
+    fi
+    old="${!var}"
+    if [ "$old" = "1" ]; then
+        printf -v "$var" '%s' "0"
+        log_warn "$name lost (1 -> 0) after $detail; falling back (re-probe on next use)"
+    fi
+}
+
+# --- D-Bus helpers --------------------------------------------------------
+
+upower_get_raw() {
+    local out
+    out="$(timeout 3 gdbus call --system --dest org.freedesktop.UPower --object-path "$UP_PATH" --method "$UP_IFACE.GetBrightness" 2> /dev/null)" || return 1
+    parse_first_int "$out"
+}
+
+upower_set_raw() {
+    timeout 3 gdbus call --system --dest org.freedesktop.UPower --object-path "$UP_PATH" --method "$UP_IFACE.SetBrightness" "$1" > /dev/null 2>&1
+}
+
+gsd_get_pct() {
+    local out
+    out="$(timeout 3 gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" --method "$DBUS_PROPS.Get" "$GSD_IFACE" Brightness 2> /dev/null)" || return 1
+    parse_first_int "$out"
+}
+
+gsd_set_pct() {
+    timeout 3 gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path "$GSD_PATH" --method "$DBUS_PROPS.Set" "$GSD_IFACE" Brightness "<int32 $1>" > /dev/null 2>&1
+}
+
 get_max() {
-    if [ -f "$SYSFS_MAX" ]; then
-        cat "$SYSFS_MAX" 2> /dev/null || echo 100
+    local m
+    m="$(cat "$SYSFS_MAX" 2> /dev/null || echo "")"
+    if [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -gt 0 ]; then
+        echo "$m"
     else
         echo 100
     fi
 }
 
+# --- ectool fallback helpers ---------------------------------------------
+
+ectool_get_raw() {
+    local pct=""
+    local max
+    if command -v ectool > /dev/null 2>&1; then
+        pct="$(ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+            pct="$(sudo -n ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        fi
+    elif [ -x /usr/local/bin/ectool ]; then
+        pct="$(/usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+            pct="$(sudo -n /usr/local/bin/ectool pwmgetkblight 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo "")"
+        fi
+    fi
+    if [[ "$pct" =~ ^[0-9]+$ ]]; then
+        max="$(get_max)"
+        if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
+            max=100
+        fi
+        echo $((pct * max / 100))
+    else
+        log_warn_once "ectool-read" "ectool pwmgetkblight unavailable or failed (sudo -n attempted)"
+        echo ""
+    fi
+}
+
+# Returns 0 when at least one ectool invocation (direct, sudo -n, or the
+# /usr/local/bin copy) accepted the write, 1 when all of them failed.
+ectool_set_pct() {
+    local pct="$1"
+    if command -v ectool > /dev/null 2>&1; then
+        if ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        if sudo -n ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        log_warn_once "ectool-set" "ectool pwmsetkblight $pct failed even with sudo -n"
+        return 1
+    elif [ -x /usr/local/bin/ectool ]; then
+        if /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        if sudo -n /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1; then
+            return 0
+        fi
+        log_warn_once "ectool-local-set" "/usr/local/bin/ectool pwmsetkblight $pct failed even with sudo -n"
+        return 1
+    fi
+    log_warn_once "ectool-missing" "no ectool available for legacy fallback"
+    return 1
+}
+
+# Returns 0 only when the write is confirmed.  A readable sysfs that does not
+# show the target value is NOT a success even when echo/tee returned 0: only a
+# successful ectool rescue can turn that into a success.  When sysfs cannot be
+# read back at all, the write syscall result is trusted.
+legacy_set_brightness() {
+    local val="$1"
+    local max="$2"
+    local pct
+    pct=$((val * 100 / max))
+
+    if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
+        log_warn_once "legacy-no-sysfs" "$SYSFS_BRIGHTNESS missing; using ectool only"
+        ectool_set_pct "$pct" || return 1
+        return 0
+    fi
+    local write_ok=0
+    if [ -w "$SYSFS_BRIGHTNESS" ]; then
+        if echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null; then
+            write_ok=1
+        else
+            log_warn_once "sysfs-write" "direct write to $SYSFS_BRIGHTNESS failed"
+        fi
+    else
+        if echo "$val" | sudo -n tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1; then
+            write_ok=1
+        else
+            log_warn_once "sysfs-sudo" "sudo -n tee $SYSFS_BRIGHTNESS failed (user service may lack passwordless sudo)"
+        fi
+    fi
+    local cur
+    cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
+    if [[ "$cur" =~ ^[0-9]+$ ]]; then
+        if [ "$cur" -eq "$val" ]; then
+            return 0
+        fi
+        log_warn_once "sysfs-verify" "sysfs verify mismatch ($cur != $val); falling back to ectool"
+        if ectool_set_pct "$pct"; then
+            return 0
+        fi
+        return 1
+    fi
+    # No readback possible: trust the write syscall (or let ectool try).
+    if [ "$write_ok" -eq 1 ]; then
+        return 0
+    fi
+    if ectool_set_pct "$pct"; then
+        return 0
+    fi
+    return 1
+}
+
+# --- Read / write chain ---------------------------------------------------
+
+get_brightness() {
+    local raw=""
+    if [ "$C640_KBD_FORCE_LEGACY" != "1" ]; then
+        ensure_backends
+        if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+            raw="$(upower_get_raw || echo "")"
+            if [[ "$raw" =~ ^[0-9]+$ ]]; then
+                echo "$raw"
+                return 0
+            fi
+            log_warn_once "upower-get" "UPower GetBrightness failed; falling back to sysfs/ectool"
+            backend_runtime_failed upower "GetBrightness failure"
+        fi
+    fi
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        local sys
+        sys="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "")"
+        if [[ "$sys" =~ ^[0-9]+$ ]]; then
+            echo "$sys"
+            return 0
+        fi
+    fi
+    ectool_get_raw
+}
+
+# Verify a written value through any available readback path.  This
+# deliberately does NOT consult HAVE_GSD_KBD/HAVE_UPOWER_KBD: the Phase 1
+# backend re-probe caches those for write routing, while a verifier may still
+# be readable (or may have just disappeared) independently of that cache.
+# rc 0 = at least one verifier matches, 1 = every readable verifier disagrees,
+# 2 = no readback path at all.
+verify_brightness() {
+    local want="$1"
+    local found=0
+    local raw
+    if [ "$C640_KBD_FORCE_LEGACY" != "1" ]; then
+        raw="$(upower_get_raw 2> /dev/null || echo "")"
+        if [[ "$raw" =~ ^[0-9]+$ ]]; then
+            found=1
+            if [ "$raw" -eq "$want" ]; then
+                return 0
+            fi
+        fi
+    fi
+    if [ -f "$SYSFS_BRIGHTNESS" ]; then
+        raw="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "")"
+        if [[ "$raw" =~ ^[0-9]+$ ]]; then
+            found=1
+            if [ "$raw" -eq "$want" ]; then
+                return 0
+            fi
+        fi
+    fi
+    if [ "$found" -eq 1 ]; then
+        return 1
+    fi
+    return 2
+}
+
+# rc 0 = at least one backend accepted the write and a readback (where
+# available) confirmed the target; rc 1 = invalid value, every writer failed,
+# or every readback disagreed.  A write with no readback path at all is
+# accepted as authoritative, but emits a WARN.
 set_brightness() {
     local val="$1"
-    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
-        return 0
+    if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
+        return 1
     fi
     local max
     max="$(get_max)"
@@ -95,141 +580,2136 @@ set_brightness() {
     if [ "$val" -gt "$max" ]; then
         val="$max"
     fi
-    if [ ! -f "$SYSFS_BRIGHTNESS" ]; then
-        local pct
-        pct=$((val * 100 / max))
-        if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
-        elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+
+    ensure_backends
+    local vrc=0
+
+    # 1) gsd-power property (pct) is the single writer: it updates its own
+    #    cache and drives UPower -> LED.  Availability is proven by a
+    #    successful Properties.Get.
+    if [ "$HAVE_GSD_KBD" = "1" ]; then
+        local gpct
+        gpct="$(gsd_get_pct || echo "")"
+        if [[ "$gpct" =~ ^[0-9]+$ ]]; then
+            local pct
+            pct=$((val * 100 / max))
+            if gsd_set_pct "$pct"; then
+                if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+                case "$vrc" in
+                    0) return 0 ;;
+                    2)
+                        log_warn_once "verify-unavailable" "gsd-power write accepted but no brightness readback available; treating as success (WARN)"
+                        return 0
+                        ;;
+                esac
+                # vrc == 1: the write did not reach the LED.  The common cause
+                # is kbd_brightness_now == value short-circuit: gsd-power
+                # skipped the hardware write because its cache was already at
+                # pct.  Re-setting the same property would short-circuit
+                # again, so force the hardware via UPower -- then VERIFY it,
+                # otherwise a "gsd fake success" would be mistaken for a
+                # completed restore.
+                if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+                    log_warn "gsd cache already at pct=$pct but brightness readback mismatch (expected $val); forcing hardware via UPower"
+                    if upower_set_raw "$val"; then
+                        if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+                        if [ "$vrc" -eq 0 ]; then
+                            return 0
+                        fi
+                        if [ "$vrc" -eq 2 ]; then
+                            log_warn_once "verify-unavailable" "UPower repair accepted but no brightness readback available; treating as success (WARN)"
+                            return 0
+                        fi
+                        log_warn "UPower repair for $val did not verify; continuing fallback"
+                    else
+                        log_warn "UPower SetBrightness $val failed during gsd-power repair"
+                    fi
+                fi
+                # Fall through to the direct UPower / legacy writers.
+            else
+                log_warn_once "gsd-set" "gsd-power Properties.Set failed; trying UPower directly"
+                backend_runtime_failed gsd "Properties.Set failure"
+            fi
+        else
+            log_warn_once "gsd-get" "gsd-power Brightness Properties.Get failed; trying UPower directly"
+            backend_runtime_failed gsd "Properties.Get failure"
         fi
+    fi
+
+    # 2) Direct UPower write.  gsd-power ignores UPower "external" signals,
+    #    so its cache may stay out of sync -> warn once.  The write itself is
+    #    not enough: read it back before declaring success.
+    if [ "$HAVE_UPOWER_KBD" = "1" ]; then
+        if upower_set_raw "$val"; then
+            log_warn_once "upower-direct" "wrote UPower directly (raw=$val); gsd-power cache may be out of sync"
+            if verify_brightness "$val"; then vrc=0; else vrc=$?; fi
+            case "$vrc" in
+                0) return 0 ;;
+                2)
+                    log_warn_once "verify-unavailable" "UPower write accepted but no brightness readback available; treating as success (WARN)"
+                    return 0
+                    ;;
+            esac
+            log_warn "UPower SetBrightness $val succeeded but readback mismatch; trying legacy fallback"
+        else
+            log_warn_once "upower-set" "UPower SetBrightness $val failed; falling back to legacy path"
+            backend_runtime_failed upower "SetBrightness failure"
+        fi
+    fi
+
+    # 3) Legacy sysfs / sudo tee / ectool fallback.  It performs its own
+    #    readback for sysfs; ectool has no readback path and is authoritative
+    #    when its set command succeeds.
+    if [ "$HAVE_GSD_KBD" != "1" ] && [ "$HAVE_UPOWER_KBD" != "1" ]; then
+        log_warn_once "no-dbus-backend" "gsd-power and UPower keyboard backends unavailable; using legacy sysfs/ectool path"
+    fi
+    legacy_set_brightness "$val" "$max" || return 1
+    return 0
+}
+
+# --- ScreenSaver state helpers -------------------------------------------
+
+# Tristate ScreenSaver probe.  Only an explicit "true"/"false" reply is
+# trusted.  A missing tool, a timeout, a missing service or an unrecognisable
+# reply is "unknown" -- it must NOT be read as "false" on a restore path.
+# Every gdbus/busctl call is bounded by `timeout 3`.
+screensaver_tristate() {
+    local out
+    if command -v gdbus > /dev/null 2>&1; then
+        out="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        out="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        echo "unknown"
         return 0
     fi
-    if [ -w "$SYSFS_BRIGHTNESS" ]; then
-        echo "$val" > "$SYSFS_BRIGHTNESS" 2> /dev/null || true
-    else
-        echo "$val" | sudo tee "$SYSFS_BRIGHTNESS" > /dev/null 2>&1 || true
+    if command -v busctl > /dev/null 2>&1; then
+        out="$(timeout 3 busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        out="$(timeout 3 busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || true)"
+        if grep -qw "true" <<< "$out"; then
+            echo "active"
+            return 0
+        fi
+        if grep -qw "false" <<< "$out"; then
+            echo "inactive"
+            return 0
+        fi
+        echo "unknown"
+        return 0
     fi
-    # Verify write and fallback to ectool if needed (covers both branches)
-    local cur
-    cur="$(cat "$SYSFS_BRIGHTNESS" 2> /dev/null || echo "-1")"
-    if [ "$cur" != "$val" ]; then
-        local pct
-        pct=$((val * 100 / max))
-        if command -v ectool > /dev/null 2>&1; then
-            ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
-        elif [ -x /usr/local/bin/ectool ]; then
-            /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || sudo /usr/local/bin/ectool pwmsetkblight "$pct" > /dev/null 2>&1 || true
+    echo "unknown"
+}
+
+# Backwards-compatible boolean wrapper for the sampler, the restart seed and
+# guard_blank.  It is fail-open: "unknown" becomes false.  The sampler/seed
+# then merely skip a sample, but guard_blank CAN write 0 when the answer is an
+# explicit "true" (a best-effort secondary forced-off, not a restore).
+# Restore paths must call screensaver_tristate() and fail closed instead.
+screensaver_is_active() {
+    if [ "$(screensaver_tristate)" = "active" ]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+# Read the complete last-user record with ONE cat of the meta file.  Parsing
+# value and restore stamp from the SAME snapshot is what prevents the torn read
+# where two separate cats see an old value followed by a new generation (or
+# vice versa).  Output is "<value> <restore-gen>" with "-" for an absent field;
+# callers must use this pair whenever the value and its stamp are compared.
+read_last_user_record() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line v="" g=""
+    while IFS= read -r line; do
+        case "$line" in
+            value=*) v="${line#value=}" ;;
+            restore=*) g="${line#restore=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    # Legacy caches (and unit tests that write the file directly) carry no
+    # value= line; fall back to the bare-number file.  0 is a legitimate value:
+    # the user deliberately switched the light off while the screen was on.
+    if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+        v="$(cat "$LAST_USER_FILE" 2> /dev/null || echo "")"
+        [[ "$v" =~ ^[0-9]+$ ]] || v=""
+    fi
+    [[ "$g" =~ ^[0-9]+$ ]] || g=""
+    printf '%s %s' "${v:--}" "${g:--}"
+}
+
+read_last_user_brightness() {
+    local rec v
+    rec="$(read_last_user_record)"
+    v="${rec%% *}"
+    [ "$v" = "-" ] || printf '%s' "$v"
+}
+
+# Atomically publish the complete last-user record.  The sidecar is the
+# canonical copy (value + source + ts + restore generation in ONE rename);
+# LAST_USER_FILE stays a bare number for compatibility and is written second.
+# Failures are non-fatal: the cache is best-effort.
+write_last_user() {
+    local v="$1" src="$2"
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local tmp ts gen
+
+    ts="$(date +%s 2> /dev/null || echo 0)"
+    # Stamp the restore generation that was current when this observation was
+    # made.  A later guard can then tell a user change made AFTER a restore
+    # from a stale pre-restore cache that merely differs from the saved value.
+    # Absolute reader (no PATH-level `cat`) so a stubbed/compromised reader
+    # cannot forge the generation stamp of a last-user observation.
+    gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo "")"
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lum-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lum-XXXXXX" 2> /dev/null || echo "")"
+    if [ -n "$tmp" ]; then
+        {
+            printf 'value=%s\n' "$v"
+            printf 'source=%s\n' "$src"
+            printf 'ts=%s\n' "$ts"
+            printf 'restore=%s\n' "$gen"
+        } > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$meta" 2> /dev/null || cp "$tmp" "$meta" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+    fi
+
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-lu-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-lu-XXXXXX" 2> /dev/null || echo "")"
+    if [ -n "$tmp" ]; then
+        printf '%s\n' "$v" > "$tmp" 2> /dev/null || true
+        chmod 600 "$tmp" 2> /dev/null || true
+        mv -f "$tmp" "$LAST_USER_FILE" 2> /dev/null || cp "$tmp" "$LAST_USER_FILE" 2> /dev/null || true
+        rm -f "$tmp" 2> /dev/null || true
+    fi
+}
+
+# Source recorded in LAST_USER_META_FILE ("nonzero" or "manual0"), empty when
+# the sidecar is missing or malformed (e.g. a cache left by an older daemon).
+last_user_cache_source() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line src=""
+    while IFS= read -r line; do
+        case "$line" in
+            source=*) src="${line#source=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    printf '%s' "$src"
+}
+
+# Age of the cached value in seconds.  Prefer the sidecar's ts; fall back to
+# LAST_USER_FILE's mtime when ts is absent (older cache / manual file write).
+last_user_cache_age() {
+    local meta="${LAST_USER_META_FILE:-$LAST_USER_FILE.meta}"
+    local line ts="" now mtime
+    while IFS= read -r line; do
+        case "$line" in
+            ts=*) ts="${line#ts=}" ;;
+        esac
+    done <<< "$(cat "$meta" 2> /dev/null || true)"
+    now="$(date +%s 2> /dev/null || echo 0)"
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$((now - ts))"
+    elif [ -f "$LAST_USER_FILE" ]; then
+        mtime="$(stat -c %Y "$LAST_USER_FILE" 2> /dev/null || echo "")"
+        if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$((now - mtime))"
         fi
     fi
 }
 
-save_state() {
-    # Atomic first-wins with flock on STATE_LOCK
-    (
-        flock -n 200 || return 0
-        if [ -f "$STATE_FILE" ]; then
+# Restore generation recorded by write_last_user() at observation time.  Empty
+# means an older cache with no generation stamp (or no restore yet).
+last_user_restore_gen() {
+    local rec g
+    rec="$(read_last_user_record)"
+    g="${rec##* }"
+    [ "$g" = "-" ] || printf '%s' "$g"
+}
+
+current_restore_gen() {
+    /bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo ""
+}
+
+# One sampler tick, kept separate from the infinite loop so it is unit
+# testable. Only observations made while the screen is ON count as user
+# intent; a blank-side transient 0 is ignored.
+sample_brightness_once() {
+    # Convergence path for systems without a working dbus-monitor: a stray
+    # resume flag left by the sleep hook is picked up by the sampler too.
+    # handle_resume serialises itself with RESUME_LOCK, so racing with the
+    # login1 monitor cannot issue two writes.
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        # A DEFER (rc=2) keeps the flag for the next 5s tick; it is not a
+        # sampler failure.  `|| true` is required under set -e.
+        handle_resume || true
+    fi
+    if [ "$(screensaver_is_active)" = "true" ]; then
+        _C640_ZERO_STREAK=0
+        return 0
+    fi
+    local b pct
+    b="$(get_brightness)"
+    if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -ne 0 ]; then
+        _C640_ZERO_STREAK=0
+        last_user_brightness="$b"
+        write_last_user "$b" nonzero
+        return 0
+    fi
+    if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -eq 0 ]; then
+        pct="$(gsd_get_pct 2> /dev/null || echo "")"
+        # A non-zero gsd percentage means gsd still considers the light on;
+        # the zero is a transient/hardware artefact, not user intent.
+        if [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ne 0 ]; then
+            _C640_ZERO_STREAK=0
             return 0
         fi
-        if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+        # Empty/failed gsd query is "cannot confirm", NOT 0.  Two unconfirmed
+        # zeros must never be promoted to a manual-off record: that would let
+        # a later suspend adopt a hardware 0 over a real saved brightness.
+        if [ "$pct" != "0" ]; then
+            _C640_ZERO_STREAK=0
+            log_debug "sampler: on-screen 0 with unconfirmed gsd pct='$pct'; not recording manual off"
             return 0
         fi
-        local curr
-        curr="$(get_brightness)"
-        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
-            return 0
+        _C640_ZERO_STREAK=$((_C640_ZERO_STREAK + 1))
+        if [ "$_C640_ZERO_STREAK" -ge 2 ]; then
+            last_user_brightness=0
+            write_last_user 0 manual0
+            log "sampler: two consecutive on-screen zeros (gsd pct=0) -> recording explicit off"
         fi
-        if [ "$curr" -eq 0 ]; then
-            return 0
+    fi
+}
+
+brightness_sampler_loop() {
+    log "brightness sampler started (interval 5s)"
+    _C640_ZERO_STREAK=0
+    while true; do
+        sample_brightness_once
+        sleep 5
+    done
+}
+
+# A LAST_USER_FILE left behind by a previous daemon run is stale. Re-seed it
+# from the brightness the user currently sees so the first blank after a
+# restart saves the real value (including 0) instead of an old one.
+seed_last_user_from_current() {
+    if [ "$(screensaver_is_active)" = "true" ]; then
+        return 0
+    fi
+    local cur
+    cur="$(get_brightness)"
+    if [[ "$cur" =~ ^[0-9]+$ ]]; then
+        last_user_brightness="$cur"
+        # A restart seed normally records what the user currently sees.  When
+        # the light is already off, record it as an explicit off so a later
+        # blank with a non-zero firmware residue cannot re-light the keyboard
+        # before the sampler has observed a fresh manual off (~5-10s).
+        if [ "$cur" -eq 0 ]; then
+            write_last_user "$cur" manual0
+        else
+            write_last_user "$cur" nonzero
         fi
-        mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
-        local tmp
-        tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
-        echo "$curr" > "$tmp" 2> /dev/null || true
-        chmod 600 "$tmp" 2> /dev/null || true
-        mv -f "$tmp" "$STATE_FILE" 2> /dev/null || cp "$tmp" "$STATE_FILE" 2> /dev/null || true
+    fi
+}
+
+# --- State save / restore -------------------------------------------------
+
+# Pure value-selection helper: print the brightness that save_state should
+# persist and return 1 when no usable value exists.  The selection logic is
+# copied verbatim from the old save_state (including the "only an explicit
+# gsd-pct 0 confirms manual off" semantics) but kept separate from the
+# lock/write path so handle_blank can
+# sample the user-visible brightness BEFORE writing 0.  Writing 0 changes the
+# live reading, so recomputing after the write would lose the real value.
+compute_save_brightness() {
+    local live cache curr src age pct
+    # A current valid non-zero reading wins: the sampler only runs every 5s,
+    # so a brightness change made just before a blank must not be lost to a
+    # stale cache.  The cache is used for blank-side zeros (firmware already
+    # off) and unreadable hardware.  An explicit manual off stays in force
+    # only while it is fresh and gsd-power still reports off; once gsd reports
+    # non-zero the user has brightened again and the live reading wins.
+    # get_brightness() runs in a command substitution (its own subshell), so
+    # its backend probe would not be visible here.  Probe once in this shell
+    # so HAVE_GSD_KBD is accurate for the gsd pct check below.
+    ensure_backends
+    live="$(get_brightness 2> /dev/null || echo "")"
+    cache="$(read_last_user_brightness)"
+    src="$(last_user_cache_source)"
+    curr=""
+    if [[ "$live" =~ ^[0-9]+$ ]] && [ "$live" -ne 0 ]; then
+        if [ "$cache" = "0" ] && [ "$src" = "manual0" ]; then
+            age="$(last_user_cache_age)"
+            if [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ]; then
+                pct=""
+                # An explicit gsd pct 0 is the confirmation that the user's
+                # manual off is still in force.  A query failure/timeout yields
+                # EMPTY, which means "cannot confirm", NOT 0: in that case fall
+                # through to the live non-zero reading instead of silently
+                # treating an unavailable D-Bus service as user intent.
+                if [ "$HAVE_GSD_KBD" = "1" ]; then
+                    pct="$(gsd_get_pct 2> /dev/null || echo "")"
+                fi
+                if [ "$pct" = "0" ]; then
+                    curr=0
+                else
+                    log_debug "manual0 cache unconfirmed by gsd pct (pct='$pct'); using live non-zero reading"
+                fi
+            fi
+        fi
+        if [ -z "$curr" ] && [ -n "$cache" ] && [ -z "$src" ]; then
+            # A cache without metadata has no provenance (older daemon or a
+            # direct file write, e.g. a blank simulated mid-restore): retain
+            # the historical cache-wins behaviour for it.
+            curr="$cache"
+        fi
+        if [ -z "$curr" ]; then
+            curr="$live"
+        fi
+    elif [ "$live" = "0" ]; then
+        # Blank-side zero: the firmware already turned the LED off, so the
+        # live reading carries no user intent.  Use the cache regardless of
+        # age; an old value still beats a dark keyboard on unblank.
+        if [ -n "$cache" ]; then
+            curr="$cache"
+        else
+            curr=0
+        fi
+    else
+        # Unreadable hardware: use the cache when available.
+        curr="$cache"
+    fi
+    # Final fallbacks when the live reading and the cache were unusable.
+    if [ -z "$curr" ]; then
+        curr="$last_user_brightness"
+    fi
+    if [ -z "$curr" ]; then
+        curr="$(get_brightness 2> /dev/null || echo "")"
+    fi
+    if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$curr"
+}
+
+# --- STATE_FILE value/format helpers ---------------------------------------
+# Single source of truth for the accepted brightness grammar: a bare
+# non-negative decimal integer (leading zeros allowed); "0" is a real value.
+_is_brightness_value() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# Return 0 iff STATE_FILE holds a VALID saved brightness.
+# CALLER MUST HOLD STATE_LOCK: a concurrent restore stages/renames STATE_FILE,
+# so an unlocked read would be a TOCTOU race.
+_state_file_valid() {
+    [ -f "$STATE_FILE" ] || return 1
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo '')" || return 1
+    # cat keeps embedded newlines; multi-line/binary content is not a value.
+    [[ "$saved" != *$'\n'* ]] || return 1
+    _is_brightness_value "$saved"
+}
+
+# Atomically publish a validated value.  CALLER MUST HOLD STATE_LOCK.
+# No first-wins shortcut here -- the caller decides when to call it.
+# rc: 0 = verified on disk; 2 = invalid value / mktemp or write failure.
+_publish_state_file() {
+    local val="${1:-}" tmp
+    _is_brightness_value "$val" || return 2
+    mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || true
+    tmp="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null \
+        || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX" 2> /dev/null)" || return 2
+    printf '%s\n' "$val" > "$tmp" 2> /dev/null || {
         rm -f "$tmp" 2> /dev/null || true
-        log "saved brightness $curr"
-    ) 200> "$STATE_LOCK" 2> /dev/null || true
+        return 2
+    }
+    chmod 600 "$tmp" 2> /dev/null || true
+    if ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
+        cp "$tmp" "$STATE_FILE" 2> /dev/null || {
+            rm -f "$tmp" 2> /dev/null || true
+            return 2
+        }
+    fi
+    rm -f "$tmp" 2> /dev/null || true
+    # cp fallback onto an existing file keeps the OLD mode; never widen it.
+    chmod 600 "$STATE_FILE" 2> /dev/null || true
+    # Keep the silent-write-failure guard from the old save_state: a wrong
+    # value on disk must never be reported as a successful save.
+    [ "$(cat "$STATE_FILE" 2> /dev/null || echo '')" = "$val" ] || return 2
+    return 0
+}
+
+# Persist the brightness to STATE_FILE (atomic, first-wins for a VALID copy).
+# rc: 0 = a valid copy exists (already present or self-healed now),
+#     1 = the bounded lock wait failed / flock errored,
+#     2 = value selection or the state write failed.
+# Optional $1 is an already-sampled value (skips selection); this is what
+# handle_blank uses so a blank's new value cannot be lost to a lock timeout,
+# nor replaced by a second (blank-side) sample.
+save_state() {
+    local val="${1:-}"
+    if [ -z "$val" ]; then
+        val="$(compute_save_brightness)" || return 2
+    fi
+    _is_brightness_value "$val" || return 2
+    (
+        flock -w "$C640_KBD_SAVE_LOCK_WAIT" 200 || exit 1
+        # First-wins applies ONLY to a VALID existing copy.  An empty,
+        # non-numeric or corrupt file is not a copy: self-heal it with the
+        # value sampled before the LED was switched off (finding #1).
+        if _state_file_valid; then
+            exit 0
+        fi
+        if [ -f "$STATE_FILE" ]; then
+            log_warn "replacing invalid saved brightness with $val"
+        fi
+        _publish_state_file "$val" || exit 2
+        log "saved brightness $val"
+        exit 0
+    ) 200> "$STATE_LOCK"
+}
+
+# Serialise every physical brightness write (fd 209).  Call points wrap
+# set_brightness(); the function itself remains lock-free.  Nothing inside a
+# WRITE_LOCK critical section may acquire STATE_LOCK or RESUME_LOCK, so
+# finalize/verify/gen bookkeeping always happen after _release_write_lock.
+_acquire_write_lock() {
+    if ! exec 209> "$WRITE_LOCK"; then
+        log_warn "cannot open write lock $WRITE_LOCK"
+        return 1
+    fi
+    if ! flock -w 5 209; then
+        exec 209>&-
+        log_warn "cannot take write lock $WRITE_LOCK"
+        return 1
+    fi
+    return 0
+}
+
+_release_write_lock() {
+    flock -u 209 2> /dev/null || true
+    exec 209>&-
+}
+
+# Cleared under WRITE_LOCK by bump_restore_gen(): a guard that already wrote
+# for generation N must not suppress generation N+1's guards.  Return nonzero
+# if a marker survives, so the caller can treat the cycle as unsettled.
+_clear_guard_markers() {
+    local rc=0
+    rm -f -- "$GUARD_WRITTEN_GEN_FILE" "$SELF_WRITE_SENTINEL" 2> /dev/null || rc=1
+    if [ -e "$GUARD_WRITTEN_GEN_FILE" ] || [ -e "$SELF_WRITE_SENTINEL" ]; then
+        rc=1
+    fi
+    return "$rc"
+}
+
+# Atomic, fail-closed publish of a small text value to $2.  Same-directory
+# mktemp + printf + chmod + `mv -T` (no cross-device TMPDIR fallback and no cp
+# fallback): any failed step returns nonzero and leaves no temp behind.  The
+# readback uses the bash `read` builtin, so a PATH-level `cat` stub cannot fake
+# success.  A mismatching destination is REMOVED, so every generation gate
+# fails closed on the next read instead of trusting an unverifiable value.
+_atomic_publish_text() {
+    local value="$1" dest="$2" dir tmp got rc=0
+    dir="${dest%/*}"
+    [ "$dir" != "$dest" ] || dir="."
+    if [ ! -d "$dir" ]; then
+        log_warn "cannot publish $dest: parent directory $dir missing"
+        return 1
+    fi
+    # A symlink or directory destination would be followed / used as a
+    # container by mv; neither is a legitimate generation or marker file.
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if [ ! -f "$dest" ] || [ -L "$dest" ]; then
+            log_warn "cannot publish $dest: destination is not a regular file"
+            return 1
+        fi
+    fi
+    tmp="$(mktemp "$dir/.c640-kbd-gen-XXXXXX" 2> /dev/null)" || {
+        log_warn "cannot create same-dir temp for $dest"
+        return 1
+    }
+    if ! printf '%s\n' "$value" > "$tmp" 2> /dev/null; then
+        log_warn "cannot write value to temp for $dest"
+        rc=1
+    elif ! chmod 600 "$tmp" 2> /dev/null; then
+        log_warn "cannot chmod temp for $dest"
+        rc=1
+    elif ! mv -T -f -- "$tmp" "$dest" 2> /dev/null; then
+        log_warn "cannot rename temp onto $dest"
+        rc=1
+    else
+        tmp=""
+        got=""
+        IFS= read -r got 2> /dev/null < "$dest" || true
+        if [ "$got" != "$value" ]; then
+            log_warn "readback mismatch for $dest ('$got' != '$value'); invalidating destination"
+            rm -f -- "$dest" 2> /dev/null || true
+            rc=1
+        fi
+    fi
+    if [ -n "$tmp" ]; then
+        rm -f -- "$tmp" 2> /dev/null || true
+    fi
+    return "$rc"
+}
+
+# Retry/guard epoch helpers.  Reading with `read` (not cat) keeps the gate
+# independent of PATH-level readers.  Absent / empty / non-numeric / symlink /
+# directory / overflowing content is INVALID, never "0": "0" could equal a
+# captured token and resurrect a worker after a failed publish.
+_read_retry_epoch() {
+    local e=""
+    [ -f "$RESTORE_RETRY_EPOCH_FILE" ] && [ ! -L "$RESTORE_RETRY_EPOCH_FILE" ] \
+        || {
+            printf '%s' "$EPOCH_INVALID"
+            return 0
+        }
+    IFS= read -r e 2> /dev/null < "$RESTORE_RETRY_EPOCH_FILE" || e=""
+    # Bound the digits so 10#$e cannot wrap (Phase C D4 overflow lesson).
+    # A minted nonce is R<seq>-<pid>-<random>: the PID prevents a seq collision
+    # after a daemon restart.  INVALID is never a valid token.
+    [[ "$e" =~ ^[0-9]{1,18}$ || "$e" =~ ^R[0-9]+-[0-9]+-[0-9]+$ ]] || e="$EPOCH_INVALID"
+    printf '%s' "$e"
+}
+
+# Fail-closed helpers.  COORDINATION_UNHEALTHY lives only in this process, so
+# a worker forked before a failed revocation would never see it.  The marker is
+# materialized as an empty file next to the epoch: every gate calls
+# _coordination_writable(), which reads the marker with [ -e ] AT CHECK TIME.
+# Removing that one check resurrects already-forked writers.
+_set_coordination_unhealthy() {
+    COORDINATION_UNHEALTHY=1
+    : > "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
+}
+
+_clear_coordination_unhealthy() {
+    COORDINATION_UNHEALTHY=0
+    rm -f -- "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
+}
+
+# Channel health: `: >> file` appends ZERO bytes -- no temp, no rename, no new
+# block -- so it still works under the fs-full condition that breaks
+# _atomic_publish_text().  A forced hook exists only for deterministic tests.
+# "ignore-marker" is used ONLY by _ensure_retry_epoch: a restart must be able
+# to prove writability before it retires a marker left by an earlier process.
+_coordination_writable() {
+    [ "${C640_KBD_FORCE_COORD_UNHEALTHY:-0}" -eq 0 ] || return 1
+    [ "${COORDINATION_UNHEALTHY:-0}" -eq 0 ] || return 1
+    if [ "${1:-}" != "ignore-marker" ]; then
+        [ ! -e "$RETRY_EPOCH_UNHEALTHY_FILE" ] || return 1
+    fi
+    local f="$RESTORE_RETRY_EPOCH_FILE"
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    : >> "$f" 2> /dev/null || return 1
+    return 0
+}
+
+# Four independent rejections: a globally unhealthy channel, a PERSISTENT
+# unhealthy marker (visible to already-forked workers), a channel that cannot
+# prove writability right now, and INVALID == INVALID.
+_epoch_is_current() {
+    local captured="$1" cur
+    _coordination_writable || return 1
+    cur="$(_read_retry_epoch)"
+    [ "$cur" != "$EPOCH_INVALID" ] && [ "$cur" = "$captured" ]
+}
+
+# In-place revocation.  NEVER route this through _atomic_publish_text(): that
+# is exactly the channel that just failed.  Truncation needs no new directory
+# entry or block; unlink is the fallback (absent reads as INVALID).  Verify the
+# OBSERVED result: a leftover DIRECTORY also reads as INVALID but must be
+# rejected, because it cannot be trusted as coordination storage.
+_invalidate_retry_epoch() {
+    local f="$RESTORE_RETRY_EPOCH_FILE" e=""
+    if [ -L "$f" ]; then
+        # Never truncate through a symlink; unlink it instead.
+        rm -f -- "$f" 2> /dev/null || true
+    elif [ -p "$f" ]; then
+        # Opening a FIFO for truncation BLOCKS forever with no writer.  An
+        # unlink is non-blocking and leaves absent == INVALID, as intended.
+        rm -f -- "$f" 2> /dev/null || true
+    elif ! : > "$f" 2> /dev/null; then
+        # append-only inode (chattr +a) or read-only dir: rm is the fallback.
+        rm -f -- "$f" 2> /dev/null || true
+    fi
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        return 0
+    fi
+    [ -f "$f" ] && [ ! -L "$f" ] || {
+        _set_coordination_unhealthy
+        return 1
+    }
+    IFS= read -r e 2> /dev/null < "$f" || e=""
+    # An append-only file still holds the OLD token: truncating failed, so the
+    # revocation did NOT happen.  Never let old workers through.
+    [ -z "$e" ] || {
+        _set_coordination_unhealthy
+        return 1
+    }
+    return 0
+}
+
+# A numeric e+1 after INVALID could equal a token captured BEFORE the failure
+# (e.g. 1 -> 0+1 = 1), resurrecting the old worker.  Mint a fresh-form nonce.
+# seq is process-local and restarts at 0 after a daemon restart, so include the
+# PID (plus RANDOM for two mints in one process) to keep tokens disjoint.
+_next_retry_epoch() {
+    retry_epoch_seq=$((retry_epoch_seq + 1))
+    RETRY_EPOCH_NONCE="R$retry_epoch_seq-$$-$RANDOM"
+    printf '%s' "$RETRY_EPOCH_NONCE"
+}
+
+# Called by bump_restore_gen() under WRITE_LOCK.  A rotate failure is handled
+# by the caller with an in-place invalidation (fail closed).  Numeric rotations
+# keep the existing e+1 semantics; only recovery from INVALID uses a nonce.
+_rotate_retry_epoch() {
+    local e="" rc=1
+    e="$(_read_retry_epoch)"
+    if [[ "$e" =~ ^[0-9]{1,18}$ ]]; then
+        if _atomic_publish_text "$((10#$e + 1))" "$RESTORE_RETRY_EPOCH_FILE"; then
+            rc=0
+        fi
+    else
+        # INVALID or a previously minted nonce: never resurrect an old token.
+        _next_retry_epoch > /dev/null
+        if _atomic_publish_text "$RETRY_EPOCH_NONCE" "$RESTORE_RETRY_EPOCH_FILE"; then
+            rc=0
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        # A verified rotate mints a token no old worker can match, so a
+        # fail-closed marker from an earlier cycle can be retired here.
+        rm -f -- "$RETRY_EPOCH_UNHEALTHY_FILE" 2> /dev/null || true
+    fi
+    return "$rc"
+}
+
+# Startup/worker initialization of a fresh coordination channel.  Called from
+# main() before any worker is forked, and directly by the unit tests.
+_ensure_retry_epoch() {
+    local e had_marker=0
+    e="$(_read_retry_epoch)"
+    # A persistent unhealthy marker means an EARLIER process could not revoke
+    # the epoch in place: a worker it forked may still hold the old numeric
+    # token.  Restarting must not merely prove `: >>` writability and retire
+    # the marker -- that would let the survivor pass every gate again.  Mint a
+    # fresh nonce FIRST, then (only after a verified publish) retire the marker.
+    [ -e "$RETRY_EPOCH_UNHEALTHY_FILE" ] && had_marker=1
+    if [ "$had_marker" -eq 1 ] || [ "$e" = "$EPOCH_INVALID" ]; then
+        _next_retry_epoch > /dev/null
+        if ! _atomic_publish_text "$RETRY_EPOCH_NONCE" "$RESTORE_RETRY_EPOCH_FILE"; then
+            _set_coordination_unhealthy
+            log_warn "cannot rotate retry epoch on restart; all brightness writers fail closed"
+            return 1
+        fi
+        # A verified nonce is a token no old worker captured, so the in-process
+        # fail-closed decision is obsolete; the on-disk marker is retired only
+        # after the writability proof below.
+        COORDINATION_UNHEALTHY=0
+    fi
+    # Prove the channel BEFORE retiring a marker.  `: >>` can succeed on an
+    # append-only inode where a rename cannot; if the nonce publish above
+    # failed we already returned with the marker intact.
+    if ! _coordination_writable ignore-marker; then
+        _set_coordination_unhealthy
+        log_warn "retry epoch channel unhealthy; all brightness writers fail closed"
+        return 1
+    fi
+    _clear_coordination_unhealthy
+    return 0
+}
+
+# Atomic publish of the in-process $restore_gen.  Caller holds WRITE_LOCK
+# (see bump_restore_gen) so guards cannot miss the new generation between the
+# check and their own write.
+_publish_restore_gen() {
+    local gen="${1:-$restore_gen}"
+    _atomic_publish_text "$gen" "$RESTORE_GEN_FILE"
+}
+
+# Fail-closed generation bump.  The read-modify-publish of the generation and
+# the clearing of the guard markers happen INSIDE WRITE_LOCK -- the same lock
+# a guard holds during its final check -- so two concurrent bumps cannot stamp
+# the same generation and no guard can pass its check before the bump lands.
+# In-memory restore_gen advances ONLY after a verified publish AND successful
+# marker cleanup.  On success the epoch is rotated; on failure it is revoked in
+# place (and a failed revocation makes all writers fail closed).  Returns 0
+# only when the publish, marker cleanup and epoch rotation all succeeded.
+bump_restore_gen() {
+    if ! _acquire_write_lock; then
+        # No lock means no atomic bump; the only safe move is to revoke every
+        # worker armed in the old cycle.  In-place invalidation takes no lock.
+        # Scope (for the Phase E docs): this blocks all SUBSEQUENT gates; a
+        # writer that already entered the WRITE_LOCK critical section cannot be
+        # recalled and may still perform one write.  Without the lock there is
+        # no way to retract it; the next gate check will reject it.
+        log_warn "cannot take write lock while bumping restore generation; not publishing, invalidating retry epoch"
+        if ! _invalidate_retry_epoch; then
+            _set_coordination_unhealthy
+            log_warn "retry epoch invalidation failed; all brightness writers fail closed"
+        fi
+        return 1
+    fi
+    local g="" gen rc=0
+    # Read the file under the lock with the bash builtin: no cat, no stale
+    # in-memory value, no fallback write outside the lock.  In-memory
+    # restore_gen is only clamped AFTER a successful publish below.
+    IFS= read -r g 2> /dev/null < "$RESTORE_GEN_FILE" || g=""
+    [[ "$g" =~ ^[0-9]+$ ]] || g=0
+    gen=$((10#$g + 1))
+    if ! _publish_restore_gen "$gen"; then
+        log_warn "restore generation publish failed (gen=$gen); markers and state kept"
+        rc=1
+    elif ! _clear_guard_markers; then
+        log_warn "guard marker cleanup failed after generation $gen publish; cycle not settled"
+        rc=1
+    else
+        # Only a fully settled cycle advances the in-process mirror.
+        restore_gen="$gen"
+    fi
+    if ! _rotate_retry_epoch; then
+        log_warn "retry epoch rotation failed; invalidating retry epoch in place"
+        if ! _invalidate_retry_epoch; then
+            _set_coordination_unhealthy
+            log_warn "retry epoch invalidation failed; all brightness writers fail closed"
+        fi
+        rc=1
+    fi
+    _release_write_lock
+    return "$rc"
+}
+
+# Crash recovery for the staging window: the value in PENDING is a restore
+# that never reached finalize_restore().  If a new STATE_FILE exists it is
+# newer (a blank saved it) and wins; otherwise the staged value is moved back
+# so the next unblank can retry it.  Always returns 0 (safe to call in main).
+recover_pending_state() {
+    if [ ! -f "$RESTORE_PENDING_FILE" ]; then
+        return 0
+    fi
+    if ! exec 204> "$STATE_LOCK"; then
+        return 0
+    fi
+    if ! flock -n 204; then
+        exec 204>&-
+        return 0
+    fi
+    if [ -f "$STATE_FILE" ]; then
+        rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+        log "discarding interrupted restore (newer state already saved)"
+    else
+        if mv -f "$RESTORE_PENDING_FILE" "$STATE_FILE" 2> /dev/null; then
+            log "recovered interrupted restore from $RESTORE_PENDING_FILE"
+        else
+            log_warn "cannot recover $RESTORE_PENDING_FILE to $STATE_FILE"
+        fi
+    fi
+    flock -u 204
+    exec 204>&-
+    return 0
+}
+
+# Shared tail of every restore attempt.  PENDING is consumed only after the
+# write succeeded; on failure it is rolled back to STATE_FILE (unless a newer
+# blank already saved a replacement).  Returns the write's rc so the caller
+# can report failure and re-arm retries.
+#
+# The state lock is taken with a bounded wait (flock -w 1) here.  Every holder
+# is a short critical section (save_state, a stage step, a retry's stage) and
+# the slow brightness write is already finished before finalize runs, so one
+# second is enough; on timeout we fall through to the degraded path below and
+# resolve PENDING anyway, so the staged value can never be orphaned.  A purely
+# non-blocking flock used to bail out on transient contention while PENDING
+# held the only copy of the saved value: STATE_FILE was already staged away,
+# so the PENDING guard made every later restore_state/cleanup skip forever
+# until a daemon restart.  If flock (or the open) still fails, resolve PENDING
+# anyway so it can never be orphaned.
+finalize_restore() {
+    local saved="$1" rc="$2" gen="$3"
+    local have_lock=1
+    if exec 203> "$STATE_LOCK"; then
+        # PENDING holds the only copy of the staged value, so wait briefly for
+        # a short holder instead of bailing out immediately.  The degraded
+        # path below is unchanged when the bounded wait still fails.
+        if ! flock -w 1 203; then
+            log_warn "restore finalize (gen=$gen): flock failed; resolving PENDING without the lock"
+            have_lock=0
+        fi
+    else
+        log_warn "cannot open state lock $STATE_LOCK in finalize_restore; resolving PENDING without the lock"
+        have_lock=0
+    fi
+    local newer=""
+    if [ -f "$STATE_FILE" ]; then
+        newer="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    fi
+    if [ "$rc" -eq 0 ]; then
+        rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+        if [ -n "$newer" ] && [ "$newer" != "$saved" ]; then
+            log "restore (gen=$gen) succeeded; keeping newer blank-time state $newer"
+        fi
+    else
+        if [ -z "$newer" ]; then
+            if ! mv -f "$RESTORE_PENDING_FILE" "$STATE_FILE" 2> /dev/null; then
+                log_warn "restore failed (gen=$gen): could not roll staged value $saved back to $STATE_FILE"
+            fi
+        else
+            rm -f "$RESTORE_PENDING_FILE" 2> /dev/null || true
+            log "restore failed (gen=$gen): keeping newer blank-time state $newer"
+        fi
+        log_warn "restore failed (gen=$gen, rc=$rc): keeping brightness $saved for retry"
+    fi
+    if [ "$have_lock" -eq 1 ]; then
+        flock -u 203
+    fi
+    exec 203>&-
+    return "$rc"
+}
+
+# A zero rc from set_brightness + finalize_restore is NOT proof that the
+# restore completed: finalize may have failed to consume STATE/PENDING (e.g. a
+# blank saved a replacement value), or the LED may never have changed.  Read
+# brightness outside the lock so a slow D-Bus query cannot starve save_state;
+# the STATE/PENDING check is then done under a short STATE_LOCK critical section.
+verify_restore_applied() {
+    local saved="$1" gen="$2"
+    local cur
+    cur="$(get_brightness 2> /dev/null || echo "")"
+    if ! exec 208> "$STATE_LOCK"; then
+        log_warn "restore verify (gen=$gen): cannot open state lock $STATE_LOCK"
+        return "$RC_DEFER"
+    fi
+    if ! flock -n 208; then
+        exec 208>&-
+        log "restore verify (gen=$gen): state lock busy; not completed"
+        return "$RC_DEFER"
+    fi
+    local rc="$RC_DONE"
+    if [ -f "$RESTORE_PENDING_FILE" ] || [ -f "$STATE_FILE" ]; then
+        log_warn "restore verify (gen=$gen): rc=0 but STATE/PENDING still exists; not completed"
+        rc="$RC_DEFER"
+    elif [[ "$cur" =~ ^[0-9]+$ ]] && [ "$((10#$cur))" -ne "$((10#$saved))" ]; then
+        log_warn "restore verify (gen=$gen): brightness readback $cur != $saved; not completed"
+        rc="$RC_FAIL"
+        # Do NOT re-seed STATE_FILE here: the mismatch may be a deliberate
+        # user brightness change made after the restore write.
+        # Known limitation: set_brightness() can report success via vrc=2
+        # ("no readback path; trust the write") on the legacy/ectool path,
+        # while this get_brightness() can still read a DIFFERENT backend
+        # (ectool or a stale sysfs value).  That cross-backend mismatch is
+        # reported as FAIL even though the write may have succeeded and the
+        # staged state is already consumed.  Re-seeding would overwrite a
+        # genuine user change, so it is deliberately not done; a later
+        # unblank can still save/restore from the last-user cache.
+    fi
+    flock -u 208 2> /dev/null || true
+    exec 208>&-
+    return "$rc"
+}
+
+schedule_restore_retries() {
+    local gen="$1"
+    shift
+    # Epoch barrier: a bump that fails to publish still rotates this epoch, so
+    # a retry armed before that failure must not write with a stale gen.
+    local epoch
+    epoch="$(_read_retry_epoch)"
+    # Never arm on a revoked/unprovable token: a worker that cannot be revoked
+    # must not be created in the first place.
+    if [ "$epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "restore retries: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
+    local delay
+    for delay in "$@"; do
+        (
+            sleep "$delay"
+            local cur_gen
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ]; then
+                log_debug "restore retry +${delay}s gen=$gen superseded by $cur_gen"
+                exit 0
+            fi
+            if ! _epoch_is_current "$epoch"; then
+                log_debug "restore retry +${delay}s (gen=$gen): epoch superseded after sleep; retry cancelled"
+                exit 0
+            fi
+            # Recovery is startup-only: a PENDING that still exists here can
+            # only belong to a restore that is mid-write, so never adopt it.
+            if [ ! -f "$STATE_FILE" ]; then
+                exit 0
+            fi
+            # Fail closed: only an explicit "inactive" permits a restore
+            # write.  "active" and "unknown" both defer to a later unblank.
+            if [ "$(screensaver_tristate)" != "inactive" ]; then
+                exit 0
+            fi
+            # A slow tristate probe can straddle a failed bump; the epoch is
+            # the only witness that the generation was never published.
+            if ! _epoch_is_current "$epoch"; then
+                log_debug "restore retry +${delay}s (gen=$gen): epoch superseded after probe; retry cancelled"
+                exit 0
+            fi
+            if ! exec 202> "$STATE_LOCK"; then
+                exit 0
+            fi
+            if ! flock -n 202; then
+                exec 202>&-
+                exit 0
+            fi
+            # Re-check the generation while holding the lock, so a restore
+            # that started after this retry was scheduled cannot be undone.
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if [ "$cur_gen" != "$gen" ] || ! _epoch_is_current "$epoch"; then
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            local saved
+            saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+            if ! _is_brightness_value "$saved"; then
+                rm -f "$STATE_FILE" 2> /dev/null || true
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            # Stage before writing, exactly like the initial restore: a blank
+            # during the write can still save a newer value to STATE_FILE.
+            if ! mv -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null; then
+                flock -u 202
+                exec 202>&-
+                exit 0
+            fi
+            flock -u 202
+            exec 202>&-
+            log "restore retry +${delay}s (gen=$gen): restoring brightness $saved"
+            local rc=0
+            if ! _acquire_write_lock; then
+                log_warn "restore retry +${delay}s (gen=$gen): WRITE_LOCK unavailable; not writing"
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
+            # The earlier generation checks were made while holding STATE_LOCK,
+            # which was released before waiting for WRITE_LOCK.  A newer resume
+            # can bump the generation in that gap (e.g. a DONE-with-no-write
+            # cycle that never sees STATE_FILE because we staged it away), so
+            # the gate MUST be re-checked after acquiring the write lock.  On a
+            # mismatch, roll the staged value back to STATE_FILE before exiting;
+            # just `exit` here would orphan PENDING and strand the saved value.
+            cur_gen="$(/bin/cat "$RESTORE_GEN_FILE" 2> /dev/null || echo 0)"
+            if ! _epoch_is_current "$epoch"; then
+                log "restore retry +${delay}s (gen=$gen): epoch superseded inside WRITE_LOCK; rolling staged value back"
+                _release_write_lock
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
+            if [ "$cur_gen" != "$gen" ]; then
+                log "restore retry +${delay}s (gen=$gen): generation superseded inside WRITE_LOCK ($cur_gen); rolling staged value back"
+                _release_write_lock
+                finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+                exit 0
+            fi
+            if set_brightness "$saved"; then rc=0; else rc=$?; fi
+            # finalize/verify MUST follow the release: WRITE_LOCK -> STATE_LOCK
+            # would invert the global lock order.
+            _release_write_lock
+            # No recursive re-schedule: a failing backend would otherwise
+            # create a retry storm.  The state file is left in place for the
+            # next unblank event.
+            finalize_restore "$saved" "$rc" "$gen" || true
+            exit 0
+        ) &
+    done
 }
 
 restore_state() {
+    # Normal callers never pass an argument: the ScreenSaver check below is
+    # fail-closed for every restore path.  The ONLY bypass is the explicit
+    # C640_KBD_RESUME_ALLOW_UNKNOWN=1 resume opt-in (force=1), which must also
+    # set that env var -- a stray `restore_state 1` cannot open the bypass.
+    local force="${1:-0}"
+    if ! exec 201> "$STATE_LOCK"; then
+        log_warn "cannot open state lock $STATE_LOCK"
+        return "$RC_DEFER"
+    fi
+    if ! flock -n 201; then
+        exec 201>&-
+        log "restore deferred: state lock busy; keeping state for retry"
+        return "$RC_DEFER"
+    fi
+
+    # PENDING is the marker for a restore between stage and finalize.  Such a
+    # restore has released STATE_LOCK for the slow D-Bus write, so a second
+    # monitor source can reach this point while its value is staged.  Leave
+    # that value (and the generation) alone: its own finalize, or the daemon
+    # restart, owns it.  Crash recovery therefore runs only in main().
+    if [ -f "$RESTORE_PENDING_FILE" ]; then
+        log "restore skipped: another restore is in progress (staged value pending)"
+        flock -u 201
+        exec 201>&-
+        return "$RC_DEFER"
+    fi
+
+    # Bump the generation only after owning the lock: two concurrent restores
+    # can no longer stamp the file with the same generation and let a stale
+    # scheduled retry through.  If the lock is unavailable the cycle is NOT
+    # settled: keep state/handoff and defer instead of writing unguarded.
+    if ! bump_restore_gen; then
+        log_warn "restore: cannot bump generation without WRITE_LOCK; deferring"
+        flock -u 201
+        exec 201>&-
+        return "$RC_DEFER"
+    fi
+    local gen="$restore_gen"
+
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    if ! _is_brightness_value "$saved"; then
+        log_warn "discarding invalid saved brightness '$saved'"
+        rm -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null || true
+        flock -u 201
+        exec 201>&-
+        # Nothing usable to restore: a safe no-op, so the caller may consume
+        # its resume flag (DONE), unlike a deferral or a failure.
+        return "$RC_DONE"
+    fi
+
+    # Defer while the screen is still active (re-blank race, TROUBLESHOOTING
+    # §11), but converge via +0.5s/+1.5s/+3s retries.  Old retries are
+    # invalidated by the generation counter; keeping the state makes the
+    # retries meaningful (and lets a later unblank restore it too).
+    local ss
+    ss="$(screensaver_tristate)"
+    if [ "$ss" != "inactive" ] && ! { [ "$force" = "1" ] && [ "$C640_KBD_RESUME_ALLOW_UNKNOWN" = "1" ]; }; then
+        log "restore deferred: ScreenSaver $ss (gen=$gen); only inactive permits a write"
+        flock -u 201
+        exec 201>&-
+        schedule_restore_retries "$gen" 0.5 1.5 3
+        return "$RC_DEFER"
+    fi
+    if [ "$ss" != "inactive" ]; then
+        log_warn "restore: explicit C640_KBD_RESUME_ALLOW_UNKNOWN=1 overrides ScreenSaver=$ss"
+    fi
+
+    # A valid 0 goes through the exact same write path as any other value:
+    # "0" means the user explicitly switched the light off and MUST be
+    # written, otherwise a non-zero residual brightness survives the restore.
+    # Stage the value to PENDING so a blank arriving during the write can
+    # still save_state() its new value into STATE_FILE.
+    if ! mv -f "$STATE_FILE" "$RESTORE_PENDING_FILE" 2> /dev/null; then
+        log_warn "cannot stage saved brightness $saved; keeping $STATE_FILE"
+        flock -u 201
+        exec 201>&-
+        return "$RC_FAIL"
+    fi
+    log "restoring brightness $saved"
+    # Release the state lock BEFORE the D-Bus write. set_brightness can block
+    # for several seconds (gdbus timeouts); a blank arriving in that window
+    # must still be able to save_state() the new value with a bounded
+    # flock -w wait (C640_KBD_SAVE_LOCK_WAIT).
+    flock -u 201
+    exec 201>&-
+
+    local rc=0
+    if ! _acquire_write_lock; then
+        log_warn "restore (gen=$gen): WRITE_LOCK unavailable; deferring without a write"
+        finalize_restore "$saved" "$RC_DEFER" "$gen" || true
+        return "$RC_DEFER"
+    fi
+    if set_brightness "$saved"; then rc=0; else rc=$?; fi
+    # Release BEFORE finalize/verify (both take STATE_LOCK): WRITE_LOCK is the
+    # innermost lock and must never wait on an outer one.
+    _release_write_lock
+    if finalize_restore "$saved" "$rc" "$gen"; then :; else rc=$?; fi
+
+    if [ "$rc" -ne 0 ]; then
+        # Re-arm the same generation once; retries themselves do not recurse.
+        schedule_restore_retries "$gen" 0.5 1.5 3
+        return "$RC_FAIL"
+    fi
+    # A zero write rc alone does not mean the restore completed (e.g. a blank
+    # saved a new STATE_FILE while the write was in flight).
+    if verify_restore_applied "$saved" "$gen"; then :; else rc=$?; fi
+    if [ "$rc" -eq "$RC_DEFER" ]; then
+        schedule_restore_retries "$gen" 0.5 1.5 3
+    fi
+    return "$rc"
+}
+
+# --- Phase 4b: resume handoff ---------------------------------------------
+
+# Body of adopt_suspend_handoff(), called with STATE_LOCK held.  No brightness
+# write: publishing the value into STATE_FILE is all this does.  The hook
+# never deletes the handoff; consuming it here (only after a successful
+# adoption) is what stops a later cycle reusing a stale value.
+_adopt_suspend_handoff_locked() {
+    # A staged restore owns STATE_FILE until its finalize; do not overwrite it.
+    # Return a distinct "deferred" code (2): the caller must NOT treat the
+    # missing STATE_FILE as "no saved state" and clear the resume flag while
+    # the staged restore is still in flight (P2-1).  The handoff is kept and
+    # the sampler/startup handler will adopt it once PENDING disappears.
+    if [ -f "$RESTORE_PENDING_FILE" ]; then
+        log "suspend handoff adoption deferred: restore in progress (staged value pending)"
+        return 2
+    fi
+    local raw val val_raw committed existing tmp lu src age token tok_epoch begin_raw adopted resume_raw
+    # Strict per-cycle wire format: "<token> <value> published".  The legacy
+    # bare-integer handoff is REJECTED: without a token there is nothing to
+    # cross-check against a resume flag or an already-adopted cycle.
+    # Command substitution strips one trailing newline; extra lines are
+    # explicitly refused.  A value of 0 is still a real value.
+    raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    raw="${raw%$'\n'}"
+    # Use [[:blank:]] (space/tab), NOT [[:space:]]: in bash the latter also
+    # matches CR, so "token 7\rpublished" would pass the parser and overwrite
+    # STATE_FILE (fail open on a torn/malformed handoff).
+    if [[ "$raw" == *$'\n'* ]] \
+        || ! [[ "$raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]]; then
+        # The sampler calls handle_resume every 5s in a subshell; the
+        # file-backed log_warn_once keeps a stale invalid handoff from
+        # flooding the journal (an in-process array cannot do this).
+        log_warn_once "suspend-handoff-invalid" "suspend handoff invalid ('$raw'); daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+    tok_epoch="${BASH_REMATCH[1]}"
+    token="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+    val_raw="${BASH_REMATCH[4]}"
+    # Bound the suspend value BEFORE arithmetic for the same reason as the
+    # epoch and committed value: 10#<digits> wraps at 2^64.  This is the value
+    # a legacy 3-column resume flag adopts, so an oversized copy must fail
+    # closed instead of aliasing a plausible brightness (e.g. 2^64+7 -> 7).
+    if [[ ! "$val_raw" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "suspend handoff value '$val_raw' out of range; daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+    val=$((10#${val_raw}))
+
+    # Bound the epoch BEFORE arithmetic: $((10#<digits>)) wraps at 2^64, so a
+    # >=20-digit epoch (e.g. 2^64+<fresh epoch>) would alias a stale token to
+    # "fresh" and be adopted.  1-10 digits covers all real epoch values and
+    # cannot overflow; anything else fails closed.
+    if [[ ! "$tok_epoch" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "suspend handoff token epoch '$tok_epoch' out of range; daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+
+    # If post did publish a flag, its token must be the SAME cycle.  A stale
+    # suspend copy plus a stale/forged flag must never be adopted together.
+    # A missing flag is tolerated here (adopt-only callers still work); the
+    # login1(false) monitor has its own no-flag gate below.
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        resume_raw="$(cat "$HANDOFF_RESUME_FILE" 2> /dev/null || echo "")"
+        resume_raw="${resume_raw%$'\n'}"
+        # The 4th field (committed value) is optional for backward
+        # compatibility with 3-column flags from an older hook, but a present
+        # field is authoritative for the restore value: the suspend copy may
+        # have been rewritten after post verified it against the root marker.
+        if [[ "$resume_raw" == *$'\n'* ]] \
+            || ! [[ "$resume_raw" =~ ^${token}[[:blank:]]([0-9]+)[[:blank:]][A-Za-z]+([[:blank:]]([0-9]+))?$ ]]; then
+            log_warn "suspend/resume handoff token mismatch ('$resume_raw' vs '$token'); daemon state left unchanged"
+            return "$RC_FAIL"
+        fi
+        committed="${BASH_REMATCH[3]:-}"
+        if [ -n "$committed" ]; then
+            # Same 1-10 digit bound as the hook's marker: 10#$committed wraps
+            # at 2^64, so an oversized committed value must fail closed here.
+            if [[ ! "$committed" =~ ^[0-9]{1,10}$ ]]; then
+                log_warn "suspend handoff committed value '$committed' out of range; daemon state left unchanged"
+                return "$RC_FAIL"
+            fi
+            if [ "$((10#$committed))" -ne "$val" ]; then
+                log_warn "suspend/resume committed value mismatch ('$committed' vs '$val_raw'); using committed value $committed"
+            fi
+            val_raw="$committed"
+            val=$((10#$committed))
+        fi
+    fi
+
+    # Freshness: PrepareForSleep(true) publishes the current epoch into
+    # cycle-begin and clears the stale handoff.  A handoff whose pre epoch is
+    # older than begin-skew belongs to a previous cycle.  `>=` (via -lt here)
+    # tolerates pre running slightly before the login1 signal; a clock jump
+    # only makes this gate more conservative (fail closed).
+    if [ ! -f "$CYCLE_BEGIN_FILE" ]; then
+        log_warn "cycle-begin file $CYCLE_BEGIN_FILE missing; suspend handoff not adopted"
+        return "$RC_FAIL"
+    fi
+    begin_raw="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo "")"
+    begin_raw="${begin_raw%$'\n'}"
+    # Same 1-10 digit bound as the token epoch: an oversized begin value wraps
+    # in 10#$begin_raw (2^64 -> 0), which would make every stale token pass the
+    # freshness check below.  Invalid/overflowing values fail closed.
+    if [[ ! "$begin_raw" =~ ^[0-9]{1,10}$ ]]; then
+        log_warn "cycle-begin file $CYCLE_BEGIN_FILE invalid ('$begin_raw'); suspend handoff not adopted"
+        return "$RC_FAIL"
+    fi
+    if ((10#$tok_epoch < 10#$begin_raw - C640_KBD_CYCLE_BEGIN_SKEW)); then
+        log_warn "suspend handoff token epoch $tok_epoch is stale (cycle-begin $begin_raw, skew $C640_KBD_CYCLE_BEGIN_SKEW); daemon state left unchanged"
+        return "$RC_FAIL"
+    fi
+
+    # Replay barrier: once this token has been adopted, a later copy of the
+    # same handoff must NOT overwrite a newer STATE_FILE again.
+    if [ -f "$ADOPTED_CYCLE_FILE" ]; then
+        adopted="$(cat "$ADOPTED_CYCLE_FILE" 2> /dev/null || echo "")"
+        adopted="${adopted%$'\n'}"
+        if [ "$adopted" = "$token" ]; then
+            log "suspend handoff token $token was already adopted; not rewriting daemon state"
+            return "$RC_DONE"
+        fi
+    fi
+
+    existing="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    # Branch A (screen already blank at suspend time): the hook reads the LED,
+    # which is 0 because the screen blank turned it off.  That 0 is a hardware
+    # reading, NOT user intent, while STATE_FILE holds the last user-visible
+    # brightness.  Never let the blank-side 0 overwrite a valid non-zero saved
+    # value: the next unlock must restore the user's brightness, not 0.  The
+    # handoff is still consumed so a later cycle cannot re-adopt this stale 0.
+    # The RC_DONE here means "handoff consumed AND a valid STATE_FILE remains"
+    # for the following restore -- it does NOT mean a brightness was written.
+    # All other cases are unchanged: 0 with no/absent/invalid saved state is
+    # adopted (a real "user switched it off"), and a non-zero handoff wins.
+    #
+    # Exception (P2-b): Branch A's "blank-side 0" assumption is false when the
+    # user actively switched the light OFF after a DEFER and before suspend.
+    # In that case the last-user cache says `0 / source=manual0`, is still
+    # within TTL, AND gsd-power explicitly confirms 0.  The same "empty means
+    # cannot confirm" rule as P1 applies: a failed gsd query must NOT turn a
+    # hardware blank-side 0 into user intent.
+    if [ "$val" -eq 0 ] && [ -f "$STATE_FILE" ] && [[ "$existing" =~ ^[0-9]+$ ]] && [ "$((10#$existing))" -ne 0 ]; then
+        local pct=""
+        ensure_backends
+        if [ "$HAVE_GSD_KBD" = "1" ]; then
+            pct="$(gsd_get_pct 2> /dev/null || echo "")"
+        fi
+        lu="$(read_last_user_brightness)"
+        src="$(last_user_cache_source)"
+        age="$(last_user_cache_age)"
+        if [ "$lu" = "0" ] && [ "$src" = "manual0" ] && [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -le "$C640_KBD_LAST_USER_TTL" ] && [ "$pct" = "0" ]; then
+            log "suspend handoff 0 confirms a fresh manual off (manual0 age ${age}s, gsd pct=0); adopting it over saved $((10#$existing))"
+        else
+            if [ "$pct" != "0" ]; then
+                log "ignoring suspend handoff 0: manual off not confirmed by gsd pct ('$pct'); keeping saved user brightness $((10#$existing))"
+            else
+                log "ignoring blank-side suspend handoff 0; keeping saved user brightness $((10#$existing))"
+            fi
+            # This cycle settles DONE without any brightness write: cancel a
+            # guard still pending from the previous cycle so it cannot write
+            # over the (unchanged) user brightness later.  Fail closed: if the
+            # generation cannot be bumped under WRITE_LOCK, keep the handoff
+            # and defer instead of claiming a settled cycle.
+            if ! bump_restore_gen; then
+                log_warn "suspend handoff 0: generation bump failed; keeping handoff for retry"
+                return "$RC_DEFER"
+            fi
+            if ! _publish_adopted_cycle "$token"; then
+                return "$RC_DEFER"
+            fi
+            rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+            return 0
+        fi
+    fi
+    if [ -n "$existing" ] && [ "$existing" != "$val" ]; then
+        log "suspend handoff $val overrides differing daemon state $existing"
+    fi
+    # Same-directory atomic publish with readback; NO cp fallback that could
+    # fake a successful rename.  A failure keeps handoff/flag for retry.
+    if ! _atomic_publish_text "$val" "$STATE_FILE"; then
+        log_warn "could not publish adopted brightness $val to $STATE_FILE"
+        return "$RC_FAIL"
+    fi
+    log "adopted suspend handoff brightness $val"
+    # Record the token BEFORE consuming the handoff: a reappearing copy of the
+    # same token is then a replay, not a second STATE_FILE overwrite.
+    if ! _publish_adopted_cycle "$token"; then
+        return "$RC_DEFER"
+    fi
+    # Only the daemon consumes the handoff, and only after the value is ours.
+    rm -f "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+    return 0
+}
+
+# Publish the adopted token with the SAME fail-closed text publisher as the
+# generation markers (no cp fallback).  Failure is retryable: keep the
+# handoff and the resume flag so the next sampler tick can try again.
+_publish_adopted_cycle() {
+    if ! _atomic_publish_text "$1" "$ADOPTED_CYCLE_FILE"; then
+        log_warn "cannot publish adopted-cycle marker $ADOPTED_CYCLE_FILE; keeping handoff for retry"
+        return "$RC_DEFER"
+    fi
+    return 0
+}
+
+adopt_suspend_handoff() {
+    if [ ! -f "$HANDOFF_SUSPEND_FILE" ]; then
+        # Only an explicit override mismatch is diagnosable from here; there
+        # is no cross-uid traversal and no cross-adoption.  The root hook's
+        # journal carries the authoritative uid/session/path diagnostics.
+        _warn_hook_side_handoff "c640-kbd-backlight.suspend" "$HANDOFF_SUSPEND_FILE"
+        log_warn "suspend handoff $HANDOFF_SUSPEND_FILE missing; nothing to adopt"
+        # Neutral: the caller simply restores from a valid STATE_FILE if any.
+        return "$RC_DONE"
+    fi
     (
-        flock -n 200 || return 0
-        if [ ! -f "$STATE_FILE" ]; then
-            return 0
+        local arc=0
+        if ! exec 205> "$STATE_LOCK"; then
+            log_warn "cannot open state lock in adopt_suspend_handoff"
+            exit "$RC_DEFER"
         fi
-        local saved
+        if ! flock -n 205; then
+            exec 205>&-
+            log "suspend handoff adoption deferred: state lock busy"
+            exit "$RC_DEFER"
+        fi
+        # Propagate the locked body's rc: 2 (deferred while a staged restore
+        # owns STATE_FILE) and 1 (invalid handoff / I/O failure) both mean the
+        # resume flag and the handoff must be kept.  Anything outside the
+        # contract is treated as a failure, never as success.
+        _adopt_suspend_handoff_locked || arc=$?
+        # Release explicitly: the stub flock keys on the open fd and a real
+        # flock would release on fd close, but leaving a lock file behind would
+        # make the immediately following restore_state() skip its write.
+        flock -u 205 2> /dev/null || true
+        exec 205>&-
+        case "$arc" in
+            0 | 1 | 2) exit "$arc" ;;
+            *) exit "$RC_FAIL" ;;
+        esac
+    )
+}
+
+# Map restore_state()'s result to the resume contract.  Only RC_DONE consumes
+# the resume flag; RC_DEFER and RC_FAIL keep it (and the saved state) for retry.
+# The local-state fallback passes consume=0: it must never touch a handoff.
+_finish_resume_restore() {
+    local rc="$1" consume="${2:-1}"
+    case "$rc" in
+        "$RC_DONE")
+            if [ "$consume" -eq 1 ]; then
+                rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                log "resume: restore complete; resume flag consumed"
+            else
+                log "resume: local restore complete; handoff left untouched"
+            fi
+            return "$RC_DONE"
+            ;;
+        "$RC_DEFER")
+            log "resume: restore deferred (rc=$rc); keeping resume flag and state for retry"
+            return "$RC_DEFER"
+            ;;
+        *)
+            log_warn "resume: restore failed (rc=$rc); keeping resume flag; state may already be consumed — captured value retained only in last-user cache"
+            return "$RC_FAIL"
+            ;;
+    esac
+}
+
+# The only implementation of "restore after thaw".  RESUME_LOCK makes the
+# login1 monitor, the 5s sampler and the startup handler mutually exclusive,
+# so gsd Properties.Set is issued at most once per resume cycle.  ALL writes
+# go through restore_state() -> set_brightness(); this function never writes
+# sysfs/ectool directly.
+_handle_resume_locked() {
+    # Thaw invalidates any D-Bus cache taken before suspend: drop it and
+    # re-probe (Phase 1 semantics; FORCE_LEGACY still short-circuits in
+    # ensure_backends).  A stale HAVE_*=1 must not write into a dead backend.
+    HAVE_GSD_KBD=""
+    HAVE_UPOWER_KBD=""
+    ensure_backends
+
+    local adopt_rc=0
+    adopt_suspend_handoff || adopt_rc=$?
+    case "$adopt_rc" in
+        "$RC_DEFER")
+            # P2-1: adoption was deferred (a staged restore owns STATE_FILE, or
+            # the lock was busy).  Do NOT clear the resume flag, do NOT adopt
+            # again and do NOT restore: another writer still owns this cycle.
+            # The sampler/startup handler retries when the lock/PENDING clears.
+            log "resume: handoff adoption deferred (restore in flight); keeping flag and handoff"
+            return "$RC_DEFER"
+            ;;
+        "$RC_FAIL")
+            log_warn "resume: handoff adoption failed (rc=$adopt_rc); keeping flag and handoff"
+            return "$RC_FAIL"
+            ;;
+        0) ;;
+        *)
+            log_warn "resume: unexpected handoff adoption rc=$adopt_rc; keeping flag and handoff"
+            return "$RC_FAIL"
+            ;;
+    esac
+
+    if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+        _warn_hook_side_handoff "c640-kbd-backlight.resume" "$HANDOFF_RESUME_FILE"
+        log_debug "resume: no resume flag present; continuing from saved state"
+    fi
+
+    _restore_local_state_locked 1
+}
+
+# Shared local restore body.  CALLER MUST HOLD RESUME_LOCK.  consume=1 settles
+# a committed cycle (a completed restore may clear the resume flag); consume=0
+# is the no-flag fallback, which NEVER adopts, NEVER touches a handoff file and
+# NEVER writes adopted-cycle.  Tristate / generation / DEFER rules are shared.
+_restore_local_state_locked() {
+    local consume_flag="${1:-0}"
+    local saved
+    saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+    if ! _is_brightness_value "$saved"; then
+        # Nothing to restore: LED_CORE_SUSPENDRESUME normally kept the value.
+        # DONE with no write: a guard left over from the previous cycle must
+        # not re-write the brightness after this cycle has settled.  Fail
+        # closed: without the bump this cycle is not settled, so keep the
+        # resume flag and defer to a later sampler tick.
+        if ! bump_restore_gen; then
+            log_warn "resume: generation bump failed with no saved state; keeping resume flag"
+            return "$RC_DEFER"
+        fi
+        if [ "$consume_flag" -eq 1 ]; then
+            rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+            log "resume: no saved state; clearing resume flag (kernel likely preserved brightness)"
+        else
+            log "resume: no saved state; nothing to restore locally"
+        fi
+        return "$RC_DONE"
+    fi
+    saved=$((10#$saved))
+
+    # Poll for an explicit answer.  Only "inactive" is a write permit;
+    # "active" and "unknown" both defer.  The old loop capped only the sum of
+    # sleep delays (~6s) and ignored the time spent inside the D-Bus queries:
+    # six slow tristate probes could hold RESUME_LOCK for ~40s.  Track an
+    # additional WALL-CLOCK deadline (C640_KBD_RESUME_PROBE_MAX, default 10s)
+    # and check it after every probe and before the next one.  This is NOT a
+    # hard interrupt: a query already in flight can still take up to ~6s
+    # (GNOME + freedesktop, each `timeout 3`), so the worst case hold time is
+    # ~probe_max + one tristate query.  0 makes an unknown converge at once.
+    local ss="unknown"
+    local -a delays=(0.2 0.4 0.8 1.6 3.2)
+    local i d next elapsed=0 wall=0 probe_max="$C640_KBD_RESUME_PROBE_MAX"
+    local probe_started_at now
+    case "$probe_max" in
+        '' | *[!0-9.]*) probe_max=10 ;;
+    esac
+    probe_started_at="$(date +%s 2> /dev/null || echo 0)"
+    case "$probe_started_at" in '' | *[!0-9]*) probe_started_at=0 ;; esac
+    for i in 0 1 2 3 4 5; do
+        if [ "$i" -gt 0 ]; then
+            # The previous iteration's sleep may also have crossed the budget.
+            now="$(date +%s 2> /dev/null || echo 0)"
+            case "$now" in '' | *[!0-9]*) now=0 ;; esac
+            wall=$((now - probe_started_at))
+            if awk -v w="$wall" -v m="$probe_max" 'BEGIN { exit !(w >= m) }'; then
+                log "resume: ScreenSaver probe deadline (${wall}s >= ${probe_max}s); converging as unknown"
+                break
+            fi
+        fi
+        ss="$(screensaver_tristate)"
+        if [ "$ss" != "unknown" ]; then
+            break
+        fi
+        if [ "$i" -eq 5 ]; then
+            break
+        fi
+        # A slow gdbus/busctl query may already have consumed the whole budget.
+        now="$(date +%s 2> /dev/null || echo 0)"
+        case "$now" in '' | *[!0-9]*) now=0 ;; esac
+        wall=$((now - probe_started_at))
+        if awk -v w="$wall" -v m="$probe_max" 'BEGIN { exit !(w >= m) }'; then
+            log "resume: ScreenSaver probe deadline (${wall}s >= ${probe_max}s) after slow query; converging as unknown"
+            break
+        fi
+        d="${delays[$i]}"
+        next="$(awk -v a="$elapsed" -v b="$d" 'BEGIN { printf "%.1f", a+b }')"
+        if ! awk -v t="$next" -v m="$probe_max" 'BEGIN { exit !(t <= m) }'; then
+            break
+        fi
+        sleep "$d"
+        elapsed="$next"
+    done
+    log "resume: ScreenSaver=$ss after ${elapsed}s delay / ${wall}s wall-clock (saved=$saved)"
+
+    local rc cur
+    case "$ss" in
+        active)
+            log "resume deferred: ScreenSaver still active (saved=$saved)"
+            # A failed bump must not arm retries stamped with a stale/unchanged
+            # generation; the next sampler tick re-enters handle_resume.
+            if ! bump_restore_gen; then
+                log_warn "resume: generation bump failed while active; keeping flag for next tick"
+                return "$RC_DEFER"
+            fi
+            schedule_restore_retries "$restore_gen" 0.5 1.5 3
+            return "$RC_DEFER"
+            ;;
+        inactive)
+            rc=0
+            if restore_state; then rc=0; else rc=$?; fi
+            local frc=0
+            _finish_resume_restore "$rc" "$consume_flag" || frc=$?
+            return "$frc"
+            ;;
+        unknown)
+            cur="$(get_brightness 2> /dev/null || echo "")"
+            # P2-2: re-read + compare + consume must be one STATE_LOCK critical
+            # section.  Without the lock a blank arriving between the probe and
+            # `rm` could save a newer STATE_FILE that we then delete; re-reading
+            # under the lock also protects against a non-cooperative writer.
+            if ! exec 207> "$STATE_LOCK"; then
+                log_warn "resume: cannot open state lock for convergence check; keeping state"
+                return "$RC_DEFER"
+            fi
+            if ! flock -n 207; then
+                exec 207>&-
+                log "resume: state lock busy during convergence check; keeping state"
+                return "$RC_DEFER"
+            fi
+            local latest=""
+            latest="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
+            if [ -f "$RESTORE_PENDING_FILE" ]; then
+                log "resume: unknown but a restore is in flight; not consuming state"
+                flock -u 207 2> /dev/null || true
+                exec 207>&-
+                return "$RC_DEFER"
+            fi
+            if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$((10#$cur))" -eq "$saved" ]; then
+                if [ "$latest" != "$saved" ]; then
+                    # A blank replaced the state while we were probing; its
+                    # newer value must survive (and the flag stays for retry).
+                    log "resume: state changed to $latest during probe; keeping it"
+                    flock -u 207 2> /dev/null || true
+                    exec 207>&-
+                    return "$RC_DEFER"
+                fi
+                # Safe convergence: firmware already shows the saved value and
+                # STATE_FILE is unchanged, so consume it WITHOUT any write.
+                # Bump the generation BEFORE consuming anything: without the
+                # write lock the bump is refused and this cycle stays DEFER
+                # with flag/state intact (a pending guard must not outlive a
+                # cycle that claimed DONE).
+                if ! bump_restore_gen; then
+                    log_warn "resume: generation bump failed during convergence; keeping state"
+                    flock -u 207 2> /dev/null || true
+                    exec 207>&-
+                    return "$RC_DEFER"
+                fi
+                rm -f "$STATE_FILE" 2> /dev/null || true
+                if [ "$consume_flag" -eq 1 ]; then
+                    rm -f "$HANDOFF_RESUME_FILE" 2> /dev/null || true
+                fi
+                log "resume: ScreenSaver unknown but brightness already $saved; state consumed without writing"
+                flock -u 207 2> /dev/null || true
+                exec 207>&-
+                return "$RC_DONE"
+            fi
+            flock -u 207 2> /dev/null || true
+            exec 207>&-
+            if [ "$C640_KBD_RESUME_ALLOW_UNKNOWN" = "1" ]; then
+                log_warn "resume: ScreenSaver unknown and brightness $cur != $saved; C640_KBD_RESUME_ALLOW_UNKNOWN=1 -> restoring"
+                rc=0
+                # Explicit opt-in is the only allowed bypass of the
+                # fail-closed tristate guard inside restore_state.
+                if restore_state 1; then rc=0; else rc=$?; fi
+                local frc=0
+                _finish_resume_restore "$rc" "$consume_flag" || frc=$?
+                return "$frc"
+            fi
+            log_warn "resume: ScreenSaver unknown (current=$cur saved=$saved); deferring restore, handoff kept"
+            return "$RC_DEFER"
+            ;;
+    esac
+    # Defensive fallback: an unhandled tristate value is never a success.
+    return "$RC_DEFER"
+}
+
+handle_resume() {
+    (
+        if ! exec 206> "$RESUME_LOCK"; then
+            log_warn "cannot open resume lock $RESUME_LOCK"
+            exit 0
+        fi
+        if ! flock -n 206; then
+            log_debug "resume: another handler already active; skipping duplicate"
+            exec 206>&-
+            exit 0
+        fi
+        local rc=0
+        _handle_resume_locked || rc=$?
+        flock -u 206 2> /dev/null || true
+        exec 206>&-
+        exit "$rc"
+    )
+}
+
+# PrepareForSleep(false) with NO resume flag: pre never committed a cycle, so
+# there is nothing to adopt.  The old code skipped restore entirely and left a
+# perfectly valid daemon state un-restored.  This path serialises with the same
+# RESUME_LOCK as handle_resume(), but only restores the daemon's own state: it
+# never adopts a handoff, never deletes one and never writes adopted-cycle.
+restore_from_local_state() {
+    (
+        if ! exec 210> "$RESUME_LOCK"; then
+            log_warn "local restore: cannot open resume lock $RESUME_LOCK"
+            exit 0
+        fi
+        if ! flock -n 210; then
+            log_debug "local restore: another handler already active; skipping"
+            exec 210>&-
+            exit 0
+        fi
+        # Thaw invalidates D-Bus caches just as it does on the adopt path.
+        HAVE_GSD_KBD=""
+        HAVE_UPOWER_KBD=""
+        ensure_backends
+        local rc=0
+        _restore_local_state_locked 0 || rc=$?
+        flock -u 210 2> /dev/null || true
+        exec 210>&-
+        exit "$rc"
+    )
+}
+
+# Startup recovery for a daemon restarted while the machine was suspended, or
+# for a dead dbus-monitor that missed PrepareForSleep(false).  main() calls
+# this in the background so startup latency is unaffected.
+startup_resume_handoff() {
+    if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+        return 0
+    fi
+    log "startup: resume handoff found; adopting after thaw"
+    handle_resume
+}
+
+# --- Blank / unblank guards ----------------------------------------------
+
+guard_blank() {
+    local delay captured_gen captured_epoch
+    # A blank guard started in generation N must never force 0 after a newer
+    # resume cycle (N+1) has restored the user's brightness.  The epoch also
+    # covers a cycle whose generation publish FAILED (no gen bump to detect).
+    captured_gen="$(current_restore_gen)"
+    captured_epoch="$(_read_retry_epoch)"
+    if [ "$captured_epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "blank guard: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
+    for delay in 0.25 1.0; do
+        (
+            sleep "$delay"
+            local gen_now
+            gen_now="$(current_restore_gen)"
+            if [ "$gen_now" != "$captured_gen" ]; then
+                log "blank guard +${delay}s: generation superseded (${captured_gen:-none} -> ${gen_now:-none}); guard cancelled"
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "blank guard +${delay}s: retry epoch superseded after sleep; guard cancelled"
+                exit 0
+            fi
+            # Only an explicit "true" counts as active; every other value
+            # (including a future tristate "unknown") means inactive.
+            if [ "$(screensaver_is_active)" = "true" ]; then
+                : # active: verify the light is really off
+            else
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "blank guard +${delay}s: retry epoch superseded after probe; guard cancelled"
+                exit 0
+            fi
+            local cur
+            cur="$(get_brightness)"
+            if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$cur" -ne 0 ]; then
+                log_warn "blank guard +${delay}s: brightness=$cur while ScreenSaver active; forcing 0"
+                if ! _acquire_write_lock; then
+                    log_warn "blank guard +${delay}s: WRITE_LOCK unavailable; not forcing 0"
+                    exit 0
+                fi
+                # Final check is inside the same lock bump_restore_gen() uses
+                # to publish a new generation: a writer cannot slip in between
+                # the check and the physical write.
+                gen_now="$(current_restore_gen)"
+                if [ "$gen_now" != "$captured_gen" ]; then
+                    log "blank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
+                if ! _epoch_is_current "$captured_epoch"; then
+                    log "blank guard +${delay}s: retry epoch superseded inside WRITE_LOCK; guard cancelled"
+                    _release_write_lock
+                    exit 0
+                fi
+                local grc=0
+                if set_brightness 0; then grc=0; else grc=$?; fi
+                _release_write_lock
+                if [ "$grc" -ne 0 ]; then
+                    log_warn "blank guard +${delay}s: failed to force 0 (rc=$grc)"
+                fi
+            fi
+        ) &
+    done
+}
+
+guard_unblank() {
+    local saved="$1"
+    local max
+    max="$(get_max)"
+    if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -eq 0 ]; then
+        max=100
+    fi
+    local want_pct
+    want_pct=$((saved * 100 / max))
+    # Capture the generation of THIS restore before forking the guards.  Only
+    # a last-user record stamped with the same generation counts as evidence
+    # of a user change made after the restore; an older cache may simply be
+    # the pre-blank brightness (e.g. 6 while the saved value is 8).
+    local restore_gen_now captured_epoch
+    restore_gen_now="$(current_restore_gen)"
+    captured_epoch="$(_read_retry_epoch)"
+    if [ "$captured_epoch" = "$EPOCH_INVALID" ] || ! _coordination_writable; then
+        log_warn "unblank guard: retry epoch invalid/unwritable; not arming"
+        return 0
+    fi
+    local delay
+    for delay in 0.3 0.9; do
+        (
+            # This runs in a subshell: it cannot write HAVE_* back to the
+            # parent, but it does give this guard the freshest backend state.
+            ensure_backends
+            sleep "$delay"
+            # The generation captured before the fork is only a hint: a second
+            # blank/unblank/resume cycle may have completed during the sleep.
+            # Re-check immediately; a superseded guard does ZERO writes.
+            local gen_now
+            gen_now="$(current_restore_gen)"
+            if [ "$gen_now" != "$restore_gen_now" ]; then
+                log "unblank guard +${delay}s: generation superseded (${restore_gen_now:-none} -> ${gen_now:-none}); guard cancelled"
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "unblank guard +${delay}s: retry epoch superseded after sleep; guard cancelled"
+                exit 0
+            fi
+            # Evidence TTL starts HERE: after backend preparation and the
+            # deliberate gated sleep (which are NOT evidence and cost up to
+            # 6s each), but BEFORE the first evidence query.  A slow tristate /
+            # last-user / LED / gsd probe, the WRITE_LOCK wait and the gsd
+            # re-check all still count toward witness age.  Taking the stamp
+            # after those probes would make age ~0 forever; taking it before
+            # the sleep would make a slow backend/sleep burn the whole TTL.
+            local ev_at
+            ev_at="$(_monotonic_ms || echo '')"
+            # This guard can write a restored brightness, so it follows the
+            # same fail-closed rule as restore_state: only inactive proceeds.
+            if [ "$(screensaver_tristate)" != "inactive" ]; then
+                exit 0
+            fi
+            if ! _epoch_is_current "$captured_epoch"; then
+                log "unblank guard +${delay}s: retry epoch superseded after probe; guard cancelled"
+                exit 0
+            fi
+            local lu lu_gen rec gpct raw gsd_positive=0 gsd_changed=0 write_it=0
+            # ONE read of the meta record: value and its generation stamp must
+            # come from the same snapshot, otherwise a sampler rewrite between
+            # two cats yields "old value + new gen" and can impersonate user
+            # intent (P2-3).  "-" means the field is absent.
+            rec="$(read_last_user_record)"
+            lu="${rec%% *}"
+            lu_gen="${rec##* }"
+            [ "$lu" = "-" ] && lu=""
+            [ "$lu_gen" = "-" ] && lu_gen=""
+            raw="$(get_brightness)"
+            if [ "$HAVE_GSD_KBD" = "1" ]; then
+                gpct="$(gsd_get_pct || echo "")"
+                if [[ "$gpct" =~ ^[0-9]+$ ]]; then
+                    if [ "$gpct" = "$want_pct" ]; then
+                        gsd_positive=1
+                    else
+                        gsd_changed=1
+                    fi
+                fi
+            fi
+            # A cache stamped with the CURRENT generation is the only proof of
+            # a user change made after this restore.  An empty/older stamp has
+            # no evidentiary power (it may be the stale pre-blank 6 vs 8).
+            local stamped=0
+            if [ -n "$restore_gen_now" ] && [ "$lu_gen" = "$restore_gen_now" ]; then
+                stamped=1
+            fi
+            if [ "$raw" = "$saved" ]; then
+                : # nothing to repair
+            elif [ "$stamped" -eq 1 ] && [ -n "$lu" ] && [ "$lu" != "$saved" ]; then
+                # Post-restore user change outranks gsd's cache: gsd may be the
+                # stale party when its pct still disagrees with the LED.
+                if [ "$gsd_changed" -eq 1 ] && [ -n "$gpct" ] && [ "$raw" != "$saved" ] && [ "$lu" = "$raw" ]; then
+                    log "unblank guard +${delay}s: gsd=$gpct, LED=$raw and post-restore cache agree on $lu; treating as user intent, not re-setting"
+                else
+                    log "unblank guard +${delay}s: last-user brightness $lu recorded after restore (gen=$restore_gen_now); treating as a new user choice, not re-setting"
+                fi
+                exit 0
+            elif [ "$gsd_positive" -eq 1 ]; then
+                # gsd still asks for the restored value and the LED is not
+                # there: a genuine lost restore.  This covers both a stamped
+                # cache that still equals $saved and an unstamped/stale cache.
+                write_it=1
+            else
+                # No positive gsd evidence.  A mismatch here is AMBIGUOUS: it
+                # may be a user change whose sampler record has not landed yet
+                # (the 5s window).  Blindly re-applying $saved would overwrite
+                # that user choice, so log and leave the brightness alone.
+                log "unblank guard +${delay}s: ambiguous post-restore change (raw=${raw:-unknown}, gsd=${gpct:-unknown}, want=$want_pct, cache=${lu:-none} gen=${lu_gen:-none}, restore gen=${restore_gen_now:-none}); no write"
+                exit 0
+            fi
+            if [ "$write_it" -eq 1 ]; then
+                # Slow D-Bus reads must NOT happen under WRITE_LOCK: bump and
+                # restore wait up to 5s for this lock, and a multi-second
+                # gdbus timeout here widens that degradation window.  Re-read
+                # the LED here, then keep the lock only for cheap local checks
+                # plus the physical write.  The gsd/ScreenSaver witnesses have
+                # a TTL because both the probe and the lock wait can be slow.
+                local raw_now now age_ms=0 attempts=0 grc=0 stale=0 clock_bad=0
+                while :; do
+                    raw_now="$(get_brightness 2> /dev/null || echo "")"
+                    if [ "$raw_now" = "$saved" ]; then
+                        log "unblank guard +${delay}s: brightness already $saved before write; skipping (gen=$restore_gen_now)"
+                        exit 0
+                    fi
+                    log_warn "unblank guard +${delay}s: brightness mismatch (raw=$raw, want=$saved); re-setting"
+                    if ! _acquire_write_lock; then
+                        log_warn "unblank guard +${delay}s: WRITE_LOCK unavailable; not re-setting"
+                        exit 0
+                    fi
+                    # TTL re-check INSIDE the lock.  Stale evidence -> unlock,
+                    # re-probe outside the lock, re-acquire (bounded retries).
+                    # Every re-acquire re-runs the generation and epoch gates.
+                    stale=0 clock_bad=0
+                    now="$(_monotonic_ms || echo '')"
+                    # Keep the two clock failures distinguishable in the log,
+                    # and NEVER print "aged 0ms > TTL" for them: no age was
+                    # actually measured.
+                    if [ -z "$now" ] || [ -z "$ev_at" ]; then
+                        log_warn "unblank guard +${delay}s: evidence clock unavailable; evidence expired"
+                        stale=1 clock_bad=1
+                    elif [ "$now" -lt "$ev_at" ]; then
+                        log_warn "unblank guard +${delay}s: evidence clock moved backwards; evidence expired"
+                        stale=1 clock_bad=1
+                    else
+                        age_ms=$((now - ev_at))
+                        if [ "$age_ms" -gt "$((C640_KBD_GUARD_EVIDENCE_TTL * 1000))" ]; then
+                            stale=1
+                        fi
+                    fi
+                    if [ "$stale" -eq 1 ]; then
+                        _release_write_lock
+                        if [ "$attempts" -ge 2 ]; then
+                            log_warn "unblank guard +${delay}s: evidence still stale after $attempts re-probes; guard cancelled"
+                            exit 0
+                        fi
+                        attempts=$((attempts + 1))
+                        if [ "$clock_bad" -eq 0 ]; then
+                            log "unblank guard +${delay}s: evidence aged ${age_ms}ms > TTL $((C640_KBD_GUARD_EVIDENCE_TTL * 1000))ms; re-probing ($attempts)"
+                        fi
+                        if [ "$(screensaver_tristate)" != "inactive" ]; then
+                            exit 0
+                        fi
+                        if ! _epoch_is_current "$captured_epoch"; then
+                            log "unblank guard +${delay}s: retry epoch superseded during evidence re-probe; guard cancelled"
+                            exit 0
+                        fi
+                        gpct="$(gsd_get_pct || echo "")"
+                        raw="$(get_brightness || echo "")"
+                        gsd_positive=0
+                        if [[ "$gpct" =~ ^[0-9]+$ ]] && [ "$gpct" = "$want_pct" ]; then
+                            gsd_positive=1
+                        fi
+                        if [ "$raw" = "$saved" ]; then
+                            log "unblank guard +${delay}s: brightness already $saved after re-probe; skipping"
+                            exit 0
+                        fi
+                        if [ "$gsd_positive" -ne 1 ]; then
+                            log "unblank guard +${delay}s: gsd no longer supports a re-set after re-probe (pct=${gpct:-unknown}); guard cancelled"
+                            exit 0
+                        fi
+                        # Re-stamp AFTER the fresh evidence has been read, not
+                        # before: the new witnesses start aging from here.
+                        ev_at="$(_monotonic_ms || echo '')"
+                        continue
+                    fi
+                    # The generation gate lives inside the lock bump_restore_gen()
+                    # uses, so a writer cannot slip between the check and the
+                    # physical write.
+                    gen_now="$(current_restore_gen)"
+                    if [ "$gen_now" != "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation superseded inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    if ! _epoch_is_current "$captured_epoch"; then
+                        log "unblank guard +${delay}s: retry epoch superseded inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    local written_gen
+                    written_gen="$(cat "$GUARD_WRITTEN_GEN_FILE" 2> /dev/null || echo "")"
+                    if [ -n "$restore_gen_now" ] && [ "$written_gen" = "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation $restore_gen_now already re-set; skipping duplicate write"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    # Last-chance re-check immediately before set_brightness: a
+                    # non-cooperative publisher cannot slip a new generation past
+                    # the first check while the marker is being examined.
+                    gen_now="$(current_restore_gen)"
+                    if [ "$gen_now" != "$restore_gen_now" ]; then
+                        log "unblank guard +${delay}s: generation changed before write inside WRITE_LOCK; guard cancelled"
+                        _release_write_lock
+                        exit 0
+                    fi
+                    if set_brightness "$saved"; then grc=0; else grc=$?; fi
+                    if [ "$grc" -eq 0 ] && [ -n "$restore_gen_now" ]; then
+                        # Publish the marker while still holding the lock so the
+                        # later guard of the same generation cannot write twice.
+                        # The atomic helper verifies the readback: the old
+                        # `|| true` chain could silently leave no marker and let a
+                        # second guard re-write the same generation.  The LED
+                        # re-check above still skips a redundant physical write.
+                        if ! _atomic_publish_text "$restore_gen_now" "$GUARD_WRITTEN_GEN_FILE"; then
+                            log_warn "unblank guard +${delay}s: cannot publish generation marker (gen=$restore_gen_now); duplicate suppression degraded"
+                        fi
+                    fi
+                    _release_write_lock
+                    break
+                done
+                if [ "$grc" -ne 0 ]; then
+                    log_warn "unblank guard +${delay}s: re-set failed (rc=$grc)"
+                fi
+            fi
+        ) &
+    done
+}
+
+handle_blank() {
+    local captured="" src=0 attempt
+    # Sample BEFORE writing 0: the write changes the live reading, so a
+    # recomputation afterwards could capture the (meaningless) blank-side 0
+    # or nothing at all.  The captured value is reused for every retry.
+    captured="$(compute_save_brightness 2> /dev/null || true)"
+    # Save the pre-blank snapshot on the FIRST attempt.  Calling an
+    # un-parameterised save_state here would sample a second time: if
+    # GNOME/firmware drops the LED to 0 between the two reads, the second
+    # compute_save_brightness sees a blank-side 0 and falls back to the stale
+    # last-user cache (e.g. saving 8 instead of the real 30).  A successful
+    # save of that wrong value would never be corrected by the retry below.
+    # Only let save_state sample itself when captured is empty; do NOT pass
+    # an empty string (that would suppress the fallback).
+    if [ -n "$captured" ]; then
+        if save_state "$captured"; then src=0; else src=$?; fi
+    else
+        if save_state; then src=0; else src=$?; fi
+    fi
+    if [ "$src" -ne 0 ] && [ -n "$captured" ]; then
+        for attempt in 1 2; do
+            if save_state "$captured"; then
+                src=0
+                break
+            else src=$?; fi
+            log_warn "blank: deferred save attempt $attempt failed (rc=$src)"
+        done
+    fi
+    if [ "$src" -ne 0 ]; then
+        # No copy of the new brightness exists.  Keep the LED ON rather than
+        # going dark with nothing to restore on unblank, and leave the value
+        # in the last-user cache so a later blank/save can still pick it up.
+        log_warn "blank: brightness NOT saved (rc=$src); leaving LED on, keeping captured=$captured in cache"
+        if [ -n "$captured" ]; then
+            if [ "$captured" = "0" ]; then
+                write_last_user 0 manual0
+            else
+                write_last_user "$captured" nonzero
+            fi
+        fi
+        return "$src"
+    fi
+    local rc=0
+    if ! _acquire_write_lock; then
+        rc=1
+        log_warn "blank: WRITE_LOCK unavailable; leaving LED on"
+    else
+        if set_brightness 0; then rc=0; else rc=$?; fi
+        _release_write_lock
+    fi
+    if [ "$rc" -ne 0 ]; then
+        log_warn "blank: failed to switch keyboard backlight off (rc=$rc)"
+    fi
+    guard_blank
+}
+
+handle_unblank() {
+    # P1: when the sleep hook has published a resume flag, this restore belongs
+    # to handle_resume(), which serialises every resume writer with RESUME_LOCK
+    # and consumes the handoff exactly once.  Going straight to restore_state()
+    # here races with the login1 monitor / sampler and lets a later
+    # handle_resume() re-adopt a stale handoff value (double gsd write, or
+    # overwriting a brightness the user changed in between).
+    if [ -f "$HANDOFF_RESUME_FILE" ]; then
+        log "unblank: resume flag present; routing through handle_resume"
+        local rrc=0
+        handle_resume || rrc=$?
+        # DEFER is the normal "retry later" outcome, not a handler failure:
+        # callers using `handle_unblank || log_warn ...` must not print a false
+        # failure.  Other rc values still propagate.
+        if [ "$rrc" -eq "$RC_DEFER" ]; then
+            rrc=0
+        fi
+        return "$rrc"
+    fi
+    local saved=""
+    if [ -f "$STATE_FILE" ]; then
         saved="$(cat "$STATE_FILE" 2> /dev/null || echo "")"
-        if ! [[ "$saved" =~ ^[0-9]+$ ]]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        if [ "$saved" -eq 0 ]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
-            rm -f "$STATE_FILE" 2> /dev/null || true
-            return 0
-        fi
-        local curr
-        curr="$(get_brightness)"
-        if ! [[ "$curr" =~ ^[0-9]+$ ]]; then
-            curr=0
-        fi
-        if [ "$curr" -ne 0 ]; then
-            log "skip restore: current brightness $curr != 0 (user changed manually)"
-            return 0
-        fi
-        # Re-check ScreenSaver still active -> defer restore (covers §11 re-blank)
-        local active="" active2=""
-        if command -v gdbus > /dev/null 2>&1; then
-            active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
-            if echo "$active" | grep -q "true"; then
-                active="true"
-            else
-                # Try freedesktop fallback
-                active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                if echo "$active2" | grep -q "true"; then
-                    active="true"
-                else
-                    active="false"
-                fi
-            fi
-        elif command -v busctl > /dev/null 2>&1; then
-            active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
-            if echo "$active" | grep -q "true"; then
-                active="true"
-            else
-                active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
-                if echo "$active2" | grep -q "true"; then
-                    active="true"
-                else
-                    active="false"
-                fi
-            fi
-        fi
-        if [ "$active" = "true" ]; then
-            log "skip restore: ScreenSaver still active, re-saving"
-            local tmp2
-            tmp2="$(mktemp "$STATE_DIR/.c640-kbd-XXXXXX" 2> /dev/null || mktemp "${TMPDIR:-/tmp}/.c640-kbd-XXXXXX")"
-            echo "$saved" > "$tmp2" 2> /dev/null || true
-            chmod 600 "$tmp2" 2> /dev/null || true
-            mv -f "$tmp2" "$STATE_FILE" 2> /dev/null || true
-            rm -f "$tmp2" 2> /dev/null || true
-            return 0
-        fi
-        rm -f "$STATE_FILE" 2> /dev/null || true
-        log "restoring brightness $saved"
-        set_brightness "$saved"
-    ) 200> "$STATE_LOCK" 2> /dev/null || true
+    fi
+    local rc=0
+    if restore_state; then rc=0; else rc=$?; fi
+    # RC_DEFER is a normal retryable outcome (active screen, lock contention
+    # or a staged restore in flight), not a failure.  Printing "restore
+    # failed" here would cry wolf on every ordinary deferral.
+    if [ "$rc" -eq "$RC_DEFER" ]; then
+        log "unblank: restore deferred (rc=$rc); state kept for retry"
+    elif [ "$rc" -ne 0 ]; then
+        log_warn "unblank: restore failed (rc=$rc)"
+    elif [[ "$saved" =~ ^[0-9]+$ ]] && [ "$saved" -ne 0 ]; then
+        guard_unblank "$saved"
+    fi
 }
 
 is_screensaver_available() {
     if command -v gdbus > /dev/null 2>&1; then
-        gdbus introspect --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
-        gdbus introspect --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+        timeout 3 gdbus introspect --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
+        timeout 3 gdbus introspect --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver 2> /dev/null | grep -q "ActiveChanged" && return 0
     fi
     if command -v busctl > /dev/null 2>&1; then
         busctl --user status org.gnome.ScreenSaver 2> /dev/null | grep -q "org.gnome.ScreenSaver" && return 0
@@ -243,6 +2723,7 @@ monitor_screensaver_dbus_monitor() {
     # Monitor both GNOME and freedesktop ScreenSaver (covers GNOME Wayland + KDE/Sway fallback)
     # shellcheck disable=SC2094
     dbus-monitor --session "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'" "type='signal',interface='org.freedesktop.ScreenSaver',member='ActiveChanged'" 2> /dev/null | while IFS= read -r line; do
+        log_debug "dbus-monitor: $line"
         # Filter to ScreenSaver interfaces only - dbus-monitor already filtered, but keep guard for gdbus fallback
         if echo "$line" | grep -q "ActiveChanged"; then
             # Need to read next lines for boolean value; we handle per-line boolean
@@ -251,13 +2732,12 @@ monitor_screensaver_dbus_monitor() {
         case "$line" in
             *boolean\ true*)
                 log "ScreenSaver active -> saving and turning off kbd backlight"
-                save_state
-                set_brightness 0
+                handle_blank || log_warn "dbus-monitor: blank handler failed"
                 ;;
             *boolean\ false*)
                 log "ScreenSaver inactive -> restoring kbd backlight"
                 sleep 0.5
-                restore_state
+                handle_unblank || log_warn "dbus-monitor: unblank handler failed"
                 ;;
         esac
     done
@@ -266,33 +2746,181 @@ monitor_screensaver_dbus_monitor() {
 monitor_screensaver_gdbus() {
     # Fallback via gdbus monitor: watch both destinations without --dest filter
     gdbus monitor --session 2> /dev/null | while IFS= read -r line; do
+        log_debug "gdbus monitor: $line"
         if echo "$line" | grep -q "ActiveChanged"; then
             if echo "$line" | grep -q "org.gnome.ScreenSaver\|org.freedesktop.ScreenSaver"; then
                 if echo "$line" | grep -q "true"; then
                     log "ScreenSaver active (gdbus) -> off"
-                    save_state
-                    set_brightness 0
+                    handle_blank || log_warn "gdbus monitor: blank handler failed"
                 elif echo "$line" | grep -q "false"; then
                     log "ScreenSaver inactive (gdbus) -> restore"
                     sleep 0.5
-                    restore_state
+                    handle_unblank || log_warn "gdbus monitor: unblank handler failed"
                 fi
             fi
         fi
     done
 }
 
+# Extract a parseable, 1-10 digit epoch from the CURRENT suspend handoff.
+# A missing, malformed or overflowing handoff prints nothing and fails: it
+# cannot prove a committed cycle, so PrepareForSleep(true) may drop it.
+_suspend_handoff_token_epoch() {
+    local raw epoch
+    [ -f "$HANDOFF_SUSPEND_FILE" ] || return 1
+    raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    raw="${raw%$'\n'}"
+    [[ "$raw" != *$'\n'* ]] || return 1
+    [[ "$raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]] || return 1
+    epoch="${BASH_REMATCH[1]}"
+    [[ "$epoch" =~ ^[0-9]{1,10}$ ]] || return 1
+    printf '%s\n' "$epoch"
+}
+
+# Commit proof for the CURRENT cycle: a resume flag whose token equals the
+# live (published) suspend handoff.  A Phase B 4-column flag additionally has
+# to carry the same committed value as the suspend copy; a legacy 3-column
+# flag from an older hook proves the commit by token identity alone, exactly
+# as adopt_suspend_handoff() accepts it.  Unlike a wall-clock epoch this proof
+# is causal: a clock rollback or a poisoned future cycle-begin cannot disprove
+# it.  Prints the token epoch on success; prints nothing when the flag is
+# missing, malformed, foreign or in disagreement (then the epoch fence may
+# still drop the pair).
+_current_cycle_commit_proof() {
+    local suspend_raw resume_raw token epoch value committed
+    [ -f "$HANDOFF_SUSPEND_FILE" ] && [ -f "$HANDOFF_RESUME_FILE" ] || return 1
+    suspend_raw="$(cat "$HANDOFF_SUSPEND_FILE" 2> /dev/null || echo "")"
+    suspend_raw="${suspend_raw%$'\n'}"
+    [[ "$suspend_raw" != *$'\n'* ]] || return 1
+    [[ "$suspend_raw" =~ ^([0-9]+)-([0-9]+)-([0-9a-f]{6,12})[[:blank:]]([0-9]+)[[:blank:]]published$ ]] || return 1
+    token="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+    epoch="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[4]}"
+    # Bound before 10# arithmetic: 2^64 wrap would alias an oversized token
+    # epoch / value into a plausible match for the current cycle.
+    [[ "$epoch" =~ ^[0-9]{1,10}$ ]] || return 1
+    [[ "$value" =~ ^[0-9]{1,10}$ ]] || return 1
+
+    resume_raw="$(cat "$HANDOFF_RESUME_FILE" 2> /dev/null || echo "")"
+    resume_raw="${resume_raw%$'\n'}"
+    [[ "$resume_raw" != *$'\n'* ]] || return 1
+    # Both wire formats are accepted: the 4th column is optional, just as it
+    # is in adopt_suspend_handoff().  Bound every numeric field before 10#
+    # arithmetic so an oversized copy cannot alias into a plausible match.
+    [[ "$resume_raw" =~ ^([^[:blank:]]+)[[:blank:]]([0-9]{1,10})[[:blank:]]([A-Za-z]+)([[:blank:]]([0-9]{1,10}))?$ ]] || return 1
+    [ "${BASH_REMATCH[1]}" = "$token" ] || return 1
+    committed="${BASH_REMATCH[5]:-}"
+    # A 3-column flag has no committed value: token identity with the live
+    # published suspend handoff IS the proof the legacy hook committed.  A
+    # present 4th column stays authoritative and must agree with suspend.
+    if [ -n "$committed" ] && [ "$((10#$committed))" -ne "$((10#$value))" ]; then
+        return 1
+    fi
+    printf '%s\n' "$epoch"
+}
+
+# PrepareForSleep(true) cleanup (Phase D, 19th re-review P2).  A delayed signal
+# may arrive AFTER the hook's pre/post commit: never delete a handoff that is
+# not PROVABLY old.  Commit proof wins over wall-clock time: a flag matching
+# the live suspend token (and, when present, its committed value) IS this
+# cycle's commit, even when a rolled-back clock or a poisoned future
+# cycle-begin makes `epoch < begin - skew`.  Only without proof is the epoch
+# fence consulted; a
+# token that cannot be parsed or is provably older than begin-skew is dropped.
+# When cycle-begin is missing/invalid we cannot prove oldness either, so the
+# pair is kept and begin is anchored to the token.  Trade-off: a genuinely old
+# cycle could then be adopted, but adoption still needs the flag/token/
+# committed cross-check and the replay barrier, whereas discarding a valid
+# commit would feed a stale local value to the LED (wrong brightness).
+_prepare_for_sleep_true_cleanup() {
+    local tok_epoch="" begin_raw="" kept=0 now_epoch=""
+    if [ -f "$CYCLE_BEGIN_FILE" ]; then
+        begin_raw="$(cat "$CYCLE_BEGIN_FILE" 2> /dev/null || echo "")"
+        begin_raw="${begin_raw%$'\n'}"
+        [[ "$begin_raw" =~ ^[0-9]{1,10}$ ]] || begin_raw=""
+    fi
+
+    # 1. Commit proof FIRST: causal evidence must not be overturned by a wall
+    #    clock fence, even when the token epoch precedes begin-skew.
+    if tok_epoch="$(_current_cycle_commit_proof)" && [ -n "$tok_epoch" ]; then
+        kept=1
+    elif tok_epoch="$(_suspend_handoff_token_epoch)" && [ -n "$tok_epoch" ]; then
+        if [ -n "$begin_raw" ] \
+            && ((10#$tok_epoch < 10#$begin_raw - C640_KBD_CYCLE_BEGIN_SKEW)); then
+            : # no proof, provably old: drop both handoffs and open a fresh fence
+        else
+            # Missing/invalid begin, or a current token: not provably old.
+            kept=1
+        fi
+    fi
+    if [ "$kept" -eq 1 ]; then
+        # Keep BOTH files: the resume flag is the commit proof, so a delayed
+        # signal must never split a committed cycle.  Anchoring to the token
+        # epoch (possibly LOWER than a poisoned begin) is the recovery path for
+        # that poisoned fence; it is a causal fence, never wall-clock time.
+        if ! _atomic_publish_text "$tok_epoch" "$CYCLE_BEGIN_FILE"; then
+            log_warn "prepare-for-sleep: cannot anchor cycle-begin to token $tok_epoch; resume will fail closed"
+        fi
+        if [ -f "$HANDOFF_SUSPEND_FILE" ] && [ -f "$HANDOFF_RESUME_FILE" ]; then
+            log "keeping committed cycle handoff"
+        fi
+        return 0
+    fi
+    rm -f "$HANDOFF_RESUME_FILE" "$HANDOFF_SUSPEND_FILE" 2> /dev/null || true
+    if [ -e "$HANDOFF_RESUME_FILE" ] || [ -e "$HANDOFF_SUSPEND_FILE" ] \
+        || [ -L "$HANDOFF_RESUME_FILE" ] || [ -L "$HANDOFF_SUSPEND_FILE" ]; then
+        log_warn "prepare-for-sleep: stale handoff could not be cleared; this cycle will fail closed"
+    fi
+    # 2. Monotonic wall-clock fence: a rolled-back `date +%s` must never lower
+    #    an existing begin and thereby admit an old cycle.  A poisoned FUTURE
+    #    begin is recovered by the commit-proof anchor above instead.  If
+    #    `date` fails, the existing begin is the only trustworthy epoch; with
+    #    no usable begin at all there is nothing safe to publish, so keep the
+    #    old fence instead of opening a zero/empty window.
+    now_epoch="$(date +%s 2> /dev/null || printf '%s' "${begin_raw:-0}")"
+    if [[ ! "$now_epoch" =~ ^[0-9]{1,10}$ ]] || [ "$((10#$now_epoch))" -eq 0 ]; then
+        log_warn "prepare-for-sleep: clock unavailable and no valid cycle-begin; existing fence kept"
+        return 0
+    fi
+    if [ -n "$begin_raw" ] && ((10#$now_epoch < 10#$begin_raw)); then
+        now_epoch="$begin_raw"
+    fi
+    if ! _atomic_publish_text "$now_epoch" "$CYCLE_BEGIN_FILE"; then
+        log_warn "prepare-for-sleep: cannot publish cycle-begin; resume will fail closed"
+    fi
+}
+
 monitor_login1() {
     dbus-monitor --system "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'" 2> /dev/null | while IFS= read -r line; do
+        log_debug "login1: $line"
         case "$line" in
             *boolean\ true*)
                 log "PrepareForSleep true -> saving"
-                save_state
+                save_state || log_warn "prepare-for-sleep: save_state failed (rc=$?)"
+                _prepare_for_sleep_true_cleanup
                 ;;
             *boolean\ false*)
-                log "PrepareForSleep false -> restore after delay"
-                sleep 0.6
-                restore_state
+                log "PrepareForSleep false -> daemon adopts handoff and restores"
+                # Finding #2 main gate: the hook publishes the resume flag
+                # ONLY after its root commit marker verified the fresh suspend
+                # handoff.  No flag means pre did not commit: do NOT adopt a
+                # handoff, but still restore the daemon's own saved brightness
+                # (Phase D fallback).  The sampler/unblank/startup paths stay
+                # flag-gated for adoption.
+                local rrc=0
+                if [ ! -f "$HANDOFF_RESUME_FILE" ]; then
+                    # Finding #4: no committed cycle does NOT mean "no work".
+                    # Restore the daemon's own state; never adopt a handoff.
+                    log "login1: no resume flag; falling back to local daemon state"
+                    restore_from_local_state || rrc=$?
+                else
+                    # The thawed daemon owns the single restore path now.
+                    handle_resume || rrc=$?
+                fi
+                # rc=2 means deferred (retry via sampler/unblank), not failure.
+                if [ "$rrc" -ne 0 ] && [ "$rrc" -ne "$RC_DEFER" ]; then
+                    log_warn "login1: resume handler failed (rc=$rrc)"
+                fi
                 ;;
         esac
     done
@@ -305,7 +2933,7 @@ idle_poll_loop() {
     if ! command -v gdbus > /dev/null 2>&1; then
         return 0
     fi
-    if ! gdbus introspect --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core 2> /dev/null | grep -q "GetIdletime"; then
+    if ! timeout 3 gdbus introspect --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core 2> /dev/null | grep -q "GetIdletime"; then
         log "Mutter IdleMonitor not available, idle polling disabled"
         return 0
     fi
@@ -321,22 +2949,21 @@ idle_poll_loop() {
     local was_idle=0
     while true; do
         local idletime
-        idletime="$(gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo 0)"
+        idletime="$(timeout 3 gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime 2> /dev/null | grep -o '[0-9][0-9]*' | head -n1 || echo 0)"
         if ! [[ "$idletime" =~ ^[0-9]+$ ]]; then
             idletime=0
         fi
         if [ "$idletime" -ge "$threshold" ]; then
             if [ "$was_idle" -eq 0 ]; then
                 log "idle threshold reached (${idletime}ms) -> off"
-                save_state
-                set_brightness 0
+                handle_blank || log_warn "idle poll: blank handler failed"
                 was_idle=1
             fi
         else
             if [ "$was_idle" -eq 1 ]; then
                 log "user active (idletime ${idletime}ms) -> restore"
                 sleep 0.5
-                restore_state
+                handle_unblank || log_warn "idle poll: unblank handler failed"
                 was_idle=0
             fi
         fi
@@ -354,6 +2981,25 @@ print_help() {
     echo ""
     echo "Env:"
     echo "  C640_KBD_ENABLE_IDLEMONITOR=1  Enable Mutter IdleMonitor polling"
+    echo "  C640_KBD_FORCE_LEGACY=1        Force sysfs/ectool path (no D-Bus)"
+    echo "  C640_KBD_DEBUG=1               Verbose monitor/debug logging"
+    echo "  C640_KBD_SYSFS_BRIGHTNESS=PATH Override sysfs brightness path"
+    echo "  C640_KBD_SYSFS_MAX=PATH        Override sysfs max_brightness path"
+    echo "  C640_KBD_HANDOFF_SUSPEND=PATH  Override suspend handoff file (tests)"
+    echo "  C640_KBD_HANDOFF_RESUME=PATH   Override resume handoff flag (tests)"
+    echo "  C640_KBD_ADOPTED_CYCLE=PATH    Override adopted-cycle marker (tests)"
+    echo "  C640_KBD_CYCLE_BEGIN=PATH      Override cycle-begin epoch file (tests)"
+    echo "  C640_KBD_CYCLE_BEGIN_SKEW=N    Seconds of pre/true ordering skew (default 5)"
+    echo "  C640_KBD_RESUME_PROBE_MAX=N    Cap ScreenSaver polling after thaw (default 10s)"
+    echo "  C640_KBD_RESUME_ALLOW_UNKNOWN=1 Opt in to restoring when ScreenSaver is unknown"
+    echo "  C640_KBD_SAVE_LOCK_WAIT=N      Bounded wait for the state lock on save (default 2s)"
+    echo "  C640_KBD_GUARD_EVIDENCE_TTL=N  Max age (s) of LED/gsd evidence before a guard re-probes (default 6)"
+    echo "  C640_KBD_MONOTONIC_SOURCE=SRC  Evidence clock: uptime (default) or date (degraded/test)"
+    echo "  C640_KBD_MONOTONIC_FILE=PATH   Override monotonic clock file (tests)"
+    echo "  C640_KBD_FORCE_COORD_UNHEALTHY=1 Force coordination fail-closed (tests)"
+    echo "  C640_KBD_RESTORE_GEN_FILE=PATH Override restore-generation file (tests)"
+    echo "  C640_KBD_RESTORE_RETRY_EPOCH=PATH Override retry/guard epoch file (tests)"
+    echo "  C640_KBD_RETRY_EPOCH_UNHEALTHY=PATH Override fail-closed marker file (tests)"
 }
 
 check_status() {
@@ -373,6 +3019,11 @@ check_status() {
     echo "Daemon running: $(pgrep -f "[c]640-kbd-backlight-sync" > /dev/null && echo yes || echo no)"
     echo "ScreenSaver available: $(is_screensaver_available && echo yes || echo no)"
     echo "IdleMonitor enabled: $C640_KBD_ENABLE_IDLEMONITOR"
+    ensure_backends
+    echo "gsd-power keyboard backend: $([ "$HAVE_GSD_KBD" = "1" ] && echo yes || echo no)"
+    echo "UPower keyboard backend: $([ "$HAVE_UPOWER_KBD" = "1" ] && echo yes || echo no)"
+    echo "UPower raw: $(upower_get_raw 2> /dev/null || echo "?")"
+    echo "gsd-power pct: $(gsd_get_pct 2> /dev/null || echo "?")"
     if command -v gdbus > /dev/null 2>&1; then
         echo "gdbus: available"
     else
@@ -385,133 +3036,184 @@ check_status() {
     fi
 }
 
-# Handle CLI
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    print_help
-    exit 0
-fi
-if [ "${1:-}" = "--test-blank" ]; then
-    save_state
-    set_brightness 0
-    echo "simulated blank: saved and set 0"
-    exit 0
-fi
-if [ "${1:-}" = "--test-unblank" ]; then
-    restore_state
-    echo "simulated unblank: restored"
-    exit 0
-fi
-if [ "${1:-}" = "--check" ]; then
-    check_status
-    exit 0
-fi
-
-# Main daemon
-if [ ! -f "$SYSFS_BRIGHTNESS" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
-    log "no backlight interface found, exiting"
-    exit 0
-fi
-
-# Single instance per user via flock (secure per-user lock)
-umask 077
-mkdir -p "$STATE_DIR" 2> /dev/null || true
-chmod 700 "$STATE_DIR" 2> /dev/null || true
-# Open lock file securely (do not fallback to world-writable /tmp)
-if ! exec 9> "$LOCK_FILE" 2> /dev/null; then
-    log "cannot open lock file $LOCK_FILE, exiting"
-    exit 1
-fi
-chmod 600 "$LOCK_FILE" 2> /dev/null || true
-if ! flock -n 9 2> /dev/null; then
-    log "another instance is running, exiting"
-    exit 0
-fi
-
 cleanup() {
     log "cleanup: restoring if needed"
-    restore_state || true
+    local rc=0
+    if restore_state; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        log_warn "cleanup restore not completed (rc=$rc); state kept for retry"
+    fi
     # kill background jobs
     jobs -p | xargs -r kill 2> /dev/null || true
     exit 0
 }
-trap cleanup TERM INT EXIT HUP
 
-log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR"
+main() {
+    # Recover a value stranded by a crash between restore staging and finalize.
+    recover_pending_state
 
-# Start optional idle polling in background
-if [ "$C640_KBD_ENABLE_IDLEMONITOR" = "1" ]; then
-    idle_poll_loop &
-fi
+    # Handle CLI (semantics unchanged; --test-* do not touch ScreenSaver).
+    if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+        print_help
+        exit 0
+    fi
+    if [ "${1:-}" = "--test-blank" ]; then
+        if ! save_state; then
+            echo "simulated blank: save failed" >&2
+            exit 1
+        fi
+        local rc=0
+        if _acquire_write_lock; then
+            if set_brightness 0; then rc=0; else rc=$?; fi
+            _release_write_lock
+        else
+            rc=1
+        fi
+        if [ "$rc" -ne 0 ]; then
+            echo "simulated blank: failed to set 0 (rc=$rc)" >&2
+            exit 1
+        fi
+        echo "simulated blank: saved and set 0"
+        exit 0
+    fi
+    if [ "${1:-}" = "--test-unblank" ]; then
+        local rc=0
+        if restore_state; then rc=0; else rc=$?; fi
+        if [ "$rc" -ne 0 ]; then
+            if [ "$rc" -eq "$RC_DEFER" ]; then
+                echo "simulated unblank: restore deferred (rc=$rc); state kept for retry" >&2
+            else
+                echo "simulated unblank: restore failed (rc=$rc)" >&2
+            fi
+            # Keep the non-zero CLI contract even for a deferral.
+            exit 1
+        fi
+        echo "simulated unblank: restored"
+        exit 0
+    fi
+    if [ "${1:-}" = "--check" ]; then
+        check_status
+        exit 0
+    fi
 
-# Start login1 monitor in background if dbus-monitor available (with retry)
-if command -v dbus-monitor > /dev/null 2>&1; then
-    (while true; do
-        monitor_login1 || log "login1 monitor exited $?, retry in 2s"
-        sleep 2
-    done) &
-fi
+    # Probe gsd-power / UPower once at daemon start.
+    ensure_backends
 
-# Main screensaver monitor (foreground) with retry to avoid Restart storm
-# dbus-monitor may exit if session bus disappears (e.g. gnome-shell restart)
-if command -v dbus-monitor > /dev/null 2>&1; then
-    while true; do
-        monitor_screensaver_dbus_monitor || log "dbus-monitor exited $?, retry in 2s"
-        sleep 2
-    done &
-    wait || true
-else
-    if command -v gdbus > /dev/null 2>&1; then
-        log "dbus-monitor not found, falling back to gdbus"
+    if [ ! -f "$SYSFS_BRIGHTNESS" ] && [ "$HAVE_UPOWER_KBD" != "1" ] && ! command -v ectool > /dev/null 2>&1 && [ ! -x /usr/local/bin/ectool ]; then
+        log "no backlight interface found, exiting"
+        exit 0
+    fi
+
+    # Single instance per user via flock (secure per-user lock)
+    umask 077
+    mkdir -p "$STATE_DIR" 2> /dev/null || true
+    chmod 700 "$STATE_DIR" 2> /dev/null || true
+    # Open lock file securely.  Never redirect stderr here: daemon warnings
+    # must reach the journal (see the unit's StandardError=journal).
+    if ! exec 9> "$LOCK_FILE"; then
+        log "cannot open lock file $LOCK_FILE, exiting"
+        exit 1
+    fi
+    chmod 600 "$LOCK_FILE" 2> /dev/null || true
+    if ! flock -n 9; then
+        log "another instance is running, exiting"
+        exit 0
+    fi
+
+    trap cleanup TERM INT EXIT HUP
+
+    # Initialize the coordination channel BEFORE forking any worker that may
+    # capture a token.  Failure is not fatal to the service, but leaves every
+    # brightness writer fail closed until a later restart proves writability.
+    _ensure_retry_epoch || true
+
+    log "starting; SYSFS=$SYSFS_BRIGHTNESS STATE=$STATE_FILE IdleMonitor=$C640_KBD_ENABLE_IDLEMONITOR Legacy=$C640_KBD_FORCE_LEGACY"
+
+    # If the daemon was restarted during suspend (or dbus-monitor died), the
+    # hook's resume flag is still on disk.  Pick it up in the background so a
+    # missed PrepareForSleep(false) still converges (Phase 4b).
+    startup_resume_handoff &
+
+    # Discard any last-user value persisted by a previous daemon run.
+    seed_last_user_from_current
+
+    # Always-on sampler for the last user-visible brightness (0 = explicit off).
+    brightness_sampler_loop &
+
+    # Start optional idle polling in background
+    if [ "$C640_KBD_ENABLE_IDLEMONITOR" = "1" ]; then
+        idle_poll_loop &
+    fi
+
+    # Start login1 monitor in background if dbus-monitor available (with retry)
+    if command -v dbus-monitor > /dev/null 2>&1; then
+        (while true; do
+            monitor_login1 || log "login1 monitor exited $?, retry in 2s"
+            sleep 2
+        done) &
+    fi
+
+    # Main screensaver monitor (foreground) with retry to avoid Restart storm
+    # dbus-monitor may exit if session bus disappears (e.g. gnome-shell restart)
+    if command -v dbus-monitor > /dev/null 2>&1; then
         while true; do
-            monitor_screensaver_gdbus || log "gdbus monitor exited $?, retry in 2s"
+            monitor_screensaver_dbus_monitor || log "dbus-monitor exited $?, retry in 2s"
             sleep 2
         done &
         wait || true
     else
-        log "no dbus monitor tool found, entering poll loop"
-        prev=""
-        while true; do
-            active=""
-            if command -v gdbus > /dev/null 2>&1; then
-                active="$(gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                if echo "$active" | grep -q "true"; then
-                    active="true"
-                else
-                    # try freedesktop fallback
-                    active2="$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
-                    if echo "$active2" | grep -q "true"; then
+        if command -v gdbus > /dev/null 2>&1; then
+            log "dbus-monitor not found, falling back to gdbus"
+            while true; do
+                monitor_screensaver_gdbus || log "gdbus monitor exited $?, retry in 2s"
+                sleep 2
+            done &
+            wait || true
+        else
+            log "no dbus monitor tool found, entering poll loop"
+            prev=""
+            while true; do
+                active=""
+                if command -v gdbus > /dev/null 2>&1; then
+                    active="$(timeout 3 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                    if ! grep -q "true" <<< "$active"; then
+                        active="$(timeout 3 gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive 2> /dev/null || echo "")"
+                    fi
+                    if grep -q "true" <<< "$active"; then
                         active="true"
                     else
                         active="false"
                     fi
-                fi
-            elif command -v busctl > /dev/null 2>&1; then
-                active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
-                if echo "$active" | grep -q "true"; then
-                    active="true"
-                else
-                    active2="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
-                    if echo "$active2" | grep -q "true"; then
+                elif command -v busctl > /dev/null 2>&1; then
+                    active="$(busctl --user get-property org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver Active 2> /dev/null || echo "")"
+                    if ! grep -q "true" <<< "$active"; then
+                        active="$(busctl --user get-property org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver Active 2> /dev/null || echo "")"
+                    fi
+                    if grep -q "true" <<< "$active"; then
                         active="true"
                     else
                         active="false"
                     fi
-                fi
-            else
-                sleep 5
-                continue
-            fi
-            if [ "$active" != "$prev" ]; then
-                if [ "$active" = "true" ]; then
-                    save_state
-                    set_brightness 0
                 else
-                    sleep 0.5
-                    restore_state
+                    sleep 5
+                    continue
                 fi
-                prev="$active"
-            fi
-            sleep 2
-        done
+                if [ "$active" != "$prev" ]; then
+                    if [ "$active" = "true" ]; then
+                        handle_blank || log_warn "poll loop: blank handler failed"
+                    else
+                        sleep 0.5
+                        handle_unblank || log_warn "poll loop: unblank handler failed"
+                    fi
+                    prev="$active"
+                fi
+                sleep 2
+            done
+        fi
     fi
+}
+
+# Safe to source for stub/unit testing: only run when executed directly.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

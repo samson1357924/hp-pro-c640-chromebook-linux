@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: 2026 Samson <https://github.com/samson1357924>
+#
+# Physical AT scancode -> hwdb key name for the HP Pro c640 top row.
+# Inferred on real Dratini hardware on 2026-10-31: EVIOCGKEY showed the
+# post-hwdb key state (KEY_F1..F10) and, combined with the standard AT
+# scancode->keycode table, this corresponds to scancodes 0x3b-0x44 (keycodes
+# 59-68); EVIOCGKEYCODE was then used to verify the kernel's translation.
+# NOTE: EVIOCGKEY reports post-hwdb keycodes, not raw MSC_SCAN, so it alone
+# does not *prove* the raw scancode. To verify MSC_SCAN directly use plain
+# `evtest` (do NOT pass --grab) or this repo's `--scan` mode after stopping
+# keyd (`sudo systemctl stop keyd`); when done run `sudo systemctl start keyd`
+# to restore the service.
+#
+# scancode	hwdb-key	name
+3b	back		Top 1 Back
+3c	forward		Top 2 Forward
+3d	refresh		Top 3 Refresh
+3e	f11		Top 4 Fullscreen
+3f	scale		Top 5 Overview
+40	brightnessdown	Top 6 Brightness down
+41	brightnessup	Top 7 Brightness up
+42	mute		Top 8 Mute
+43	volumedown	Top 9 Volume down
+44	volumeup	Top 10 Volume up
+db	leftmeta	Search / Launcher

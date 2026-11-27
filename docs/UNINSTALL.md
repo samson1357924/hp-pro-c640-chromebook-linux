@@ -35,10 +35,224 @@ This command automatically:
    modified (`thermald`, `tlp`, `c640-battery-limit.service`,
    `c640-kbd-backlight-sync.service` with `scope: user` via `--global` + per-user
    `daemon-reload`, …) and removes **plugdev group memberships that the installer
-   added** (memberships that existed before installation, or still required by
-   other udev rules, are kept).
+   added**. Ownership is decided from every component's original-state record,
+   so memberships that existed before installation, or still required by other
+   udev rules, are kept, and the uninstall order of the modules does not matter.
 8. Removes the fingerprint encryption seed `/var/lib/fprint/crfpmoc.key` and
    shows the commands to reinstall the distro's native `libfprint` package.
+
+### Rollback safety guarantees
+
+Rollback consumes a manifest record only after that record's whole action has been
+confirmed. If a guarantee below cannot be met, the record is **kept** in
+`/var/lib/cros-enablement/install-manifest.json` with a warning and rc 1 — including
+when no original backup exists — so a later `./setup.sh --uninstall` run can retry; it
+is never silently treated as done. Other processable items still roll back normally,
+but the final exit code is non-zero and `finished!` is not printed — the top-level
+uninstallers log `Uninstall incomplete; retained state will be retried (see FAIL/WARN lines
+above).` instead:
+
+* **Unknown original state is never assumed false.** The safety fields
+  `was_existing`, `was_enabled`, `was_active` and `was_member` are required. Rollback
+  refuses to auto-restore an entry whose snapshot is missing or not a boolean: it leaves
+  the file, service state and group membership untouched, warns
+  (`RECORD_STATE_UNKNOWN` / `SERVICE_STATE_UNKNOWN`) and returns rc 1. Likewise, without
+  a valid bool service snapshot the installer will not disable/stop `keyd`.
+* **A target that was moved away is still restored.** For files that existed before
+  installation, rollback always restores the **first (oldest) backup** — even if the
+  installed file/symlink was removed in the meantime — staging it next to the target and
+  swapping it in with a single atomic `os.replace()` (owner, mode and symlink target
+  preserved). Regular files and symlinks are **never unlinked first**, so a failed swap
+  leaves the installed target untouched; any swap involving a directory (including dir→dir)
+  briefly moves the old entry aside and back if it fails. With no backup available it keeps the
+  record, warns (`[WARN NO BACKUP]`), logs `RECORD_BACKUP_MISSING` /
+  `ROLLBACK_INCOMPLETE` and returns rc 1 rather than creating a fake file.
+* **A failed service restore keeps its record.** Every `systemctl` enable/disable/start/
+  stop return code is checked (timeouts, stderr and spawn errors included). A failed
+  restore logs `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE`, keeps the service record
+  for a retry and returns non-zero instead of silently claiming success.
+* **Group membership is recorded before it is changed.** The installer snapshots the
+  original `plugdev` membership first and only then checks `usermod` rc explicitly. If
+  the change fails it removes the record it just wrote (unless an older one existed), so
+  uninstall will not later drop a membership the user obtained on their own.
+* **plugdev ownership is decided across all components, and stale records are refreshed.**
+  A full install can write two records for the same `(group,user)` (for example keyboard
+  records `was_member=false` and fingerprint later records `was_member=true`). The shared
+  ownership probe returns rc 0 when at least one record is explicitly `was_member=false`
+  (we added the membership), rc 1 when there is **no** record for the pair, rc 3 when
+  **every** record is `was_member=true` (pre-existing), and rc 2 for a missing/wrong-type
+  field (fail closed, change nothing). first-wins is unchanged: any `false` authorizes
+  `gpasswd -d`, and a udev rule that still references the group keeps the membership.
+  After a successful `gpasswd -d` all records for that pair are consumed together
+  (including a sibling's `true`), so uninstalling fingerprint before keyboard — or the
+  reverse — gives the same result. On **rc 3** no `gpasswd` runs at all (all-true means we
+  never added the user): if a udev rule still references the group the snapshot is kept;
+  once no rule references it — the signal that every component using the group is gone —
+  all stale records are consumed **with zero `gpasswd` calls**, so the next install takes
+  a fresh snapshot of the real, possibly admin-changed membership. A consume failure
+  fails closed and keeps the records for retry. `gpasswd -d` failure logs an error and
+  returns rc 1 (the three uninstallers fold it into their exit code); no "removed" success
+  is reported, and the records stay for a later retry.
+* **A re-granted membership is tracked per install generation.** A group record may carry
+  an optional boolean `added_by_project` (absent = legacy `false`, i.e. "no extra evidence";
+  a present field of the wrong type is `MANIFEST_INVALID` and fails closed). `was_member`
+  stays first-wins and is never rewritten by a reinstall. If the original snapshot was
+  `true` but the user is **not** a member now — an administrator removed the membership
+  while the component remained installed — this install is about to re-add it, so the
+  writer sets `added_by_project=true` next to the untouched `true` snapshot. The ownership
+  probe then treats that flag like an explicit `was_member=false` (rc 0), so uninstall runs
+  `gpasswd -d` and removes exactly the membership this generation granted. If `usermod -aG`
+  fails, `manifest_clear_group_added` clears **only** the flag (the first-wins record stays);
+  consume-all removes the whole row, flag included. With no flag, an all-true snapshot still
+  returns rc 3 ("never added by us": zero `gpasswd`, stale records consumed only when no udev
+  rule needs the group) — the flag is never discarded just because the original was `true`.
+* **An active fprintd inside a symlinked `common-*` fails the install closed.** Before any
+  first-wins snapshot, manifest backup, `sed`, `pam-auth-update` call or sudo change, the
+  Debian/Ubuntu installer probes every `common-*` target through `sudo` and scans for an
+  **active** (non-commented) `pam_fprintd.so` module line. A symlinked `common-*` with such
+  a line cannot be stripped by `sed -i` without replacing the link, so install exits
+  non-zero and leaves **PAM files and the debconf selection completely untouched** (no
+  snapshot is published). Unreadable targets and grep errors also fail closed; absent or
+  dangling targets carry no active module. After a successful install the postcondition
+  verifies the **actual** `common-*` bytes contain no active fprintd — a disabled record
+  retained in the debconf selection is **not** sufficient. Fix the symlink/real target by
+  hand and re-run the installer.
+* **Only the module-path field counts; custom stacks fail closed.** The scan, strip and
+  postcondition share one PAM rule parser. A trailing `#` comment (or an argument) that
+  merely mentions `pam_fprintd.so` is **not** an active module — a non-fingerprint rule such
+  as `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable` is kept
+  byte-for-byte. Bracketed controls, `\` continuations and `@include`/`@substack` are parsed
+  as stack entries. Uncertain syntax, a malformed module path, or a numeric-jump/custom
+  landing changed by removing an fp rule makes install **fail closed before any edit**
+  (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+  `numeric jump target identity changes after removing fingerprint module`) and leaves the
+  original bytes untouched. The postcondition re-proves non-fp rule order and jump
+  endpoints. "No active fp module now" and "convergence verified" are **separate facts**:
+  a convergence failure is logged honestly (`convergence NOT verified yet`) and does not by
+  itself prove the jump endpoints stayed stable.
+* **Per-management-group stacks, argument fingerprints and force recovery (19th
+  re-review).** The awk parser emits raw rule facts only; `lib/pam_stack_model.py` builds a
+  separate handler stack per management group, expands `@include`, treats substack as an
+  opaque frame, and fails closed when an unmodelled substack can affect a numeric jump or
+  the transformation, or when topology is unresolvable/unsupported.
+  (`Uncertain PAM rule syntax ... refusing to modify PAM configuration`,
+  `Unsupported PAM stack topology in common-* files; refusing to modify PAM configuration`,
+  `Removing the fingerprint rule ... would change a per-management-group stack or its
+  numeric jump target ...`) — always **before any edit**. Every retained rule carries
+  `argsfp`, an injective hex fingerprint of the complete argument vector; the non-fp
+  postcondition is a **zero-addition** gate (allowlist empty by default), so an external
+  tool adding or rewriting a rule fails closed
+  (`a non-fprintd PAM rule or a numeric jump endpoint changed during convergence ...`).
+  If T3 or the sudo verification fails after mutation, the installer **force-restores**
+  `common-*` / sudo from the retained snapshot before returning rc 1
+  (`PAM transaction failed after mutation; force-restoring common-*/sudo from the
+  first-wins snapshot ...`); the snapshot is retained, not consumed on that path, and a
+  failed forced restore returns `manual recovery required`.
+* **PAM file bytes come from rollback; the debconf selection is snapshotted, converged and
+  restored.** `disable_pam_fingerprint()` performs **no sed and no direct edit** of
+  `/etc/pam.d/sudo` (or any distro PAM file). All bytes come from the first backup via
+  `rollback_component("fingerprint")`, so an exact `pam_fprintd` line that was already present
+  before installation is preserved. On Debian/Ubuntu the installer now: (1) snapshots the
+  debconf `libpam-runtime/profiles` selection and every saved module file under `/var/lib/pam`
+  into a sidecar next to the manifest (`pam-selection` mode `0644`, `pam-selection.saved` a
+  root-owned `0700` directory) — first-wins and atomic, with every read/copy through `sudo`
+  so a non-root uninstall can restore it and a root-only `/var/lib/pam` is captured; it also
+  publishes a **third half**, root-owned `0700` `pam-selection.common`, recording every
+  `common-*` / sudo target's bytes, mode, lstat owner, type, symlink target and absence plus
+  the live savedir directory's presence/mode/owner. For a **symlink** target the recorded
+  owner is the **lstat owner of the link itself**, and restore stages a same-directory
+  link and uses **`chown -h` + `mv -T -f --`** so the link is never dereferenced.
+  All three halves are first-wins. The savedir entry set is recorded as a checksummed,
+  NUL-separated, sorted `name<TAB>type` manifest with a three-state class — `absent`, `empty` or
+  `nonempty` — and compared against the live directory in the final verification; any
+  **non-regular entry** (symlink, directory, FIFO/device) fails closed rather than being
+  silently skipped. A legacy `.common` with no entries line degrades to a WARN-only
+  best-effort check (`Legacy PAM snapshot has no savedir entry-set manifest ...`).
+  (2) backs up **all** existing `common-*` files, not just
+  fp-containing ones, because `--package` can rewrite any of them; (3) removes only the fp
+  module lines with a direct `sed -i '/pam_fprintd\.so/d'`, immediately closing the GDM race;
+  (4) runs `pam-auth-update --package` itself so debconf and `/var/lib/pam` converge to a
+  stable "no fprintd" state and a later package-triggered run is a no-op. It **never** calls
+  `pam-auth-update --remove`, which deletes the debconf selection outright. On uninstall the
+  order is: all external tool calls finish, then the original `common-*` / sudo state is
+  re-applied from `.common`, then the **final verification** checks bytes/mode/owner/type/
+  link/absence (including the lstat owner of restored symlinks), the savedir directory
+  **and its full entry set**, and the selection/seen values; only when all pass are
+  the selection, `.saved` and `.common` halves consumed together. A consumed manifest record
+  plus an equal selection is **not** sufficient for success. A failed restore keeps all three
+  halves and returns rc 1; a corrupt manifest or a surviving record skips all debconf writes
+  and keeps the snapshots for retry. If removal of the last `.common` half fails after the
+  other two are gone, the sidecar is rebuilt but the state is **not retryable** — the log says
+  `manual recovery is REQUIRED` and the retained files must be cleaned up by hand. Non-root installers with passwordless
+  `sudo` are supported throughout. Trade-off: the snapshot is authoritative, so an
+  administrator who deliberately changes the selection during installation has it overwritten
+  on uninstall; manually re-enabling the fprintd profile during install (e.g.
+  `pam-auth-update --enable fprintd`) writes the fp line back into `common-auth` and restores
+  the GDM race until uninstall. A legacy sidecar with no `.common` emits an explicit
+  `Legacy PAM snapshot has no ... (best effort only)` WARN and claims **no** byte/metadata guarantee;
+  a missing `.saved` while the live savedir is non-empty fails closed and needs manual
+  recovery; a semantic edit to a `common-*` file (added/removed/reordered MODULE line, logged
+  as `External content change detected`) returns rc 1 and retains all three halves. A
+  read-only post-rollback check warns if a manifest record still covers `/etc/pam.d/sudo`
+  (manual cleanup may be needed) or if the manifest is corrupt — it never modifies a file.
+  Fedora `authselect` and openSUSE `pam-config` profile state is outside the manifest: the
+  tool calls remain but a warning asks you to restore any pre-existing profile manually.
+* **Concurrent install/uninstall runs cannot lose tracking records or leave untracked
+  deployments.** Each component installer takes ONE operation-level lock around its whole
+  transaction — backup/record → deploy files and services → finish or rollback — through
+  `run_manifest_operation()` in `lib/backup.sh`. Nested helpers (the backup gate, group
+  helpers, the keyd-link normalizer and `rollback_component()`) re-enter the same lock via
+  `MANIFEST_LOCK_DEPTH`, so a concurrent uninstall cannot consume a just-written
+  `was_existing=false` record while the target file is still absent — which would leave a
+  deployed file on disk with no manifest record and no way to remove it later. The lock is
+  acquired before the fail-closed validation gate and held through the final atomic replace,
+  and every manifest read-modify-write re-reads the document inside it, so one process's
+  first-wins backup/service/group records cannot be overwritten by another. Each writer uses
+  a unique `.install-manifest.*.tmp` file in the manifest directory (fsync + `chmod 0644` +
+  `os.replace`) so parallel writers cannot clobber each other's temporary file. `DRY_RUN`
+  takes no lock and creates no lock file.
+* **The lock file is root-only and safe against hostile paths.**
+  `$MANIFEST_DIR/.install-manifest.lock` is a root-owned `0600` regular file (an older `0644`
+  lock is upgraded on first use), so an unprivileged peer account cannot even open it, let
+  alone hold an exclusive `flock` and starve every installer for the whole wait window — a
+  non-root shell can still run an installer because acquisition is delegated to a short-lived
+  root helper started via passwordless `sudo`. That helper is launched with `coproc sudo bash
+  -c`: it owns fd 9, takes the bounded `flock -x -w` wait (`CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`,
+  default 10s), prints `READY`, then blocks reading its stdin. Closing the parent's write fd
+  makes the helper see EOF, exit and let the kernel release the flock, so a crash or `kill -9`
+  cannot leave a stale lock (there is deliberately no EXIT/INT/TERM trap). Symlinks and
+  non-regular lock files are refused. `CROS_ENABLEMENT_MANIFEST_DIR` must be an **absolute
+  path** (otherwise `must be an absolute path`), and **any literal symlink component is
+  rejected** — even a root-owned, otherwise safe one — logging `contains a symlink` and
+  `untrusted symlink`. This is a deliberate fail-closed choice: a symlink can hide a real
+  target in a user-writable tree whose owner could rename the lock. The gate canonicalizes
+  the deepest existing prefix with `realpath -e` and re-appends the missing layers
+  (first-time creation is still supported), then runs the root-controlled check on the
+  **real** path — a non-root-controlled canonical ancestor logs `untrusted realpath
+  ancestor`. The direct parent must be **root-owned** — a caller-owned parent can rename a
+  live lock inode, so ownership by the current EUID/UID no longer qualifies and a wrong
+  owner logs `must be root-owned` — and must not be group/other-writable (`mode & 022 == 0`,
+  so keep `/var/lib/cros-enablement` at `0755`). Every ancestor is also checked: a
+  non-root-owned or group/other-writable layer without a sticky bit fails closed with
+  `not root-controlled` (a root-owned sticky world-writable layer such as `/tmp` `1777` is
+  allowed). A custom lock parent under a user-writable tree is therefore refused. The root helper
+  compares the `(dev,ino)` of fd 9 (via `/proc/$$/fd/9`) with the lock path and
+  checks fd owner `0`, mode `600` and regular-file type — all inside the process that actually
+  holds fd 9 — so an inode swap during init or while waiting for `flock` fails closed.
+  Inside that same process the holder also re-derives `realpath -e "$dir"` and requires it
+  to equal the handed-in directory, otherwise it prints `FAILED:canonical`; every real
+  ancestor must be uid `0` and either not group/other-writable or root-owned with a sticky
+  bit, otherwise `FAILED:ancestor`. The holder also pins the direct parent with **fd 8**,
+  re-checking uid `0`, `mode & 022 == 0`, directory type and the parent's `(dev,ino)` against
+  the pathname; any mismatch prints `FAILED:parentdir` and aborts before the lock is taken,
+  defeating a rename that would let a second process lock a fresh inode while the first
+  holder is live. Missing `flock`, a timeout or any failed check leaves the manifest bytes
+  intact and returns rc 1.
+* **Long-running operations may need a larger lock timeout.**
+  `fingerprint/install-fingerprint.sh --source` holds the operation lock across the
+  `git clone`/build/compile steps, so a parallel install/uninstall can hit the default 10s
+  wait and fail closed. Raise `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT` (for example to `300`)
+  before starting a parallel operation in that window.
 
 ---
 
@@ -57,11 +271,15 @@ This command automatically:
   ./fingerprint/install-fingerprint.sh --uninstall
   ```
 
-  *(This restores the backed-up `libfprint` libraries and `60-cros-fp.rules`,
-  reverts the `pam_fprintd` PAM changes (`/etc/pam.d/sudo` back to stock,
-  fprintd out of `common-auth`), removes the `fprintd-sleep.sh` system-sleep
-  hook, removes `/var/lib/fprint/crfpmoc.key` and the plugdev membership the
-  installer added, and rolls the service states back.)*
+  *(This restores the backed-up `libfprint` libraries, `60-cros-fp.rules` and
+  sudo/`common-*` PAM bytes via manifest rollback — uninstall never sed-edits
+  `/etc/pam.d/sudo`, and a `pam_fprintd` line already present is kept. It also
+  restores the snapshotted debconf profile selection and `/var/lib/pam` files with
+  `debconf-set-selections` + `pam-auth-update --package` once rollback is confirmed.
+  It removes the `fprintd-sleep.sh` system-sleep hook and `/var/lib/fprint/crfpmoc.key`,
+  drops the installer-added plugdev membership (ownership decided across all
+  components, including per-install `added_by_project` evidence), and rolls the
+  service states back.)*
 
 * **Remove only the keyboard top-row mapping & backlight sync** (5 artifacts above):
 
@@ -72,7 +290,29 @@ This command automatically:
   > This removes all 5 keyboard artifacts, disables the user service globally,
   > restores brightness to 50% if left at 0, cleans `/run/c640-kbd-backlight/state`
   > and `/run/user/$UID/c640-kbd-backlight.state`, and drops installer-added
-  > `plugdev` membership (keeps pre-existing memberships).
+  > `plugdev` membership (ownership decided across all components;
+  > pre-existing memberships kept; a `gpasswd -d` failure returns rc 1).
+  >
+  > If you installed with `--with-keyd`, it also removes `/etc/keyd/cros.conf`
+  > and any legacy `/etc/keyd/default.conf` symlink that pointed to `cros.conf`
+  > (restoring the pre-install backup when one exists) and disables the `keyd`
+  > service.
+  >
+  > **Upgrade window:** the root commitment marker is `<token> <dev:ino> <value>`
+  > (3 columns; a legacy 2-column marker fails closed) and the resume flag is
+  > `<token> <epoch> <action> <committed_value>` (4 columns; a legacy 3-column flag is
+  > still accepted by the daemon, with the committed value authoritative when present).
+  > Upgrade the hook and daemon **as one package** — a new hook with an old daemon can
+  > publish a flag the old parser cannot read. `python3` is a runtime dependency of
+  > `pre`/`post` for both publication and the single-fd byte-exact verification.
+  >
+  > **Real-machine observation (read-only, 2026-11-26):** the local host is an HP c640
+  > class device (DMI `Google` / `Dratini` / `HP` board, coreboot `MrChromebox-2606.1`,
+  > hostname `ubuntu-c640`, kernel `7.0.0-44`; LED node present, `max=100` / current `30`),
+  > but `/usr/local/bin/c640-kbd-backlight-sync` still matches `a03e4a0`, which predates
+  > all four nineteenth-re-review fixes (observed at the time of the read-only audit).
+  > The backlight staying on when the screen blacks out is a known **Tier 2** limitation,
+  > not a regression; real S3 / lock-unlock on HEAD remains pending.
 
 * **Remove only the power management tweaks** (logind config, suspend
   helpers, TLP config, thermald service enablement):

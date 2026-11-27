@@ -29,10 +29,51 @@ Thank you for your interest in improving hardware support for the HP Pro c640 Ch
   ```bash
   sudo systemd-hwdb update
   sudo udevadm trigger --subsystem-match=input
-  sudo evtest
+  # Read-only: compares EVIOCGKEYCODE with the inferred scancode fixture
+  # (0x3b-0x44 inferred from post-hwdb EVIOCGKEY against the AT table;
+  # no raw MSC_SCAN capture in the evidence).
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # Live presses: post-hwdb KEY_* events via EVIOCGKEY, no grab:
+  sudo python3 keyboard/tests/check-top-row-hwdb.py --listen 30
+  # Synthetic-event self-check of the scanner logic; no device/evdev needed:
+  python3 keyboard/tests/check-top-row-hwdb.py --self-test
   ```
 
+  `--self-test` checks the fixture parser against synthetic events, so it needs
+  no input device or evdev and is safe to run in CI. Plain `evtest` (no
+  `--grab`) is read-only and safe. Never put an `EVIOCGRAB` on the keyd virtual
+  keyboard (`evtest --grab`, `evemu-record --grab`): that kills desktop input
+  until the tool exits. Once keyd grabs the physical AT keyboard, other readers
+  cannot see its events at all — which is why keyd-stage capture reads the keyd
+  virtual keyboard instead. These grab caveats belong to the **keyd stage**;
+  see `keyboard/README.md` ("Verification & Testing") and
+  `docs/TROUBLESHOOTING.md` §10 for the full keyd guidance.
+
 * Ensure all HWDB properties start with a **single leading space** and match proper DMI strings (`cat /sys/class/dmi/id/product_name`).
+* **New Chromebook model?** Find its raw scancodes first — do not copy the
+  Dratini block. Stop keyd (`sudo systemctl stop keyd`) and read
+  `EV_MSC/MSC_SCAN` for each top-row press with either
+  `sudo python3 keyboard/tests/check-top-row-hwdb.py --scan 60` or plain
+  `sudo evtest` (no `--grab`). On an unknown model or when `EVIOCGKEYCODE` is
+  unsupported, use `sudo python3 keyboard/tests/check-top-row-hwdb.py --scan-only 60`:
+  it skips the table check entirely, so a Dratini fixture mismatch cannot block
+  raw capture. **After capturing, run
+  `sudo systemctl start keyd` to restore the service**; otherwise Search
+  tap/hold and brightness remapping stay disabled. `--listen` is **not** for
+  this: it only observes the post-hwdb `KEY_*` key events via `EVIOCGKEY`, not
+  the raw scancode.
+  `--scan` additionally requires an observed `MSC_SCAN`: with no raw scan
+  (keyd still grabbing the device, or no key pressed) it prints
+  `RESULT=PASS (mapping check only; raw capture FAILED)` but exits
+  **non-zero**. `RESULT=` is only the EVIOCGKEYCODE mapping verdict — judge
+  overall success by the exit code / `RAW_CAPTURE=`, not `RESULT=PASS` alone.
+  Infer the scancode from the `MSC_SCAN` values against the standard AT table;
+  some Chromebooks send the ChromeOS action scancodes (`0xea`, `0xe9`, ...),
+  others standard AT `0x3b`-`0x44`. If the scancodes differ, add a
+  model-specific DMI block **and** a model-specific fixture (plus a CI
+  assertion for that DMI); do not append different scancodes to the shared
+  `keyboard/tests/hwdb-top-row-scancodes.tsv`, because CI asserts that whole
+  file against the Dratini DMI.
 
 ### 3. Audio (ALSA UCM for sofrt5682)
 

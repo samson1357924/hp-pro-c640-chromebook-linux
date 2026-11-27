@@ -58,9 +58,14 @@ check_power_status() {
     fi
 }
 
-uninstall_power() {
+_uninstall_power_body() {
     log_section "Uninstalling Power Optimization Profiles"
-    rollback_component "power"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # remaining uninstall steps. Capture the rc, finish the cleanup below, and
+    # propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "power" || rollback_rc=$?
 
     # NOTE: do NOT restart systemd-logind here — with an active desktop session
     # it logs everyone out (session leader is lost on deserialization), which
@@ -69,10 +74,24 @@ uninstall_power() {
     if [ "${DRY_RUN:-0}" != "1" ]; then
         log_info "Reboot (or log out and back in) for the lid-switch change to take effect."
     fi
-    log_success "Power optimization profiles removed."
+    # Only report success when rollback fully succeeded. A failed rollback
+    # retains state for a later retry, so a SUCCESS line here
+    # would mislead both users and log parsers (see docs/UNINSTALL.md).
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "Power optimization profiles removed."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
-install_power() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_power() {
+    run_manifest_operation _uninstall_power_body "$@"
+}
+
+_install_power_body() {
     log_section "Installing Power & S0ix Optimizations for HP Pro c640 ($DISTRO_NAME)"
 
     # Preflight check
@@ -170,6 +189,11 @@ install_power() {
     log_section "Power optimizations installed successfully! ⚡"
     echo "To test your S0ix Modern Standby health, run:"
     echo "    ./scripts/check-s0ix.sh"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_power() {
+    run_manifest_operation _install_power_body "$@"
 }
 
 ACTION="install"

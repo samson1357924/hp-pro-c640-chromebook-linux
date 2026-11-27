@@ -75,7 +75,7 @@ check_fp_status() {
     ls -la "$LIBDIR"/libfprint-2.so* 2> /dev/null || log_warn "No libfprint-2.so found in $LIBDIR."
 }
 
-uninstall_fp() {
+_uninstall_fp_body() {
     log_section "Uninstalling Custom crfpmoc Driver"
     # The encryption seed is created at driver runtime (first device open),
     # not at install time, so it can only be cleaned up on uninstall.
@@ -83,8 +83,17 @@ uninstall_fp() {
         manifest_add_entry /var/lib/fprint/crfpmoc.key "fingerprint" "0"
         log_warn "Will remove /var/lib/fprint/crfpmoc.key (enrolled prints must be re-enrolled after reinstall)"
     fi
-    rollback_component "fingerprint"
-    remove_group_membership "plugdev" "$(get_real_user)" "fingerprint"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # group removal and the udev/PAM cleanup below. Capture the rc, finish
+    # every cleanup step, and propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "fingerprint" || rollback_rc=$?
+    # gpasswd -d failure is reported by the helper as rc 1; capture it here so
+    # `set -e` does not skip the udev/PAM cleanup below, then fold it in.
+    local group_rc=0
+    remove_group_membership "plugdev" "$(get_real_user)" "fingerprint" || group_rc=$?
+    [ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"
 
     # Remove prebuilt package if installed via package manager
     if [ "${DRY_RUN:-0}" != "1" ]; then
@@ -118,8 +127,11 @@ uninstall_fp() {
         sudo udevadm control --reload-rules 2> /dev/null || true
         log_info "Reloaded udev rules."
 
-        # Revert PAM
-        disable_pam_fingerprint || true
+        # Revert PAM. Do not swallow a restore failure: fold its rc into the
+        # final rollback_rc, but only AFTER all cleanup below has run.
+        local pam_rc=0
+        disable_pam_fingerprint || pam_rc=$?
+        [ "$pam_rc" -eq 0 ] || rollback_rc="$pam_rc"
 
         # Re-register restored stock libraries
         sudo ldconfig
@@ -139,7 +151,22 @@ uninstall_fp() {
         log_dryrun "ldconfig"
         log_dryrun "Reinstall stock libfprint package via your distribution's package manager"
     fi
-    log_success "Fingerprint driver uninstallation finished."
+    # Only report success after EVERY cleanup step (rollback, group removal,
+    # PAM disable) has run AND rollback succeeded. A failed rollback retains
+    # state for a later retry, so a SUCCESS line here would
+    # contradict the WARN/FAIL lines and the documented contract.
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "Fingerprint driver uninstallation finished."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_fp() {
+    run_manifest_operation _uninstall_fp_body "$@"
 }
 
 configure_udev_and_sleep_hook() {
@@ -163,11 +190,13 @@ configure_udev_and_sleep_hook() {
         fi
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             if id -u "$real_user" > /dev/null 2>&1; then
-                local was_member=0
-                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
-                sudo usermod -aG plugdev "$real_user" || true
-                manifest_add_group "plugdev" "$real_user" "fingerprint" "$was_member"
-                log_success "Added user '$real_user' to 'plugdev' group."
+                # Record the original membership before changing /etc/group;
+                # the helper rolls its own record back if usermod fails. Check
+                # rc explicitly so a harness using `||` cannot swallow it.
+                if ! ensure_group_membership "plugdev" "$real_user" "fingerprint"; then
+                    log_error "plugdev membership setup failed for '$real_user'; refusing to continue"
+                    return 1
+                fi
             else
                 log_warn "User '$real_user' does not exist; skipping plugdev membership."
             fi
@@ -454,7 +483,8 @@ install_fp_from_source() {
             git -C "$crfpmoc_dir" fetch --depth 1 origin 56442591a5c302a906289f30988fb50fc3d82ed6 || {
                 log_error "Failed to fetch pinned commit 56442591a5c302a906289f30988fb50fc3d82ed6 of 3v1n0/libfprint (feature/crfpmoc)."
                 log_info "The pinned commit may have been rewritten upstream; verify against https://gitlab.freedesktop.org/3v1n0/libfprint."
-                exit 1
+                # return, not exit: keep the operation wrapper's unlock path.
+                return 1
             }
             git -C "$crfpmoc_dir" checkout --detach FETCH_HEAD
         fi
@@ -526,7 +556,7 @@ install_fp_from_source() {
     fi
 }
 
-install_fp() {
+_install_fp_body() {
     log_section "Installing crfpmoc Fingerprint Driver for HP Pro c640 ($DISTRO_NAME)"
 
     # 0. Preflight checks
@@ -580,6 +610,12 @@ install_fp() {
     echo "    fprintd-enroll \"$real_user\""
     echo "To verify enrollment, run:"
     echo "    fprintd-verify \"$real_user\""
+}
+
+# One operation lock for udev/PAM records, driver deployment and service setup.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_fp() {
+    run_manifest_operation _install_fp_body "$@"
 }
 
 # CLI Argument Parsing

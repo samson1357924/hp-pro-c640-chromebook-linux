@@ -76,18 +76,37 @@ check_audio_status() {
     return "$missing"
 }
 
-uninstall_audio() {
+_uninstall_audio_body() {
     log_section "Uninstalling ALSA UCM2 Profiles"
-    rollback_component "audio"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # empty-dir cleanup below. Capture the rc, finish the cleanup, and
+    # propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "audio" || rollback_rc=$?
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         # Clean up empty dirs
         sudo rmdir "$UCM_DST/conf.d/sof-rt5682" 2> /dev/null || true
     fi
-    log_success "Audio UCM profiles removed successfully."
+    # Only report success when rollback fully succeeded. A failed rollback
+    # retains state for a later retry, so a SUCCESS line here
+    # would mislead both users and log parsers (see docs/UNINSTALL.md).
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "Audio UCM profiles removed successfully."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
 }
 
-install_audio() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_audio() {
+    run_manifest_operation _uninstall_audio_body "$@"
+}
+
+_install_audio_body() {
     log_section "Installing ALSA UCM2 Profiles for HP Pro c640 (Dratini)"
 
     # Pre-flight check
@@ -102,7 +121,8 @@ install_audio() {
 
         if [ ! -f "$src_file" ]; then
             log_error "Missing source UCM file: $src_file"
-            exit 1
+            # return (not exit): the operation wrapper must still unlock.
+            return 1
         fi
 
         backup_file_manifest_aware "$dst_file" "audio"
@@ -151,6 +171,12 @@ install_audio() {
     fi
 
     log_success "Audio UCM configuration completed successfully! 🔊"
+}
+
+# All UCM backups/records + `sudo install -D` deployments are one transaction.
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_audio() {
+    run_manifest_operation _install_audio_body "$@"
 }
 
 # CLI Argument Parsing

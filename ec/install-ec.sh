@@ -26,7 +26,7 @@ show_help() {
     echo "  --help, -h              Show this help message"
 }
 
-install_ec_tools() {
+_install_ec_tools_body() {
     log_section "Installing ChromeOS EC Utilities for HP Pro c640 ($DISTRO_NAME)"
     check_dmi_board || true
 
@@ -88,10 +88,13 @@ install_ec_tools() {
         real_user="$(get_real_user)"
         if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
             if id -u "$real_user" > /dev/null 2>&1; then
-                local was_member=0
-                id -nG "$real_user" 2> /dev/null | tr ' ' '\n' | grep -qx "plugdev" && was_member=1
-                sudo usermod -aG plugdev "$real_user" || true
-                manifest_add_group "plugdev" "$real_user" "ec" "$was_member"
+                # Record the original membership before changing /etc/group;
+                # the helper rolls its own record back if usermod fails. Check
+                # rc explicitly so a harness using `||` cannot swallow it.
+                if ! ensure_group_membership "plugdev" "$real_user" "ec"; then
+                    log_error "plugdev membership setup failed for '$real_user'; refusing to continue"
+                    return 1
+                fi
             else
                 log_warn "User '$real_user' does not exist; skipping plugdev membership."
             fi
@@ -109,7 +112,12 @@ install_ec_tools() {
     echo "    c640-ec-control battery-limit 90"
 }
 
-enable_battery_service() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+install_ec_tools() {
+    run_manifest_operation _install_ec_tools_body "$@"
+}
+
+_enable_battery_service_body() {
     log_section "Enabling 90% Battery Protection Service & Sleep Hook"
     local srv_dst="/etc/systemd/system/c640-battery-limit.service"
     local srv_src="$SCRIPT_DIR/systemd/c640-battery-limit.service"
@@ -141,7 +149,12 @@ enable_battery_service() {
     fi
 }
 
-uninstall_ec_tools() {
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+enable_battery_service() {
+    run_manifest_operation _enable_battery_service_body "$@"
+}
+
+_uninstall_ec_tools_body() {
     log_section "Uninstalling ChromeOS EC Utilities"
     if [ "${DRY_RUN:-0}" != "1" ]; then
         if [ -x "/usr/local/bin/c640-ec-control" ]; then
@@ -151,13 +164,36 @@ uninstall_ec_tools() {
         sudo systemctl disable --now c640-battery-limit.service 2> /dev/null || true
     fi
 
-    rollback_component "ec"
-    remove_group_membership "plugdev" "$(get_real_user)" "ec"
+    # rollback_component now returns non-zero when a service/file could not be
+    # restored. With `set -e` an unguarded call would abort here and SKIP the
+    # group removal and the daemon-reload below. Capture the rc, finish every
+    # cleanup step, and propagate it at the very end of the function.
+    local rollback_rc=0
+    rollback_component "ec" || rollback_rc=$?
+    # gpasswd -d failure is reported by the helper as rc 1; capture it here so
+    # `set -e` does not skip the daemon-reload below, then fold it in.
+    local group_rc=0
+    remove_group_membership "plugdev" "$(get_real_user)" "ec" || group_rc=$?
+    [ "$group_rc" -eq 0 ] || rollback_rc="$group_rc"
 
     if [ "${DRY_RUN:-0}" != "1" ]; then
         sudo systemctl daemon-reload
     fi
-    log_success "EC utilities removed."
+    # Only report success when rollback fully succeeded. A failed rollback
+    # retains state for a later retry, so a SUCCESS line here
+    # would mislead both users and log parsers (see docs/UNINSTALL.md).
+    if [ "$rollback_rc" -eq 0 ]; then
+        log_success "EC utilities removed."
+    else
+        log_error "Uninstall incomplete; retained state will be retried (see FAIL/WARN lines above)."
+    fi
+    # Propagate a rollback failure only after ALL cleanup above has run.
+    return "$rollback_rc"
+}
+
+# shellcheck disable=SC2120 # thin wrapper forwards caller args
+uninstall_ec_tools() {
+    run_manifest_operation _uninstall_ec_tools_body "$@"
 }
 
 ACTION="install"

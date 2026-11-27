@@ -130,12 +130,35 @@
 
 ### 9. 頂排功能鍵（上一頁/重新整理/亮度/音量）按了無反應
 
-* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射。
+* **根本原因**：系統缺少 `90-chromebook-keyboard.hwdb` 掃描碼映射，**或**映射的是這台機器根本不會送的掃描碼（例如直接複製別台 Chromebook 的 hwdb）。第二種情況重裝 hwdb 不會修好。
 * **解決方法**：
 
   ```bash
+  # 先驗證核心套用的 hwdb 鍵碼映射（唯讀 EVIOCGKEYCODE，不 grab）：
+  sudo python3 keyboard/tests/check-top-row-hwdb.py
+  # 若失敗，再安裝/重裝映射：
   ./setup.sh --keyboard
   ```
+
+  > 本檔映射的是由 Dratini 的 post-hwdb `EVIOCGKEY` 按鍵狀態對照 AT 表推論的
+  > AT 掃描碼 `0x3b`-`0x44`（證據中沒有原始 `MSC_SCAN` 捕獲），且只套用於
+  > `keyboard/90-chromebook-keyboard.hwdb` 中明確列出的 Dratini / HP Pro c640
+  > DMI 條目——**不匹配**其他 Hatch 機板。其他 Chromebook 可能送 ChromeOS
+  > action 掃描碼（`0xea`、`0xe9`…），需要建立自己的 hwdb 條目。`--listen`
+  > 只會顯示 hwdb 轉換後的 `KEY_*` 按鍵事件（EVIOCGKEY），不是原始掃描碼。
+  > 請先停掉 keyd（`sudo systemctl stop keyd`），用
+  > `check-top-row-hwdb.py --scan 60` 或不加 `--grab` 的 `evtest` 讀
+  > `EV_MSC/MSC_SCAN`，再對照標準 AT 表推論掃描碼並建立自己的 hwdb 條目
+  > （見 `CONTRIBUTING.md` → §2 的「New Chromebook model?」）。未知機型或
+  > `EVIOCGKEYCODE` 不支援時，改用 `check-top-row-hwdb.py --scan-only 60`：
+  > 它完全跳過表格檢查，fixture 不符或 ioctl 失敗都不會擋住原始擷取。
+  > 完成後請執行
+  > `sudo systemctl start keyd` 恢復服務，否則 Search 輕點/長按與亮度重映射會持續失效。
+  >
+  > `RESULT=` 只是 EVIOCGKEYCODE 映射的判定。使用 `--scan SECONDS` 時，
+  > 若沒觀測到 `MSC_SCAN`（keyd 仍抓住裝置，或期間沒按鍵），仍會印出
+  > `RESULT=PASS (mapping check only; raw capture FAILED)`，但結束碼非 0。
+  > 判斷整體成功請看結束碼／`RAW_CAPTURE=`，不要只看 `RESULT=PASS`。
 
 ### 10. 想要將 Search 鍵設定為「短按 CapsLock、長按 Super」
 
@@ -143,35 +166,411 @@
 
   ```bash
   sudo apt install -y keyd   # (或 dnf/pacman)
-  sudo cp keyboard/keyd/cros.conf /etc/keyd/default.conf
-  sudo systemctl enable --now keyd
+  sudo cp keyboard/keyd/cros.conf /etc/keyd/cros.conf
+  sudo systemctl enable keyd
+  sudo systemctl restart keyd   # 必要：keyd 2.5.x 只在啟動時讀取設定
   ```
+
+  > Ubuntu 26.04 套件安裝的是 `/usr/bin/keyd.rvaiya`（2.5.0）；
+  > `keyd check` 僅存在於 ≥ 2.6。建議直接執行
+  > `sudo ./keyboard/install-keyboard.sh --with-keyd`，上述差異它都已處理。
+  > 若頂排仍無反應，先驗證**掃描碼**而不是只看 hwdb 文字：
+  > `sudo python3 keyboard/tests/check-top-row-hwdb.py` 必須印出
+  > `RESULT=PASS`。這台機器送的是 AT 掃描碼 `0x3b`-`0x44`，不是部分
+  > Chromebook 使用的 ChromeOS action 掃描碼。
+  > 若 Search 輕點/長按異常，請用 `overloadt2(meta, capslock, 200)`，
+  > 不要用 `overload`：後者放開時會插入 `LEFTCTRL` 防護，Mutter 就不會開總覽。
+  > 驗證請用 `sudo python3 keyboard/tests/capture-keyd-output.py`（唯讀；
+  > `keyd monitor` 無法開啟已被 keyd grab 的裝置），並確認 keyd 有 grab 內建
+  > AT 鍵盤：`journalctl -u keyd | grep 'DEVICE: match'` 應出現 `0001:0001`。
 
 ### 11. 鍵盤背光不會隨螢幕熄滅/點亮而開關
 
 * **症狀**：`c640-kbd-backlight-sync --check` 顯示 `brightness: 5/100` 但 `--test-blank`
   不會到 `0` 或不會恢復；`journalctl --user -u c640-kbd-backlight-sync` 空白或 `Daemon running: no`。
-* **排解**：
+  另一相關症狀是**閃爍/震盪**：LED 在熄滅/點亮前後於已存值與最大亮度間反覆跳動，
+  通常是 gsd-power 快取與 UPower 不一致，或 ScreenSaver 複查競態。
+
+  > [!IMPORTANT]
+  > 真實 S3 週期中，systemd 會在 sleep hook 的 `post` 階段前**凍結 `user.slice`**
+  > （[systemd-sleep(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sleep.html)）。
+  > 因此從 root hook 查詢 session bus 必然失敗或 timeout；hook 現在是**純 handoff 寫入者**：`pre` 發佈
+  > `c640-kbd-backlight.suspend`（`<token> <value> published`，`0` 有效），`post` 發佈
+  > `c640-kbd-backlight.resume`（`<token> <epoch> <action> <committed_value>`；第十九次
+  > 新增第四欄，legacy 三欄 flag 仍被接受且 committed value 為權威），兩者皆 `0600` +
+  > chown 給 session user（uid 與 gid），由釘住 directory fd 的 `python3` writer 發布到
+  > `$XDG_RUNTIME_DIR`（`C640_KBD_HANDOFF_DIR` 可覆寫）。`<token>` 是 `pre` 每輪新鑄的
+  > `<epoch>-<pid>-<random_hex>`，並綁定到 root-only `0600` cycle marker
+  > （`<token> <dev:ino> <value>`；三欄，legacy 兩欄 marker 直接拒絕）與已發布的
+  > suspend inode。`post` 從**單一**釘住 fd 對 `<token> <value> published\n` 做 byte-exact 讀取驗證。
+  > 它絕不寫 LED、不刪 state、不查 D-Bus。唯一寫入者是 thaw 後的**使用者 daemon**：
+  > 它在 **system** bus（未被凍結）收到 `PrepareForSleep(false)` 時 adopt handoff，
+  > 再經 gsd-power → UPower → legacy 還原。請勿把舊的 root 端 session bus 探測
+  > 加回 hook——那就是當年第二寫入者的 bug。`pre` 寫入的 root
+  > `/run/c640-kbd-backlight/state` 只是**本次開機第一次 suspend 的單次診斷快照**
+  > （first-wins，保留到重開機），hook 與 daemon 都不消耗它，也從不用於還原。若 hook
+  > handoff 只對**單一 active local graphical session** 寫入；0 或多個候選會在 **root journal**
+  > 以 `session selection fail-closed: ...` fail closed，選中的 uid 則記錄為
+  > `selected session ... for uid ...`，在 `pre` 釘在 root-only `0600` 檔、`post` 沿用。
+  > hook 絕不建立／chmod／chown `/run/user/<uid>`；不存在或不安全即 fail closed、不寫 handoff。
+  > uid 來自 `loginctl show-session` 的 **Session.User**（`User=<數字 uid>`），不是 User
+  > object 的 `UID=` 鍵；session ID 可為英數（如 `c1`），缺少 `User` 即排除該 session。
+  > 兩個 handoff 檔由 inline `python3` writer 釘住 directory fd 發布
+  > （`O_DIRECTORY|O_NOFOLLOW`、`O_EXCL|O_NOFOLLOW` 的 `0600` 暫存檔、`fchmod`／`fchown`、
+  > 重查目錄 identity、以 `src_dir_fd`／`dst_dir_fd` 執行 `os.rename`、驗證發布後 inode）；
+  > 此為 fd 釘住版的 `mv -T -f --`，**沒有 `cp`／一般 `mv` 降級**（`unsafe destination entry`、
+  > `cannot publish ...`）。root 診斷快照與 uid 釘住檔仍使用有 guard 的 `mv -T -f --`。
+  > explicit `C640_KBD_HANDOFF_DIR` 依設計信任 caller（只檢查 `-d`），
+  > 但最終 component 仍受保護。daemon 不再掃描其他 uid 的 runtime dir：只有 explicit
+  > `C640_KBD_HANDOFF_DIR` 覆寫與自身檔案不一致時才記錄 `[WARN] handoff directory mismatch`。
+  > 跨 uid 診斷請查 root journal，不要掃描 `/run/user`。
+
+* **第十七次 re-review 的 fail closed 訊息**（都是拒絕寫入，絕不靜默成功）：
+  `suspend/resume handoff token mismatch ...`、`cycle-begin file ... not adopted`、
+  `suspend handoff token epoch ... stale` 代表 handoff 來自更早的 cycle（或 `pre` 失敗），
+  因此已存亮度保持不變——請重跑 S3 週期，不要期待還原。`handoff skipped (fail-closed):
+  python3 unavailable` 代表新的 fd 釘住寫入器無法執行：請在目標機安裝 `python3`。
+  `retry epoch invalidation failed; all brightness writers fail closed` 代表協調通道連原地
+  撤銷都失敗（`COORDINATION_UNHEALTHY`）：修好 runtime state 目錄並重啟使用者 daemon。
+  `evidence clock unavailable; evidence expired`／`evidence clock moved backwards; evidence
+  expired` 代表 monotonic TTL（`/proc/uptime`）不可信，guard 會重新探測，仍無法驗證即 fail
+  closed。以上情況 daemon 皆**降級為拒絕寫入**，而非信任過期 witness；這些都不是真實 S3 驗證。
+
+* **第十九次 re-review 的 fail closed 訊息：**
+  `resume handoff skipped (fail-closed): invalid cycle marker ...` 代表找到 legacy 兩欄
+  root marker，而非 `<token> <dev:ino> <value>`；`suspend inode ... != cycle marker ...`、
+  `suspend/cycle value mismatch ...` 與 TOKEN/VALUE/STRUCT/IO verdict 代表 suspend bytes 在
+  `pre` 後被改動——`post` 從單一釘住 fd 逐位元組讀取，拒絕發布 resume flag。請以**同一套件**
+  還原 hook 與 daemon（升級窗：三欄 marker／四欄 flag；legacy 三欄 flag 仍可讀，兩欄
+  marker 不行）。`keeping committed cycle handoff` 是資訊訊息：延後的
+  `PrepareForSleep(true)` 保留了本輪而非刪除；沒有 flag 時 `PrepareForSleep(false)` 改呼叫
+  `restore_from_local_state()`，只還原本機已存亮度、不 adopt handoff。PAM 方面，
+  `Uncertain PAM rule syntax ...`、`Unsupported PAM include target ...`、
+  `Unsupported PAM stack topology in common-* files ...` 會在任何編輯**之前**拒絕安裝；
+  `a non-fprintd PAM rule or a numeric jump endpoint changed during convergence` 代表
+  零新增 `argsfp` gate 拒絕外部工具的變更；
+  `PAM transaction failed after mutation; force-restoring common-*/sudo ...` 代表保留的
+  snapshot 在回 rc 1 前被強制還原。
+
+* **排解**（以下 gdbus 查詢皆為唯讀）：
 
   ```bash
   c640-kbd-backlight-sync --check          # brightness、STATE_FILE、Daemon running、ScreenSaver available
   systemctl --global is-enabled c640-kbd-backlight-sync.service
   systemctl --user is-active c640-kbd-backlight-sync.service  # 需 graphical-session
   journalctl --user -u c640-kbd-backlight-sync.service -f
-  loginctl show-user "$USER" -p State
-  udevadm test /sys/class/leds/chromeos::kbd_backlight
-  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness
+  loginctl show-user "$USER" -p State       # 使用中?
+  # selector schema 的唯讀檢查（不跑 S3、不寫入）：
+  bash keyboard/tests/loginctl-contract-check.sh   # systemd host 為 CONTRACT OK，其他為 SKIP
+  loginctl show-session "$XDG_SESSION_ID" -p User  # 必須是 User=<數字 uid>，不是 UID=
+  udevadm test /sys/class/leds/chromeos::kbd_backlight  # 檢查 TAG+="uaccess" 規則
+  ls -l /sys/class/leds/chromeos::kbd_backlight/brightness  # 0660 + plugdev?
+  cat /sys/class/leds/chromeos::kbd_backlight/brightness
+  # 唯讀 handoff 檔（僅在休眠/喚醒週期間存在）：
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.suspend" 2>/dev/null  # "<token> <value> published"，0 有效
+  cat "$XDG_RUNTIME_DIR/c640-kbd-backlight.resume" 2>/dev/null   # "<token> <epoch> <action> <committed_value>"
+  # 唯讀 D-Bus 查詢（不寫入，daemon 執行中也能跑）：
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.GetActive
+  gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
+  gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower/KbdBacklight --method org.freedesktop.UPower.KbdBacklight.GetBrightness
+  # gsd 百分比應約等於 raw/max*100；不一致就可能閃爍
   # 非 GNOME（Sway/KDE）：org.gnome.ScreenSaver 不可用 -> daemon 僅靠 org.freedesktop.ScreenSaver + system-sleep 兜底
   # 最小映象缺 gdbus/dbus-monitor：sudo apt install dbus-x11 libglib2.0-bin
   # ectool 回退：ls -l /usr/local/bin/ectool && ectool pwmgetkblight
+  # 三態：只有 ScreenSaver "inactive" 允許還原寫入（active/unknown 皆延後）
+  ```
+
+  **日誌驗證**：unit 設了 `StandardError=journal`，下列訊息應該可見；若沒有，
+  代表安裝的是舊 unit 或 stderr 被導向別處：
+
+  ```bash
+  journalctl --user -u c640-kbd-backlight-sync.service --since "5 min ago" \
+    | grep -E 'backends probed|RECOVERED|saved brightness|replacing invalid saved brightness|restoring brightness|restore verify|not completed|adoption deferred|restore deferred|resume deferred|unblank: restore deferred|ignoring blank-side|brightness NOT saved|deferred save attempt|restore failed|another restore is in progress|\[WARN\]'
   ```
 
 * **常見修復**：
   * 安裝後**重新登入**（`plugdev`/`uaccess` ACL），或 `systemctl --user start c640-kbd-backlight-sync.service`。
   * 若未 enable：`sudo systemctl --global enable c640-kbd-backlight-sync.service && systemctl --user daemon-reload`。
-  * KDE/Sway 上 `ScreenSaver available: no` 時，仍由 `system-sleep` 處理盒蓋 `suspend`，
+  * KDE/Sway 上 `ScreenSaver available: no` 時，`system-sleep` 仍會在盒蓋
+    `suspend` 時發佈 handoff 檔，但還原由 thaw 後的使用者 daemon 負責，請保持啟用；
     閒置熄屏需啟用 IdleMonitor：見 `keyboard/README.zh-TW.md` `C640_KBD_ENABLE_IDLEMONITOR=1`。
+  * **螢幕黑掉但背光仍亮（真機觀察，2026-11-26）：**在本機（DMI `Google`／`Dratini`／
+    `HP` board、coreboot `MrChromebox-2606.1`、hostname `ubuntu-c640`、kernel `7.0.0-44`、
+    LED 節點 `max=100`／目前 `30`、daemon 執行中）使用者觀察到螢幕黑掉後鍵盤背光仍維持
+    `30`。這是已知 **Tier 2** 限制，不是 regression：daemon 只把
+    `ScreenSaver.ActiveChanged` 當 blank 觸發，而 Wayland 的
+    `idle-dim=true`／`idle-brightness=30` 可能讓螢幕黑掉但 ScreenSaver 仍 inactive；
+    brightness-signal／IdleMonitor 路徑未實作（預設關閉）。安裝的 daemon 亦對應 `a03e4a0`，
+    早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察）。現行 HEAD 的真實 S3／lock-unlock 仍 pending。
   * `brightness` 權限不足：檢查 `groups` 含 `plugdev`，或 `udevadm trigger --subsystem-match=leds`。
+  * Ubuntu 26.04 上，LED 屬性只有在 udev 規則的 `RUN+=chgrp plugdev` +
+    `RUN+=chmod 0660` 生效時才可寫（實測為 `-rw-rw---- root plugdev`）。
+    `MODE=`/`GROUP=`/`uaccess` 無法 chmod sysfs；若
+    `ls -l /sys/class/leds/chromeos::kbd_backlight/brightness` 顯示 `root root 0644`，
+    請執行 `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds`，
+    daemon 才不會退回 `sudo -n tee`。
+  * 根因判斷：使用者 service 無法互動輸入 sudo 密碼。若
+    `journalctl --user -u c640-kbd-backlight-sync` 出現 `sudo: a password is required`，
+    表示問題在上述權限路徑，而非 D-Bus 事件。
+  * 閃爍/震盪：檢查上面的唯讀查詢。若 gsd-power 的 `Brightness` 百分比與
+    UPower raw 值不一致，daemon 會記錄
+    `[WARN] gsd-power set ... forcing UPower + property refresh`；請確認部署的
+    daemon/unit 與 repo 完全一致（smoke 測試會檢查；但本機安裝的 daemon 仍是
+    `a03e4a0`，早於第十九次 re-review 四項 fix（唯讀稽核時點的觀察），下結論前請先從本分支重新安裝），並避免其他工具
+    直接寫 LED。
+    若還原時 ScreenSaver 為 `true` 或 `unknown`，延後是預期行為——等待
+    `+0.5s/+1.5s/+3s` 重試或解鎖工作階段。hook 已完全不再探測 session bus。
+  * `resume deferred: ScreenSaver still active`／`... unknown ... deferring restore`
+    代表三態防護正常運作；請保留 state 並等待解鎖。
+    `C640_KBD_RESUME_ALLOW_UNKNOWN=1` 是明確的**風險接受**（可能在仍鎖定的螢幕下
+    點亮鍵盤），預設關閉；`C640_KBD_RESUME_PROBE_MAX` 限制 thaw 後的輪詢（預設 10 秒）。
+  * `bash keyboard/tests/loginctl-contract-check.sh` 是對 hook 所依賴 `loginctl` schema 的
+    **唯讀**檢查：以真正的 `loginctl` 確認 `Session.User` 為數字 `User=<uid>`（不是 session
+    的 `UID=` 鍵），且 `show-seat ActiveSession` 值為英數 session ID。systemd host 印出
+    `CONTRACT OK`，非 systemd host 印出明確的 `SKIP`（`SKIP` **不是**通過）。它**不執行
+    S3 週期、也不寫 handoff**，所以 `CONTRACT OK` 不代表現行 HEAD 已通過真實 S3——請先
+    執行 [verification.md §3](verification.md) 的目標機 checklist。若失敗，請檢查
+    `show-session` 是否缺少 `User`，或舊 hook 是否仍假設 session ID 必為十進位。
+  * `handoff skipped (fail-closed): unsafe destination entry <path>` 或
+    `... destination entry changed during write` 代表 handoff 最終 component 是 symlink、
+    目錄或特殊檔（或在暫存期間被替換）。`cannot publish <path>` 代表 fd 釘住的 inline `python3` `os.rename`
+    發布失敗；暫存檔會被移除且**不嘗試 `cp`／一般 `mv` 降級**，因此不會
+    解引用惡意項目。請修正 runtime dir 中的該項目（移除 symlink／目錄）後重試 suspend
+    週期，並查 root journal 的確切路徑。
+  * `ignoring blank-side suspend handoff 0; keeping saved user brightness N` 代表
+    休眠開始時螢幕已熄滅：hook 讀到的硬體 0 被正確忽略，解鎖後會還原使用者的亮度 N
+    （已於真實 S3 週期驗證——見 [verification.md §3](verification.md)）。
+  * `restore failed (... rc=1): keeping brightness N for retry` 或 `another restore is
+    in progress` 代表 `c640-kbd-backlight.restore-pending` 中的暫存值會保留供重試；
+    當機則在 daemon 啟動時復原。`RECOVERED (0 -> 1)` 代表先前缺失的 gsd-power/UPower
+    D-Bus name 回來了，daemon 重新探測後切回 gsd 單一寫入者。
+  * `blank: brightness NOT saved (rc=...)` / `blank: deferred save attempt N failed
+    (rc=...)` 代表熄滅時無法保存新亮度。daemon 會**保持 LED 亮著**（不讓畫面全暗卻無值
+    可還原），並把擷取值留在 last-user cache。請檢查 `C640_KBD_SAVE_LOCK_WAIT`
+    （預設 2 秒）：緩慢的還原可能佔住 `STATE_LOCK` 導致 `save_state` 逾時。
+    `save_state` 的 rc：`0` = 已保存、`1` = 鎖等待失敗、`2` = 選值/寫入失敗。熄滅時
+    **只取樣一次**，第一次 `save_state "$captured"` 就直接使用該值（不會再取樣第二次而
+    讀到 blank-side 的 `0`、存進過期快取值）；只有擷取值為空時才會讓 `save_state` 自行取樣。
+  * `replacing invalid saved brightness with N` 代表 state 檔內容為空白、非數字、多列或
+    二進位。first-wins 只保護**有效的**已存整數：在 `STATE_LOCK` 內，損毀的檔案已被以熄滅前
+    擷取的亮度原子取代。真正寫入失敗仍回 rc `2` 並保持 LED 亮著；上述的 rc 與重試語意不變。
+  * 喚醒路徑使用結果碼 `0 = RC_DONE`（寫入已驗證，`STATE`/`restore-pending` 已消耗）、
+    `1 = RC_FAIL`（輸入無效／I/O 錯誤）、`2 = RC_DEFER`（鎖競爭、暫存還原仍在進行，
+    或 ScreenSaver active/unknown）。只有 `RC_DONE` 會消耗 resume flag 與 handoff 檔；
+    `RC_DEFER` 保留 flag/handoff/state 並排定重試供 sampler 或下次 unblank 使用；
+    `RC_FAIL` 保留 resume flag，但 saved state 可能已被消耗（僅 last-user cache 留有
+    擷取值）；寫入/finalize 失敗且 state 仍在時仍會重排 +0.5/+1.5/+3s 重試，而 verify 或 adoption 失敗則不排。`restore verify (gen=...): ... not
+    completed`、`suspend handoff adoption deferred`、`unblank: restore deferred` 都是
+    重試訊號而非失敗——等待下一次輪詢或解鎖工作階段即可。
+  * `MANIFEST_INVALID ... original bytes left untouched` 來自**安裝器**而非 daemon：
+    `/var/lib/cros-enablement/install-manifest.json` 已損毀，因此備份/寫入路徑 fail
+    closed，原檔保持位元組不變。**欄位型別錯誤**現在也是 manifest 無效的原因，不只是
+    JSON 格式錯誤：record 的 `target` 必須是無 NUL 的絕對路徑字串，`component`/
+    `installed_at`/`version`/`scope` 若存在必須是字串；安全欄位
+    `was_existing`/`was_enabled`/`was_active`/`was_member` 為**必填布林**（缺失代表
+    未知，絕非 `false`；字串 `"false"` 與數字 `1` 會被拒絕，不轉換）。service 的
+    `name`/`component` 與 group 的 `group`/`user`/`component` 為必填，其他選用欄位可
+    缺席（legacy v1），未知 key 忽略。`groups[*].added_by_project` 是**選用**的逐次安裝
+    布林（缺席＝legacy `false`，代表「沒有額外證據」）；出現但型別錯誤同樣是
+    `MANIFEST_INVALID` 並 fail closed，絕不會被當成權限證據。重裝前請修復或明確移除它；
+    切勿把無效的 manifest 當成空 manifest。
+  * `skipping manifest entry with non-absolute target` 代表安裝器略過了無法作為 record
+    `target` 的 pseudo-target（例如指紋的 `package:libfprint-crfpmoc`），這不是錯誤。
+    `rollback of <component> failed; service/file state may be partial (retained records
+    remain for retry)` 代表還原腳本執行到一半失敗（服務先於檔案還原）且 rollback 回傳
+    rc 1——保留的紀錄可供下次重試。rollback、uninstall 與移除群組組成員都會在任何
+    `systemctl disable keyd` / `gpasswd -d` / 檔案副作用**之前**先驗證 manifest，無效即
+    fail closed。
+  * `RECORD_STATE_UNKNOWN` / `SERVICE_STATE_UNKNOWN` 代表原始狀態快照缺失或不是布林。
+    rollback 視之為**未知，絕非 false**：不刪除/不還原該檔、不啟用/停用/啟動/停止該服務，
+    並保留紀錄且回 rc 1。keyd 也不會被停用——`_keyd_managed_by_us()` 需要有效的布林服務
+    快照才會停用/停止 keyd。
+  * `[WARN NO BACKUP]` 代表 `was_existing` 目標找不到第一份備份；紀錄會保留（不會憑空
+    建立檔案），供日後重試還原。自第九次 re-review 起這是真正的失敗：會記錄
+    `RECORD_BACKUP_MISSING` 問題並印出 `ROLLBACK_INCOMPLETE: N item(s) retained`，因此
+    rollback 結束碼為 rc 1（不印 `finished!`），但其他可處理的項目仍會正常 rollback。
+    RC/重試語意不變——備份可用後重跑 uninstall 即可。`[RESTORED PREVIOUS BACKUP] <backup>
+    -> <target>` 代表即使安裝的檔案已不存在，仍從最早符合的備份重建原檔。
+    `RECORD_RESTORE_FAILED` / `RECORD_REMOVE_FAILED` 代表檔案操作失敗，紀錄保留供重試。
+    還原取代失敗時不會先 unlink 已安裝的目標（普通檔案/symlink 使用單次原子
+    `os.replace()`）。
+  * `SERVICE_RESTORE_FAILED` / `ROLLBACK_INCOMPLETE` 代表至少一個 `systemctl`
+    enable/disable/start/stop 回傳非 0（或 timeout／spawn 失敗），或有像找不到備份的紀錄
+    被保留；這些紀錄會保留供重試，rollback 回傳 rc 1。修好根本問題後重跑 uninstall
+    即可——成功的還原會記錄 `[RESTORED SERVICE]`。只要有紀錄被保留，各最上層 uninstaller
+    就會印出 `Uninstall incomplete; retained state will be retried (see FAIL/WARN lines
+    above).` 並以非 0 結束，而不會印 `finished!`。
+  * `Manifest lock wait failed (rc=... after ...s) ... (holder: ...)` 或 `flock not found`
+    來自跨程序鎖。自第十次 re-review 起這是**操作級鎖**：`run_manifest_operation()` 在整個
+    元件安裝/解除安裝（備份/紀錄 → 部署檔案與服務 → 完成/回滾）期間持有它，因此平行程序
+    不會在目標檔缺席時消耗剛寫入的紀錄，留下沒有 manifest 紀錄的已部署檔案。等待上限為
+    `CROS_ENABLEMENT_MANIFEST_LOCK_TIMEOUT`（預設 10 秒），鎖檔為 root 擁有的 `0600` 檔案
+    `$MANIFEST_DIR/.install-manifest.lock`（fd 9，由短暫的 `coproc sudo bash -c` root helper
+    持有）；逾時、缺少 `flock` 或任何驗證失敗都會 fail closed 且保持 manifest 位元組不變
+    （回傳非 0）。`flock not found` 代表未安裝 `util-linux`。每個 writer 使用唯一的
+    `.install-manifest.*.tmp` 暫存檔（fsync + `chmod 0644` + `os.replace`），平行程序不會
+    互相遺失 first-wins 紀錄。等另一程序結束後重試；若
+    `fingerprint/install-fingerprint.sh --source` 仍在建置並持鎖，請調高 timeout（例如 300）。
+  * `Manifest directory ... must be an absolute path; refusing to lock` 代表
+    `CROS_ENABLEMENT_MANIFEST_DIR` 是相對路徑。請改用絕對路徑（通常是
+    `/var/lib/cros-enablement`）；信任邊界無法針對曖昧的 CWD 評估。
+    `Manifest lock directory ... contains a symlink (...); untrusted symlink; refusing to
+    lock` 代表路徑上有字面 symlink component。自第十二次 re-review 起，**任何**字面
+    symlink component 一律拒絕，即使是 root 擁有、其他方面安全的 symlink：symlink 可能
+    把真正的目標隱藏在使用者可寫的樹中，其擁有者能重新命名鎖。請改用真正的目錄
+    （這是刻意採取的 fail-closed 取捨，比舊版「信任的 symlink」放行更嚴格）。
+    `Manifest lock canonical path ... has an untrusted realpath ancestor; refusing to lock`
+    （`untrusted realpath ancestor`）代表**真實**路徑——以 `realpath -e` 解析最深的存在
+    前綴再加上缺少的層——有非 root 控管的祖先。請修正該真實祖先的擁有者/權限，
+    不要用另一個 symlink 繞過。
+  * `... (holder: FAILED:symlink)`、`FAILED:type`、`FAILED:open`、`FAILED:inode`、
+    `FAILED:canonical`、`FAILED:ancestor`、`FAILED:parentdir` 或 `FAILED:flock` 是
+    root helper 拒絕取鎖的原因。`FAILED:symlink` /
+    `FAILED:type` / `FAILED:inode` 代表鎖路徑是 symlink、非普通檔（例如目錄或 FIFO），或在
+    init 與 open 之間被替換：helper 會在**實際持有 fd 9 的行程內**以 `/proc/$$/fd/9` 比對
+    路徑的 `(dev,ino)`，並檢查 owner 為 `0`、mode 為 `600` 與普通檔型別，因此非特權的
+    inode 替換無法轉移 flock。`FAILED:flock` 是一般的鎖競爭。這些檢查若在 helper 啟動前
+    就失敗，會記錄 `Manifest lock path ... is a symlink` / `is not a regular file` /
+    `is not a root-owned 0600 regular file (uid=... mode=...)`。
+    **`FAILED:canonical`** 代表 holder 在實際持有 fd 9 的行程內重新導出
+    `realpath -e "$dir"`，結果不再等於 gate 交下的 canonical 目錄——gate 執行後有人換入
+    symlink。**`FAILED:ancestor`** 代表直接父目錄之上的**真實**祖先不是 uid `0`，
+    或為群組/其他可寫但不是 root 擁有的 sticky 世界可寫層（例如 `/tmp` `1777`）。
+    兩者都會在任何 `flock` 前中止且保持 manifest 位元組不變；修正路徑後重試。
+  * `FAILED:parentdir` 代表 root holder 以 fd 8 釘住鎖的**直接父目錄**失敗：父目錄不是
+    root 擁有、群組/其他可寫、不是目錄，或其 `(dev,ino)` 與路徑不符。這防堵以下競態：
+    A 持鎖中，父目錄擁有者把路徑重新命名，B 便對全新的 inode 取到第二把鎖。請檢查
+    目錄的擁有者/權限後重試；manifest 位元組保持不變。
+  * `Manifest lock parent ... is group/other-writable (mode ...)`、`is owned by uid ... (must
+    be root-owned)`、`is a symlink or not a directory` 或 `Cannot stat manifest lock parent
+    ...` 代表直接父目錄不受信任，安裝器不會對鎖做任何特權 chmod/chown/open。請讓
+    `/var/lib/cros-enablement` **由 root 擁有**且權限為 `0755`；目前 EUID/UID 擁有不再接受
+    （呼叫者擁有的父目錄可以重新命名有效的鎖），`0775` 群組可寫目錄會 fail closed，
+    sticky bit 也不能豁免直接父目錄。每一層祖先目錄也都會檢查：`Manifest lock ancestor ...
+    is not root-controlled (uid=... mode=...)` 拒絕非 root 擁有或群組/其他可寫但**沒有**
+    sticky bit 的層（root 擁有且具 sticky 的世界可寫層，例如 `/tmp` `1777`，可通過）；
+    `Manifest lock ancestor ... is an untrusted symlink` 拒絕 symlink，除非其所在目錄由
+    root 擁有且不可群組/其他可寫。此外，字面路徑檢查現在會在正規化前拒絕**任何** symlink
+    component（`contains a symlink`），canonical 路徑的祖先也一併檢查
+    （`untrusted realpath ancestor`）。因此自訂在使用者可寫目錄下的 lock parent 即使鎖檔
+    本身是 root 擁有，仍會被拒絕。
+  * `Could not set manifest lock mode to 0600` / `Could not set manifest lock owner to root`
+    代表鎖無法被設為 root 擁有的 `0600`（舊的 `0644` 鎖會自動升級），安裝器因此 fail closed。
+    peer 帳號直接開啟 `$MANIFEST_DIR/.install-manifest.lock` 時看到 `permission denied` 是
+    預期行為，正是 DoS 防護：只有短暫的 root holder（透過 passwordless `sudo`）會開啟 fd 9。
+    請勿以非特權使用者手動 chmod/chown 鎖檔——修正 `sudo` helper 或父目錄權限後重試。
+  * 群組 membership 現在**先記錄再執行 `usermod`**：安裝器先將原始 `plugdev` 成員資格
+    寫入 manifest，再明確檢查 `usermod` 的 rc（移除 `|| true`）；若變更失敗且先前沒有
+    紀錄，就移除剛寫入的紀錄。共用的歸屬探測在至少一筆明確為 `was_member=false`，**或任一
+    紀錄帶有 `added_by_project=true`** 時回 rc 0（兩者都證明是我們加入的），**沒有紀錄**
+    回 rc 1（`No group record for '<user>'@'<group>'; nothing to roll back.`），**全部皆為
+    `was_member=true` 且沒有該 flag** 回 rc 3（原本就存在），欄位型別錯誤
+    回 rc 2（`Cannot determine original membership of <user>@<group>; refusing to change it`，
+    rc 1）。first-wins 不變：rc 0 才執行 `gpasswd -d`，而仍引用該 group 的 udev rule 會
+    保留成員資格。**rc 3 時完全不呼叫 gpasswd**：若仍有 udev rule 引用該 group，會記錄
+    `udev rules still reference group '<group>'; keeping '<user>' in it (all records
+    pre-existing).` 並保留快照；一旦沒有 rule 引用它（所有使用該 group 的元件皆已卸載），
+    會記錄 `All records pre-existing and no udev rule needs '<group>'; consuming stale
+    records for '<user>'@'<group>' (membership unchanged).` 並以**零次 gpasswd** 消耗全部
+    紀錄，讓下次安裝重新擷取真實的成員資格（例如管理員已變更）。消耗失敗會記錄
+    `Could not consume stale group records for '<user>'@'<group>'; keeping them for retry.`
+    （rc 1）。rc 0 時，uninstall 只有在 `gpasswd -d` 成功後才消耗該組的所有元件紀錄
+    （`manifest_remove_group_all`），因此模組解除安裝順序不會留下過期的 `was_member` 紀錄。
+    若重裝時原始 `was_member=true` 但使用者目前**不是**成員（管理員在元件仍安裝時移除了），
+    writer 會在未變動的 first-wins 快照旁記錄 `added_by_project=true`，探測因此回 rc 0，讓
+    uninstall 移除本次授予的成員資格。若 `usermod -aG` 失敗，`manifest_clear_group_added` 只清除
+    **該 flag**（`Could not clear added-by-project evidence for <user>@<group>; kept for
+    manual cleanup` 代表清除本身失敗）；consume-all 則連整列（含 flag）一起移除。
+  * `Could not remove '<user>' from group '<group>'; keeping manifest records for retry.`
+    代表 `gpasswd -d` 失敗。現在這是**真正的失敗**（log_error、rc 1）：三個元件 uninstaller
+    會捕捉它並折進結束碼，因此完整的 `./setup.sh --uninstall` 不會在成員資格仍存在時回報
+    成功。請修正群組/權限問題後重跑 uninstall；紀錄會保留供重試。移除成功後 manifest
+    寫入失敗時，`Could not consume group records for '<user>'@'<group>'; keeping them for
+    retry.` 有相同的 rc 1／重試語意。
+  * `Manifest still records /etc/pam.d/sudo: rollback did not restore it. Uninstall did NOT
+    modify this file; remove the project line manually if needed.` 來自唯讀的 rollback 後
+    PAM 檢查：uninstall 絕不對 sudo PAM 執行 sed（所有檔案還原都由
+    `rollback_component("fingerprint")` 負責），因此原本就存在的精確 `pam_fprintd` 行不會
+    被刪除。若 manifest 損毀，則改為警告 `Manifest at ... is corrupt/invalid; cannot confirm
+    rollback of /etc/pam.d/sudo. Uninstall did NOT modify this file.`——兩種情況都只警告。
+    Debian/Ubuntu 上，原始 `common-*` 位元組會先備份（**所有**現有的檔，不只含 fp 者）並由
+    rollback 還原。安裝時**直接**以 `sed -i '/pam_fprintd\.so/d'` 移除 fp 行（記錄
+    `Removed pam_fprintd.so line(s) from ...`），**絕不呼叫** `pam-auth-update --remove
+    fprintd`——該動作會直接刪除 debconf 的 `libpam-runtime/profiles` selection。由於日後
+    `pam-auth-update --package` 會從當前的 `common-*` 內容推導 profile 清單，若不處理便會
+    永久丟失 fprintd，安裝時會把 selection 與 `/var/lib/pam/*` 快照到 first-wins sidecar，
+    並自行執行一次 `pam-auth-update --package` 收斂到穩定的「無 fprintd」狀態（日後套件
+    觸發的執行即為 no-op）。uninstall 只有在 rollback 完成後才從該快照還原。Fedora 的
+    `authselect` 與 openSUSE 的 `pam-config` profile 狀態不在 manifest 內，請依警告手動
+    還原原本的 profile。
+  * `Snapshotted the PAM profile selection to <path>` / `Keeping the existing PAM selection
+    snapshot at <path> (first-wins).` 是安裝時的 sidecar 日誌。sidecar
+    （`<manifest-dir>/pam-selection`）存放原始 debconf `libpam-runtime/profiles` multiselect；
+    `<manifest-dir>/pam-selection.saved` 則是 root 擁有、`0700` 的目錄，存放 `/var/lib/pam`
+    下每個檔案的副本。兩者都以 `sudo` 一次性、first-wins 發佈（`pam-selection` 檔為 `0644`），
+    所有讀取/複製都經由 `sudo`，讓搭配 passwordless `sudo` 的非 root uninstall 也能還原；
+    `Could not read debconf libpam-runtime/profiles; ... will be empty.`、
+    `Could not write the PAM selection snapshot; ...` 與 `Could not snapshot every saved PAM
+    profile file; ...` 代表快照不完整——uninstall 將無法完整還原原始狀態，請手動檢查這些檔案。
+    `pam-auth-update --package converged the debconf selection and saved profiles (no
+    fprintd).` 是預期的自我收斂日誌；`pam-auth-update --package failed; keeping the selection
+    snapshot for uninstall convergence.` 則保留 sidecar。
+  * `Legacy PAM sidecar without any optional metadata; using best-effort compatibility.`
+    代表該 sidecar 由較舊的安裝器寫入、沒有 `saved-snapshot` 中繼資料：還原時改為檢查
+    `.saved` 目錄（空目錄視為 absent、無法讀取則 fail closed），而不是假設快照完整。相關的
+    `Legacy PAM sidecar has an empty ...; inferring saved-snapshot=absent`、
+    `... has no saved metadata; inferring saved-snapshot=complete from ...` 與
+    `... has no saved metadata and no ...; inferring saved-snapshot=absent (best-effort).`
+    都是同一條相容路徑。**新版** sidecar 若出現矛盾的 saved-snapshot 狀態仍會 fail closed。
+  * `No PAM selection snapshot at <path>; nothing to restore.` 代表沒有支援 fprintd 的安裝
+    留下 sidecar，因此沒有需要收斂回去的狀態。`Original PAM profile selection restored;
+    snapshot consumed.` 是成功路徑：rollback 確認完成後，先複回 `.saved` 檔案，再以
+    `debconf-set-selections` 寫入 multiselect、重跑 `--package` 並驗證線上 selection。
+    `Manifest still records <path>: rollback is incomplete, leaving the PAM selection snapshot
+    for retry.` 或 `Manifest at ... is corrupt/invalid; leaving the PAM selection snapshot
+    for retry.` 代表刻意**沒有**更動 debconf；請完成 rollback（或修復 manifest）後重跑 uninstall。
+  * `debconf-set-selections is unavailable; keeping <path> for retry.` 與
+    `debconf-set-selections failed; keeping <path> for retry.` 代表 selection 無法寫入——
+    sidecar 與 `.saved` 快照會保留供日後 uninstall；請安裝 `debconf`（或修好 `sudo` helper）
+    後重試。`The PAM selection snapshot is empty; cannot restore the debconf selection.` 代表
+    只有 `.saved` 檔案被還原。`Could not restore every saved PAM profile file from the
+    snapshot.` 代表部分 `/var/lib/pam` 檔案可能仍停留在收斂後的無 fprintd 狀態；請重裝或
+    手動還原。
+  * `PAM selection restore verification failed: expected '<a>', got '<b>'. Keeping <path> for
+    retry.` 是 fail closed 的比對失敗（rc 1，保留 sidecar）。比對接受**精確比對或忽略空白／
+    順序的集合比對**：`pam-auth-update` 會把 multiselect 正規化為 "a, b, c"，因此原始值順序
+    或空白不同沒關係，但 profile **集合**不同則不接受（管理員日後刻意的變更不會被悄悄接受）。
+    **取捨**：快照具有最終權威，因此安裝期間變更 selection，會在 uninstall 時被覆寫；
+    安裝期間手動啟用 fprintd profile（`pam-auth-update --enable fprintd`）會把 fp 行寫回
+    `common-auth`，直至 uninstall 前都恢復 GDM 競賽。
+  * `External content change detected in ... since the snapshot (added/removed/reordered
+    MODULE line); refusing to overwrite it - manual recovery required.` 代表管理員或工具對
+    `common-*` 做了語意變更；uninstall 回 rc 1 並保留三個 snapshot half。預期順序日誌為
+    `PAM external tool calls complete; re-applying the original common/sudo state.`——所有工具
+    呼叫先結束才從 `.common` 還原，最後的 bytes/mode/owner/type/link/absence + savedir +
+    selection/seen 驗證全部通過才消耗。沒有 `.common` 的 legacy sidecar 會記錄
+    `Legacy PAM snapshot has no ... (best effort only)`／`No PAM common-state snapshot (...) ... (legacy best
+    effort)`，不宣稱位元組保證；`saved-snapshot=absent` 但 live savedir 非空則 fail closed
+    並要求 `manual recovery`。manifest record 已消耗加上 selection 相等並不算成功。
+    若最後一個 `.common` half 在其他兩半已消耗後無法刪除，sidecar 會重建但狀態**無法自動重試**
+    （`manual recovery is REQUIRED`），保留的檔案必須手動清理。
+  * `Symlinked /etc/pam.d/common-* contains an active pam_fprintd.so module line;
+    refusing to install because it cannot be stripped without replacing the link (the GDM
+    claim race would remain).` 是**安裝時**的 fail-closed preflight：在任何 snapshot、
+    backup、`sed`、外部工具或 sudo 變更之前，每個 `common-*` 都透過 `sudo` 探測；symlink
+    背後若有生效的 fp 模組，無法不解引用就移除，因此安裝以非 0 結束，且**不修改 PAM 檔
+    與 debconf selection**。無法讀取/grep 錯誤也 fail closed；不存在或 dangling 目標視為
+    沒有生效模組。請把 symlink 換成普通檔（或在其真實目標下手動移除 fp 行）後重跑安裝。
+    安裝成功後的 postcondition 會檢查**實際的** `common-*` 位元組沒有生效 fprintd——
+    debconf selection 中留有已停用記錄並不算數。
+  * `Uncertain PAM rule syntax in ...; refusing to modify PAM configuration` 或
+    `numeric jump target identity changes after removing fingerprint module` 代表第十七次
+    re-review 的 PAM 規則解析器無法證明自訂 stack 可安全編輯。安裝在任何 PAM 編輯**之前**
+    以非 0 結束，原始位元組與 debconf selection 完全不變。行尾註解提及 `pam_fprintd.so`
+    不再被當成生效模組，但不確定語法、自訂 jump control 或變動的 jump 落點不會被猜測：
+    請手動修正自訂 stack 後重跑安裝器。日後 `pam-auth-update` 失敗會如實記錄
+    （`convergence NOT verified yet`），也不宣稱 jump 落點已重新驗證。
 
 ---
 
@@ -249,12 +648,29 @@
   `gdm-fingerprint` PAM 服務運作，從此必定搶到 Claim。
 
   ```bash
-  # 安裝器實際執行的動作：
-  sudo pam-auth-update --remove fprintd
+  # Debian/Ubuntu 上安裝器實際執行的動作：
+  # 先備份原始 common-* 位元組（Tier 2），再只移除 fp 模組行。
+  # 切勿使用 `pam-auth-update --remove fprintd`：它會靜默刪除 debconf 的 profile
+  # selection，而 manifest 無法還原。
+  sudo sed -i '/pam_fprintd\.so/d' /etc/pam.d/common-auth
   sudo sed -i '/^@include common-auth$/i auth sufficient pam_fprintd.so max-tries=1 timeout=10' /etc/pam.d/sudo
   ```
 
-  *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）*
+  > [!WARNING]
+  > 這些 `sed` 指令是 PAM-aware 解析器（第十七次 re-review）之前的**舊手動範例**：substring
+  > 比對會刪除**任何**含 `pam_fprintd.so` 的行，包括行尾 `#` 註解只是提到它的無關 auth 規則
+  > （例如 `auth required pam_unix.so nullok # fallback when pam_fprintd.so unavailable`）。
+  > 自訂 stack 請優先重跑安裝器：它解析 **module-path 欄位**、保留非 fp 位元組，並在不確定
+  > 語法或 jump 落點變動時 fail closed（`Uncertain PAM rule syntax ...`、
+  > `numeric jump target identity changes ...`）。若必須手動編輯，請檢查 module-path 欄位並
+  > 於事後驗證非 fp 位元組。
+
+  *（這也消除了 sudo 的競賽窗口——見第 8 節「單一 stack」原則。）* 若某個
+  `common-*` 檔案是 **symlink**，其目標有生效的 `pam_fprintd.so` 行，`sed -i` 會
+  替換連結而非移除模組，因此安裝器會在碰到 PAM 或 debconf selection 之前 fail closed
+  （root journal 記錄 `Symlinked ... contains an active pam_fprintd.so module line;
+  refusing to install ...`）。請先修正 symlink 再重跑安裝；安裝後 postcondition 驗證的是
+  實際的 `common-*` 位元組，而不只是 selection。
 * **手動復原（舊安裝適用）**：按 `Esc` 取消失敗的解鎖回合再重新解鎖——
   新 worker 會乾淨地重新 Claim。或先執行 `sudo systemctl restart fprintd`
   再解鎖。
@@ -286,6 +702,13 @@
 
 * **症狀**：盒蓋休眠（S3 `deep`）後打開，系統已喚醒（`PM: suspend exit`）
   但面板**全黑**，直到按鍵或點擊才亮。不是當機——輸入一到鎖定畫面即正常。
+
+  > [!NOTE]
+  > 開蓋後**鍵盤**背光偏暗也是預期行為：thaw 後的 daemon 會等到 ScreenSaver 明確為
+  > `inactive` 才還原（`resume deferred: ScreenSaver still active`）。解鎖工作階段
+  > 即會還原（例如 `restoring brightness 30`）。這是 §11 所述的 fail-closed 三態
+  > 防護，不是上面的顯示面板問題。
+
 * **根因（2026-08-18 兩個候選機制）**：
   1. **GNOME 使用者層再次黑屏**（最可能，符合「按鍵即恢復」特徵）：
      `gsd-power` 在休眠時關閉面板；螢幕護盾的鎖定動畫在顯示器關閉期間停滯，
