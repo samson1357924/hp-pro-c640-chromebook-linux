@@ -15769,6 +15769,134 @@ EOF
         "PAM-105/limit: zero writes to the unresolved deep file"
 }
 
+# PAM-106 (CI `lib/pam.sh helper round-trip with real pam-auth-update`): a REAL
+# `pam-auth-update --enable fprintd` profile puts `try_first_pass` on the
+# pam_unix.so jump source. After the profile is disabled, the tool legally
+# converges those args back to plain `nullok`. T3 must accept ONLY that exact,
+# logged equivalence: install rc 0, fp still removed, every other rule byte
+# unchanged. Mutation: remove the built-in allowlist entry and this case fails.
+test_pam_known_convergence_arg_rewrite() {
+    local s log t
+    s="$(setup_pam_sandbox known-convergence-argsfp)"
+    pam_write_full_stack "$s"
+    /usr/bin/sed -i -e 's|pam_unix.so nullok$|pam_unix.so nullok try_first_pass|' \
+        "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/pam" "$s/pam.before"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    text = fh.read()
+text = text.replace('pam_unix.so nullok try_first_pass', 'pam_unix.so nullok')
+with open(p, 'w') as fh:
+    fh.write(text)
+PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_eq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-106/convergence: the known no-fprintd args convergence is accepted"
+    assert_contains "pam_unix.so nullok try_first_pass" "$(cat "$s/original.common-auth")" \
+        "PAM-106/convergence: baseline really carried the fprintd-profile argument"
+    assert_not_contains "try_first_pass" "$(cat "$s/tool.modified" 2> /dev/null || echo '')" \
+        "PAM-106/convergence: the tool really converged the arguments"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "known convergence arg rewrite" "$log" \
+        "PAM-106/convergence: the accepted rewrite is explicitly audited"
+    assert_contains "Verified no active pam_fprintd.so module remains" "$log" \
+        "PAM-106/convergence: the installed-state postcondition passed"
+    assert_not_contains "pam_fprintd.so" "$(cat "$s/pam/common-auth" 2> /dev/null || echo '')" \
+        "PAM-106/convergence: the fingerprint module is still removed"
+    # Everything except the fp line and the one allowlisted arg token is
+    # byte-identical to the pre-mutation file.
+    /usr/bin/sed -e '/pam_fprintd\.so/d' \
+        -e 's/pam_unix.so nullok try_first_pass/pam_unix.so nullok/' \
+        "$s/original.common-auth" > "$s/expected.common-auth"
+    assert_eq "$(file_hex "$s/expected.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-106/convergence: no other common-auth rule byte changed"
+    assert_eq "$(file_hex "$s/tool.modified")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-106/convergence: the converged file was not force-recovered"
+    for t in account password session session-noninteractive; do
+        assert_eq "$(file_hex "$s/pam.before/common-$t")" "$(file_hex "$s/pam/common-$t")" \
+            "PAM-106/convergence: common-$t is byte-unchanged"
+    done
+}
+
+# PAM-107: the built-in entry is a LITERAL full-descriptor key. A near-miss with
+# the same shape but a different module, control/landing or OLD argsfp must stay
+# a fail-closed T3 failure. The end-to-end half uses a different OLD argument
+# value (`nullok try_first_pass noecho` -> `nullok noecho`); the table half
+# checks the two other near misses against the SAME helper.
+test_pam_known_convergence_near_miss_fails_closed() {
+    local s log key modkey ctlkey fpkey candidate out rc variant
+    s="$(setup_pam_sandbox convergence-near-miss)"
+    pam_write_full_stack "$s"
+    /usr/bin/sed -i -e 's|pam_unix.so nullok$|pam_unix.so nullok try_first_pass noecho|' \
+        "$s/pam/common-auth"
+    cp -a "$s/pam/common-auth" "$s/original.common-auth"
+    cp -a "$s/stub/pam-auth-update" "$s/stub/pam-auth-update.orig"
+    cat > "$s/stub/pam-auth-update" << EOF
+#!/usr/bin/env bash
+"$s/stub/pam-auth-update.orig" "\$@"
+/usr/bin/python3 - "\$CROS_ENABLEMENT_PAM_DIR/common-auth" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p) as fh:
+    text = fh.read()
+text = text.replace('pam_unix.so nullok try_first_pass noecho', 'pam_unix.so nullok noecho')
+with open(p, 'w') as fh:
+    fh.write(text)
+PY
+cp "\$CROS_ENABLEMENT_PAM_DIR/common-auth" "$s/tool.modified"
+EOF
+    chmod +x "$s/stub/pam-auth-update"
+    CROS_ENABLEMENT_PAM_SUDO_PATH="$s/pam/sudo" CROS_ENABLEMENT_PAM_DIR="$s/pam" \
+        run_pam_install "$s" debian
+    assert_neq "0" "$(cat "$s/install.rc" 2> /dev/null || echo MISSING)" \
+        "PAM-107/argsfp: a different old argument value still fails closed"
+    assert_contains "pam_unix.so nullok noecho" "$(cat "$s/tool.modified" 2> /dev/null || echo '')" \
+        "PAM-107/argsfp: the tool really performed the near-miss rewrite"
+    assert_eq "$(file_hex "$s/original.common-auth")" "$(file_hex "$s/pam/common-auth")" \
+        "PAM-107/argsfp: the failed transaction force-restored the original bytes"
+    log="$(cat "$s/log.txt" 2> /dev/null || echo '')"
+    assert_contains "changed during convergence" "$log" \
+        "PAM-107/argsfp: the generic T3 failure is named"
+    assert_not_contains "known convergence arg rewrite" "$log" \
+        "PAM-107/argsfp: the allowlist audit line was NOT emitted"
+    assert_contains "Failed PAM transaction recovered" "$log" \
+        "PAM-107/argsfp: forced recovery succeeded"
+
+    # The exact descriptor from the model (same one the CI log shows), with
+    # literal substitutions that keep the overall shape but change one keyed
+    # field at a time. None of these may be rewritten by the built-in entry.
+    key=$'P\tcommon-auth\tauth\tcommon-auth|auth||pam_unix.so|[success=1 default=ignore]|6e756c6c6f6b.7472795f66697273745f70617373|0\tauth\t0\t[success=1 default=ignore]\tpam_unix.so\t6e756c6c6f6b.7472795f66697273745f70617373\t0\tcommon-auth|auth||pam_permit.so|required||0\tsuccess=1'
+    modkey="${key//pam_unix.so/pam_permit.so}"
+    ctlkey="${key//success=1/success=2}"
+    fpkey="${key//6e756c6c6f6b.7472795f66697273745f70617373/6e756c6c6f6b.6e6f6563686f}"
+    for variant in module control argsfp; do
+        case "$variant" in
+            module) candidate="$modkey" ;;
+            control) candidate="$ctlkey" ;;
+            argsfp) candidate="$fpkey" ;;
+        esac
+        rc=0
+        out="$(bash -c '
+            source "$1/lib/pam.sh"
+            _pam_nonfp_apply_known_convergence "$2" || exit $?
+        ' _ "$REPO_ROOT" "$candidate")" || rc=$?
+        assert_eq "0" "$rc" "PAM-107/$variant: the helper accepts any descriptor"
+        assert_eq "$candidate" "$out" \
+            "PAM-107/$variant: a near-miss descriptor is NOT rewritten"
+    done
+}
+
 test_pam_92_mixed_management_groups_fails_closed
 test_pam_93_same_module_multi_instance_fails_closed
 test_pam_94_include_expansion_parity
@@ -15786,6 +15914,8 @@ test_pam_101_zero_addition_after_jump
 test_pam_102_sudo_canonical_args_change
 test_pam_addition_allowlist_literal_match
 test_pam_105_deep_include_closure_fail_closed
+test_pam_known_convergence_arg_rewrite
+test_pam_known_convergence_near_miss_fails_closed
 
 echo ""
 echo "rollback tests: $PASS passed, $FAIL failed"

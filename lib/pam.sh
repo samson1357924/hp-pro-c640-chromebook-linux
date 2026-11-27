@@ -92,6 +92,24 @@ _PAM_NONFP_FAILURE_DETAIL=""
 # an operator/test can enumerate a known-benign generated rule; it is empty by
 # default, so a newly added rule always fails closed.
 _PAM_NONFP_ADDITION_ALLOWLIST="${CROS_ENABLEMENT_PAM_ADDITION_ALLOWLIST:-}"
+# Built-in, narrow argsfp CONVERGENCE rewrite allowlist. A REAL
+# `pam-auth-update --enable fprintd` profile adds `try_first_pass` to the
+# pam_unix.so jump source; after that profile is disabled, the tool legally
+# converges the arguments back to plain `nullok`. That one equivalence is the
+# only args rewrite accepted here (try_first_pass is meaningful only while a
+# front-end fingerprint module has already tried). Each entry keys the COMPLETE
+# per-group P descriptor with BOTH argsfp slots redacted to the literal marker
+# `<argsfp>`, plus the exact OLD and NEW hex values as separate literal strings.
+# No glob/regex/substring matching is used anywhere in the lookup, so a
+# different module, control, group, landing, action or old/new value stays a
+# fail-closed T3 failure. Do NOT re-sample the baseline after convergence:
+# that compares live state with itself and would disable the whole gate.
+_PAM_NONFP_CONVERGENCE_SHAPES=()
+_PAM_NONFP_CONVERGENCE_OLD=()
+_PAM_NONFP_CONVERGENCE_NEW=()
+_PAM_NONFP_CONVERGENCE_SHAPES+=("$(printf '%b' 'P\tcommon-auth\tauth\tcommon-auth|auth||pam_unix.so|[success=1 default=ignore]|<argsfp>|0\tauth\t0\t[success=1 default=ignore]\tpam_unix.so\t<argsfp>\t0\tcommon-auth|auth||pam_permit.so|required||0\tsuccess=1')")
+_PAM_NONFP_CONVERGENCE_OLD+=('6e756c6c6f6b.7472795f66697273745f70617373')
+_PAM_NONFP_CONVERGENCE_NEW+=('6e756c6c6f6b')
 _PAM_MODEL_HELPER="$SCRIPT_DIR_PAM/pam_stack_model.py"
 _PAM_SAVED_DIR="${CROS_ENABLEMENT_PAM_SAVED_DIR:-/var/lib/pam}"
 _PAM_SEL_SIDECAR="${CROS_ENABLEMENT_PAM_SELECTION_FILE:-${MANIFEST_FILE%/*}/pam-selection}"
@@ -449,6 +467,65 @@ _pam_nonfp_addition_allowed() {
     grep -Fxq -- "$key" <<< "$_PAM_NONFP_ADDITION_ALLOWLIST"
 }
 
+# $1=one full P descriptor, $2=replacement argsfp. Emit the descriptor with
+# BOTH argsfp slots (field 6 of the `|`-joined instance id and tab field 9)
+# set to $2; every other byte is untouched. A malformed descriptor returns 1
+# so a shape key can never be built from an untrusted/partial line.
+_pam_nonfp_descriptor_with_argsfp() {
+    awk -F '\t' -v afp="$2" '
+        BEGIN { OFS = "\t" }
+        {
+            if ($1 != "P" || split($4, p, "|") != 7) exit 1
+            p[6] = afp
+            key = p[1]
+            for (i = 2; i <= 7; i++) key = key "|" p[i]
+            $4 = key
+            $9 = afp
+            print
+        }
+    ' <<< "$1"
+}
+
+# $1=one expected P descriptor. If it matches a built-in convergence entry
+# EXACTLY (literal shape key + literal old argsfp in BOTH slots), print the
+# descriptor rewritten to the new argsfp; otherwise print $1 unchanged.
+_pam_nonfp_apply_known_convergence() {
+    local line="$1" shape afp candidate i
+    shape="$(_pam_nonfp_descriptor_with_argsfp "$line" '<argsfp>')" || {
+        printf '%s\n' "$line"
+        return 0
+    }
+    [ -n "$shape" ] || {
+        printf '%s\n' "$line"
+        return 0
+    }
+    afp="$(awk -F '\t' '$1 == "P" { print $9 }' <<< "$line")"
+    [ -n "$afp" ] || {
+        printf '%s\n' "$line"
+        return 0
+    }
+    # The model derives both slots from the same rule; if they disagree this is
+    # not a descriptor we may rewrite.
+    candidate="$(_pam_nonfp_descriptor_with_argsfp "$line" "$afp")" || {
+        printf '%s\n' "$line"
+        return 0
+    }
+    [ "$candidate" = "$line" ] || {
+        printf '%s\n' "$line"
+        return 0
+    }
+    for i in "${!_PAM_NONFP_CONVERGENCE_SHAPES[@]}"; do
+        # Quoted [ = ] is literal string equality: no glob, no regex and no
+        # substring match. A near-miss key cannot hit this entry.
+        if [ "$shape" = "${_PAM_NONFP_CONVERGENCE_SHAPES[i]}" ] \
+            && [ "$afp" = "${_PAM_NONFP_CONVERGENCE_OLD[i]}" ]; then
+            _pam_nonfp_descriptor_with_argsfp "$line" "${_PAM_NONFP_CONVERGENCE_NEW[i]}"
+            return 0
+        fi
+    done
+    printf '%s\n' "$line"
+}
+
 # $1=newline-separated expected descriptors, $2=live descriptors.
 # Keys are the FULL Phase A per-group P descriptors, including group, unique
 # instance id, control, argsfp and numeric-jump landing.
@@ -461,9 +538,28 @@ _pam_nonfp_addition_allowed() {
 # appeared (see _PAM_NONFP_FAILURE_KIND). rc 2 = pure reorder.
 _pam_nonfp_seq_contains() {
     local expected="$1" actual="$2" e a missing extra token found
+    local line rewritten effective="" oldfp newfp
     local -a ea=() aa=()
     _PAM_NONFP_FAILURE_KIND=""
     _PAM_NONFP_FAILURE_DETAIL=""
+    # Apply ONLY the built-in known convergence rewrite to the EXPECTED key set
+    # before the multiset / zero-addition / ordered-subsequence proof. Every
+    # other byte must still match exactly; the operator-supplied ADDITION
+    # allowlist below is untouched and still governs NEW keys only.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        rewritten="$(_pam_nonfp_apply_known_convergence "$line")"
+        if [ "$rewritten" != "$line" ]; then
+            # The helper runs in a command substitution (subshell), so derive
+            # the audit values in THIS shell from the two descriptors instead
+            # of relying on a global the helper cannot write back.
+            oldfp="$(awk -F '\t' '$1 == "P" { print $9 }' <<< "$line")"
+            newfp="$(awk -F '\t' '$1 == "P" { print $9 }' <<< "$rewritten")"
+            log_info "known convergence arg rewrite accepted for non-fp PAM rule ($oldfp -> $newfp); try_first_pass was only meaningful behind the removed fingerprint module."
+        fi
+        effective+="$rewritten"$'\n'
+    done <<< "$expected"
+    expected="$effective"
     e="$(_pam_tmp_file)" || return 2
     a="$(_pam_tmp_file)" || return 2
     printf '%s\n' "$expected" | grep -v '^$' | LC_ALL=C sort > "$e"
@@ -3207,7 +3303,11 @@ _pam_sudo_plan_and_verify() {
 # ZERO-ADDITION gate: any new descriptor must be explicitly allowlisted. Only
 # bracket CONTROL `=` whitespace, numeric leading zeroes and continuation
 # whitespace are normalised; every module-argument byte is covered by argsfp.
-# Mode and debconf selection changes remain irrelevant.
+# The sole exception is the BUILT-IN exact-shape argsfp convergence rewrite
+# above (pam_unix `nullok.try_first_pass` -> `nullok` after the fprintd profile
+# is disabled), which is logged explicitly; any other args/control/path/group/
+# order/addition change still fails closed. Mode and debconf selection changes
+# remain irrelevant.
 _pam_verify_installed_no_fprintd() {
     local scan_rc=0 seq_rc=0
     _pam_common_fp_scan || scan_rc=$?
